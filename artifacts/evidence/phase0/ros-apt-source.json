@@ -1,0 +1,14 @@
+{
+  "checked_at": "2026-08-25T18:34:32.929025+00:00",
+  "mode": "check",
+  "ros_apt_source": {
+    "asset_sha256": "0804d9b13db770eb87019be414cd78378835228ad5fa801fc88758596dd8f7e5",
+    "asset_url": "https://github.com/ros-infrastructure/ros-apt-source/releases/download/1.2.0/ros2-apt-source_1.2.0.noble_all.deb",
+    "installed_version": "1.2.0~noble",
+    "package": "ros2-apt-source",
+    "ros_jazzy_ros_base_candidate": "0.11.0-1noble.20260616.084325",
+    "source_file": "/etc/apt/sources.list.d/ros2.sources"
+  },
+  "schema_version": 1,
+  "status": "passed"
+}

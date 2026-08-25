@@ -1,0 +1,41 @@
+package	candidate_version	installed_version
+build-essential	12.10ubuntu1	12.10ubuntu1
+ca-certificates	20260601~24.04.1	20240203
+clang-format	1:18.0-59~exp2
+clang-tidy	1:18.0-59~exp2
+cmake	3.28.3-1build7
+cppcheck	2.13.0-2ubuntu3
+curl	8.5.0-2ubuntu10.13	8.5.0-2ubuntu10.6
+debhelper	13.14.1ubuntu5
+dh-golang	1.62
+dpkg-dev	1.22.6ubuntu6.6	1.22.6ubuntu6.5
+fakeroot	1.33-1	1.33-1
+git	1:2.43.0-1ubuntu7.3	1:2.43.0-1ubuntu7.1
+gnupg	2.4.4-2ubuntu17.4	2.4.4-2ubuntu17
+golang-go	2:1.22~2build1
+lintian	2.117.0ubuntu1.5
+ninja-build	1.11.1-2
+pkg-config	1.8.1-2build1
+pre-commit	3.6.2-1
+python3-jsonschema	4.10.3-2ubuntu1	4.10.3-2ubuntu1
+python3-matplotlib	3.6.3-1ubuntu5
+python3-pip	24.0+dfsg-1ubuntu1.3	24.0+dfsg-1ubuntu1.3
+python3-pytest	7.4.4-1
+python3-pytest-cov	4.1.0-1
+python3-venv	3.12.3-0ubuntu2.1
+python3-yaml	6.0.1-2build2	6.0.1-2build2
+ros-dev-tools	1.0.1
+ros-jazzy-ament-cmake-gtest	2.5.6-2noble.20260225.145055
+ros-jazzy-joint-state-publisher	2.4.1-1noble.20260615.140100
+ros-jazzy-launch-testing-ament-cmake	3.4.11-1noble.20260603.151149
+ros-jazzy-nav2-bringup	1.3.12-1noble.20260616.082701
+ros-jazzy-navigation2	1.3.12-1noble.20260615.181551
+ros-jazzy-robot-state-publisher	3.3.4-1noble.20260615.150609
+ros-jazzy-ros-base	0.11.0-1noble.20260616.084325
+ros-jazzy-ros-gz	1.0.22-1noble.20260616.074726
+ros-jazzy-rosbag2-storage-mcap	0.26.11-1noble.20260616.074830
+ros-jazzy-rviz2	14.1.22-1noble.20260615.174609
+ros-jazzy-teleop-twist-keyboard	2.4.1-1noble.20260615.135625
+ros-jazzy-tf2-tools	0.36.21-1noble.20260615.144219
+ros-jazzy-xacro	2.1.1-1noble.20260519.011123
+shellcheck	0.9.0-1

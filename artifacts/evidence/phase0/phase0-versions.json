@@ -1,0 +1,235 @@
+{
+  "checked_at": "2026-08-25T18:48:09.365544+00:00",
+  "manifest": {
+    "installed_entry_count": 40,
+    "packages": [
+      {
+        "architecture": "amd64",
+        "package": "build-essential",
+        "version": "12.10ubuntu1"
+      },
+      {
+        "architecture": "all",
+        "package": "ca-certificates",
+        "version": "20260601~24.04.1"
+      },
+      {
+        "architecture": "amd64",
+        "package": "clang-format",
+        "version": "1:18.0-59~exp2"
+      },
+      {
+        "architecture": "amd64",
+        "package": "clang-tidy",
+        "version": "1:18.0-59~exp2"
+      },
+      {
+        "architecture": "amd64",
+        "package": "cmake",
+        "version": "3.28.3-1build7"
+      },
+      {
+        "architecture": "amd64",
+        "package": "cppcheck",
+        "version": "2.13.0-2ubuntu3"
+      },
+      {
+        "architecture": "amd64",
+        "package": "curl",
+        "version": "8.5.0-2ubuntu10.13"
+      },
+      {
+        "architecture": "all",
+        "package": "debhelper",
+        "version": "13.14.1ubuntu5"
+      },
+      {
+        "architecture": "all",
+        "package": "dh-golang",
+        "version": "1.62"
+      },
+      {
+        "architecture": "all",
+        "package": "dpkg-dev",
+        "version": "1.22.6ubuntu6.6"
+      },
+      {
+        "architecture": "amd64",
+        "package": "fakeroot",
+        "version": "1.33-1"
+      },
+      {
+        "architecture": "amd64",
+        "package": "git",
+        "version": "1:2.43.0-1ubuntu7.3"
+      },
+      {
+        "architecture": "all",
+        "package": "gnupg",
+        "version": "2.4.4-2ubuntu17.4"
+      },
+      {
+        "architecture": "amd64",
+        "package": "golang-go",
+        "version": "2:1.22~2build1"
+      },
+      {
+        "architecture": "all",
+        "package": "lintian",
+        "version": "2.117.0ubuntu1.5"
+      },
+      {
+        "architecture": "amd64",
+        "package": "ninja-build",
+        "version": "1.11.1-2"
+      },
+      {
+        "architecture": "amd64",
+        "package": "pkg-config",
+        "version": "1.8.1-2build1"
+      },
+      {
+        "architecture": "all",
+        "package": "pre-commit",
+        "version": "3.6.2-1"
+      },
+      {
+        "architecture": "all",
+        "package": "python3-jsonschema",
+        "version": "4.10.3-2ubuntu1"
+      },
+      {
+        "architecture": "amd64",
+        "package": "python3-matplotlib",
+        "version": "3.6.3-1ubuntu5"
+      },
+      {
+        "architecture": "all",
+        "package": "python3-pip",
+        "version": "24.0+dfsg-1ubuntu1.3"
+      },
+      {
+        "architecture": "all",
+        "package": "python3-pytest",
+        "version": "7.4.4-1"
+      },
+      {
+        "architecture": "all",
+        "package": "python3-pytest-cov",
+        "version": "4.1.0-1"
+      },
+      {
+        "architecture": "amd64",
+        "package": "python3-venv",
+        "version": "3.12.3-0ubuntu2.1"
+      },
+      {
+        "architecture": "amd64",
+        "package": "python3-yaml",
+        "version": "6.0.1-2build2"
+      },
+      {
+        "architecture": "all",
+        "package": "ros-dev-tools",
+        "version": "1.0.1"
+      },
+      {
+        "architecture": "amd64",
+        "package": "ros-jazzy-ament-cmake-gtest",
+        "version": "2.5.6-2noble.20260225.145055"
+      },
+      {
+        "architecture": "amd64",
+        "package": "ros-jazzy-joint-state-publisher",
+        "version": "2.4.1-1noble.20260615.140100"
+      },
+      {
+        "architecture": "amd64",
+        "package": "ros-jazzy-launch-testing-ament-cmake",
+        "version": "3.4.11-1noble.20260603.151149"
+      },
+      {
+        "architecture": "amd64",
+        "package": "ros-jazzy-nav2-bringup",
+        "version": "1.3.12-1noble.20260616.082701"
+      },
+      {
+        "architecture": "amd64",
+        "package": "ros-jazzy-navigation2",
+        "version": "1.3.12-1noble.20260615.181551"
+      },
+      {
+        "architecture": "amd64",
+        "package": "ros-jazzy-robot-state-publisher",
+        "version": "3.3.4-1noble.20260615.150609"
+      },
+      {
+        "architecture": "amd64",
+        "package": "ros-jazzy-ros-base",
+        "version": "0.11.0-1noble.20260616.084325"
+      },
+      {
+        "architecture": "amd64",
+        "package": "ros-jazzy-ros-gz",
+        "version": "1.0.22-1noble.20260616.074726"
+      },
+      {
+        "architecture": "amd64",
+        "package": "ros-jazzy-rosbag2-storage-mcap",
+        "version": "0.26.11-1noble.20260616.074830"
+      },
+      {
+        "architecture": "amd64",
+        "package": "ros-jazzy-rviz2",
+        "version": "14.1.22-1noble.20260615.174609"
+      },
+      {
+        "architecture": "amd64",
+        "package": "ros-jazzy-teleop-twist-keyboard",
+        "version": "2.4.1-1noble.20260615.135625"
+      },
+      {
+        "architecture": "amd64",
+        "package": "ros-jazzy-tf2-tools",
+        "version": "0.36.21-1noble.20260615.144219"
+      },
+      {
+        "architecture": "amd64",
+        "package": "ros-jazzy-xacro",
+        "version": "2.1.1-1noble.20260519.011123"
+      },
+      {
+        "architecture": "amd64",
+        "package": "shellcheck",
+        "version": "0.9.0-1"
+      }
+    ],
+    "path": "config/apt-packages.txt",
+    "sha256": "c239e7b73c836c7ed7d883de30bbe47b7cec3fb4e1e5b84c64c909157d1cccea"
+  },
+  "schema_version": 1,
+  "status": "passed",
+  "tools": {
+    "clang_format": "Ubuntu clang-format version 18.1.3 (1ubuntu1)",
+    "clang_tidy": "Ubuntu LLVM version 18.1.3",
+    "cmake": "3.28.3",
+    "colcon_core": "0.21.0",
+    "cpp_compiler": "g++ 13.3.0",
+    "cppcheck": "Cppcheck 2.13.0",
+    "gazebo_sim": "8.11.0",
+    "git": "2.43.0",
+    "go": "1.22.2",
+    "lintian": "Lintian v2.117.0ubuntu1.5",
+    "nav2_bringup_prefix": "/opt/ros/jazzy",
+    "os": "Ubuntu 24.04 Noble",
+    "pre_commit": "3.6.2",
+    "python": "3.12.3",
+    "ros_apt_source": "1.2.0~noble",
+    "ros_base": "0.11.0-1noble.20260616.084325",
+    "ros_distro": "jazzy",
+    "ros_gz_bridge_prefix": "/opt/ros/jazzy",
+    "ruff": "0.16.4",
+    "shellcheck": "0.9.0"
+  },
+  "verification_scope": "Installed-tool provenance; no ROS graph or simulation was executed"
+}

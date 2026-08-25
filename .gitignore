@@ -1,0 +1,50 @@
+# ROS 2 / colcon generated workspaces
+/build/
+/install/
+/log/
+
+# Python
+/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# C/C++ and CMake
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+*.o
+*.so
+
+# Go
+/supervisor/bin/
+/supervisor/coverage.out
+
+# ROS, Gazebo, and benchmark runtime data
+*.bag
+*.db3
+*.mcap
+*.active
+/benchmarks/raw/
+/artifacts/evidence/**/.tmp/
+/artifacts/evidence/**/*.partial
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
