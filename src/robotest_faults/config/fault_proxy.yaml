@@ -1,0 +1,10 @@
+# Copyright 2026 Hasan Ahmed
+# SPDX-License-Identifier: Apache-2.0
+
+"/**/fault_proxy":
+  ros__parameters:
+    use_sim_time: true
+    expected_scan_frame: lidar_link
+    expected_odom_frame: odom
+    expected_base_frame: base_footprint
+    expected_imu_frame: imu_link

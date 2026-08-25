@@ -34,8 +34,8 @@ repos:
         entry: .venv/bin/ruff format --check
         language: system
         types: [python]
-      - id: clang-format
-        name: clang-format check
-        entry: clang-format --dry-run --Werror
+      - id: ament-uncrustify
+        name: ROS 2 C++ style check
+        entry: bash -c 'source /opt/ros/jazzy/setup.bash && ament_uncrustify "$@"' --
         language: system
         types_or: [c, c++]

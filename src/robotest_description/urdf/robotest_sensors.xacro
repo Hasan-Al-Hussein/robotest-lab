@@ -1,0 +1,57 @@
+<?xml version="1.0"?>
+<!--
+  Copyright 2026 Hasan Ahmed
+  SPDX-License-Identifier: Apache-2.0
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="robotest_sensors">
+    <link name="lidar_link">
+      <visual>
+        <geometry>
+          <cylinder radius="${lidar_radius}" length="${lidar_height}"/>
+        </geometry>
+        <material name="robotest_sensor"/>
+      </visual>
+      <collision name="lidar_link_collision">
+        <geometry>
+          <cylinder radius="${lidar_radius}" length="${lidar_height}"/>
+        </geometry>
+      </collision>
+      <xacro:z_cylinder_inertial
+        mass="${lidar_mass}"
+        radius="${lidar_radius}"
+        length="${lidar_height}"/>
+    </link>
+
+    <joint name="lidar_joint" type="fixed">
+      <origin xyz="${lidar_x} 0 ${lidar_z}" rpy="0 0 0"/>
+      <parent link="base_link"/>
+      <child link="lidar_link"/>
+    </joint>
+
+    <link name="imu_link">
+      <visual>
+        <geometry>
+          <box size="${imu_x_size} ${imu_y_size} ${imu_z_size}"/>
+        </geometry>
+        <material name="robotest_sensor"/>
+      </visual>
+      <collision name="imu_link_collision">
+        <geometry>
+          <box size="${imu_x_size} ${imu_y_size} ${imu_z_size}"/>
+        </geometry>
+      </collision>
+      <xacro:box_inertial
+        mass="${imu_mass}"
+        x="${imu_x_size}"
+        y="${imu_y_size}"
+        z="${imu_z_size}"/>
+    </link>
+
+    <joint name="imu_joint" type="fixed">
+      <origin xyz="0 0 ${imu_z}" rpy="0 0 0"/>
+      <parent link="base_link"/>
+      <child link="imu_link"/>
+    </joint>
+  </xacro:macro>
+</robot>

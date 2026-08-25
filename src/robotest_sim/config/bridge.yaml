@@ -1,0 +1,92 @@
+# Copyright 2026 Hasan Ahmed
+# SPDX-License-Identifier: Apache-2.0
+#
+# This is intentionally a top-level list for ros_gz_bridge parameter_bridge.
+# Known-direction interfaces are never configured bidirectionally. Relative ROS
+# names resolve below the launch-provided `robotest` namespace; /clock remains
+# global. Queue sizes are bounded and match the Phase 0 topic contract.
+# ros_gz_bridge 1.0.22 parseQoS maps SERVICES to rclcpp::ServicesQoS
+# (RELIABLE + VOLATILE); PublisherQoS/SubscriberQoS then apply the explicit
+# queue below as KEEP_LAST depth. It is used here for reliable topic endpoints,
+# not for ROS services.
+
+- ros_topic_name: /clock
+  gz_topic_name: /clock
+  ros_type_name: rosgraph_msgs/msg/Clock
+  gz_type_name: gz.msgs.Clock
+  direction: GZ_TO_ROS
+  publisher_queue: 1
+  subscriber_queue: 1
+  qos_profile: CLOCK
+
+- ros_topic_name: raw/scan
+  gz_topic_name: /robotest/raw/scan
+  ros_type_name: sensor_msgs/msg/LaserScan
+  gz_type_name: gz.msgs.LaserScan
+  direction: GZ_TO_ROS
+  publisher_queue: 5
+  subscriber_queue: 5
+  qos_profile: SENSOR_DATA
+
+- ros_topic_name: raw/odom
+  gz_topic_name: /robotest/raw/odom
+  ros_type_name: nav_msgs/msg/Odometry
+  gz_type_name: gz.msgs.Odometry
+  direction: GZ_TO_ROS
+  publisher_queue: 10
+  subscriber_queue: 10
+  qos_profile: SENSOR_DATA
+
+- ros_topic_name: raw/imu
+  gz_topic_name: /robotest/raw/imu
+  ros_type_name: sensor_msgs/msg/Imu
+  gz_type_name: gz.msgs.IMU
+  direction: GZ_TO_ROS
+  publisher_queue: 10
+  subscriber_queue: 10
+  qos_profile: SENSOR_DATA
+
+- ros_topic_name: joint_states
+  gz_topic_name: /robotest/joint_states
+  ros_type_name: sensor_msgs/msg/JointState
+  gz_type_name: gz.msgs.Model
+  direction: GZ_TO_ROS
+  publisher_queue: 10
+  subscriber_queue: 10
+  qos_profile: SENSOR_DATA
+
+- ros_topic_name: cmd_vel
+  gz_topic_name: /robotest/cmd_vel
+  ros_type_name: geometry_msgs/msg/Twist
+  gz_type_name: gz.msgs.Twist
+  direction: ROS_TO_GZ
+  publisher_queue: 1
+  subscriber_queue: 1
+  qos_profile: SERVICES
+
+- ros_topic_name: validation/ground_truth
+  gz_topic_name: /robotest/validation/ground_truth
+  ros_type_name: nav_msgs/msg/Odometry
+  gz_type_name: gz.msgs.Odometry
+  direction: GZ_TO_ROS
+  publisher_queue: 10
+  subscriber_queue: 10
+  qos_profile: SERVICES
+
+- ros_topic_name: validation/contacts
+  gz_topic_name: /robotest/validation/contacts
+  ros_type_name: ros_gz_interfaces/msg/Contacts
+  gz_type_name: gz.msgs.Contacts
+  direction: GZ_TO_ROS
+  publisher_queue: 10
+  subscriber_queue: 10
+  qos_profile: SERVICES
+
+- ros_topic_name: validation/world_stats
+  gz_topic_name: /world/robotest_lab/stats
+  ros_type_name: ros_gz_interfaces/msg/WorldStatistics
+  gz_type_name: gz.msgs.WorldStatistics
+  direction: GZ_TO_ROS
+  publisher_queue: 10
+  subscriber_queue: 10
+  qos_profile: SERVICES

@@ -4,9 +4,11 @@ RoboTest Lab is a CPU-only ROS 2 software-in-the-loop platform for testing,
 measuring, fault-injecting, observing, and recovering an autonomous
 differential-drive robot.
 
-> **Current status — Phase 0:** the Ubuntu 24.04 workspace and safety gates are
-> being established. No robot simulation, navigation result, recovery result,
-> benchmark, package, screenshot, or CI result is claimed yet.
+> **Current status — Phase 1 verified development:** the Ubuntu 24.04 platform
+> gate and the local minimal robot/world, pass-through fault proxy, bounded
+> headless simulation, and separate RViz inspection have passing evidence.
+> The run used a dirty worktree, so it is not release or benchmark evidence.
+> Nav2, fault campaigns, recovery, packaging, and public CI remain future work.
 
 ## Why this project exists
 
@@ -30,8 +32,9 @@ traceable to a command, configuration hash, and recorded run.
   least 20 GiB projected free space retained on the Windows host drive.
 
 The [environment audit](docs/environment-audit.md),
-[dependency plan](docs/dependencies.md), and later command transcripts are
-evidence, not a promise that an unrun phase works.
+[dependency plan](docs/dependencies.md), and
+[Phase 1 result](docs/results/phase-1/20260825T200725Z-1333.md) distinguish
+measured evidence from planned work.
 
 ## Planned architecture
 
@@ -52,8 +55,9 @@ flowchart LR
     Supervisor -. monitors .-> Mission
 ```
 
-This diagram describes the approved design. Components become implemented
-only when their phase verifier produces passing evidence.
+This diagram describes the approved design. The Gazebo, bridge, robot model,
+pass-through proxy, and Phase 1 evidence path are now implemented; Nav2 and the
+later mission, metrics, and supervisor stages remain planned.
 
 ## Phase 0 workflow
 
@@ -89,6 +93,39 @@ Machine-readable Phase 0 results are written below
 `artifacts/evidence/phase0/`. Generated evidence records what actually ran;
 it must not be edited to manufacture a passing result.
 
+## Phase 1 verification
+
+Run the bounded automated gate inside the verified Ubuntu distribution:
+
+```bash
+cd /home/hasan/robotest-lab
+taskset -c 0-5 scripts/verify_phase1.sh
+```
+
+The seeded development run `20260825T200725Z-1333` passed its build, model,
+headless runtime, topic/QoS, stamp, trace, motion, resource, and artifact-hash
+checks with `simulator_seed=42` and seed status
+`fixed_simulator_seed_recorded`. Headline observations were 103 tests with zero
+errors or failures, calculated RTF median `0.9999`, calculated RTF p5 `0.9162`,
+peak launch-group RSS `795,476 KiB`, and bounded displacement `0.2962 m`. Ten
+checks were skipped because `ament_cppcheck` declines cppcheck 2.13 for its
+known performance issue.
+
+Evidence:
+
+- [full Phase 1 report](docs/results/phase-1/20260825T200725Z-1333.md)
+- [compact canonical JSON](docs/results/phase-1/20260825T200725Z-1333.json)
+- [matching one-row CSV](docs/results/phase-1/20260825T200725Z-1333.csv)
+- [separate P1-07 RViz screenshot](docs/results/phase-1/rviz-phase1.png)
+
+The 45-entry run checksum manifest validated completely. The headless run was
+made from a dirty worktree and the RViz evidence came from a separate bounded
+run, so neither is presented as a release benchmark. Fast DDS exposed live
+reliability and durability but reported endpoint history/depth as
+`UNKNOWN`/`0`; bounded depths retain static/source-and-test support. The contact
+topic was silent, so collision absence is not established. Live TF endpoint and
+edge sets were recorded, but per-edge publisher-GID attribution was unavailable.
+
 ## Safety properties of setup
 
 - Mutating setup scripts require an explicit `--apply` argument.
@@ -102,14 +139,14 @@ it must not be edited to manufacture a passing result.
 
 ## Roadmap and evidence gates
 
-| Phase | Deliverable | Required proof before advancing |
+| Phase | Status | Deliverable and gate |
 | --- | --- | --- |
-| 0 | Environment and repository foundation | Exact install manifest, version inventory, resource gates |
-| 1 | Minimal original robot/world and pass-through proxy | Build/tests, headless launch, topics/TF, bounded motion |
-| 2 | Nav2 and deterministic waypoint mission | Action result plus matching JSON/CSV and tests |
-| 3 | LiDAR dropout, odometry drift, and metrics | Repeatable fault runs and measured reports |
-| 4 | Go supervisor, systemd, and Debian package | Race/vet, bounded restart, local health, install/remove proof |
-| 5 | Lightweight CI and portfolio evidence | Passing public workflow on the documented commit |
+| 0 | Verified locally | Environment foundation, exact install manifest, versions, and resource gates |
+| 1 | Verified development | Original robot/world, pass-through proxy, headless gates, and separate RViz evidence |
+| 2 | Planned | Nav2 mission with action result, matching JSON/CSV, and tests |
+| 3 | Planned | Repeatable LiDAR-dropout and odometry-drift campaigns with metrics |
+| 4 | Planned | Go supervisor, systemd and Debian package with lifecycle proof |
+| 5 | Planned | Public CI and portfolio evidence on a documented clean commit |
 
 ## Repository layout
 

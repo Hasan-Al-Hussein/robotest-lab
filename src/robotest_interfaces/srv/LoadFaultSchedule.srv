@@ -1,0 +1,12 @@
+# Copyright 2026 Hasan Ahmed
+# SPDX-License-Identifier: Apache-2.0
+
+# Lowercase SHA-256 of the canonical schedule document.
+string<=64 schedule_hash
+builtin_interfaces/Time mission_start
+robotest_interfaces/FaultSpec[<=256] faults
+---
+bool accepted
+string<=64 schedule_hash
+uint32 loaded_count
+string<=256 message

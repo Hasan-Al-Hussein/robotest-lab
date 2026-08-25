@@ -1,0 +1,94 @@
+<?xml version="1.0"?>
+<!--
+  Copyright 2026 Hasan Ahmed
+  SPDX-License-Identifier: Apache-2.0
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="robotest_wheel" params="side y">
+    <link name="${side}_wheel_link">
+      <visual>
+        <origin xyz="0 0 0" rpy="${pi / 2.0} 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+        </geometry>
+        <material name="robotest_dark"/>
+      </visual>
+      <collision name="${side}_wheel_collision">
+        <origin xyz="0 0 0" rpy="${pi / 2.0} 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+        </geometry>
+      </collision>
+      <xacro:y_cylinder_inertial
+        mass="${wheel_mass}"
+        radius="${wheel_radius}"
+        length="${wheel_width}"/>
+    </link>
+
+    <joint name="${side}_wheel_joint" type="continuous">
+      <origin xyz="0 ${y} ${wheel_radius - base_center_z}" rpy="0 0 0"/>
+      <parent link="base_link"/>
+      <child link="${side}_wheel_link"/>
+      <axis xyz="0 1 0"/>
+      <dynamics damping="0.05" friction="0.02"/>
+    </joint>
+  </xacro:macro>
+
+  <xacro:macro name="robotest_caster" params="position x">
+    <link name="${position}_caster_link">
+      <visual>
+        <geometry>
+          <sphere radius="${caster_radius}"/>
+        </geometry>
+        <material name="robotest_dark"/>
+      </visual>
+      <collision name="${position}_caster_collision">
+        <geometry>
+          <sphere radius="${caster_radius}"/>
+        </geometry>
+      </collision>
+      <xacro:sphere_inertial mass="${caster_mass}" radius="${caster_radius}"/>
+    </link>
+
+    <joint name="${position}_caster_joint" type="fixed">
+      <origin xyz="${x} 0 ${caster_radius - base_center_z}" rpy="0 0 0"/>
+      <parent link="base_link"/>
+      <child link="${position}_caster_link"/>
+    </joint>
+  </xacro:macro>
+
+  <xacro:macro name="robotest_base">
+    <!-- REP-105 ground-projected navigation frame: intentionally non-physical. -->
+    <link name="base_footprint"/>
+
+    <link name="base_link">
+      <visual>
+        <geometry>
+          <box size="${base_length} ${base_width} ${base_height}"/>
+        </geometry>
+        <material name="robotest_blue"/>
+      </visual>
+      <collision name="base_link_collision">
+        <geometry>
+          <box size="${base_length} ${base_width} ${base_height}"/>
+        </geometry>
+      </collision>
+      <xacro:box_inertial
+        mass="${base_mass}"
+        x="${base_length}"
+        y="${base_width}"
+        z="${base_height}"/>
+    </link>
+
+    <joint name="base_footprint_joint" type="fixed">
+      <origin xyz="0 0 ${base_center_z}" rpy="0 0 0"/>
+      <parent link="base_footprint"/>
+      <child link="base_link"/>
+    </joint>
+
+    <xacro:robotest_wheel side="left" y="${wheel_separation / 2.0}"/>
+    <xacro:robotest_wheel side="right" y="${-wheel_separation / 2.0}"/>
+    <xacro:robotest_caster position="front" x="${caster_x}"/>
+    <xacro:robotest_caster position="rear" x="${-caster_x}"/>
+  </xacro:macro>
+</robot>
