@@ -742,11 +742,11 @@ class Phase1Probe(Node):
                     self.motion_command_wall_times.append(now)
                     self._append_motion_command(command, 'motion')
                     next_command_wall = now + command_period_wall
+                # Process callbacks continuously during motion.  Adding an
+                # unconditional sleep here caps the single-threaded executor's
+                # callback throughput and can make reliable evidence streams
+                # stale even while the simulator itself remains healthy.
                 rclpy.spin_once(self, timeout_sec=0.01)
-                # A high-rate /clock can make spin_once return immediately. A
-                # short steady-wall sleep prevents a busy loop without coupling
-                # the 10 Hz command cadence to simulation RTF.
-                time.sleep(0.005)
             else:
                 self.failures.append('two-second simulated motion interval timed out')
         finally:

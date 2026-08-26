@@ -90,6 +90,31 @@ def load_runtime_probe_module():
     return module
 
 
+def test_phase1_motion_loop_does_not_throttle_callback_dispatch() -> None:
+    """The motion loop must not impose a fixed sleep after each ROS callback."""
+    path = PACKAGE / 'tools' / 'phase1_runtime_probe.py'
+    tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+    probe_class = next(
+        node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'Phase1Probe'
+    )
+    move_test = next(
+        node
+        for node in probe_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == 'move_test'
+    )
+    calls = [node for node in ast.walk(move_test) if isinstance(node, ast.Call)]
+    assert any(
+        isinstance(call.func, ast.Attribute) and call.func.attr == 'spin_once' for call in calls
+    )
+    assert not any(
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == 'time'
+        and call.func.attr == 'sleep'
+        for call in calls
+    )
+
+
 def test_phase1_and_phase2_hash_runtime_attestation_helper_bytes() -> None:
     helpers = (
         WORKSPACE / 'config/collision-coverage.yaml',
