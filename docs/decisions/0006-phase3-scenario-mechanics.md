@@ -418,10 +418,12 @@ chassis collision and
 snapshot record and
 exactly one de-duplicated counterpart episode must be observed, named, closed,
 and reconciled from snapshot presence/absence. The test also requires public
-source gaps and delivery clock brackets within `0.22 s`, exact graph endpoint
-cardinality/GID continuity, the final command to be zero, all collector
-overflows to be false, the actor to be deleted, and both owned process groups
-to terminate.
+source gaps and an explicitly caught-up final clock bracket within `0.22 s`.
+Passive collector callback offsets are retained as noncausal diagnostics; the
+active driver's own callback-time bound remains fail-closed. Exact graph
+endpoint cardinality/GID continuity, the final command being zero, false
+collector overflows, actor deletion, and termination of both owned process
+groups are also required.
 
 The coverage manifest, not this one chassis contact alone, must enumerate and
 bind every rendered robot collision geometry. A chassis-only production

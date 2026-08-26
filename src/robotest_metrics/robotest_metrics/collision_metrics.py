@@ -1789,12 +1789,9 @@ def analyze_collisions(
             message.get('delivery_clock_offset_ns'),
             f'messages[{message_index}].delivery_clock_offset_ns',
         )
-        if (
-            delivery_clock_stamp - stamp != delivery_clock_offset
-            or abs(delivery_clock_offset) > _MAX_CONTACT_SNAPSHOT_GAP_NS
-        ):
+        if delivery_clock_stamp - stamp != delivery_clock_offset:
             raise MetricUnavailable(
-                'authoritative contact snapshot delivery clock bracket is invalid'
+                'authoritative contact snapshot delivery clock offset is inconsistent'
             )
         contacts = message.get('contacts')
         if not isinstance(contacts, list) or not 1 <= len(contacts) <= 16:

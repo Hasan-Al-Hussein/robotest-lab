@@ -81,6 +81,7 @@ CONTACT_PUBLIC_HEARTBEAT_NS = 200_000_000
 CONTACT_PUBLIC_MAX_GAP_NS = 220_000_000
 CONTACT_PUBLIC_MAX_CLOCK_LAG_NS = 220_000_000
 CONTACT_CLOCK_BRACKET_WALL_TIMEOUT_S = 2.0
+CONTACT_PUBLIC_MAX_WALL_INTER_RECEIPT_GAP_S = CONTACT_CLOCK_BRACKET_WALL_TIMEOUT_S
 CONTACT_PUBLIC_MAX_RECORDS = 16
 
 
@@ -263,8 +264,16 @@ class StampTracker:
     receipt_age_sample_count: int = 0
     maximum_receipt_age_ns: int = 0
     future_relative_to_clock_count: int = 0
+    previous_receipt_wall_s: float | None = None
+    wall_inter_receipt_interval_count: int = 0
+    maximum_wall_inter_receipt_gap_s: float = 0.0
 
-    def observe(self, stamp: int, latest_clock: int | None) -> None:
+    def observe(
+        self,
+        stamp: int,
+        latest_clock: int | None,
+        receipt_wall_s: float | None = None,
+    ) -> None:
         self.sample_count += 1
         if self.first_stamp_ns is None:
             self.first_stamp_ns = stamp
@@ -280,6 +289,16 @@ class StampTracker:
         self.latest_stamp_ns = (
             stamp if self.latest_stamp_ns is None else max(self.latest_stamp_ns, stamp)
         )
+
+        if receipt_wall_s is not None:
+            if self.previous_receipt_wall_s is not None:
+                wall_gap = receipt_wall_s - self.previous_receipt_wall_s
+                self.wall_inter_receipt_interval_count += 1
+                self.maximum_wall_inter_receipt_gap_s = max(
+                    self.maximum_wall_inter_receipt_gap_s,
+                    wall_gap,
+                )
+            self.previous_receipt_wall_s = receipt_wall_s
 
         if latest_clock is not None:
             receipt_age = latest_clock - stamp
@@ -298,6 +317,7 @@ class StampTracker:
         maximum_gap_s: float,
         maximum_final_age_s: float,
         maximum_receipt_age_s: float,
+        maximum_wall_inter_receipt_gap_s: float | None = None,
     ) -> dict[str, Any]:
         final_age_ns = None
         if latest_clock is not None and self.latest_stamp_ns is not None:
@@ -316,6 +336,12 @@ class StampTracker:
             'future_relative_to_clock_count': self.future_relative_to_clock_count,
             'final_age_s': None if final_age_ns is None else final_age_ns / 1e9,
             'final_age_ns': final_age_ns,
+            'wall_inter_receipt_interval_count': self.wall_inter_receipt_interval_count,
+            'maximum_wall_inter_receipt_gap_s': (
+                self.maximum_wall_inter_receipt_gap_s
+                if self.wall_inter_receipt_interval_count
+                else None
+            ),
             'limits': {
                 'maximum_gap_s': maximum_gap_s,
                 'maximum_gap_ns': round(maximum_gap_s * 1e9),
@@ -323,6 +349,7 @@ class StampTracker:
                 'maximum_final_age_ns': round(maximum_final_age_s * 1e9),
                 'maximum_receipt_age_s': maximum_receipt_age_s,
                 'maximum_receipt_age_ns': round(maximum_receipt_age_s * 1e9),
+                'maximum_wall_inter_receipt_gap_s': maximum_wall_inter_receipt_gap_s,
             },
         }
 
@@ -356,7 +383,12 @@ def qos_policy_failures(
     return failures
 
 
-def stamp_evidence_failures(topic: str, evidence: dict[str, Any]) -> list[str]:
+def stamp_evidence_failures(
+    topic: str,
+    evidence: dict[str, Any],
+    *,
+    enforce_callback_clock_offset: bool = True,
+) -> list[str]:
     """Apply explicit Phase 1 ordering, gap, and staleness bounds."""
     failures = []
     limits = evidence['limits']
@@ -371,10 +403,22 @@ def stamp_evidence_failures(topic: str, evidence: dict[str, Any]) -> list[str]:
             f'{topic} maximum stamp gap {evidence["maximum_forward_gap_s"]:.6f} s '
             f'exceeds {limits["maximum_gap_s"]:.6f} s'
         )
-    if evidence['maximum_receipt_age_ns'] > limits['maximum_receipt_age_ns']:
+    if (
+        enforce_callback_clock_offset
+        and evidence['maximum_receipt_age_ns'] > limits['maximum_receipt_age_ns']
+    ):
         failures.append(
             f'{topic} maximum receipt age {evidence["maximum_receipt_age_s"]:.6f} s '
             f'exceeds {limits["maximum_receipt_age_s"]:.6f} s'
+        )
+    maximum_wall_gap_s = limits['maximum_wall_inter_receipt_gap_s']
+    observed_wall_gap_s = evidence['maximum_wall_inter_receipt_gap_s']
+    if maximum_wall_gap_s is not None and (
+        observed_wall_gap_s is None or observed_wall_gap_s > maximum_wall_gap_s
+    ):
+        failures.append(
+            f'{topic} maximum wall inter-receipt gap {observed_wall_gap_s} s '
+            f'exceeds {maximum_wall_gap_s} s'
         )
     final_age = evidence['final_age_s']
     if evidence['final_age_ns'] is None:
@@ -497,7 +541,11 @@ class Phase1Probe(Node):
             self.sim_counts[key] += 1
             self.first_sim_ns.setdefault(key, simulation_stamp_ns)
             self.last_sim_ns[key] = simulation_stamp_ns
-            self.stamp_trackers[key].observe(simulation_stamp_ns, self.latest_clock_ns)
+            self.stamp_trackers[key].observe(
+                simulation_stamp_ns,
+                self.latest_clock_ns,
+                receipt_wall_s=now,
+            )
 
     def _subscribe_pair(
         self, stream: str, plane: str, topic: str, message_type: Any, profile: QoSProfile
@@ -1143,9 +1191,26 @@ class Phase1Probe(Node):
                 maximum_gap_s,
                 maximum_final_age_s,
                 maximum_receipt_age_s,
+                (
+                    CONTACT_PUBLIC_MAX_WALL_INTER_RECEIPT_GAP_S
+                    if topic == '/robotest/validation/contacts'
+                    else None
+                ),
+            )
+            passive_contact = topic == '/robotest/validation/contacts'
+            evidence['callback_clock_offset_semantics'] = (
+                'diagnostic_noncausal_cached_clock_offset'
+                if passive_contact
+                else 'bounded_cached_clock_offset'
             )
             stamp_evidence[topic] = evidence
-            self.failures.extend(stamp_evidence_failures(topic, evidence))
+            self.failures.extend(
+                stamp_evidence_failures(
+                    topic,
+                    evidence,
+                    enforce_callback_clock_offset=not passive_contact,
+                )
+            )
         stamp_evidence['/robotest/validation/contacts'].update(
             {
                 'clock_bracket': self.contact_clock_bracket,

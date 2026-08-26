@@ -1118,11 +1118,30 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     orchestration.atomic_write_json(capture_path, capture)
     orchestration.atomic_write_json(contact_progress_path, contact_progress)
 
-    delivery_ahead = copy.deepcopy(capture)
-    delivery_ahead['streams']['contacts']['items'][1]['delivery_clock_stamp_ns'] = 520_000_001
-    delivery_ahead['streams']['contacts']['items'][1]['delivery_clock_offset_ns'] = 220_000_001
-    orchestration.atomic_write_json(capture_path, delivery_ahead)
-    with pytest.raises(orchestration.EvidenceError, match='delivery /clock bracket'):
+    diagnostic_offset = copy.deepcopy(capture)
+    diagnostic_offset['streams']['contacts']['items'][1]['delivery_clock_stamp_ns'] = 578_000_000
+    diagnostic_offset['streams']['contacts']['items'][1]['delivery_clock_offset_ns'] = 278_000_000
+    orchestration.atomic_write_json(capture_path, diagnostic_offset)
+    diagnostic_bound = orchestration.reconcile_positive_control(
+        workspace=Path(__file__).parents[1],
+        build_binding=positive_build_binding,
+        result_path=result_path,
+        capture_path=capture_path,
+        contact_progress_path=contact_progress_path,
+        manifest_path=manifest_path,
+        collector_configuration_sha256='7' * 64,
+        owned_process_group_shutdown=True,
+        checksum_verified=True,
+    )
+    assert (
+        diagnostic_bound['collector_reconciliation']['release_delivery_clock_offset_ns']
+        == 278_000_000
+    )
+
+    inconsistent_offset = copy.deepcopy(diagnostic_offset)
+    inconsistent_offset['streams']['contacts']['items'][1]['delivery_clock_offset_ns'] = 278_000_001
+    orchestration.atomic_write_json(capture_path, inconsistent_offset)
+    with pytest.raises(orchestration.EvidenceError, match='offset is inconsistent'):
         orchestration.reconcile_positive_control(
             workspace=Path(__file__).parents[1],
             build_binding=positive_build_binding,

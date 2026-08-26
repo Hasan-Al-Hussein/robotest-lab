@@ -76,6 +76,7 @@ EXPECTED_CONTACT_STREAM_POLICY = {
     'max_public_snapshot_gap_ns': 220_000_000,
     'max_public_snapshot_clock_lag_ns': 220_000_000,
     'max_raw_clock_lag_ns': 220_000_000,
+    'passive_callback_clock_offset_semantics': 'diagnostic_noncausal',
     'limits': {
         'max_active_contact_pairs': 16,
         'max_active_contact_records': 16,
@@ -97,6 +98,9 @@ EXPECTED_CONTACT_STREAM_POLICY = {
     ),
     'raw_messages_require_nonempty_contacts': True,
     'public_snapshot_cardinality': 'required_nonempty_1_to_16',
+    'public_snapshot_clock_lag_scope': (
+        'active_positive_control_and_explicit_caught_up_brackets_only'
+    ),
     'public_snapshots_per_finalized_stamp': 'at_most_one',
     'public_snapshots_require_nonempty_contacts': True,
     'required_raw_frame_id': '',
@@ -1279,11 +1283,8 @@ def _captured_contact_projection(
             message.get('delivery_clock_offset_ns'),
             f'captured contacts[{message_index}].delivery_clock_offset_ns',
         )
-        if (
-            delivery_clock - stamp != delivery_offset
-            or abs(delivery_offset) > CONTACT_MAX_CLOCK_LAG_NS
-        ):
-            raise EvidenceError('captured contact snapshot delivery /clock bracket is invalid')
+        if delivery_clock - stamp != delivery_offset:
+            raise EvidenceError('captured contact snapshot delivery /clock offset is inconsistent')
         records = message.get('contacts')
         if not isinstance(records, list) or not 1 <= len(records) <= 16:
             raise EvidenceError('captured contact snapshot must contain 1 to 16 records')
@@ -1541,11 +1542,8 @@ def reconcile_positive_control(
     if (
         release_delivery_clock_offset_ns
         != release_delivery_clock_stamp_ns - qualifying_contact_snapshot_stamp_ns
-        or not -CONTACT_MAX_CLOCK_LAG_NS
-        <= release_delivery_clock_offset_ns
-        <= CONTACT_MAX_CLOCK_LAG_NS
     ):
-        raise EvidenceError('positive-control release delivery /clock bracket is invalid')
+        raise EvidenceError('positive-control release delivery /clock offset is inconsistent')
     robot_collisions = {
         require_bounded_string(
             _require_mapping(entry, 'coverage robot collision').get('name'),
@@ -2550,16 +2548,8 @@ def _capture_contains_qualified_contact_snapshot(
             item.get('delivery_clock_offset_ns'),
             f'capture.contacts.items[{index}].delivery_clock_offset_ns',
         )
-        minimum_clock_offset = -CONTACT_MAX_CLOCK_LAG_NS
-        maximum_clock_offset = CONTACT_MAX_CLOCK_LAG_NS
-        delivery_within_clock_lag = (
-            minimum_clock_offset <= delivery_clock_offset_ns <= maximum_clock_offset
-        )
-        if (
-            delivery_clock_offset_ns != delivery_clock_stamp_ns - stamp
-            or not delivery_within_clock_lag
-        ):
-            raise EvidenceError('capture contact snapshot delivery /clock bracket is invalid')
+        if delivery_clock_offset_ns != delivery_clock_stamp_ns - stamp:
+            raise EvidenceError('capture contact snapshot delivery /clock offset is inconsistent')
         if item.get('frame_id') != '':
             raise EvidenceError('capture public contact snapshot frame_id must be empty')
         contacts = item.get('contacts')

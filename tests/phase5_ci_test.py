@@ -3839,6 +3839,18 @@ def test_release_evidence_rejects_boolean_positive_control_exit_code(tmp_path: P
         _validate_release_fixture(fixture)
 
 
+def test_release_evidence_treats_passive_release_clock_offset_as_diagnostic() -> None:
+    reconciliation = {
+        'release_delivery_clock_offset_ns': 278_000_000,
+        'release_delivery_clock_stamp_ns': 578_000_000,
+        'release_qualified_snapshot_stamp_ns': 300_000_000,
+    }
+    assert release_module._passive_release_clock_offset_is_consistent(reconciliation)
+
+    reconciliation['release_delivery_clock_offset_ns'] += 1
+    assert not release_module._passive_release_clock_offset_is_consistent(reconciliation)
+
+
 def test_release_evidence_rejects_missing_collision_coverage_sha(tmp_path: Path) -> None:
     fixture = _release_fixture(tmp_path)
     candidate_root = Path(fixture['candidate_root'])

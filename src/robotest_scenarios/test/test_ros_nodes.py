@@ -24,7 +24,7 @@ from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from robotest_scenarios.contact_control_driver import ContactControlApp, ContactControlNode
 from robotest_scenarios.contact_evidence import load_coverage_manifest
-from robotest_scenarios.errors import ProtocolError
+from robotest_scenarios.errors import ProtocolError, ScenarioFailureError
 from robotest_scenarios.models import load_scenario
 from robotest_scenarios.scenario_controller import ScenarioControllerNode
 from ros_gz_interfaces.msg import Contact, Contacts
@@ -186,6 +186,41 @@ def test_contact_node_stops_immediately_then_settles_future_snapshot_latency() -
         assert node.stop_latency_ns == 30_000_000
         assert node.stop_latency_clock_stamp_ns == 1_080_000_000
         assert node.first_qualifying_contact['stop_latency_upper_bound_ns'] == 30_000_000
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+@pytest.mark.parametrize(
+    ('stop_latency_ns', 'misses_deadline'),
+    [(100_000_000, False), (100_000_001, True)],
+)
+def test_contact_node_stop_latency_100ms_boundary(
+    stop_latency_ns: int,
+    misses_deadline: bool,
+) -> None:
+    _init_ros()
+    manifest = load_coverage_manifest(str(REPOSITORY / 'config' / 'collision-coverage.yaml'))
+    node = ContactControlNode(manifest)
+    try:
+        node._on_clock(_clock(1_000_000_000))
+        node.start_forward()
+        node._on_clock(_clock(1_000_000_000 + stop_latency_ns))
+        contact = Contact()
+        contact.collision1.name, contact.collision2.name = manifest.expected_control_pair
+        message = Contacts()
+        message.header.stamp.sec = 1
+        message.contacts = [contact]
+
+        if misses_deadline:
+            with pytest.raises(ScenarioFailureError, match=r'missed its 0\.10 s deadline'):
+                node._on_contacts(message)
+        else:
+            node._on_contacts(message)
+
+        assert node.commands.items[-1]['phase'] == 'CONTACT_STOP'
+        assert node.commands.items[-1]['linear_x'] == 0.0
+        assert node.stop_latency_ns == stop_latency_ns
     finally:
         node.destroy_node()
         rclpy.try_shutdown()

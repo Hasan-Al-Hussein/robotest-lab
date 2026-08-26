@@ -54,13 +54,23 @@ Unless a scenario below overrides a value:
 - the contact gate's active-pair expiry is **0.25 simulation seconds**, with
   release proven only by a completed authoritative snapshot whose stamp is
   strictly greater than the pair's last-seen stamp plus that gap;
-- public contact snapshot source gaps and consumer callback-time `/clock` skew
-  are each at most **0.22 simulation seconds** throughout the accepted
-  interval; the gate measures source cadence from causally ordered finalized
-  raw stamps and separately detects pending/raw silence, while evidence
-  consumers measure callback skew without treating it as DDS transport age;
-  no stricter consecutive-private-callback spacing is inferred from the
-  simulator's delivered raw sequence;
+- public contact snapshot source gaps are at most **0.22 simulation seconds**
+  throughout the accepted interval; the gate measures source cadence from
+  causally ordered finalized raw stamps and separately detects pending/raw
+  silence;
+- passive evidence consumers retain each callback's cached `/clock` offset as
+  diagnostic telemetry, not DDS transport age or an acceptance bound, because
+  the contact and `/clock` subscriptions have no causal callback order; they
+  instead require an explicitly caught-up final snapshot/clock bracket of at
+  most **0.22 simulation seconds** within a bounded wall wait; the Phase 1/2
+  probes additionally reject a public-contact inter-receipt silence longer
+  than their existing **2.0 steady-wall-second** bracket timeout as observer
+  liveness evidence, not simulation-time freshness;
+- the active positive-control driver separately fails closed when its own
+  callback-time offset exceeds **0.22 simulation seconds** and proves the
+  qualifying stop command within **0.10 simulation seconds**; no stricter
+  consecutive-private-callback spacing is inferred from the simulator's
+  delivered raw sequence;
 - terminal drain is an actually retained, collector-acknowledged public
   snapshot `q`, with `q > T_terminal + 0.25 s`; the target boundary alone is
   not completion evidence;

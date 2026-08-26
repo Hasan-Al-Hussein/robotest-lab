@@ -750,7 +750,7 @@ def test_snapshot_presence_equality_pair_migration_and_absence_recontact() -> No
     assert result['events'][1]['end_stamp_ns'] == 601
 
 
-def test_public_snapshot_shape_ordering_and_delivery_bracket_fail_closed() -> None:
+def test_public_snapshot_shape_ordering_and_delivery_offset_identity_fail_closed() -> None:
     manifest, positive, binding = collision_fixture()
     base = [_message(100, 1), _message(451, 2)]
     duplicate = copy.deepcopy(base)
@@ -773,8 +773,30 @@ def test_public_snapshot_shape_ordering_and_delivery_bracket_fail_closed() -> No
             oversized, 100, 200, 451, manifest, positive, binding, release_gap_ns=250
         )
 
-    stale = copy.deepcopy(base)
-    stale[0]['delivery_clock_stamp_ns'] = 220_000_101
-    stale[0]['delivery_clock_offset_ns'] = 220_000_001
-    with pytest.raises(MetricUnavailable, match='delivery clock bracket'):
-        analyze_collisions(stale, 100, 200, 451, manifest, positive, binding, release_gap_ns=250)
+    diagnostic_offset = copy.deepcopy(base)
+    diagnostic_offset[0]['delivery_clock_stamp_ns'] = 278_000_100
+    diagnostic_offset[0]['delivery_clock_offset_ns'] = 278_000_000
+    analyze_collisions(
+        diagnostic_offset,
+        100,
+        200,
+        451,
+        manifest,
+        positive,
+        binding,
+        release_gap_ns=250,
+    )
+
+    inconsistent_offset = copy.deepcopy(diagnostic_offset)
+    inconsistent_offset[0]['delivery_clock_offset_ns'] = 278_000_001
+    with pytest.raises(MetricUnavailable, match='delivery clock offset is inconsistent'):
+        analyze_collisions(
+            inconsistent_offset,
+            100,
+            200,
+            451,
+            manifest,
+            positive,
+            binding,
+            release_gap_ns=250,
+        )

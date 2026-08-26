@@ -122,8 +122,12 @@ EXPECTED_CONTACT_STREAM_POLICY = {
     'max_public_snapshot_gap_ns': 220_000_000,
     'max_public_snapshot_clock_lag_ns': 220_000_000,
     'max_raw_clock_lag_ns': 220_000_000,
+    'passive_callback_clock_offset_semantics': 'diagnostic_noncausal',
     'public_snapshots_require_nonempty_contacts': True,
     'public_snapshot_cardinality': 'required_nonempty_1_to_16',
+    'public_snapshot_clock_lag_scope': (
+        'active_positive_control_and_explicit_caught_up_brackets_only'
+    ),
     'public_snapshots_per_finalized_stamp': 'at_most_one',
     'limits': {
         'max_active_contact_pairs': 16,

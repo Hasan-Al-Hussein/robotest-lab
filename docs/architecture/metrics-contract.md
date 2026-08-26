@@ -121,9 +121,13 @@ plan-pose limit is overflow.
 A retained scan sample is bounded metadata (stamp, frame, range count, and
 payload hash), not a copy of an unbounded range array. Public contact snapshots
 contain 1--16 records and are normalized on receipt; the collector retains the
-snapshot stamp, empty frame, callback-time clock bracket, names, and delivered
-snapshot force/depth maxima. It does not claim to retain every raw physics
-sample or an intermediate peak. Crossing either contact limit is overflow.
+snapshot stamp, empty frame, callback-time cached clock offset, names, and
+delivered snapshot force/depth maxima. The offset is arithmetic and diagnostic:
+independently scheduled contact and `/clock` callbacks do not form a transport-
+age measurement. Source-stamp gaps and an explicitly caught-up terminal clock
+bracket own passive liveness acceptance. The collector does not claim to retain
+every raw physics sample or an intermediate peak. Crossing either contact limit
+is overflow.
 Variable-length strings are UTF-8 validated and capped at
 4,096 bytes per field; an over-limit field is invalid evidence and is never
 truncated into a misleading value.

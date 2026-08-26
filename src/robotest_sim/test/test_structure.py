@@ -688,6 +688,85 @@ def test_contact_stamp_tracker_accepts_220ms_and_rejects_one_ns_more() -> None:
     )
 
 
+def test_passive_contact_cached_clock_offset_is_diagnostic() -> None:
+    module = load_runtime_probe_module()
+    tracker = module.StampTracker()
+    tracker.observe(10_000_000_000, 10_278_000_000, receipt_wall_s=10.0)
+    tracker.observe(10_200_000_000, 10_300_000_000, receipt_wall_s=10.25)
+    tracker.observe(10_400_000_000, 10_448_000_000, receipt_wall_s=10.50)
+    evidence = tracker.evidence(
+        10_448_000_000,
+        0.22,
+        0.22,
+        0.22,
+        module.CONTACT_PUBLIC_MAX_WALL_INTER_RECEIPT_GAP_S,
+    )
+
+    assert evidence['maximum_forward_gap_ns'] == 200_000_000
+    assert evidence['maximum_receipt_age_ns'] == 278_000_000
+    assert evidence['final_age_ns'] == 48_000_000
+    assert (
+        module.stamp_evidence_failures(
+            '/robotest/validation/contacts',
+            evidence,
+            enforce_callback_clock_offset=False,
+        )
+        == []
+    )
+    assert any(
+        'maximum receipt age' in failure
+        for failure in module.stamp_evidence_failures('/robotest/validation/contacts', evidence)
+    )
+
+
+def test_passive_contact_source_final_and_wall_liveness_stay_fail_closed() -> None:
+    module = load_runtime_probe_module()
+    source_gap = module.StampTracker()
+    source_gap.observe(1_000_000_000, 1_000_000_000, receipt_wall_s=10.0)
+    source_gap.observe(1_220_000_001, 1_220_000_001, receipt_wall_s=10.1)
+    source_gap.observe(1_440_000_001, 1_440_000_001, receipt_wall_s=10.2)
+    evidence = source_gap.evidence(1_440_000_001, 0.22, 0.22, 0.22, 2.0)
+    failures = module.stamp_evidence_failures(
+        '/robotest/validation/contacts',
+        evidence,
+        enforce_callback_clock_offset=False,
+    )
+    assert any('maximum stamp gap' in failure for failure in failures)
+
+    final_age = module.StampTracker()
+    final_age.observe(1_000_000_000, 1_000_000_000, receipt_wall_s=10.0)
+    final_age.observe(1_200_000_000, 1_200_000_000, receipt_wall_s=10.1)
+    final_age.observe(1_400_000_000, 1_400_000_000, receipt_wall_s=10.2)
+    boundary = final_age.evidence(1_620_000_000, 0.22, 0.22, 0.22, 2.0)
+    assert (
+        module.stamp_evidence_failures(
+            '/robotest/validation/contacts',
+            boundary,
+            enforce_callback_clock_offset=False,
+        )
+        == []
+    )
+    evidence = final_age.evidence(1_620_000_001, 0.22, 0.22, 0.22, 2.0)
+    failures = module.stamp_evidence_failures(
+        '/robotest/validation/contacts',
+        evidence,
+        enforce_callback_clock_offset=False,
+    )
+    assert any('final stamp age' in failure for failure in failures)
+
+    wall_gap = module.StampTracker()
+    wall_gap.observe(1_000_000_000, 1_000_000_000, receipt_wall_s=10.0)
+    wall_gap.observe(1_200_000_000, 1_200_000_000, receipt_wall_s=12.000_001)
+    wall_gap.observe(1_400_000_000, 1_400_000_000, receipt_wall_s=12.1)
+    evidence = wall_gap.evidence(1_400_000_000, 0.22, 0.22, 0.22, 2.0)
+    failures = module.stamp_evidence_failures(
+        '/robotest/validation/contacts',
+        evidence,
+        enforce_callback_clock_offset=False,
+    )
+    assert any('wall inter-receipt gap' in failure for failure in failures)
+
+
 def test_windowed_rtf_uses_multi_sample_non_overlapping_intervals() -> None:
     module = load_runtime_probe_module()
     samples = [

@@ -54,6 +54,7 @@ CONTACT_PUBLIC_HEARTBEAT_NS = 200_000_000
 CONTACT_PUBLIC_MAX_GAP_NS = 220_000_000
 CONTACT_PUBLIC_MAX_CLOCK_LAG_NS = 220_000_000
 CONTACT_CLOCK_BRACKET_WALL_TIMEOUT_S = 2.0
+CONTACT_PUBLIC_MAX_WALL_INTER_RECEIPT_GAP_S = CONTACT_CLOCK_BRACKET_WALL_TIMEOUT_S
 CONTACT_PUBLIC_MAX_RECORDS = 16
 
 # Gazebo advances this world in 2 ms steps at a configured target RTF of 1.0.
@@ -207,6 +208,31 @@ def finite_values(values: dict[str, float]) -> tuple[bool, list[str]]:
     """Return whether named floating-point evidence is JSON-safe and finite."""
     invalid = sorted(name for name, value in values.items() if not math.isfinite(value))
     return not invalid, invalid
+
+
+def cached_clock_offset_failures(
+    topic: str,
+    evidence: dict[str, Any],
+    *,
+    maximum_receipt_age_s: float,
+    maximum_future_offset_s: float,
+    enforce: bool,
+) -> list[str]:
+    """Validate a cached callback clock relation only when it is causal policy."""
+    if not enforce:
+        return []
+    failures = []
+    if evidence['maximum_receipt_age_s'] > maximum_receipt_age_s:
+        failures.append(
+            f'{topic} maximum receipt age {evidence["maximum_receipt_age_s"]} '
+            f'exceeds {maximum_receipt_age_s} s'
+        )
+    if evidence['maximum_future_offset_s'] > maximum_future_offset_s:
+        failures.append(
+            f'{topic} maximum future offset {evidence["maximum_future_offset_s"]} '
+            f'exceeds {maximum_future_offset_s} s'
+        )
+    return failures
 
 
 def windowed_rtf(
@@ -930,6 +956,7 @@ class Phase2RuntimeProbe(Node):
         minimum_sample_count: int = 3,
         maximum_wall_receipt_age_s: float = 1.0,
         maximum_wall_inter_receipt_gap_s: float | None = None,
+        enforce_callback_clock_offset: bool = True,
     ) -> dict[str, Any]:
         evidence = self.stamp_trackers[key].evidence(self.latest_clock_ns)
         rate = self.simulation_rate(key)
@@ -945,6 +972,11 @@ class Phase2RuntimeProbe(Node):
         evidence['simulation_rate_hz'] = rate
         evidence['simulation_span_s'] = simulation_span_s
         evidence['wall_receipt_age_s'] = wall_receipt_age_s
+        evidence['callback_clock_offset_semantics'] = (
+            'bounded_cached_clock_offset'
+            if enforce_callback_clock_offset
+            else 'diagnostic_noncausal_cached_clock_offset'
+        )
         evidence['limits'] = {
             'minimum_simulation_rate_hz': minimum_simulation_rate,
             'maximum_gap_s': maximum_gap_s,
@@ -982,16 +1014,15 @@ class Phase2RuntimeProbe(Node):
                 f'{topic} maximum stamp gap {evidence["maximum_forward_gap_s"]} '
                 f'exceeds {maximum_gap_s} s'
             )
-        if evidence['maximum_receipt_age_ns'] > evidence['limits']['maximum_receipt_age_ns']:
-            self.failures.append(
-                f'{topic} maximum receipt age {evidence["maximum_receipt_age_s"]} '
-                f'exceeds {maximum_receipt_age_s} s'
+        self.failures.extend(
+            cached_clock_offset_failures(
+                topic,
+                evidence,
+                maximum_receipt_age_s=maximum_receipt_age_s,
+                maximum_future_offset_s=maximum_future_offset_s,
+                enforce=enforce_callback_clock_offset,
             )
-        if evidence['maximum_future_offset_s'] > maximum_future_offset_s:
-            self.failures.append(
-                f'{topic} maximum future offset {evidence["maximum_future_offset_s"]} '
-                f'exceeds {maximum_future_offset_s} s'
-            )
+        )
         final_age = evidence['final_age_s']
         final_age_ns = evidence['final_age_ns']
         if (
@@ -1255,6 +1286,8 @@ class Phase2RuntimeProbe(Node):
                 0.22,
                 0.22,
                 0.25,
+                maximum_wall_inter_receipt_gap_s=(CONTACT_PUBLIC_MAX_WALL_INTER_RECEIPT_GAP_S),
+                enforce_callback_clock_offset=False,
             ),
             '/robotest/validation/world_stats': self._check_stamp_stream(
                 '/robotest/validation/world_stats',
@@ -1569,6 +1602,49 @@ def run_self_test() -> int:
     assert tracker_evidence['maximum_future_offset_s'] == 0.2
     assert tracker_evidence['wall_inter_receipt_interval_count'] == 4
     assert math.isclose(tracker_evidence['maximum_wall_inter_receipt_gap_s'], 0.5)
+
+    lagged_contacts = StampTracker()
+    lagged_contacts.observe(10_000_000_000, 10_278_000_000, receipt_wall_s=20.0)
+    lagged_contacts.observe(10_200_000_000, 10_300_000_000, receipt_wall_s=20.25)
+    lagged_contacts.observe(10_400_000_000, 10_448_000_000, receipt_wall_s=20.50)
+    lagged_evidence = lagged_contacts.evidence(10_448_000_000)
+    assert lagged_evidence['maximum_forward_gap_ns'] == 200_000_000
+    assert lagged_evidence['maximum_receipt_age_ns'] == 278_000_000
+    assert lagged_evidence['final_age_ns'] == 48_000_000
+    assert (
+        cached_clock_offset_failures(
+            '/robotest/validation/contacts',
+            lagged_evidence,
+            maximum_receipt_age_s=0.22,
+            maximum_future_offset_s=0.25,
+            enforce=False,
+        )
+        == []
+    )
+    assert cached_clock_offset_failures(
+        '/robotest/scan',
+        lagged_evidence,
+        maximum_receipt_age_s=0.22,
+        maximum_future_offset_s=0.25,
+        enforce=True,
+    )
+
+    future_contacts = StampTracker()
+    future_contacts.observe(10_000_000_000, 9_722_000_000, receipt_wall_s=30.0)
+    future_contacts.observe(10_200_000_000, 10_000_000_000, receipt_wall_s=30.25)
+    future_contacts.observe(10_400_000_000, 10_448_000_000, receipt_wall_s=30.50)
+    future_evidence = future_contacts.evidence(10_448_000_000)
+    assert future_evidence['maximum_future_offset_s'] == 0.278
+    assert (
+        cached_clock_offset_failures(
+            '/robotest/validation/contacts',
+            future_evidence,
+            maximum_receipt_age_s=0.22,
+            maximum_future_offset_s=0.25,
+            enforce=False,
+        )
+        == []
+    )
     assert math.isclose(CLOCK_MAXIMUM_STAMP_GAP_S, 0.5)
     assert math.isclose(WORLD_STATS_MAXIMUM_RECEIPT_AGE_S, 1.5)
     valid, invalid = finite_values({'finite': 1.0, 'nan': math.nan})

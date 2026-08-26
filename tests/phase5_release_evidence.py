@@ -217,6 +217,21 @@ def _require(condition: bool, message: str) -> None:
         raise EvidenceError(message)
 
 
+def _passive_release_clock_offset_is_consistent(
+    reconciliation: Mapping[str, Any],
+) -> bool:
+    """Check passive cached-clock arithmetic without imposing a magnitude bound."""
+    offset = reconciliation.get('release_delivery_clock_offset_ns')
+    delivery = reconciliation.get('release_delivery_clock_stamp_ns')
+    release = reconciliation.get('release_qualified_snapshot_stamp_ns')
+    if any(
+        not isinstance(value, int) or isinstance(value, bool)
+        for value in (offset, delivery, release)
+    ):
+        return False
+    return delivery >= 0 and release >= 0 and offset == delivery - release
+
+
 def _mapping(value: object, label: str) -> dict[str, Any]:
     _require(isinstance(value, dict), f'{label} must be a mapping')
     return value
@@ -1351,8 +1366,7 @@ def _phase3_evidence(
                 'release_delivery_clock_offset_ns',
             }
         )
-        and isinstance(collector_reconciliation['release_delivery_clock_offset_ns'], int)
-        and not isinstance(collector_reconciliation['release_delivery_clock_offset_ns'], bool)
+        and _passive_release_clock_offset_is_consistent(collector_reconciliation)
         and isinstance(collector_reconciliation['contact_progress_artifact_sha256'], str)
         and isinstance(collector_reconciliation['contact_projection_sha256'], str)
         and re.fullmatch(
@@ -1379,12 +1393,7 @@ def _phase3_evidence(
         and collector_reconciliation['release_qualified_snapshot_stamp_ns']
         > collector_reconciliation['release_required_through_stamp_ns']
         and collector_reconciliation['latest_clock_stamp_ns']
-        >= collector_reconciliation['release_qualified_snapshot_stamp_ns']
-        and collector_reconciliation['release_delivery_clock_offset_ns']
-        == collector_reconciliation['release_delivery_clock_stamp_ns']
-        - collector_reconciliation['release_qualified_snapshot_stamp_ns']
-        and abs(collector_reconciliation['release_delivery_clock_offset_ns'])
-        <= orchestration.CONTACT_MAX_CLOCK_LAG_NS,
+        >= collector_reconciliation['release_qualified_snapshot_stamp_ns'],
         'Phase 3 positive-control reconciliation is invalid',
     )
     _metrics_package_root(repository)
