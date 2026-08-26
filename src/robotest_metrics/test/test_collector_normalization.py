@@ -22,6 +22,7 @@ import robotest_metrics.collector_node as collector_node
 from geometry_msgs.msg import Transform, Vector3
 from nav_msgs.msg import Odometry, Path
 from ros_gz_interfaces.msg import Contact, Contacts, JointWrench
+from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import LaserScan
 
 
@@ -33,11 +34,62 @@ def test_collector_source_is_observer_only() -> None:
     assert 'create_subscription' in source
 
 
-def test_collector_node_uses_rclpy_subscription_registry_and_destroys_cleanly() -> None:
+def test_collector_waits_for_post_clock_contact_and_destroys_cleanly(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     rclpy.init()
     node = collector_node.MetricsCollectorNode()
     try:
         assert node.get_name() == 'metrics_collector'
+        message = Contacts()
+        message.header.stamp.sec = 1
+        message.contacts = [Contact()]
+        zero_clock = Clock()
+        clock = Clock()
+        clock.clock.sec = 1
+        assert not collector_node._wait_for_startup_ready(
+            node,
+            deadline=collector_node.time.monotonic() - 1.0,
+            stop_file=tmp_path / 'no-stop',
+        )
+        stop_file = tmp_path / 'stop'
+        stop_file.touch()
+        assert not collector_node._wait_for_startup_ready(
+            node,
+            deadline=collector_node.time.monotonic() + 1.0,
+            stop_file=stop_file,
+        )
+        stop_file.unlink()
+
+        callback_order = iter(
+            (
+                lambda: node._on_contacts(message),
+                lambda: node._on_clock(zero_clock),
+                lambda: node._on_contacts(message),
+                lambda: node._on_clock(clock),
+                lambda: node._on_contacts(message),
+            )
+        )
+        spin_count = 0
+
+        def spin_once(_node: object, *, timeout_sec: float) -> None:
+            nonlocal spin_count
+            assert timeout_sec == 0.1
+            spin_count += 1
+            next(callback_order)()
+
+        monkeypatch.setattr(collector_node.rclpy, 'spin_once', spin_once)
+        assert collector_node._wait_for_startup_ready(
+            node,
+            deadline=collector_node.time.monotonic() + 1.0,
+            stop_file=stop_file,
+        )
+        assert spin_count == 5
+        assert node.pre_clock_contact_message_count == 2
+        assert node.core.snapshot()['streams']['contacts']['quality']['retained_count'] == 1
+        assert node.latest_retained_contact_stamp_ns == 1_000_000_000
+        assert node.startup_ready is True
     finally:
         try:
             node.destroy_node()

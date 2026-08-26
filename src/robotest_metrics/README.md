@@ -24,8 +24,12 @@ ros2 run robotest_metrics metrics_collector \
 The runner waits for the atomically written ready file, executes the scenario,
 then waits for a retained public contact snapshot strictly beyond
 `T_terminal + 0.25 s` and its atomic progress acknowledgement before creating
-the stop file. The collector writes `capture.json` atomically even when its wall
-deadline expires. Exit codes are:
+the stop file. READY is emitted only after the collector has observed a positive `/clock`
+and retained a subsequent authoritative public contact snapshot. Contact
+callbacks that arrive before the first positive `/clock` callback are counted in READY
+and discarded as a pre-evidence prefix; they are never assigned a fabricated
+delivery-clock value. The collector writes `capture.json` atomically even when
+its wall deadline expires. Exit codes are:
 
 | Exit | Meaning |
 | ---: | --- |

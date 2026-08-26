@@ -293,6 +293,8 @@ class MetricsCollectorNode(Node):
         self.core = CollectorCore()
         self.contact_progress_path = contact_progress_path
         self.retained_contact_message_count = 0
+        self.latest_retained_contact_stamp_ns: int | None = None
+        self.pre_clock_contact_message_count = 0
         self.latest_clock_ns: int | None = None
         self._subscribe(Clock, '/clock', self._on_clock, _qos(1, reliable=False))
         self._subscribe(
@@ -417,12 +419,14 @@ class MetricsCollectorNode(Node):
         )
 
     def _on_contacts(self, message: Contacts) -> None:
-        if self.latest_clock_ns is None:
-            raise ArtifactError('cannot retain a public contact snapshot before /clock')
+        if self.latest_clock_ns is None or self.latest_clock_ns <= 0:
+            self.pre_clock_contact_message_count += 1
+            return
         item = _contacts_item(message, delivery_clock_stamp_ns=self.latest_clock_ns)
         if not self.core.record('contacts', item):
             return
         self.retained_contact_message_count += 1
+        self.latest_retained_contact_stamp_ns = int(item['stamp_ns'])
         if self.contact_progress_path is not None:
             write_json_atomic(
                 {
@@ -435,6 +439,13 @@ class MetricsCollectorNode(Node):
                 self.contact_progress_path,
                 maximum_bytes=16_384,
             )
+
+    @property
+    def startup_ready(self) -> bool:
+        """Return whether clock and one authoritative contact seed are retained."""
+        clock_seen = self.latest_clock_ns is not None and self.latest_clock_ns > 0
+        contact_seeded = self.latest_retained_contact_stamp_ns is not None
+        return clock_seen and contact_seeded
 
     def _on_world_stats(self, message: WorldStatistics) -> None:
         self.core.record(
@@ -528,6 +539,20 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _wait_for_startup_ready(
+    node: MetricsCollectorNode,
+    *,
+    deadline: float,
+    stop_file: Path,
+) -> bool:
+    """Spin until both clock and a post-clock contact seed are retained."""
+    while rclpy.ok() and not stop_file.exists() and not node.startup_ready:
+        if time.monotonic() >= deadline:
+            return False
+        rclpy.spin_once(node, timeout_sec=0.1)
+    return rclpy.ok() and node.startup_ready
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run until the stop-file appears or the bounded wall deadline expires."""
     raw_arguments = list(sys.argv) if argv is None else [sys.argv[0], *argv]
@@ -560,21 +585,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     started_wall_ns = time.monotonic_ns()
     try:
         node = MetricsCollectorNode(contact_progress_path=arguments.contact_progress_file)
-        write_json_atomic(
-            {
-                'node_name': node.get_fully_qualified_name(),
-                'started_steady_wall_ns': started_wall_ns,
-                'status': 'READY',
-            },
-            arguments.ready_file,
-            maximum_bytes=16_384,
-        )
         deadline = time.monotonic() + arguments.wall_timeout_s
-        while rclpy.ok() and not arguments.stop_file.exists():
-            if time.monotonic() >= deadline:
-                timed_out = True
-                break
-            rclpy.spin_once(node, timeout_sec=0.1)
+        startup_ready = _wait_for_startup_ready(
+            node,
+            deadline=deadline,
+            stop_file=arguments.stop_file,
+        )
+        if startup_ready:
+            write_json_atomic(
+                {
+                    'initial_contact_stamp_ns': node.latest_retained_contact_stamp_ns,
+                    'node_name': node.get_fully_qualified_name(),
+                    'pre_clock_contact_message_count': node.pre_clock_contact_message_count,
+                    'started_steady_wall_ns': started_wall_ns,
+                    'status': 'READY',
+                },
+                arguments.ready_file,
+                maximum_bytes=16_384,
+            )
+            while rclpy.ok() and not arguments.stop_file.exists():
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
+                rclpy.spin_once(node, timeout_sec=0.1)
+        elif rclpy.ok() and not arguments.stop_file.exists():
+            timed_out = True
         runtime_interrupted = not rclpy.ok() and not arguments.stop_file.exists()
         capture = node.core.snapshot()
         capture.update(
