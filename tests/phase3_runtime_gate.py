@@ -393,7 +393,10 @@ def _parse_proc_maps(payload: bytes) -> tuple[ProcMapEntry, ...]:
             if not inode_text.isdecimal():
                 raise ValueError('inode is not decimal')
             inode = int(inode_text, 10)
-            path = fields[5].decode('utf-8', errors='surrogateescape') if len(fields) == 6 else None
+            raw_path = fields[5] if len(fields) == 6 else None
+            path = None
+            if raw_path is not None:
+                path = raw_path.decode('utf-8', errors='surrogateescape')
         except (OverflowError, UnicodeError, ValueError) as exc:
             raise EvidenceError(f'/proc maps line {line_number} is malformed: {exc}') from exc
         if (
@@ -878,7 +881,8 @@ def _contact_aggregator_binary_attestation(
             live_installed_inode_match
             and frozen['installed_elf_build_id'] == frozen['build_elf_build_id']
         )
-        live_embedded_source_inventory_sha256 = frozen['installed_embedded_source_inventory_sha256']
+        installed_inventory_sha256 = frozen['installed_embedded_source_inventory_sha256']
+        live_embedded_source_inventory_sha256 = installed_inventory_sha256
         live_embedded_source_inventory_match = (
             live_installed_inode_match
             and live_embedded_source_inventory_sha256 == frozen['source_inventory_sha256']

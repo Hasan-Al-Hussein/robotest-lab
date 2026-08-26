@@ -1290,7 +1290,8 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     )
 
     inconsistent_offset = copy.deepcopy(diagnostic_offset)
-    inconsistent_offset['streams']['contacts']['items'][1]['delivery_clock_offset_ns'] = 278_000_001
+    inconsistent_contact_items = inconsistent_offset['streams']['contacts']['items']
+    inconsistent_contact_items[1]['delivery_clock_offset_ns'] = 278_000_001
     orchestration.atomic_write_json(capture_path, inconsistent_offset)
     with pytest.raises(orchestration.EvidenceError, match='offset is inconsistent'):
         orchestration.reconcile_positive_control(
