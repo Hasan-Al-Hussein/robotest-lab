@@ -111,8 +111,8 @@ def contact_control_configuration() -> dict[str, object]:
         'capacities': {
             'actor_state': constants.ACTOR_STATE_CAPACITY,
             'command': constants.COMMAND_CAPACITY,
-            'contact_records': constants.CONTACT_RECORD_CAPACITY,
-            'contact_summaries': constants.CONTACT_SUMMARY_CAPACITY,
+            'contact_snapshot_records': constants.CONTACT_RECORD_CAPACITY,
+            'contact_snapshots': constants.CONTACT_SUMMARY_CAPACITY,
             'ground_truth': constants.GROUND_TRUTH_CAPACITY,
         },
         'contact_deadline_ns': constants.CONTROL_CONTACT_DEADLINE_NS,

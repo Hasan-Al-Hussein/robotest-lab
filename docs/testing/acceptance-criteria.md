@@ -51,7 +51,14 @@ Unless a scenario below overrides a value:
 - steady wall-clock escape timeout is **300 s**;
 - required localization-error sample coverage is at least **95%**;
 - maximum ground-truth/interpolation gap is **0.25 simulation seconds**;
-- collision release gap is **0.25 simulation seconds**;
+- the contact gate's active-pair expiry is **0.25 simulation seconds**, with
+  release proven only by a completed authoritative snapshot whose stamp is
+  strictly greater than the pair's last-seen stamp plus that gap;
+- public contact snapshot source gaps and callback `/clock` skew are at most
+  **0.22 simulation seconds** throughout the accepted interval;
+- terminal drain is an actually retained, collector-acknowledged public
+  snapshot `q`, with `q > T_terminal + 0.25 s`; the target boundary alone is
+  not completion evidence;
 - zero-command tolerance is
   `abs(linear.x) <= 0.02 m/s` and
   `abs(angular.z) <= 0.05 rad/s`.

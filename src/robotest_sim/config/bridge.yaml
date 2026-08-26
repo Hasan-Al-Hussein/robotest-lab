@@ -73,13 +73,13 @@
   subscriber_queue: 10
   qos_profile: SERVICES
 
-- ros_topic_name: validation/contacts
+- ros_topic_name: internal/raw_contacts
   gz_topic_name: /robotest/validation/contacts
   ros_type_name: ros_gz_interfaces/msg/Contacts
   gz_type_name: gz.msgs.Contacts
   direction: GZ_TO_ROS
-  publisher_queue: 10
-  subscriber_queue: 10
+  publisher_queue: 64
+  subscriber_queue: 64
   qos_profile: SERVICES
 
 - ros_topic_name: validation/world_stats

@@ -94,8 +94,11 @@ def test_contact_normalization_extracts_exact_names_depths_and_normal_force() ->
     contact.normals = [normal]
     contact.wrenches = [wrench]
     message.contacts = [contact]
-    item = collector_node._contacts_item(message)
+    item = collector_node._contacts_item(message, delivery_clock_stamp_ns=1_010_000_000)
     assert item['stamp_ns'] == 1_000_000_000
+    assert item['frame_id'] == ''
+    assert item['delivery_clock_stamp_ns'] == 1_010_000_000
+    assert item['delivery_clock_offset_ns'] == 10_000_000
     assert item['contacts'] == [
         {
             'collision1': 'robotest::base::collision',
@@ -104,6 +107,26 @@ def test_contact_normalization_extracts_exact_names_depths_and_normal_force() ->
             'maximum_normal_force_n': 5.0,
         }
     ]
+
+
+def test_contact_normalization_rejects_impossible_public_snapshot_shapes() -> None:
+    empty = Contacts()
+    empty.header.stamp.sec = 1
+    with pytest.raises(collector_node.ArtifactError, match='between one and 16'):
+        collector_node._contacts_item(empty, delivery_clock_stamp_ns=1_000_000_000)
+
+    oversized = Contacts()
+    oversized.header.stamp.sec = 1
+    oversized.contacts = [Contact() for _ in range(17)]
+    with pytest.raises(collector_node.ArtifactError, match='between one and 16'):
+        collector_node._contacts_item(oversized, delivery_clock_stamp_ns=1_000_000_000)
+
+    framed = Contacts()
+    framed.header.stamp.sec = 1
+    framed.header.frame_id = 'world'
+    framed.contacts = [Contact()]
+    with pytest.raises(collector_node.ArtifactError, match='frame_id'):
+        collector_node._contacts_item(framed, delivery_clock_stamp_ns=1_000_000_000)
 
 
 def test_runtime_ros_names_are_relative_except_architectural_globals() -> None:
@@ -115,12 +138,17 @@ def test_runtime_ros_names_are_relative_except_architectural_globals() -> None:
 
 @pytest.mark.parametrize(
     ('stale_index', 'label'),
-    ((0, 'output'), (1, 'ready'), (2, 'stop')),
+    ((0, 'output'), (1, 'ready'), (2, 'stop'), (3, 'contact progress')),
 )
 def test_collector_rejects_every_stale_artifact_path(
     tmp_path, stale_index: int, label: str
 ) -> None:
-    paths = [tmp_path / 'capture.json', tmp_path / 'ready.json', tmp_path / 'stop']
+    paths = [
+        tmp_path / 'capture.json',
+        tmp_path / 'ready.json',
+        tmp_path / 'stop',
+        tmp_path / 'contact-progress.json',
+    ]
     paths[stale_index].write_text('stale', encoding='utf-8')
     with pytest.raises(SystemExit, match=rf'stale {label} file'):
         collector_node.main(
@@ -131,5 +159,7 @@ def test_collector_rejects_every_stale_artifact_path(
                 str(paths[1]),
                 '--stop-file',
                 str(paths[2]),
+                '--contact-progress-file',
+                str(paths[3]),
             ]
         )

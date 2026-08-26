@@ -261,14 +261,38 @@ def _collision_metrics(
             'collector_configuration_sha256'
         ):
             raise MetricUnavailable('collision collector configuration target binding differs')
+    drain_evidence = _mapping(collision_request.get('contact_drain'), 'collision.contact_drain')
+    drain_ack = _mapping(collision_request.get('contact_drain_ack'), 'collision.contact_drain_ack')
+    drain_stamp = require_int(
+        collision_request.get('drain_completed_stamp_ns'),
+        'collision.drain_completed_stamp_ns',
+    )
+    qualifying_stamp = require_int(
+        drain_evidence.get('qualifying_contact_snapshot_stamp_ns'),
+        'collision.contact_drain.qualifying_contact_snapshot_stamp_ns',
+    )
+    if (
+        drain_stamp != qualifying_stamp
+        or require_int(
+            drain_evidence.get('terminal_action_stamp_ns'),
+            'collision.contact_drain.terminal_action_stamp_ns',
+        )
+        != terminal
+        or drain_stamp <= terminal + 250_000_000
+        or drain_ack.get('producer') != 'robotest_metrics/metrics_collector'
+        or drain_ack.get('public_topic') != '/robotest/validation/contacts'
+        or require_int(
+            drain_ack.get('latest_retained_stamp_ns'),
+            'collision.contact_drain_ack.latest_retained_stamp_ns',
+        )
+        < drain_stamp
+    ):
+        raise MetricUnavailable('contact drain/collector acknowledgement binding is invalid')
     return analyze_collisions(
         _stream(capture, 'contacts'),
         start,
         terminal,
-        require_int(
-            collision_request.get('drain_completed_stamp_ns'),
-            'collision.drain_completed_stamp_ns',
-        ),
+        drain_stamp,
         manifest,
         _mapping(collision_request.get('positive_control'), 'collision.positive_control'),
         binding,

@@ -504,11 +504,14 @@ explicit = [
     workspace / 'README.md',
     workspace / 'pyproject.toml',
     workspace / 'scripts/verify_phase2.sh',
+    workspace / 'config/collision-coverage.yaml',
     workspace / 'tests/phase2_startup_gate.py',
     workspace / 'tests/phase2_runtime_probe.py',
     workspace / 'tests/phase2_lifecycle_probe.py',
     workspace / 'tests/phase2_parameter_probe.py',
     workspace / 'tests/phase2_graph_probe.py',
+    workspace / 'tests/phase3_runtime_gate.py',
+    workspace / 'tests/phase3_orchestration.py',
     workspace / 'docs/testing/acceptance-criteria.md',
     workspace / 'docs/testing/verification-matrix.md',
     workspace / 'docs/architecture/metrics-contract.md',
@@ -924,6 +927,57 @@ for build_relative, install_relative in (
     )
     if not matches:
         failures.append(f'robotest_faults/{install_relative}')
+
+sim_prefix = prefix('robotest_sim')
+gate_build = (workspace / 'build/robotest_sim/contact_stream_gate').resolve()
+gate_installed_declared = sim_prefix / 'lib/robotest_sim/contact_stream_gate'
+try:
+    gate_installed = gate_installed_declared.resolve(strict=True)
+except OSError:
+    gate_installed = gate_installed_declared
+gate_build_hash = digest(gate_build)
+gate_installed_hash = digest(gate_installed)
+gate_build_id = elf_build_id(gate_build)
+gate_installed_build_id = elf_build_id(gate_installed)
+gate_matches = (
+    gate_build.is_file()
+    and os.access(gate_build, os.X_OK)
+    and gate_installed.is_file()
+    and os.access(gate_installed, os.X_OK)
+    and gate_installed_declared.samefile(gate_installed)
+    and gate_build_hash == gate_installed_hash
+    and gate_build_id is not None
+    and gate_build_id == gate_installed_build_id
+)
+entries.append(
+    {
+        'binding_type': 'built_runtime_artifact',
+        'package': 'robotest_sim',
+        'executable': 'contact_stream_gate',
+        'build_path': str(gate_build),
+        'installed_declared_path': str(gate_installed_declared),
+        'installed_path': str(gate_installed),
+        'build_sha256': gate_build_hash,
+        'installed_sha256': gate_installed_hash,
+        'build_elf_build_id': gate_build_id,
+        'build_install_sha256_match': gate_build_hash == gate_installed_hash,
+        'installed_elf_build_id': gate_installed_build_id,
+        'installed_declared_samefile': (
+            gate_installed_declared.exists()
+            and gate_installed_declared.samefile(gate_installed)
+        ),
+        'regular_executable': (
+            gate_installed.is_file() and os.access(gate_installed, os.X_OK)
+        ),
+        'comparison_method': (
+            'matching whole-file SHA-256 and GNU ELF build-id plus exact resolved '
+            'installed executable identity'
+        ),
+        'matches': gate_matches,
+    }
+)
+if not gate_matches:
+    failures.append('robotest_sim/contact_stream_gate executable')
 evidence = {'verdict': 'PASS' if not failures else 'FAIL', 'failures': failures, 'files': entries}
 output.write_text(json.dumps(evidence, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 if failures:
@@ -1018,6 +1072,7 @@ evidence = {
     },
     'failures': failures,
 }
+
 descriptor, pending_name = tempfile.mkstemp(
     dir=output.parent, prefix=f'.{output.name}.', suffix='.pending', text=True
 )
@@ -1036,6 +1091,123 @@ finally:
 print(json.dumps(evidence, indent=2, sort_keys=True))
 if failures:
     raise SystemExit('; '.join(failures))
+PY
+}
+
+write_contact_gate_runtime_attestation() {
+  local output_path="$1"
+  local initial_path="${2:-}"
+  python3 - \
+    "$WORKSPACE" "$LAUNCH_PID" "$ROS_DOMAIN_ID" "$GZ_PARTITION" \
+    "$output_path" "$initial_path" <<'PY'
+import hashlib
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import yaml
+
+workspace = Path(sys.argv[1]).resolve()
+launch_pid = int(sys.argv[2])
+domain_id = int(sys.argv[3])
+partition = sys.argv[4]
+output = Path(sys.argv[5])
+initial_path = Path(sys.argv[6]) if sys.argv[6] else None
+module_path = workspace / 'tests/phase3_runtime_gate.py'
+sys.path.insert(0, str(workspace / 'tests'))
+import phase3_orchestration as orchestration
+spec = importlib.util.spec_from_file_location('robotest_contact_gate_attestor', module_path)
+if spec is None or spec.loader is None:
+    raise SystemExit('cannot load contact gate attestor')
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+attestation = module._contact_gate_binary_attestation(
+    workspace, launch_pid, domain_id, partition
+)
+if attestation.get('verdict') != 'PASS':
+    raise SystemExit(f'contact gate runtime attestation failed: {attestation}')
+manifest_path = workspace / 'config/collision-coverage.yaml'
+manifest_bytes = manifest_path.read_bytes()
+manifest = yaml.safe_load(manifest_bytes)
+contact_stream = orchestration._contact_stream_manifest_v3(manifest, workspace)
+declared_source_inventory_sha256 = contact_stream['gate'][
+    'source_inventory_sha256'
+]
+if attestation.get('source_inventory_sha256') != declared_source_inventory_sha256:
+    raise SystemExit('contact gate runtime source inventory differs from manifest v3')
+binding_path = output.parent / 'installed-source-binding.json'
+binding_bytes = binding_path.read_bytes()
+binding = json.loads(binding_bytes)
+gate_records = [
+    record
+    for record in binding.get('files', [])
+    if record.get('package') == 'robotest_sim'
+    and record.get('executable') == 'contact_stream_gate'
+]
+if len(gate_records) != 1:
+    raise SystemExit('installed source binding lacks exactly one contact gate record')
+gate_record = gate_records[0]
+if not (
+    gate_record.get('matches') is True
+    and gate_record.get('build_install_sha256_match') is True
+    and gate_record.get('regular_executable') is True
+    and gate_record.get('installed_declared_samefile') is True
+    and Path(gate_record['build_path']).resolve()
+    == (workspace / attestation['build_path']).resolve()
+    and Path(gate_record['installed_declared_path']).resolve()
+    == (workspace / attestation['installed_declared_path']).resolve()
+    and Path(gate_record['installed_path']).resolve()
+    == (workspace / attestation['installed_path']).resolve()
+    and gate_record.get('build_sha256') == attestation.get('build_sha256')
+    and gate_record.get('installed_sha256') == attestation.get('installed_sha256')
+    and gate_record.get('build_sha256') == gate_record.get('installed_sha256')
+    and gate_record.get('build_elf_build_id') == attestation.get('build_elf_build_id')
+    and gate_record.get('installed_elf_build_id')
+    == attestation.get('installed_elf_build_id')
+):
+    raise SystemExit('contact gate runtime differs from installed source binding')
+result = {
+    'contact_gate_binary_attestation': attestation,
+    'manifest_declared_sha256': manifest['manifest_sha256'],
+    'manifest_file_sha256': hashlib.sha256(manifest_bytes).hexdigest(),
+    'manifest_path': manifest_path.relative_to(workspace).as_posix(),
+    'manifest_source_inventory_sha256': declared_source_inventory_sha256,
+    'installed_source_binding_sha256': hashlib.sha256(binding_bytes).hexdigest(),
+    'phase': 'final' if initial_path is not None else 'ready',
+    'producer': 'robotest_phase2/contact_gate_runtime_attestor',
+    'schema_version': 1,
+    'stable_identity': None,
+}
+if initial_path is not None:
+    initial_bytes = initial_path.read_bytes()
+    initial = json.loads(initial_bytes)
+    initial_attestation = initial['contact_gate_binary_attestation']
+    if (
+        initial.get('manifest_path') != result['manifest_path']
+        or initial.get('manifest_file_sha256') != result['manifest_file_sha256']
+        or initial.get('manifest_declared_sha256') != result['manifest_declared_sha256']
+    ):
+        raise SystemExit('contact stream manifest changed before final evaluation')
+    stable_fields = (
+        'build_elf_build_id', 'build_embedded_source_inventory_sha256',
+        'build_install_sha256_match',
+        'build_path', 'build_sha256', 'installed_declared_path',
+        'installed_device', 'installed_elf_build_id', 'installed_inode',
+        'installed_embedded_source_inventory_sha256', 'installed_path',
+        'installed_sha256',
+        'live_cmdline_sha256', 'live_device', 'live_elf_build_id',
+        'live_embedded_source_inventory_sha256',
+        'live_executable_link', 'live_executable_path', 'live_executable_sha256', 'live_inode',
+        'live_pgid', 'live_pid', 'live_ppid', 'live_sid', 'live_size_bytes',
+        'live_start_ticks', 'observed_gz_partition', 'observed_ros_domain_id',
+        'source_inventory_sha256',
+    )
+    if any(initial_attestation.get(key) != attestation.get(key) for key in stable_fields):
+        raise SystemExit('contact gate runtime identity changed before final evaluation')
+    result['initial_artifact_sha256'] = hashlib.sha256(initial_bytes).hexdigest()
+    result['stable_identity'] = True
+output.write_text(json.dumps(result, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 PY
 }
 
@@ -2017,6 +2189,8 @@ provenance = {
         'graph_node_identities': 'nodes-ready.txt',
         'action_ownership_during_mission': 'action-ownership-during-mission.json',
         'runtime_qos_ownership_isolation': 'runtime-probe.json',
+        'contact_gate_runtime_ready': 'contact-gate-runtime-ready.json',
+        'contact_gate_runtime_final': 'contact-gate-runtime-final.json',
         'lifecycle_startup_result': (
             'lifecycle-startup-result.json'
             if (run_dir / 'lifecycle-startup-result.json').is_file()
@@ -2322,6 +2496,7 @@ graph_topic_contracts=(
   /robotest/odom=nav_msgs/msg/Odometry
   /robotest/raw/imu=sensor_msgs/msg/Imu
   /robotest/imu=sensor_msgs/msg/Imu
+  /robotest/internal/raw_contacts=ros_gz_interfaces/msg/Contacts
   /robotest/navigation/plan=nav_msgs/msg/Path
   /robotest/cmd_vel_nav=geometry_msgs/msg/Twist
   /robotest/cmd_vel_smoothed=geometry_msgs/msg/Twist
@@ -2367,6 +2542,8 @@ timeout --signal=TERM --kill-after=5s 100s \
     --wall-timeout 90 \
     --watch-pid "$LAUNCH_PID" \
   | tee "$RUN_DIR/graph-readiness.log"
+write_contact_gate_runtime_attestation \
+  "$RUN_DIR/contact-gate-runtime-ready.json"
 
 # Collision-monitor activation is rechecked after graph convergence and before mission start.
 timeout --signal=TERM --kill-after=3s 15s \
@@ -2569,6 +2746,10 @@ if result['bounded_depth_live_proven_for_all_endpoints'] and any(
 ):
     raise SystemExit('incomplete QoS introspection was mislabeled as live bounded-depth proof')
 PY
+
+write_contact_gate_runtime_attestation \
+  "$RUN_DIR/contact-gate-runtime-final.json" \
+  "$RUN_DIR/contact-gate-runtime-ready.json"
 
 ps -eo pid=,ppid=,pgid=,psr=,stat=,comm=,args= > "$RUN_DIR/processes-post-mission.txt"
 

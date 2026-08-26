@@ -425,7 +425,8 @@ close_verify_log() {
 }
 
 write_source_config_hashes() {
-  python3 - "$WORKSPACE" "$RUN_DIR/source-config-hashes.json" <<'PY'
+  local output="${1:-$RUN_DIR/source-config-hashes.json}"
+  python3 - "$WORKSPACE" "$output" <<'PY'
 import hashlib
 import json
 import sys
@@ -437,6 +438,9 @@ explicit_files = [
     workspace / 'scripts/verify_phase1.sh',
     workspace / 'scripts/phase1_process_group.sh',
     workspace / 'scripts/phase1_pidfd_group.py',
+    workspace / 'config/collision-coverage.yaml',
+    workspace / 'tests/phase3_runtime_gate.py',
+    workspace / 'tests/phase3_orchestration.py',
     workspace / 'docs/testing/acceptance-criteria.md',
     workspace / 'docs/testing/verification-matrix.md',
     workspace / 'docs/architecture/metrics-contract.md',
@@ -479,6 +483,135 @@ output.write_text(
     ) + '\n',
     encoding='utf-8',
 )
+PY
+}
+
+write_source_config_mutation_evidence() {
+  write_source_config_hashes "$RUN_DIR/source-config-hashes-end.json" || return 1
+  python3 - \
+    "$RUN_DIR/source-config-hashes.json" \
+    "$RUN_DIR/source-config-hashes-end.json" \
+    "$RUN_DIR/source-config-mutation.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+start = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+end = json.loads(Path(sys.argv[2]).read_text(encoding='utf-8'))
+output = Path(sys.argv[3])
+start_files = {item['path']: item['sha256'] for item in start['files']}
+end_files = {item['path']: item['sha256'] for item in end['files']}
+added = sorted(set(end_files) - set(start_files))
+removed = sorted(set(start_files) - set(end_files))
+changed = sorted(
+    path for path in set(start_files) & set(end_files) if start_files[path] != end_files[path]
+)
+failures = []
+if added:
+    failures.append(f'source/config files added during run: {added}')
+if removed:
+    failures.append(f'source/config files removed during run: {removed}')
+if changed:
+    failures.append(f'source/config files changed during run: {changed}')
+evidence = {
+    'added_paths': added,
+    'changed_paths': changed,
+    'end_aggregate_sha256': end['aggregate_sha256'],
+    'failures': failures,
+    'removed_paths': removed,
+    'schema_version': 1,
+    'start_aggregate_sha256': start['aggregate_sha256'],
+    'verdict': 'PASS' if not failures else 'FAIL',
+}
+output.write_text(json.dumps(evidence, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+if failures:
+    raise SystemExit('; '.join(failures))
+PY
+}
+
+write_contact_gate_runtime_attestation() {
+  local output_path="$1"
+  local initial_path="${2:-}"
+  python3 - \
+    "$WORKSPACE" "$LAUNCH_PID" "$ROS_DOMAIN_ID" "$GZ_PARTITION" \
+    "$output_path" "$initial_path" <<'PY'
+import hashlib
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+import yaml
+
+workspace = Path(sys.argv[1]).resolve()
+launch_pid = int(sys.argv[2])
+domain_id = int(sys.argv[3])
+partition = sys.argv[4]
+output = Path(sys.argv[5])
+initial_path = Path(sys.argv[6]) if sys.argv[6] else None
+module_path = workspace / 'tests/phase3_runtime_gate.py'
+sys.path.insert(0, str(workspace / 'tests'))
+import phase3_orchestration as orchestration
+spec = importlib.util.spec_from_file_location('robotest_contact_gate_attestor', module_path)
+if spec is None or spec.loader is None:
+    raise SystemExit('cannot load contact gate attestor')
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+attestation = module._contact_gate_binary_attestation(
+    workspace, launch_pid, domain_id, partition
+)
+if attestation.get('verdict') != 'PASS':
+    raise SystemExit(f'contact gate runtime attestation failed: {attestation}')
+manifest_path = workspace / 'config/collision-coverage.yaml'
+manifest_bytes = manifest_path.read_bytes()
+manifest = yaml.safe_load(manifest_bytes)
+contact_stream = orchestration._contact_stream_manifest_v3(manifest, workspace)
+declared_source_inventory_sha256 = contact_stream['gate'][
+    'source_inventory_sha256'
+]
+if attestation.get('source_inventory_sha256') != declared_source_inventory_sha256:
+    raise SystemExit('contact gate runtime source inventory differs from manifest v3')
+result = {
+    'contact_gate_binary_attestation': attestation,
+    'manifest_declared_sha256': manifest['manifest_sha256'],
+    'manifest_file_sha256': hashlib.sha256(manifest_bytes).hexdigest(),
+    'manifest_path': manifest_path.relative_to(workspace).as_posix(),
+    'manifest_source_inventory_sha256': declared_source_inventory_sha256,
+    'phase': 'final' if initial_path is not None else 'ready',
+    'producer': 'robotest_phase1/contact_gate_runtime_attestor',
+    'schema_version': 1,
+    'stable_identity': None,
+}
+if initial_path is not None:
+    initial_bytes = initial_path.read_bytes()
+    initial = json.loads(initial_bytes)
+    initial_attestation = initial['contact_gate_binary_attestation']
+    if (
+        initial.get('manifest_path') != result['manifest_path']
+        or initial.get('manifest_file_sha256') != result['manifest_file_sha256']
+        or initial.get('manifest_declared_sha256') != result['manifest_declared_sha256']
+    ):
+        raise SystemExit('contact stream manifest changed before final evaluation')
+    stable_fields = (
+        'build_elf_build_id', 'build_embedded_source_inventory_sha256',
+        'build_install_sha256_match',
+        'build_path', 'build_sha256', 'installed_declared_path',
+        'installed_device', 'installed_elf_build_id', 'installed_inode',
+        'installed_embedded_source_inventory_sha256', 'installed_path',
+        'installed_sha256',
+        'live_cmdline_sha256', 'live_device', 'live_elf_build_id',
+        'live_embedded_source_inventory_sha256',
+        'live_executable_link', 'live_executable_path', 'live_executable_sha256',
+        'live_inode', 'live_pgid', 'live_pid', 'live_ppid', 'live_sid',
+        'live_size_bytes', 'live_start_ticks',
+        'observed_gz_partition', 'observed_ros_domain_id',
+        'source_inventory_sha256',
+    )
+    if any(initial_attestation.get(key) != attestation.get(key) for key in stable_fields):
+        raise SystemExit('contact gate runtime identity changed before final evaluation')
+    result['initial_artifact_sha256'] = hashlib.sha256(initial_bytes).hexdigest()
+    result['stable_identity'] = True
+output.write_text(json.dumps(result, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 PY
 }
 
@@ -751,7 +884,11 @@ provenance = {
         'checksum_manifest': 'SHA256SUMS',
         'checksum_validation': 'checksum-validation.txt',
         'canonical_json': 'run-result.json',
+        'contact_gate_runtime_final': 'contact-gate-runtime-final.json',
+        'contact_gate_runtime_ready': 'contact-gate-runtime-ready.json',
         'matching_csv': 'run-result.csv',
+        'source_config_end': 'source-config-hashes-end.json',
+        'source_config_mutation': 'source-config-mutation.json',
     },
     'command': read_json(sys.argv[2]),
     'effective_parameters': {
@@ -792,6 +929,12 @@ provenance = {
         'simulator_seed': int(sys.argv[13]),
     },
     'source_config': read_json(sys.argv[3]),
+    'source_config_end': read_json(
+        Path(sys.argv[3]).with_name('source-config-hashes-end.json')
+    ),
+    'source_config_mutation': read_json(
+        Path(sys.argv[3]).with_name('source-config-mutation.json')
+    ),
     'target_set': {
         'path': 'docs/testing/acceptance-criteria.md',
         'revision': 'Frozen Phase 0 target set, revision 1',
@@ -1201,6 +1344,7 @@ required_topics=(
   /robotest/raw/scan /robotest/scan
   /robotest/raw/odom /robotest/odom
   /robotest/raw/imu /robotest/imu
+  /robotest/internal/raw_contacts
   /robotest/validation/ground_truth
   /robotest/validation/contacts
   /robotest/validation/world_stats
@@ -1219,6 +1363,7 @@ done
 
 ros2 topic list -t | tee "$RUN_DIR/topics.txt"
 ros2 node list | tee "$RUN_DIR/nodes.txt"
+grep -Fxq /robotest/contact_stream_gate "$RUN_DIR/nodes.txt"
 for node in \
   /robotest/robot_state_publisher \
   /robotest/parameter_bridge \
@@ -1234,6 +1379,8 @@ for topic in "${required_topics[@]}" /robotest/cmd_vel /tf /tf_static; do
   safe_name="${safe_name//\//_}"
   timeout 10s ros2 topic info "$topic" -v > "$RUN_DIR/qos-${safe_name}.txt"
 done
+write_contact_gate_runtime_attestation \
+  "$RUN_DIR/contact-gate-runtime-ready.json"
 
 timeout --signal=TERM --kill-after=5s 55s \
   python3 "$WORKSPACE/src/robotest_sim/tools/phase1_runtime_probe.py" \
@@ -1259,6 +1406,10 @@ if result['bounded_depth_live_proven_for_all_endpoints'] and any(
 ):
     raise SystemExit('incomplete QoS introspection was mislabeled as live bounded-depth proof')
 PY
+
+write_contact_gate_runtime_attestation \
+  "$RUN_DIR/contact-gate-runtime-final.json" \
+  "$RUN_DIR/contact-gate-runtime-ready.json"
 
 set +e
 timeout 8s ros2 run tf2_ros tf2_echo odom base_footprint \
@@ -1319,3 +1470,5 @@ with open(sys.argv[1], encoding='utf-8', newline='') as stream:
 if escaped:
     raise SystemExit(f'runtime processors escaped inherited affinity: {escaped}')
 PY
+
+write_source_config_mutation_evidence

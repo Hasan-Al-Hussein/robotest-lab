@@ -77,13 +77,18 @@ PHASE1_CONTACT_DISPOSITIONS = (
 )
 CONTACT_EVIDENCE_CAPACITY = 64
 CONTACT_NAME_EVIDENCE_LIMIT = 256
+CONTACT_PUBLIC_HEARTBEAT_NS = 200_000_000
+CONTACT_PUBLIC_MAX_GAP_NS = 220_000_000
+CONTACT_PUBLIC_MAX_CLOCK_LAG_NS = 220_000_000
+CONTACT_CLOCK_BRACKET_WALL_TIMEOUT_S = 2.0
+CONTACT_PUBLIC_MAX_RECORDS = 16
 
 
 def classify_phase1_contact_pair(collision1: Any, collision2: Any) -> str:
     """Classify an exact pair against the frozen collision-coverage policy."""
-    if not isinstance(collision1, str) or not collision1:
+    if not valid_scoped_collision_name(collision1):
         return 'invalid_collision_name'
-    if not isinstance(collision2, str) or not collision2:
+    if not valid_scoped_collision_name(collision2):
         return 'invalid_collision_name'
     first_robot = collision1 in PHASE1_ROBOT_COLLISIONS
     second_robot = collision2 in PHASE1_ROBOT_COLLISIONS
@@ -98,6 +103,23 @@ def classify_phase1_contact_pair(collision1: Any, collision2: Any) -> str:
     if (robot_collision, counterpart_collision) in PHASE1_SUPPORT_PAIRS:
         return 'allowlisted_support_contact'
     return 'unexpected_robot_environment_contact'
+
+
+def valid_scoped_collision_name(value: Any) -> bool:
+    """Require at least model, link, and collision scoped-name segments."""
+    if not isinstance(value, str) or not value:
+        return False
+    segments = value.split('::')
+    return len(segments) >= 3 and all(segments)
+
+
+def valid_public_contact_record_count(value: Any) -> bool:
+    """Require the bounded, nonempty v3 public snapshot cardinality."""
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 1 <= value <= CONTACT_PUBLIC_MAX_RECORDS
+    )
 
 
 def contact_name_evidence(value: Any) -> str:
@@ -286,15 +308,21 @@ class StampTracker:
             'latest_stamp_ns': self.latest_stamp_ns,
             'regression_count': self.regression_count,
             'duplicate_count': self.duplicate_count,
+            'maximum_forward_gap_ns': self.maximum_forward_gap_ns,
             'maximum_forward_gap_s': self.maximum_forward_gap_ns / 1e9,
+            'maximum_receipt_age_ns': self.maximum_receipt_age_ns,
             'maximum_receipt_age_s': self.maximum_receipt_age_ns / 1e9,
             'receipt_age_sample_count': self.receipt_age_sample_count,
             'future_relative_to_clock_count': self.future_relative_to_clock_count,
             'final_age_s': None if final_age_ns is None else final_age_ns / 1e9,
+            'final_age_ns': final_age_ns,
             'limits': {
                 'maximum_gap_s': maximum_gap_s,
+                'maximum_gap_ns': round(maximum_gap_s * 1e9),
                 'maximum_final_age_s': maximum_final_age_s,
+                'maximum_final_age_ns': round(maximum_final_age_s * 1e9),
                 'maximum_receipt_age_s': maximum_receipt_age_s,
+                'maximum_receipt_age_ns': round(maximum_receipt_age_s * 1e9),
             },
         }
 
@@ -338,20 +366,20 @@ def stamp_evidence_failures(topic: str, evidence: dict[str, Any]) -> list[str]:
         failures.append(f'{topic} has {evidence["regression_count"]} timestamp regressions')
     if evidence['duplicate_count']:
         failures.append(f'{topic} has {evidence["duplicate_count"]} duplicate timestamps')
-    if evidence['maximum_forward_gap_s'] > limits['maximum_gap_s']:
+    if evidence['maximum_forward_gap_ns'] > limits['maximum_gap_ns']:
         failures.append(
             f'{topic} maximum stamp gap {evidence["maximum_forward_gap_s"]:.6f} s '
             f'exceeds {limits["maximum_gap_s"]:.6f} s'
         )
-    if evidence['maximum_receipt_age_s'] > limits['maximum_receipt_age_s']:
+    if evidence['maximum_receipt_age_ns'] > limits['maximum_receipt_age_ns']:
         failures.append(
             f'{topic} maximum receipt age {evidence["maximum_receipt_age_s"]:.6f} s '
             f'exceeds {limits["maximum_receipt_age_s"]:.6f} s'
         )
     final_age = evidence['final_age_s']
-    if final_age is None:
+    if evidence['final_age_ns'] is None:
         failures.append(f'{topic} final timestamp age is unavailable')
-    elif final_age > limits['maximum_final_age_s']:
+    elif evidence['final_age_ns'] > limits['maximum_final_age_ns']:
         failures.append(
             f'{topic} final stamp age {final_age:.6f} s '
             f'exceeds {limits["maximum_final_age_s"]:.6f} s'
@@ -378,6 +406,13 @@ class Phase1Probe(Node):
         self.latest_ground_truth: Odometry | None = None
         self.last_cmd: Twist | None = None
         self.nonempty_contact_messages = 0
+        self.contact_frame_id_violation_count = 0
+        self.contact_record_count_violation_count = 0
+        self.contact_same_pair_set_interval_violation_count = 0
+        self.contact_minimum_same_pair_set_interval_ns: int | None = None
+        self.previous_contact_pair_set: frozenset[tuple[str, str]] | None = None
+        self.previous_contact_pair_set_stamp_ns: int | None = None
+        self.contact_clock_bracket: dict[str, Any] | None = None
         self.contact_record_count = 0
         self.contact_dispositions: dict[str, int] = defaultdict(int)
         self.unexpected_contact_pair_count = 0
@@ -518,12 +553,20 @@ class Phase1Probe(Node):
         self.last_cmd = message
 
     def _on_contacts(self, message: Contacts) -> None:
-        self._record('contacts')
+        simulation_stamp = stamp_ns(message)
+        self._record('contacts', simulation_stamp)
+        if message.header.frame_id:
+            self.contact_frame_id_violation_count += 1
+        if not valid_public_contact_record_count(len(message.contacts)):
+            self.contact_record_count_violation_count += 1
         if message.contacts:
             self.nonempty_contact_messages += 1
+        pair_set: set[tuple[str, str]] = set()
         for contact_index, contact in enumerate(message.contacts):
             collision1 = getattr(getattr(contact, 'collision1', None), 'name', None)
             collision2 = getattr(getattr(contact, 'collision2', None), 'name', None)
+            if isinstance(collision1, str) and isinstance(collision2, str):
+                pair_set.add(tuple(sorted((collision1, collision2))))
             disposition = classify_phase1_contact_pair(collision1, collision2)
             self.contact_record_count += 1
             self.contact_dispositions[disposition] += 1
@@ -542,6 +585,23 @@ class Phase1Probe(Node):
                 )
             else:
                 self.unexpected_contact_pair_omitted_count += 1
+        frozen_pair_set = frozenset(pair_set)
+        if (
+            self.previous_contact_pair_set is not None
+            and self.previous_contact_pair_set_stamp_ns is not None
+            and frozen_pair_set == self.previous_contact_pair_set
+            and simulation_stamp > self.previous_contact_pair_set_stamp_ns
+        ):
+            interval_ns = simulation_stamp - self.previous_contact_pair_set_stamp_ns
+            self.contact_minimum_same_pair_set_interval_ns = (
+                interval_ns
+                if self.contact_minimum_same_pair_set_interval_ns is None
+                else min(self.contact_minimum_same_pair_set_interval_ns, interval_ns)
+            )
+            if interval_ns < CONTACT_PUBLIC_HEARTBEAT_NS:
+                self.contact_same_pair_set_interval_violation_count += 1
+        self.previous_contact_pair_set = frozen_pair_set
+        self.previous_contact_pair_set_stamp_ns = simulation_stamp
 
     def _on_fault_event(self, message: FaultEvent) -> None:
         self._record('fault_events', stamp_ns(message))
@@ -590,6 +650,51 @@ class Phase1Probe(Node):
         deadline = time.monotonic() + wall_seconds
         while time.monotonic() < deadline and not self.stop_requested:
             rclpy.spin_once(self, timeout_sec=0.05)
+
+    def wait_for_contact_clock_bracket(self) -> None:
+        """Bind the latest public snapshot to a caught-up clock sample."""
+        deadline = time.monotonic() + CONTACT_CLOCK_BRACKET_WALL_TIMEOUT_S
+        while time.monotonic() < deadline and not self.stop_requested:
+            latest_contact = self.stamp_trackers['contacts'].latest_stamp_ns
+            latest_clock = self.latest_clock_ns
+            if (
+                latest_contact is not None
+                and latest_clock is not None
+                and latest_clock >= latest_contact
+            ):
+                lag_ns = latest_clock - latest_contact
+                if lag_ns <= CONTACT_PUBLIC_MAX_CLOCK_LAG_NS:
+                    self.contact_clock_bracket = {
+                        'clock_stamp_ns': latest_clock,
+                        'clock_minus_public_latest_ns': lag_ns,
+                        'limits': {
+                            'maximum_clock_lag_ns': CONTACT_PUBLIC_MAX_CLOCK_LAG_NS,
+                            'maximum_public_gap_ns': CONTACT_PUBLIC_MAX_GAP_NS,
+                        },
+                        'public_latest_stamp_ns': latest_contact,
+                    }
+                    return
+            rclpy.spin_once(self, timeout_sec=0.02)
+        latest_contact = self.stamp_trackers['contacts'].latest_stamp_ns
+        latest_clock = self.latest_clock_ns
+        lag_ns = (
+            latest_clock - latest_contact
+            if latest_clock is not None and latest_contact is not None
+            else None
+        )
+        self.contact_clock_bracket = {
+            'clock_stamp_ns': latest_clock,
+            'clock_minus_public_latest_ns': lag_ns,
+            'limits': {
+                'maximum_clock_lag_ns': CONTACT_PUBLIC_MAX_CLOCK_LAG_NS,
+                'maximum_public_gap_ns': CONTACT_PUBLIC_MAX_GAP_NS,
+            },
+            'public_latest_stamp_ns': latest_contact,
+        }
+        self.failures.append(
+            'contact public snapshot did not obtain a caught-up /clock bracket within '
+            f'{CONTACT_CLOCK_BRACKET_WALL_TIMEOUT_S:.1f} s'
+        )
 
     def publish_zero(self) -> None:
         zero = Twist()
@@ -807,9 +912,16 @@ class Phase1Probe(Node):
                 'VOLATILE',
                 '/robotest/parameter_bridge',
             ),
-            # Chassis-only contact can be silent while the wheels support the robot.
             '/robotest/validation/contacts': (
                 'contacts',
+                4.0,
+                'simulation',
+                'RELIABLE',
+                'VOLATILE',
+                '/robotest/contact_stream_gate',
+            ),
+            '/robotest/internal/raw_contacts': (
+                'private_raw_contacts',
                 None,
                 'none',
                 'RELIABLE',
@@ -916,6 +1028,28 @@ class Phase1Probe(Node):
             self.failures.append(
                 f'observed {self.unexpected_contact_pair_count} unexpected contact records'
             )
+        if self.contact_frame_id_violation_count:
+            self.failures.append('public contact snapshot frame_id must be empty')
+        if self.contact_record_count_violation_count:
+            self.failures.append('public contact snapshots must contain 1 to 16 records')
+        if self.contact_same_pair_set_interval_violation_count:
+            self.failures.append(
+                'public contact snapshot repeated an unchanged pair set before the 200 ms '
+                'heartbeat interval'
+            )
+
+        raw_contact_subscribers = endpoint_evidence['/robotest/internal/raw_contacts'][
+            'subscribers'
+        ]
+        raw_contact_subscriber_nodes = [endpoint['node'] for endpoint in raw_contact_subscribers]
+        if len(raw_contact_subscribers) != 1 or raw_contact_subscriber_nodes != [
+            '/robotest/contact_stream_gate'
+        ]:
+            self.failures.append(
+                '/robotest/internal/raw_contacts subscribers '
+                f'{sorted(raw_contact_subscriber_nodes)} != exactly one '
+                "'/robotest/contact_stream_gate' endpoint"
+            )
 
         validation_topics = [
             '/robotest/validation/ground_truth',
@@ -995,6 +1129,7 @@ class Phase1Probe(Node):
             '/robotest/raw/imu': ('raw_imu', 0.15, 0.25, 0.50),
             '/robotest/imu': ('validated_imu', 0.15, 0.25, 0.50),
             '/robotest/validation/ground_truth': ('ground_truth', 0.25, 0.35, 0.50),
+            '/robotest/validation/contacts': ('contacts', 0.22, 0.22, 0.22),
         }
         stamp_evidence: dict[str, Any] = {}
         for topic, (
@@ -1011,6 +1146,19 @@ class Phase1Probe(Node):
             )
             stamp_evidence[topic] = evidence
             self.failures.extend(stamp_evidence_failures(topic, evidence))
+        stamp_evidence['/robotest/validation/contacts'].update(
+            {
+                'clock_bracket': self.contact_clock_bracket,
+                'frame_id_violation_count': self.contact_frame_id_violation_count,
+                'record_count_violation_count': (self.contact_record_count_violation_count),
+                'minimum_same_pair_set_interval_ns': (
+                    self.contact_minimum_same_pair_set_interval_ns
+                ),
+                'same_pair_set_interval_violation_count': (
+                    self.contact_same_pair_set_interval_violation_count
+                ),
+            }
+        )
 
         rtf_sample_span = 5
         rtf_values = windowed_rtf(self.world_samples, rtf_sample_span)
@@ -1166,6 +1314,7 @@ def main() -> int:
         # motion-window performance measurement.
         probe.world_samples.clear()
         displacement = probe.move_test()
+        probe.wait_for_contact_clock_bracket()
         result = probe.evaluate(displacement)
         exit_code = 0 if result['verdict'] == 'PASS' else 1
     except Exception as error:

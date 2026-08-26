@@ -49,13 +49,13 @@ from robotest_interfaces.msg import FaultEvent
 from robotest_metrics.artifacts import write_json_atomic
 from robotest_metrics.collector import CollectorCore
 from robotest_metrics.constants import (
-    CONTACT_RECORD_CAPACITY,
     NAV2_LIFECYCLE_NODES,
     PLAN_POSE_CAPACITY,
 )
 from robotest_metrics.errors import ArtifactError
 
 FeedbackMessage = FollowWaypoints.Impl.FeedbackMessage
+PUBLIC_CONTACT_SNAPSHOT_TOPIC = '/robotest/validation/contacts'
 
 
 def _qos(depth: int, *, reliable: bool) -> QoSProfile:
@@ -213,7 +213,18 @@ def _maximum_penetration_depth(contact: Any) -> float | None:
     return maximum
 
 
-def _contacts_item(message: Contacts) -> dict[str, Any]:
+def _contacts_item(message: Contacts, *, delivery_clock_stamp_ns: int) -> dict[str, Any]:
+    if message.header.frame_id != '':
+        raise ArtifactError('authoritative contact snapshot frame_id must be empty')
+    if not 1 <= len(message.contacts) <= 16:
+        raise ArtifactError(
+            'authoritative contact snapshot must contain between one and 16 records'
+        )
+    stamp_ns = _time_ns(message.header.stamp)
+    if stamp_ns <= 0:
+        raise ArtifactError('authoritative contact snapshot stamp must be positive')
+    if delivery_clock_stamp_ns < 0:
+        raise ArtifactError('contact snapshot delivery clock stamp cannot be negative')
     return {
         'contacts': [
             {
@@ -222,10 +233,12 @@ def _contacts_item(message: Contacts) -> dict[str, Any]:
                 'maximum_penetration_depth_m': _maximum_penetration_depth(contact),
                 'maximum_normal_force_n': _maximum_normal_force(contact),
             }
-            for contact in islice(message.contacts, CONTACT_RECORD_CAPACITY + 1)
+            for contact in message.contacts
         ],
         'frame_id': message.header.frame_id,
-        'stamp_ns': _time_ns(message.header.stamp),
+        'delivery_clock_offset_ns': delivery_clock_stamp_ns - stamp_ns,
+        'delivery_clock_stamp_ns': delivery_clock_stamp_ns,
+        'stamp_ns': stamp_ns,
     }
 
 
@@ -271,13 +284,15 @@ def _fault_event_item(message: FaultEvent) -> dict[str, Any]:
 class MetricsCollectorNode(Node):
     """Normalize only observed ROS messages into a bounded ``CollectorCore``."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, contact_progress_path: Path | None = None) -> None:
         """Create subscriptions for every Phase 3 observer stream."""
         super().__init__(
             'metrics_collector',
             parameter_overrides=[Parameter('use_sim_time', value=True)],
         )
         self.core = CollectorCore()
+        self.contact_progress_path = contact_progress_path
+        self.retained_contact_message_count = 0
         self.latest_clock_ns: int | None = None
         self._subscriptions: list[Any] = []
         self._subscribe(Clock, '/clock', self._on_clock, _qos(1, reliable=False))
@@ -322,7 +337,7 @@ class MetricsCollectorNode(Node):
         self._subscribe(
             Contacts,
             'validation/contacts',
-            lambda message: self.core.record('contacts', _contacts_item(message)),
+            self._on_contacts,
             _qos(10, reliable=True),
         )
         self._subscribe(
@@ -401,6 +416,26 @@ class MetricsCollectorNode(Node):
                 'stamp_ns': self._callback_stamp_ns(),
             },
         )
+
+    def _on_contacts(self, message: Contacts) -> None:
+        if self.latest_clock_ns is None:
+            raise ArtifactError('cannot retain a public contact snapshot before /clock')
+        item = _contacts_item(message, delivery_clock_stamp_ns=self.latest_clock_ns)
+        if not self.core.record('contacts', item):
+            return
+        self.retained_contact_message_count += 1
+        if self.contact_progress_path is not None:
+            write_json_atomic(
+                {
+                    'latest_retained_stamp_ns': int(item['stamp_ns']),
+                    'producer': 'robotest_metrics/metrics_collector',
+                    'public_topic': PUBLIC_CONTACT_SNAPSHOT_TOPIC,
+                    'retained_message_count': self.retained_contact_message_count,
+                    'schema_version': 1,
+                },
+                self.contact_progress_path,
+                maximum_bytes=16_384,
+            )
 
     def _on_world_stats(self, message: WorldStatistics) -> None:
         self.core.record(
@@ -489,6 +524,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--ready-file', required=True, type=Path)
     parser.add_argument('--stop-file', required=True, type=Path)
+    parser.add_argument('--contact-progress-file', required=True, type=Path)
     parser.add_argument('--wall-timeout-s', type=float, default=360.0)
     return parser
 
@@ -503,16 +539,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         ('output', arguments.output),
         ('ready', arguments.ready_file),
         ('stop', arguments.stop_file),
+        ('contact progress', arguments.contact_progress_file),
     ):
         if path.exists():
             raise SystemExit(f'stale {label} file already exists: {path}')
+    artifact_paths = {
+        path.expanduser().resolve()
+        for path in (
+            arguments.output,
+            arguments.ready_file,
+            arguments.stop_file,
+            arguments.contact_progress_file,
+        )
+    }
+    if len(artifact_paths) != 4:
+        raise SystemExit('output, ready, stop, and contact-progress paths must be distinct')
     rclpy.init(args=raw_arguments)
     node: MetricsCollectorNode | None = None
     timed_out = False
     runtime_interrupted = False
     started_wall_ns = time.monotonic_ns()
     try:
-        node = MetricsCollectorNode()
+        node = MetricsCollectorNode(contact_progress_path=arguments.contact_progress_file)
         write_json_atomic(
             {
                 'node_name': node.get_fully_qualified_name(),

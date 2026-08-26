@@ -16,12 +16,14 @@ ros2 run robotest_metrics metrics_collector \
   --output /run/robotest/capture.json \
   --ready-file /run/robotest/metrics.ready.json \
   --stop-file /run/robotest/metrics.stop \
+  --contact-progress-file /run/robotest/contact-progress.json \
   --wall-timeout-s 360 \
   --ros-args -r __ns:=/robotest
 ```
 
 The runner waits for the atomically written ready file, executes the scenario,
-advances simulation through `T_terminal + 0.25 s`, and then atomically creates
+then waits for a retained public contact snapshot strictly beyond
+`T_terminal + 0.25 s` and its atomic progress acknowledgement before creating
 the stop file. The collector writes `capture.json` atomically even when its wall
 deadline expires. Exit codes are:
 
@@ -36,7 +38,8 @@ deadline expires. Exit codes are:
 Every stream retains its first valid observations and never overwrites them.
 The hard limits are 8,192 ground-truth samples; 8,192 per TF edge and odometry
 stream; 2,048 per scan stream; 4,096 final commands; 1,024 plans and 65,536
-total plan poses; 8,192 contact messages and 32,768 normalized contact records;
+total plan poses; 8,192 authoritative public contact snapshots and 32,768
+normalized snapshot records;
 4,096 world-statistics samples; 1,024 state transitions; and 512 fault events.
 The clock uses a constant-space summary. UTF-8 strings are limited to 4,096
 bytes. The first overflow preserves the prefix and fails closed.

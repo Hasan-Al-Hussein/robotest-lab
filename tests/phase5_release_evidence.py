@@ -579,6 +579,75 @@ def _validate_source_install(value: object) -> None:
     )
 
 
+def _validate_contact_gate_binary_binding(value: object) -> None:
+    binding = _mapping(value, 'Phase 3 contact gate binary binding')
+    _require(
+        set(binding)
+        == {
+            'build_embedded_source_inventory_match',
+            'build_embedded_source_inventory_sha256',
+            'build_elf_build_id',
+            'build_install_build_id_match',
+            'build_install_sha256_match',
+            'build_path',
+            'build_regular_executable',
+            'build_sha256',
+            'installed_declared_path',
+            'installed_declared_samefile',
+            'installed_embedded_source_inventory_match',
+            'installed_embedded_source_inventory_sha256',
+            'installed_elf_build_id',
+            'installed_path',
+            'installed_regular_executable',
+            'installed_sha256',
+            'package',
+            'schema_version',
+            'source_inventory_sha256',
+        }
+        and binding.get('package') == 'robotest_sim'
+        and binding.get('schema_version') == 1
+        and binding.get('build_path') == 'build/robotest_sim/contact_stream_gate'
+        and binding.get('installed_declared_path')
+        == 'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
+        and binding.get('installed_path')
+        == 'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
+        and binding.get('build_install_build_id_match') is True
+        and binding.get('build_install_sha256_match') is True
+        and binding.get('build_embedded_source_inventory_match') is True
+        and binding.get('build_regular_executable') is True
+        and binding.get('installed_declared_samefile') is True
+        and binding.get('installed_regular_executable') is True
+        and binding.get('installed_embedded_source_inventory_match') is True,
+        'Phase 3 contact gate build/install binding changed',
+    )
+    for field in (
+        'build_embedded_source_inventory_sha256',
+        'build_sha256',
+        'installed_embedded_source_inventory_sha256',
+        'installed_sha256',
+        'source_inventory_sha256',
+    ):
+        _require(
+            isinstance(binding.get(field), str)
+            and re.fullmatch(r'[0-9a-f]{64}', binding[field]) is not None,
+            f'Phase 3 contact gate {field} is invalid',
+        )
+    _require(
+        binding.get('build_embedded_source_inventory_sha256')
+        == binding.get('source_inventory_sha256')
+        and binding.get('installed_embedded_source_inventory_sha256')
+        == binding.get('source_inventory_sha256')
+        and binding.get('build_sha256') == binding.get('installed_sha256'),
+        'Phase 3 contact gate embedded source or build/install hash differs',
+    )
+    _require(
+        isinstance(binding.get('build_elf_build_id'), str)
+        and re.fullmatch(r'[0-9a-f]+', binding['build_elf_build_id']) is not None
+        and binding.get('installed_elf_build_id') == binding.get('build_elf_build_id'),
+        'Phase 3 contact gate ELF build ID binding is invalid',
+    )
+
+
 def _validate_phase3_bundle(
     repository: Path,
     result_directory: Path,
@@ -645,12 +714,21 @@ def _validate_phase3_bundle(
     mission_path = run_root / 'mission-result.json'
     scenario_path = run_root / 'scenario-result.json'
     capture_path = run_root / 'capture.json'
+    contact_drain_path = run_root / 'contact-drain.json'
+    contact_progress_path = run_root / 'contact-progress.json'
+    initial_contact_gate_path = run_root / 'runtime-gate.json'
+    final_contact_gate_path = run_root / 'contact-stream-final-gate.json'
+    contact_gate_revalidation_path = run_root / 'contact-gate-revalidation.json'
     orchestrator_path = run_root / 'orchestrator.json'
     lifecycle_path = run_root / 'lifecycle-snapshot.json'
     raw_paths = (
         (mission_path, 'Phase 3 mission result'),
         (scenario_path, 'Phase 3 scenario result'),
         (capture_path, 'Phase 3 capture'),
+        (contact_drain_path, 'Phase 3 contact drain'),
+        (initial_contact_gate_path, 'Phase 3 initial contact gate'),
+        (final_contact_gate_path, 'Phase 3 final contact gate'),
+        (contact_gate_revalidation_path, 'Phase 3 contact gate revalidation'),
         (orchestrator_path, 'Phase 3 orchestrator result'),
     )
     for path, label in raw_paths:
@@ -666,6 +744,8 @@ def _validate_phase3_bundle(
         'Phase 3 capture',
         maximum_bytes=PHASE3_RESULT_JSON_MAX_BYTES,
     )
+    _regular_file(contact_progress_path, 'Phase 3 contact progress')
+    _load_canonical_json(contact_progress_path, 'Phase 3 contact progress')
     _validate_schema_file(
         repository,
         capture_document,
@@ -713,10 +793,13 @@ def _validate_phase3_bundle(
             _exact_integer(terminal_stamp) and terminal_stamp > 0,
             'Phase 3 mission terminal stamp is invalid',
         )
-        drain_stamp = terminal_stamp + orchestration.CONTACT_DRAIN_NS
+        contact_drain = _mapping(collision.get('contact_drain'), 'Phase 3 analysis contact drain')
+        drain_stamp = contact_drain.get('qualifying_contact_snapshot_stamp_ns')
         _require(
-            collision.get('drain_completed_stamp_ns') == drain_stamp,
-            'Phase 3 analysis drain stamp is not derived from the mission terminal stamp',
+            _exact_integer(drain_stamp)
+            and drain_stamp > terminal_stamp + orchestration.CONTACT_DRAIN_NS
+            and collision.get('drain_completed_stamp_ns') == drain_stamp,
+            'Phase 3 analysis drain stamp is not a strict authoritative post-terminal snapshot',
         )
         expected_request = orchestration.compose_analysis_request(
             workspace=repository,
@@ -726,8 +809,27 @@ def _validate_phase3_bundle(
             capture_path=capture_path,
             positive_binding_path=positive_binding_path,
             orchestrator_path=orchestrator_path,
-            drain_completed_stamp_ns=drain_stamp,
+            contact_drain_path=contact_drain_path,
+            contact_progress_path=contact_progress_path,
             lifecycle_snapshot_path=(lifecycle_path if scenario_id == 4 else None),
+        )
+        expected_contact_gate_revalidation = orchestration.reconcile_contact_gate_reobservation(
+            initial_contact_gate_path,
+            final_contact_gate_path,
+            build_binding=build_binding,
+            expected_domain_id=expected_plan['ros_domain_id'],
+            expected_gz_partition=expected_plan['gz_partition'],
+        )
+        observed_contact_gate_revalidation = _load_canonical_json(
+            contact_gate_revalidation_path,
+            'Phase 3 contact gate revalidation',
+        )
+        _require(
+            _exact_json_equal(
+                observed_contact_gate_revalidation,
+                expected_contact_gate_revalidation,
+            ),
+            f'Phase 3 run {suite_index} contact gate revalidation changed',
         )
         recomputed_result = analyze_run(request)
     except Exception as exc:
@@ -930,6 +1032,7 @@ def _phase3_evidence(
         set(binding)
         == {
             'collector_configuration_sha256',
+            'contact_gate_binary',
             'created_by',
             'git',
             'install',
@@ -949,6 +1052,7 @@ def _phase3_evidence(
     _validate_tree_manifest(binding.get('source'), 'Phase 3 source tree manifest')
     _validate_tree_manifest(binding.get('install'), 'Phase 3 install tree manifest')
     _validate_source_install(binding.get('source_install'))
+    _validate_contact_gate_binary_binding(binding.get('contact_gate_binary'))
     orchestration = _load_repository_module(
         repository,
         'tests/phase3_orchestration.py',
@@ -998,6 +1102,10 @@ def _phase3_evidence(
     positive_marker_path = positive_directory / 'PASS.json'
     positive_result_path = positive_directory / 'contact-control-result.json'
     positive_capture_path = positive_directory / 'capture.json'
+    positive_contact_progress_path = positive_directory / 'contact-progress.json'
+    positive_initial_contact_gate_path = positive_directory / 'runtime-gate.json'
+    positive_final_contact_gate_path = positive_directory / 'contact-stream-final-gate.json'
+    positive_contact_gate_revalidation_path = positive_directory / 'contact-gate-revalidation.json'
     positive_component_manifest_path = positive_directory / 'component-manifest.json'
     positive_binding = _load_canonical_json(
         positive_binding_path, 'Phase 3 positive-control binding'
@@ -1015,6 +1123,10 @@ def _phase3_evidence(
         'Phase 3 positive-control capture',
         maximum_bytes=PHASE3_RESULT_JSON_MAX_BYTES,
     )
+    _load_canonical_json(
+        positive_contact_progress_path,
+        'Phase 3 positive-control contact progress',
+    )
     positive_component_manifest = _load_canonical_json(
         positive_component_manifest_path,
         'Phase 3 positive-control component manifest',
@@ -1022,6 +1134,12 @@ def _phase3_evidence(
     for path, label in (
         (positive_result_path, 'Phase 3 positive-control component result'),
         (positive_capture_path, 'Phase 3 positive-control capture'),
+        (positive_initial_contact_gate_path, 'Phase 3 positive initial contact gate'),
+        (positive_final_contact_gate_path, 'Phase 3 positive final contact gate'),
+        (
+            positive_contact_gate_revalidation_path,
+            'Phase 3 positive contact gate revalidation',
+        ),
         (positive_component_manifest_path, 'Phase 3 positive-control component manifest'),
     ):
         _validate_json_sidecar(path, label)
@@ -1164,7 +1282,7 @@ def _phase3_evidence(
         and _exact_integer(positive_binding.get('schema_version'))
         and positive_binding.get('schema_version') == 1
         and _exact_integer(coverage_manifest.get('schema_version'))
-        and coverage_manifest.get('schema_version') == 2
+        and coverage_manifest.get('schema_version') == 3
         and isinstance(positive_json_sha, str)
         and re.fullmatch(r'[0-9a-f]{64}', positive_json_sha) is not None
         and positive_json_sha == _canonical_sha256(positive_control)
@@ -1205,21 +1323,68 @@ def _phase3_evidence(
         == {
             'captured_command_count',
             'captured_exact_pair_count',
+            'captured_release_expected_pair_count',
+            'captured_release_snapshot_count',
+            'contact_projection_episode_count',
+            'contact_projection_first_stamp_ns',
+            'contact_projection_record_count',
+            'contact_projection_sha256',
+            'contact_projection_snapshot_count',
+            'contact_progress_artifact_sha256',
+            'contact_progress_latest_retained_stamp_ns',
+            'contact_progress_retained_message_count',
             'component_command_count',
             'component_exact_pair_count',
             'latest_clock_stamp_ns',
+            'release_delivery_clock_offset_ns',
+            'release_delivery_clock_stamp_ns',
+            'release_qualified_snapshot_stamp_ns',
             'release_required_through_stamp_ns',
         }
         and all(
             isinstance(value, int) and not isinstance(value, bool) and value >= 0
-            for value in collector_reconciliation.values()
+            for key, value in collector_reconciliation.items()
+            if key
+            not in {
+                'contact_progress_artifact_sha256',
+                'contact_projection_sha256',
+                'release_delivery_clock_offset_ns',
+            }
         )
+        and isinstance(collector_reconciliation['release_delivery_clock_offset_ns'], int)
+        and not isinstance(collector_reconciliation['release_delivery_clock_offset_ns'], bool)
+        and isinstance(collector_reconciliation['contact_progress_artifact_sha256'], str)
+        and isinstance(collector_reconciliation['contact_projection_sha256'], str)
+        and re.fullmatch(
+            r'[0-9a-f]{64}',
+            collector_reconciliation['contact_progress_artifact_sha256'],
+        )
+        is not None
+        and re.fullmatch(r'[0-9a-f]{64}', collector_reconciliation['contact_projection_sha256'])
+        is not None
+        and collector_reconciliation['contact_progress_artifact_sha256']
+        == file_sha256(positive_contact_progress_path)
         and collector_reconciliation['captured_command_count']
         >= collector_reconciliation['component_command_count']
         and collector_reconciliation['captured_exact_pair_count']
-        >= collector_reconciliation['component_exact_pair_count']
+        == collector_reconciliation['component_exact_pair_count']
+        and collector_reconciliation['contact_projection_episode_count'] == 1
+        and collector_reconciliation['contact_projection_snapshot_count'] > 0
+        and collector_reconciliation['contact_projection_record_count']
+        >= collector_reconciliation['contact_projection_snapshot_count']
+        and collector_reconciliation['contact_projection_first_stamp_ns']
+        <= collector_reconciliation['release_qualified_snapshot_stamp_ns']
+        and collector_reconciliation['captured_release_snapshot_count'] == 1
+        and collector_reconciliation['captured_release_expected_pair_count'] == 0
+        and collector_reconciliation['release_qualified_snapshot_stamp_ns']
+        > collector_reconciliation['release_required_through_stamp_ns']
         and collector_reconciliation['latest_clock_stamp_ns']
-        >= collector_reconciliation['release_required_through_stamp_ns'],
+        >= collector_reconciliation['release_qualified_snapshot_stamp_ns']
+        and collector_reconciliation['release_delivery_clock_offset_ns']
+        == collector_reconciliation['release_delivery_clock_stamp_ns']
+        - collector_reconciliation['release_qualified_snapshot_stamp_ns']
+        and abs(collector_reconciliation['release_delivery_clock_offset_ns'])
+        <= orchestration.CONTACT_MAX_CLOCK_LAG_NS,
         'Phase 3 positive-control reconciliation is invalid',
     )
     _metrics_package_root(repository)
@@ -1252,9 +1417,30 @@ def _phase3_evidence(
         'Phase 3 collision qualification report is not the exact canonical PASS binding',
     )
     try:
+        expected_positive_gate_revalidation = orchestration.reconcile_contact_gate_reobservation(
+            positive_initial_contact_gate_path,
+            positive_final_contact_gate_path,
+            build_binding=binding,
+            expected_domain_id=positive_plan['ros_domain_id'],
+            expected_gz_partition=positive_plan['gz_partition'],
+        )
+        observed_positive_gate_revalidation = _load_canonical_json(
+            positive_contact_gate_revalidation_path,
+            'Phase 3 positive contact gate revalidation',
+        )
+        _require(
+            _exact_json_equal(
+                observed_positive_gate_revalidation,
+                expected_positive_gate_revalidation,
+            ),
+            'Phase 3 positive contact gate revalidation changed',
+        )
         recomputed_positive_binding = orchestration.reconcile_positive_control(
+            workspace=repository,
+            build_binding=binding,
             result_path=positive_result_path,
             capture_path=positive_capture_path,
+            contact_progress_path=positive_contact_progress_path,
             manifest_path=repository / 'config/collision-coverage.yaml',
             collector_configuration_sha256=binding['collector_configuration_sha256'],
             owned_process_group_shutdown=True,

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import pathlib
 import shutil
 import subprocess
@@ -190,9 +191,37 @@ def test_collision_coverage_manifest_matches_contact_sensors() -> None:
     coverage = yaml.safe_load(COLLISION_COVERAGE.read_text(encoding='utf-8'))
     entries = coverage['robot_collisions']
 
-    assert coverage['schema_version'] == 2
+    assert coverage['schema_version'] == 3
     assert coverage['robot_model'] == 'robotest'
     assert coverage['contact_topic'] == '/robotest/validation/contacts'
+    contact_stream = coverage['contact_stream']
+    assert contact_stream['schema_version'] == 1
+    assert contact_stream['topics'] == {
+        'gazebo_raw': '/robotest/validation/contacts',
+        'private_raw_ros': '/robotest/internal/raw_contacts',
+        'public_ros': '/robotest/validation/contacts',
+    }
+    assert contact_stream['policy']['delivery_semantics'] == (
+        'authoritative_delivered_active_pair_snapshot'
+    )
+    assert contact_stream['policy']['string_budget_accounting'] == (
+        'payload_strings_plus_normalized_pair_key_once_per_stored_pair'
+    )
+    assert contact_stream['qos']['private_raw_ros']['depth'] == 64
+    assert contact_stream['qos']['public_ros']['depth'] == 10
+    source_inventory = contact_stream['gate']['source_inventory']
+    expected_source_paths = [
+        'src/robotest_sim/CMakeLists.txt',
+        'src/robotest_sim/include/robotest_sim/contact_stream_gate.hpp',
+        'src/robotest_sim/src/contact_stream_gate.cpp',
+        'src/robotest_sim/src/contact_stream_gate_node.cpp',
+    ]
+    assert [source['path'] for source in source_inventory['sources']] == expected_source_paths
+    for source in source_inventory['sources']:
+        assert (
+            source['sha256']
+            == hashlib.sha256((REPOSITORY_ROOT / source['path']).read_bytes()).hexdigest()
+        )
     assert len(entries) == len(CONTACT_SENSORS)
     assert {entry['contact_sensor'] for entry in entries} == set(CONTACT_SENSORS)
     assert {entry['collision'] for entry in entries} == {

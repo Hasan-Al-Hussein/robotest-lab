@@ -19,10 +19,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import yaml
 from robotest_metrics.artifacts import canonical_sha256
 from robotest_metrics.collector import CollectorCore
 from robotest_scenarios.constants import CONTROL_ROBOT_START, CONTROL_WALL_POSE
+from robotest_scenarios.contact_evidence import EXPECTED_CONTACT_STREAM_POLICY
 from robotest_scenarios.provenance import (
     contact_control_configuration,
     contact_control_configuration_sha256,
@@ -228,6 +228,29 @@ def _orchestrator(identity: dict[str, Any]) -> dict[str, Any]:
         'schema_version': 1,
         'source_binding': {
             'collector_configuration_sha256': '1' * 64,
+            'contact_gate_binary': {
+                'build_embedded_source_inventory_match': True,
+                'build_embedded_source_inventory_sha256': '5' * 64,
+                'build_elf_build_id': 'a' * 40,
+                'build_install_build_id_match': True,
+                'build_install_sha256_match': True,
+                'build_path': 'build/robotest_sim/contact_stream_gate',
+                'build_regular_executable': True,
+                'build_sha256': '6' * 64,
+                'installed_declared_path': (
+                    'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
+                ),
+                'installed_declared_samefile': True,
+                'installed_embedded_source_inventory_match': True,
+                'installed_embedded_source_inventory_sha256': '5' * 64,
+                'installed_elf_build_id': 'a' * 40,
+                'installed_path': ('install/robotest_sim/lib/robotest_sim/contact_stream_gate'),
+                'installed_regular_executable': True,
+                'installed_sha256': '6' * 64,
+                'package': 'robotest_sim',
+                'schema_version': 1,
+                'source_inventory_sha256': '5' * 64,
+            },
             'install_end_sha256': 'b' * 64,
             'install_start_sha256': 'b' * 64,
             'install_unchanged': True,
@@ -244,37 +267,96 @@ def _orchestrator(identity: dict[str, Any]) -> dict[str, Any]:
 
 def collision_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     repository = Path(__file__).resolve().parents[3]
-    rendered_manifest = yaml.safe_load(
-        (repository / 'config/collision-coverage.yaml').read_text(encoding='utf-8')
-    )
     control_configuration = contact_control_configuration()
     control_configuration_sha256 = contact_control_configuration_sha256()
     wall_asset_sha256 = file_sha256(
         repository / 'src/robotest_sim/models/phase3_contact_control_wall.sdf'
     )
+    chassis_collision = 'robotest::base_link::base_collision'
+    support_collision = 'robotest::left_wheel_link::left_wheel_collision'
+    gate_source_inventory = {
+        'schema_version': 1,
+        'sources': [
+            {'path': path, 'sha256': str(index) * 64}
+            for index, path in enumerate(
+                (
+                    'src/robotest_sim/CMakeLists.txt',
+                    'src/robotest_sim/include/robotest_sim/contact_stream_gate.hpp',
+                    'src/robotest_sim/src/contact_stream_gate.cpp',
+                    'src/robotest_sim/src/contact_stream_gate_node.cpp',
+                ),
+                start=1,
+            )
+        ],
+    }
+    contact_stream = {
+        'gate': {
+            'executable': 'contact_stream_gate',
+            'launch_sha256': 'a' * 64,
+            'package': 'robotest_sim',
+            'source_inventory': gate_source_inventory,
+            'source_inventory_sha256': canonical_sha256(gate_source_inventory),
+        },
+        'policy': copy.deepcopy(EXPECTED_CONTACT_STREAM_POLICY),
+        'policy_sha256': canonical_sha256(EXPECTED_CONTACT_STREAM_POLICY),
+        'qos': {
+            'private_raw_ros': {
+                'depth': 64,
+                'durability': 'VOLATILE',
+                'history': 'KEEP_LAST',
+                'reliability': 'RELIABLE',
+            },
+            'public_ros': {
+                'depth': 10,
+                'durability': 'VOLATILE',
+                'history': 'KEEP_LAST',
+                'reliability': 'RELIABLE',
+            },
+        },
+        'schema_version': 1,
+        'topics': {
+            'gazebo_raw': '/robotest/validation/contacts',
+            'private_raw_ros': '/robotest/internal/raw_contacts',
+            'public_ros': '/robotest/validation/contacts',
+        },
+    }
     manifest = {
         'bridge_sha256': '1' * 64,
-        'contact_configuration_sha256': rendered_manifest['contact_configuration_sha256'],
-        'covered_collisions': ['robotest::base_link::base_collision'],
+        'contact_configuration_sha256': '2' * 64,
+        'contact_stream': contact_stream,
+        'contact_topic': '/robotest/validation/contacts',
+        'covered_collisions': [chassis_collision, support_collision],
         'rendered_sdf_sha256': '4' * 64,
-        'rendered_robot_collisions': ['robotest::base_link::base_collision'],
+        'rendered_robot_collisions': [chassis_collision, support_collision],
         'robot_description_sha256': '7' * 64,
         'robot_collisions': [
             {
-                'name': 'robotest::base_link::base_collision',
+                'name': chassis_collision,
                 'role': 'chassis',
-                'source': 'all_robot_contacts',
-            }
+                'source': '/robotest/validation/contacts',
+            },
+            {
+                'name': support_collision,
+                'role': 'left_wheel',
+                'source': '/robotest/validation/contacts',
+            },
         ],
         'robot_model': 'robotest',
-        'support_pairs': [],
+        'schema_version': 3,
+        'support_pairs': [
+            {
+                'environment_collision': 'ground_plane::ground_link::ground_collision',
+                'robot_collision': support_collision,
+            }
+        ],
         'world_source_sha256': '8' * 64,
     }
     manifest['manifest_sha256'] = canonical_sha256(manifest)
     expected_pair = [
         'phase3_contact_control_wall::link::collision',
-        'robotest::base_link::base_collision',
+        chassis_collision,
     ]
+    support_pair = sorted([support_collision, 'ground_plane::ground_link::ground_collision'])
     fixture = {
         'control': control_configuration,
         'entity': {
@@ -311,6 +393,98 @@ def collision_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
             'retained_count': count,
         }
 
+    snapshot_layout = (
+        (4, 5, None, 900_000_000),
+        (8, 9, 10, 1_100_000_000),
+        (13, 14, 15, 1_300_000_000),
+        (17, 18, None, 1_500_000_000),
+        (19, 20, None, 1_700_000_000),
+        (21, 22, None, 1_900_000_000),
+        (23, 24, None, 2_100_000_000),
+        (25, 26, None, 2_300_000_000),
+        (28, 29, None, 2_500_000_000),
+        (30, 31, None, 2_700_000_000),
+    )
+    snapshot_records: list[dict[str, Any]] = []
+    snapshots: list[dict[str, Any]] = []
+    for summary_sequence, support_sequence, wall_sequence, stamp_ns in snapshot_layout:
+        snapshot_records.append(
+            {
+                'collector_sequence': support_sequence,
+                'counterpart_collision': None,
+                'counterpart_model': None,
+                'disposition': 'support_ground_excluded',
+                'normalized_pair': support_pair,
+                'robot_collision': None,
+                'sim_stamp_ns': stamp_ns,
+                'snapshot_sequence': summary_sequence,
+            }
+        )
+        counted_records: list[dict[str, Any]] = []
+        if wall_sequence is not None:
+            snapshot_records.append(
+                {
+                    'collector_sequence': wall_sequence,
+                    'counterpart_collision': expected_pair[0],
+                    'counterpart_model': 'phase3_contact_control_wall',
+                    'disposition': 'counted',
+                    'normalized_pair': expected_pair,
+                    'robot_collision': expected_pair[1],
+                    'sim_stamp_ns': stamp_ns,
+                    'snapshot_sequence': summary_sequence,
+                }
+            )
+            counted_records.append(
+                {
+                    'counterpart_model': 'phase3_contact_control_wall',
+                    'normalized_pair': expected_pair,
+                    'record_sequence': wall_sequence,
+                    'snapshot_sequence': summary_sequence,
+                }
+            )
+        snapshots.append(
+            {
+                'classified_count': len(counted_records),
+                'collector_sequence': summary_sequence,
+                'counted_snapshot_records': counted_records,
+                'delivery_clock_offset_ns': 0,
+                'delivery_clock_stamp_ns': stamp_ns,
+                'exact_pair_count': len(counted_records),
+                'sim_stamp_ns': stamp_ns,
+                'snapshot_record_count': 1 + len(counted_records),
+            }
+        )
+
+    def graph_endpoint(node_fqn: str, depth: int, gid_byte: str) -> dict[str, Any]:
+        return {
+            'endpoint_gid': gid_byte * 24,
+            'node_fqn': node_fqn,
+            'qos': {
+                'depth': depth,
+                'durability': 'VOLATILE',
+                'history': 'KEEP_LAST',
+                'reliability': 'RELIABLE',
+            },
+            'qos_status': {
+                'depth_matches_or_unknown': True,
+                'durability_volatile': True,
+                'history_keep_last_or_unknown': True,
+                'reliability_reliable': True,
+            },
+            'topic_type': 'ros_gz_interfaces/msg/Contacts',
+        }
+
+    graph_snapshot = {
+        'private_raw_publishers': [graph_endpoint('/robotest/parameter_bridge', 64, '1a')],
+        'private_raw_subscribers': [graph_endpoint('/robotest/contact_stream_gate', 64, '2b')],
+        'public_snapshot_publishers': [graph_endpoint('/robotest/contact_stream_gate', 10, '3c')],
+        'topics': {
+            'private_raw_contact_topic': '/robotest/internal/raw_contacts',
+            'public_contact_snapshot_topic': '/robotest/validation/contacts',
+        },
+    }
+    graph_snapshot_sha256 = canonical_sha256(graph_snapshot)
+
     positive = {
         'cleanup': {
             'actor_absent': True,
@@ -322,12 +496,12 @@ def collision_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
                 'pose_source_publishers_before': 1,
                 'post_delete_pose_count': 0,
                 'post_delete_pose_source_heartbeat_count': 1,
-                'post_delete_pose_source_latest_sim_stamp_ns': 3_900_000_000,
-                'quiet_until_sim_stamp_ns': 3_900_000_000,
-                'request_sequence': 14,
-                'request_stamp_ns': 3_500_000_000,
-                'response_sequence': 15,
-                'response_stamp_ns': 3_650_000_000,
+                'post_delete_pose_source_latest_sim_stamp_ns': 3_050_000_000,
+                'quiet_until_sim_stamp_ns': 3_050_000_000,
+                'request_sequence': 32,
+                'request_stamp_ns': 2_710_000_000,
+                'response_sequence': 33,
+                'response_stamp_ns': 2_800_000_000,
             },
             'required': True,
         },
@@ -356,78 +530,81 @@ def collision_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
             'command_trace': [
                 {
                     'angular_z': 0.0,
-                    'collector_sequence': 5,
+                    'collector_sequence': 7,
                     'linear_x': 0.05,
                     'phase': 'FORWARD',
                     'sim_stamp_ns': 1_000_000_000,
                 },
                 {
                     'angular_z': 0.0,
-                    'collector_sequence': 8,
+                    'collector_sequence': 11,
                     'linear_x': 0.0,
                     'phase': 'CONTACT_STOP',
-                    'sim_stamp_ns': 2_000_000_000,
-                },
-                {
-                    'angular_z': 0.0,
-                    'collector_sequence': 9,
-                    'linear_x': 0.0,
-                    'phase': 'HOLD',
-                    'sim_stamp_ns': 2_100_000_000,
-                },
-                {
-                    'angular_z': 0.0,
-                    'collector_sequence': 10,
-                    'linear_x': -0.05,
-                    'phase': 'REVERSE',
-                    'sim_stamp_ns': 2_250_000_000,
+                    'sim_stamp_ns': 1_100_000_000,
                 },
                 {
                     'angular_z': 0.0,
                     'collector_sequence': 12,
                     'linear_x': 0.0,
+                    'phase': 'HOLD',
+                    'sim_stamp_ns': 1_200_000_000,
+                },
+                {
+                    'angular_z': 0.0,
+                    'collector_sequence': 16,
+                    'linear_x': -0.05,
+                    'phase': 'REVERSE',
+                    'sim_stamp_ns': 1_350_000_000,
+                },
+                {
+                    'angular_z': 0.0,
+                    'collector_sequence': 27,
+                    'linear_x': 0.0,
                     'phase': 'FINAL_ZERO',
-                    'sim_stamp_ns': 3_250_000_000,
+                    'sim_stamp_ns': 2_350_000_000,
                 },
             ],
             'contact': {
                 'active_counterpart_count': 0,
-                'classified_record_count': 1,
+                'classified_record_count': 2,
+                'contact_clock_bracket': {
+                    'clock_stamp_ns': 2_710_000_000,
+                    'lag_ns': 10_000_000,
+                    'limit_ns': 220_000_000,
+                    'snapshot_stamp_ns': 2_700_000_000,
+                },
                 'counterpart_tracker_count': 1,
                 'episodes': [
                     {
                         'counterpart_model': 'phase3_contact_control_wall',
-                        'end_stamp_ns': 2_250_000_000,
+                        'end_stamp_ns': 1_500_000_000,
                         'normalized_pairs': [expected_pair],
-                        'sample_count': 1,
-                        'start_stamp_ns': 2_000_000_000,
+                        'snapshot_record_count': 2,
+                        'start_stamp_ns': 1_100_000_000,
                     }
                 ],
-                'exact_pair_raw_count': 1,
+                'exact_pair_snapshot_record_count': 2,
                 'expected_pair': expected_pair,
                 'first_qualifying_contact': {
-                    'clock_delivery_offset_ns': 0,
-                    'collector_sequence': 7,
+                    'callback_clock_offset_ns': 0,
+                    'callback_clock_stamp_ns': 1_100_000_000,
+                    'collector_sequence': 10,
                     'normalized_pair': expected_pair,
-                    'observed_sim_stamp_ns': 2_000_000_000,
-                    'sim_stamp_ns': 2_000_000_000,
+                    'sim_stamp_ns': 1_100_000_000,
+                    'stop_latency_clock_stamp_ns': 1_100_000_000,
+                    'stop_latency_upper_bound_ns': 0,
                 },
-                'raw_contact_record_count': 1,
-                'records': [
-                    {
-                        'collector_sequence': 7,
-                        'counterpart_collision': expected_pair[0],
-                        'counterpart_model': 'phase3_contact_control_wall',
-                        'disposition': 'counted',
-                        'normalized_pair': expected_pair,
-                        'robot_collision': expected_pair[1],
-                        'sim_stamp_ns': 2_000_000_000,
-                    }
-                ],
+                'release_snapshot': {
+                    'collector_sequence': 30,
+                    'sim_stamp_ns': 2_700_000_000,
+                },
+                'snapshot_contact_record_count': len(snapshot_records),
+                'snapshot_records': snapshot_records,
+                'snapshots': snapshots,
             },
             'observed_robot_start': {
                 'alignment_error_ns': 100_000_000,
-                'collector_sequence': 4,
+                'collector_sequence': 6,
                 'position_error_m': 0.0,
                 'sim_stamp_ns': 900_000_000,
                 'x': 0.0,
@@ -445,7 +622,7 @@ def collision_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
                     'graph_isolated',
                     'hold_completed',
                     'overflow_free',
-                    'raw_expected_contact_observed',
+                    'expected_contact_snapshot_observed',
                     'release_completed',
                     'release_source_spanned',
                     'reverse_completed',
@@ -465,7 +642,7 @@ def collision_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
             'setup': {
                 'observed_robot_start': {
                     'alignment_error_ns': 100_000_000,
-                    'collector_sequence': 4,
+                    'collector_sequence': 6,
                     'position_error_m': 0.0,
                     'sim_stamp_ns': 900_000_000,
                     'x': 0.0,
@@ -495,14 +672,17 @@ def collision_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
             },
             'timeline': {
                 'control_started_stamp_ns': 1_000_000_000,
-                'final_zero_stamp_ns': 3_250_000_000,
-                'hold_complete_stamp_ns': 2_250_000_000,
-                'release_complete_stamp_ns': 3_500_000_000,
-                'release_contact_message_end_count': 3,
-                'release_contact_message_start_count': 2,
-                'release_required_through_stamp_ns': 3_500_000_000,
-                'reverse_start_stamp_ns': 2_250_000_000,
-                'stop_command_stamp_ns': 2_000_000_000,
+                'final_zero_stamp_ns': 2_350_000_000,
+                'hold_complete_stamp_ns': 1_350_000_000,
+                'release_complete_stamp_ns': 2_700_000_000,
+                'release_contact_snapshot_end_count': 10,
+                'release_contact_snapshot_start_count': 8,
+                'release_observed_clock_stamp_ns': 2_710_000_000,
+                'release_qualified_snapshot_stamp_ns': 2_700_000_000,
+                'release_required_through_stamp_ns': 2_600_000_000,
+                'reverse_start_stamp_ns': 1_350_000_000,
+                'stop_command_stamp_ns': 1_100_000_000,
+                'stop_latency_clock_stamp_ns': 1_100_000_000,
                 'stop_latency_ns': 0,
             },
         },
@@ -517,30 +697,38 @@ def collision_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
             'buffers': {
                 'actor_state': positive_buffer(1_024, 1),
                 'command': positive_buffer(4_096, 5),
-                'contact_records': positive_buffer(32_768, 1),
-                'contact_summaries': positive_buffer(8_192, 3),
+                'contact_snapshot_records': positive_buffer(32_768, len(snapshot_records)),
+                'contact_snapshots': positive_buffer(8_192, len(snapshots)),
                 'ground_truth': positive_buffer(8_192, 1),
             },
             'cmd_vel_publisher_count': 1,
             'collision_monitor_absent': True,
+            'contact_graph_topology': {
+                'audit_count': 10,
+                'first_sha256': graph_snapshot_sha256,
+                'first_snapshot': graph_snapshot,
+                'last_sha256': graph_snapshot_sha256,
+                'last_snapshot': copy.deepcopy(graph_snapshot),
+            },
             'clock': {
                 'first_stamp_ns': 0,
-                'latest_stamp_ns': 3_900_000_000,
+                'latest_stamp_ns': 3_050_000_000,
                 'max_gap_ns': 100_000_000,
                 'regression_count': 0,
                 'sample_count': 36,
             },
-            'contact_message_heartbeat': {
-                'first_stamp_ns': 1_000_000_000,
-                'latest_stamp_ns': 3_500_000_000,
-                'max_gap_ns': 500_000_000,
-                'message_count': 3,
+            'public_contact_snapshot_heartbeat': {
+                'first_stamp_ns': 900_000_000,
+                'future_delivery_count': 0,
+                'latest_stamp_ns': 2_700_000_000,
+                'max_gap_ns': 200_000_000,
+                'snapshot_count': len(snapshots),
             },
             'forbidden_nodes': [],
             'nav2_absent': True,
             'overflow_free': True,
             'protocol_error_count': 0,
-            'raw_contact_stream': positive_buffer(32_768, 1),
+            'public_contact_snapshot_stream': positive_buffer(32_768, len(snapshot_records)),
             'relative_project_names': True,
             'sole_cmd_vel_publisher': True,
             'source_publisher_counts': {
@@ -627,8 +815,23 @@ def complete_request() -> dict[str, Any]:
             'stamp_ns': 1_100_000_000,
         }
     )
-    core.record('contacts', {'contacts': [], 'stamp_ns': 400_000_000})
-    core.record('contacts', {'contacts': [], 'stamp_ns': 1_800_000_000})
+    support_contact = {
+        'collision1': 'robotest::left_wheel_link::left_wheel_collision',
+        'collision2': 'ground_plane::ground_link::ground_collision',
+        'maximum_normal_force_n': 5.0,
+        'maximum_penetration_depth_m': 0.01,
+    }
+    for stamp in range(200_000_000, 2_200_000_001, 200_000_000):
+        core.record(
+            'contacts',
+            {
+                'contacts': [support_contact],
+                'delivery_clock_offset_ns': 0,
+                'delivery_clock_stamp_ns': stamp,
+                'frame_id': '',
+                'stamp_ns': stamp,
+            },
+        )
     for sequence, stamp in enumerate((200_000_000, 1_000_000_000, 1_800_000_000)):
         core.record(
             'world_stats',
@@ -640,7 +843,7 @@ def complete_request() -> dict[str, Any]:
                 'steady_wall_ns': sequence * 800_000_000,
             },
         )
-    for stamp in (0, 1_000_000_000, 2_000_000_000):
+    for stamp in (0, 1_000_000_000, 2_000_000_000, 2_200_000_000):
         core.observe_clock(stamp)
     fault_events = [
         _fault_event(1, 3, 100_000_000),
@@ -741,8 +944,48 @@ def complete_request() -> dict[str, Any]:
         'capture': capture,
         'collision': {
             'benchmark_binding': binding,
+            'contact_drain': {
+                'clock_first_stamp_ns': 0,
+                'clock_latest_stamp_ns': 2_200_000_000,
+                'clock_message_count': 4,
+                'clock_minus_qualifying_contact_ns': 0,
+                'clock_regression_count': 0,
+                'contact_message_count': 11,
+                'contact_record_count_violation_count': 0,
+                'contact_stamp_duplicate_count': 0,
+                'contact_stamp_regression_count': 0,
+                'first_contact_stamp_ns': 200_000_000,
+                'gate_node_present': True,
+                'latest_contact_stamp_ns': 2_200_000_000,
+                'limits': {
+                    'heartbeat_period_ns': 200_000_000,
+                    'max_clock_lag_ns': 220_000_000,
+                    'max_public_gap_ns': 220_000_000,
+                    'release_gap_ns': 250_000_000,
+                },
+                'maximum_contact_record_count': 1,
+                'maximum_contact_source_gap_ns': 200_000_000,
+                'minimum_contact_record_count': 1,
+                'minimum_same_pair_set_interval_ns': 200_000_000,
+                'producer': 'robotest_phase3/contact_drain_observer',
+                'public_publisher_nodes': ['/robotest/contact_stream_gate'],
+                'public_topic': '/robotest/validation/contacts',
+                'qualifying_contact_snapshot_stamp_ns': 2_200_000_000,
+                'same_pair_set_interval_violation_count': 0,
+                'schema_version': 3,
+                'target_stamp_ns': 2_050_000_000,
+                'terminal_action_stamp_ns': 1_800_000_000,
+            },
+            'contact_drain_ack': {
+                'artifact_sha256': 'f' * 64,
+                'latest_retained_stamp_ns': 2_200_000_000,
+                'producer': 'robotest_metrics/metrics_collector',
+                'public_topic': '/robotest/validation/contacts',
+                'retained_message_count': 11,
+                'schema_version': 1,
+            },
             'coverage_manifest': manifest,
-            'drain_completed_stamp_ns': 2_050_000_000,
+            'drain_completed_stamp_ns': 2_200_000_000,
             'positive_control': positive,
         },
         'fault': {'kind': 'none'},

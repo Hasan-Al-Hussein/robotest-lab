@@ -13,6 +13,7 @@ from launch.actions import (
     IncludeLaunchDescription,
     OpaqueFunction,
     SetEnvironmentVariable,
+    Shutdown,
     TimerAction,
 )
 from launch.conditions import IfCondition
@@ -159,6 +160,22 @@ def _launch_runtime(context):
                 ),
             },
         ],
+        on_exit=Shutdown(reason='parameter bridge exited'),
+    )
+
+    # Gazebo Sim 8 does not honor the contact sensor's declared update rate.
+    # The private raw bridge therefore feeds a fail-closed, simulation-stamp
+    # gate that owns the bounded authoritative public snapshot stream.
+    contact_stream_gate = Node(
+        package='robotest_sim',
+        executable='contact_stream_gate',
+        namespace=namespace,
+        name='contact_stream_gate',
+        output='screen',
+        parameters=[
+            {'use_sim_time': ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool)}
+        ],
+        on_exit=Shutdown(reason='contact stream gate exited'),
     )
 
     scenario_bridge = Node(
@@ -207,6 +224,7 @@ def _launch_runtime(context):
         gazebo,
         state_publisher,
         bridge,
+        contact_stream_gate,
         scenario_bridge,
         fault_proxy,
         TimerAction(period=spawn_delay, actions=[spawn]),

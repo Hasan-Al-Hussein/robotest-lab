@@ -47,6 +47,7 @@ ROOT_FIELDS = {
     'schema_version',
     'robot_model',
     'contact_topic',
+    'contact_stream',
     'robot_collisions',
     'covered_collisions',
     'rendered_robot_collisions',
@@ -89,7 +90,7 @@ def test_committed_manifest_exactly_matches_current_sources(
     assert committed == generated_manifest
     assert payload == generator.manifest_yaml_bytes(generated_manifest)
     assert set(committed) == ROOT_FIELDS
-    assert committed['schema_version'] == 2
+    assert committed['schema_version'] == 3
     assert all(SHA256_PATTERN.fullmatch(committed[field]) for field in HASH_FIELDS)
     assert b'&id' not in payload and b'*id' not in payload
 
@@ -103,13 +104,25 @@ def test_manifest_hashes_real_rendered_and_source_evidence(
     generated_manifest: dict[str, Any],
     rendered_sdf: bytes,
 ) -> None:
-    geometries, contact_hash = generator.extract_rendered_coverage(rendered_sdf)
+    geometries, sensor_projection = generator.extract_rendered_coverage(rendered_sdf)
     names = [geometry['name'] for geometry in geometries]
 
     assert generated_manifest['robot_collisions'] == geometries
     assert generated_manifest['covered_collisions'] == names
     assert generated_manifest['rendered_robot_collisions'] == names
-    assert generated_manifest['contact_configuration_sha256'] == contact_hash
+    contact_stream = generator.contact_stream_configuration(REPOSITORY_ROOT)
+    contact_configuration = {
+        'contact_stream': contact_stream,
+        'declared_sensor_update_rate_authoritative': False,
+        'gazebo_contact_topic': generator.GAZEBO_CONTACT_TOPIC,
+        'robot_model': generator.ROBOT_MODEL,
+        'schema_version': 2,
+        'sensors': sensor_projection,
+    }
+    assert generated_manifest['contact_stream'] == contact_stream
+    assert generated_manifest['contact_configuration_sha256'] == generator.canonical_sha256(
+        contact_configuration
+    )
     assert generated_manifest['rendered_sdf_sha256'] == hashlib.sha256(rendered_sdf).hexdigest()
     assert generated_manifest['bridge_sha256'] == generator.bridge_sha256(REPOSITORY_ROOT)
     assert generated_manifest['robot_description_sha256'] == (
@@ -161,7 +174,7 @@ def test_bridge_validation_rejects_contact_mapping_drift(
     source = REPOSITORY_ROOT / 'src' / 'robotest_sim' / 'config' / 'bridge.yaml'
     document = yaml.safe_load(source.read_text(encoding='utf-8'))
     contact = next(
-        entry for entry in document if entry.get('ros_topic_name') == 'validation/contacts'
+        entry for entry in document if entry.get('ros_topic_name') == 'internal/raw_contacts'
     )
     contact['publisher_queue'] = 9
     destination = tmp_path / 'src' / 'robotest_sim' / 'config' / 'bridge.yaml'
@@ -196,7 +209,7 @@ def test_check_mode_fails_closed_for_stale_manifest(
 ) -> None:
     assert generator.main(['--repository-root', str(REPOSITORY_ROOT), '--mode', 'check']) == 0
     stale = tmp_path / 'collision-coverage.yaml'
-    stale.write_text('schema_version: 2\n', encoding='utf-8')
+    stale.write_text('schema_version: 3\n', encoding='utf-8')
     assert (
         generator.main(
             [

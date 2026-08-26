@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 import struct
 import sys
@@ -19,6 +20,64 @@ from ros_gz_interfaces.msg import Contact, Contacts
 from sensor_msgs.msg import Imu, LaserScan
 
 PACKAGE = Path(__file__).resolve().parents[1]
+WORKSPACE = PACKAGE.parents[1]
+
+
+def _source_hash_declarations(script_path: Path) -> tuple[list[Path], list[Path]]:
+    text = script_path.read_text(encoding='utf-8')
+    function = text.split('write_source_config_hashes() {', 1)[1]
+    python_source = function.split("<<'PY'\n", 1)[1].split('\nPY\n}', 1)[0]
+    tree = ast.parse(python_source, filename=str(script_path))
+
+    assignments: dict[str, list[Path]] = {}
+    for statement in tree.body:
+        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+            continue
+        target = statement.targets[0]
+        if not isinstance(target, ast.Name) or not isinstance(statement.value, ast.List):
+            continue
+        paths = [
+            WORKSPACE / element.right.value
+            for element in statement.value.elts
+            if (
+                isinstance(element, ast.BinOp)
+                and isinstance(element.op, ast.Div)
+                and isinstance(element.left, ast.Name)
+                and element.left.id == 'workspace'
+                and isinstance(element.right, ast.Constant)
+                and isinstance(element.right.value, str)
+            )
+        ]
+        assignments[target.id] = paths
+    explicit = assignments.get('explicit_files', assignments.get('explicit', []))
+    roots = assignments.get('source_roots', assignments.get('roots', []))
+    assert explicit and roots
+    return explicit, roots
+
+
+def _source_hash_evidence(
+    script_path: Path, overrides: dict[Path, bytes] | None = None
+) -> tuple[str, dict[str, str]]:
+    explicit, roots = _source_hash_declarations(script_path)
+    paths = {path for path in explicit if path.is_file() and not path.is_symlink()}
+    for root in roots:
+        paths.update(
+            path
+            for path in root.rglob('*')
+            if path.is_file()
+            and not path.is_symlink()
+            and '__pycache__' not in path.parts
+            and path.suffix != '.pyc'
+        )
+    aggregate = hashlib.sha256()
+    entries: dict[str, str] = {}
+    for path in sorted(paths):
+        relative = path.relative_to(WORKSPACE).as_posix()
+        content = overrides.get(path, path.read_bytes()) if overrides else path.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        entries[relative] = digest
+        aggregate.update(relative.encode('utf-8') + b'\0' + digest.encode('ascii') + b'\n')
+    return aggregate.hexdigest(), entries
 
 
 def load_runtime_probe_module():
@@ -29,6 +88,31 @@ def load_runtime_probe_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_phase1_and_phase2_hash_runtime_attestation_helper_bytes() -> None:
+    helpers = (
+        WORKSPACE / 'config/collision-coverage.yaml',
+        WORKSPACE / 'tests/phase3_runtime_gate.py',
+        WORKSPACE / 'tests/phase3_orchestration.py',
+    )
+    for phase in (1, 2):
+        script = WORKSPACE / 'scripts' / f'verify_phase{phase}.sh'
+        script_text = script.read_text(encoding='utf-8')
+        assert 'source-config-hashes-end.json' in script_text
+        assert 'source-config-mutation.json' in script_text
+        assert script_text.count('write_source_config_mutation_evidence') >= 2
+        explicit, _ = _source_hash_declarations(script)
+        assert set(helpers) <= set(explicit)
+        baseline_aggregate, baseline_entries = _source_hash_evidence(script)
+        for helper in helpers:
+            relative = helper.relative_to(WORKSPACE).as_posix()
+            mutated_aggregate, mutated_entries = _source_hash_evidence(
+                script, {helper: helper.read_bytes() + b'\n# mutation sentinel\n'}
+            )
+            assert relative in baseline_entries
+            assert baseline_entries[relative] != mutated_entries[relative]
+            assert baseline_aggregate != mutated_aggregate
 
 
 def load_sim_launch_module():
@@ -46,7 +130,9 @@ def test_package_is_apache_ament_cmake_and_installs_runtime_assets() -> None:
     assert root.findtext('name') == 'robotest_sim'
     assert root.findtext('license') == 'Apache-2.0'
     assert root.find('./export/build_type').text == 'ament_cmake'
-    runtime_dependencies = {element.text for element in root.findall('exec_depend')}
+    runtime_dependencies = {
+        element.text for tag in ('depend', 'exec_depend') for element in root.findall(tag)
+    }
     assert {'robotest_interfaces', 'ros_gz_interfaces', 'tf2_msgs'} <= runtime_dependencies
     cmake = (PACKAGE / 'CMakeLists.txt').read_text(encoding='utf-8')
     for directory in ('config', 'launch', 'models', 'rviz', 'worlds'):
@@ -124,7 +210,7 @@ def test_bridge_matches_the_frozen_data_plane() -> None:
             'GZ_TO_ROS',
             'SERVICES',
         ),
-        'validation/contacts': (
+        'internal/raw_contacts': (
             'ros_gz_interfaces/msg/Contacts',
             'gz.msgs.Contacts',
             'GZ_TO_ROS',
@@ -378,6 +464,16 @@ def test_runtime_probe_contact_classifier_allows_only_support_and_internal_pairs
     assert module.classify_phase1_contact_pair(obstacle, ground) == 'unexpected_non_robot_pair'
     assert module.classify_phase1_contact_pair('', ground) == 'invalid_collision_name'
     assert module.classify_phase1_contact_pair(None, ground) == 'invalid_collision_name'
+    assert module.classify_phase1_contact_pair('model::collision', ground) == (
+        'invalid_collision_name'
+    )
+    assert module.classify_phase1_contact_pair('model::::collision', ground) == (
+        'invalid_collision_name'
+    )
+    assert module.valid_public_contact_record_count(1)
+    assert module.valid_public_contact_record_count(16)
+    assert not module.valid_public_contact_record_count(0)
+    assert not module.valid_public_contact_record_count(17)
 
 
 def test_runtime_probe_contact_evidence_names_are_bounded() -> None:
@@ -416,6 +512,12 @@ def test_runtime_probe_contact_callback_counts_and_bounds_unexpected_prefix() ->
         def __init__(self) -> None:
             self.counts: dict[str, int] = {}
             self.nonempty_contact_messages = 0
+            self.contact_frame_id_violation_count = 0
+            self.contact_record_count_violation_count = 0
+            self.contact_same_pair_set_interval_violation_count = 0
+            self.contact_minimum_same_pair_set_interval_ns: int | None = None
+            self.previous_contact_pair_set = None
+            self.previous_contact_pair_set_stamp_ns = None
             self.contact_record_count = 0
             self.contact_dispositions = {
                 disposition: 0 for disposition in module.PHASE1_CONTACT_DISPOSITIONS
@@ -424,7 +526,7 @@ def test_runtime_probe_contact_callback_counts_and_bounds_unexpected_prefix() ->
             self.unexpected_contact_pair_prefix: list[dict[str, object]] = []
             self.unexpected_contact_pair_omitted_count = 0
 
-        def _record(self, key: str) -> None:
+        def _record(self, key: str, _stamp_ns: int) -> None:
             self.counts[key] = self.counts.get(key, 0) + 1
 
     state = ProbeState()
@@ -440,6 +542,10 @@ def test_runtime_probe_contact_callback_counts_and_bounds_unexpected_prefix() ->
     assert state.unexpected_contact_pair_count == module.CONTACT_EVIDENCE_CAPACITY + 1
     assert len(state.unexpected_contact_pair_prefix) == module.CONTACT_EVIDENCE_CAPACITY
     assert state.unexpected_contact_pair_omitted_count == 1
+    assert state.contact_record_count_violation_count == 1
+
+    module.Phase1Probe._on_contacts(state, Contacts())
+    assert state.contact_record_count_violation_count == 2
 
 
 def test_semantic_fingerprint_ignores_nan_payload_but_detects_value_changes() -> None:
@@ -535,6 +641,26 @@ def test_stamp_tracker_reports_order_gap_and_staleness_bounds() -> None:
     assert any('duplicate timestamps' in failure for failure in failures)
     assert any('maximum receipt age' in failure for failure in failures)
     assert any('final stamp age' in failure for failure in failures)
+
+
+def test_contact_stamp_tracker_accepts_220ms_and_rejects_one_ns_more() -> None:
+    module = load_runtime_probe_module()
+    boundary = module.StampTracker()
+    boundary.observe(1_000_000_000, 1_000_000_000)
+    boundary.observe(1_220_000_000, 1_220_000_000)
+    boundary.observe(1_440_000_000, 1_440_000_000)
+    evidence = boundary.evidence(1_440_000_000, 0.22, 0.22, 0.22)
+    assert module.stamp_evidence_failures('/robotest/validation/contacts', evidence) == []
+
+    exceeded = module.StampTracker()
+    exceeded.observe(1_000_000_000, 1_000_000_000)
+    exceeded.observe(1_220_000_000, 1_220_000_000)
+    exceeded.observe(1_440_000_001, 1_440_000_001)
+    evidence = exceeded.evidence(1_440_000_001, 0.22, 0.22, 0.22)
+    assert any(
+        'maximum stamp gap' in failure
+        for failure in module.stamp_evidence_failures('/robotest/validation/contacts', evidence)
+    )
 
 
 def test_windowed_rtf_uses_multi_sample_non_overlapping_intervals() -> None:

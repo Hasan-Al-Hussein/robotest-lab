@@ -24,6 +24,7 @@ import math
 import os
 from pathlib import Path
 import re
+import subprocess
 import tempfile
 from typing import Any
 
@@ -49,6 +50,60 @@ COLLECTOR_WALL_TIMEOUT_S = 360.0
 TRIAL_WALL_TIMEOUT_S = 300.0
 CONTACT_CONTROL_WALL_TIMEOUT_S = 30.0
 CONTACT_DRAIN_NS = 250_000_000
+CONTACT_HEARTBEAT_NS = 200_000_000
+CONTACT_MAX_PUBLIC_GAP_NS = 220_000_000
+CONTACT_MAX_CLOCK_LAG_NS = 220_000_000
+CONTACT_PUBLIC_TOPIC = '/robotest/validation/contacts'
+CONTACT_GATE_NODE = '/robotest/contact_stream_gate'
+CONTACT_PRIVATE_RAW_TOPIC = '/robotest/internal/raw_contacts'
+EXPECTED_CONTACT_STREAM_POLICY = {
+    'active_pair_expiry_ns': 250_000_000,
+    'active_pair_scope': 'support_robot_internal_and_countable_robot_external',
+    'accepted_run_scope': 'continuous_sensed_support_contact_required',
+    'capacity_claim_scope': 'unchanged_pair_set_heartbeat_only',
+    'completed_stamp_batching': 'finalize_on_strictly_greater_raw_stamp',
+    'delivery_semantics': 'authoritative_delivered_active_pair_snapshot',
+    'emission_policy': ('immediate_active_pair_set_transition_else_heartbeat_at_or_after_200ms'),
+    'heartbeat_period_ns': 200_000_000,
+    'ingress_memory_bound_scope': ('post_dds_deserialization_of_trusted_sole_private_bridge_input'),
+    'initial_finalized_stamp_suppressed': True,
+    'max_pending_batch_clock_lag_ns': 220_000_000,
+    'max_public_snapshot_gap_ns': 220_000_000,
+    'max_public_snapshot_clock_lag_ns': 220_000_000,
+    'max_raw_clock_lag_ns': 220_000_000,
+    'limits': {
+        'max_active_contact_pairs': 16,
+        'max_active_contact_records': 16,
+        'max_active_string_bytes': 65_536,
+        'max_body_name_bytes': 4_096,
+        'max_collision_name_bytes': 4_096,
+        'max_contact_points_per_record': 64,
+        'max_contact_records_per_pair': 4,
+        'max_contact_string_bytes': 8_192,
+        'max_frame_id_bytes': 256,
+        'max_raw_contact_records': 16,
+        'max_raw_messages_per_completed_stamp': 7,
+        'max_raw_stamp_advance_ns': 20_000_000,
+        'max_raw_string_bytes_per_completed_stamp': 65_536,
+    },
+    'release_comparison': ('completed_absent_stamp_strictly_greater_than_last_seen_plus_gap'),
+    'raw_contact_positions': 'required_nonempty_1_to_64',
+    'raw_stamp_gap_semantics': 'greater_than_20ms_is_invalid_not_zero_contact',
+    'raw_messages_require_nonempty_contacts': True,
+    'public_snapshot_cardinality': 'required_nonempty_1_to_16',
+    'public_snapshots_per_finalized_stamp': 'at_most_one',
+    'public_snapshots_require_nonempty_contacts': True,
+    'required_raw_frame_id': '',
+    'retained_contact_payload': 'exact_nested_contact_record_copy',
+    'synthesized_envelope': [
+        'container',
+        'current_completed_header',
+        'normalized_pair_order',
+    ],
+    'synchronization': 'second_finalized_stamp_seeds_public_stream',
+    'semantic_fatal_delivery': 'best_effort_diagnostic_snapshot_before_process_failure',
+    'string_budget_accounting': ('payload_strings_plus_normalized_pair_key_once_per_stored_pair'),
+}
 LIFECYCLE_SAMPLE_PERIOD_NS = 200_000_000
 LIFECYCLE_FIRST_OFFSET_NS = 11_600_000_000
 LIFECYCLE_SAMPLE_COUNT = 96
@@ -509,6 +564,113 @@ def install_manifest(workspace: Path) -> dict[str, Any]:
     return tree_manifest(install_root, RUNTIME_PACKAGES)
 
 
+def _elf_build_id(path: Path) -> str:
+    result = subprocess.run(
+        ['readelf', '-n', str(path)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10.0,
+    )
+    for line in result.stdout.splitlines():
+        if 'Build ID:' in line:
+            value = line.split('Build ID:', 1)[1].strip()
+            if value:
+                return value
+    raise EvidenceError(f'ELF build ID is unavailable: {path}')
+
+
+CONTACT_GATE_SOURCE_TAG = b'ROBOTEST_CONTACT_GATE_SOURCE_INVENTORY_SHA256='
+CONTACT_GATE_SOURCE_PATHS = (
+    'src/robotest_sim/CMakeLists.txt',
+    'src/robotest_sim/include/robotest_sim/contact_stream_gate.hpp',
+    'src/robotest_sim/src/contact_stream_gate.cpp',
+    'src/robotest_sim/src/contact_stream_gate_node.cpp',
+)
+
+
+def _elf_embedded_source_inventory_sha256(path: Path) -> str:
+    pattern = re.compile(re.escape(CONTACT_GATE_SOURCE_TAG) + rb'([0-9a-f]{64})')
+    overlap = b''
+    matches: set[str] = set()
+    retained = len(CONTACT_GATE_SOURCE_TAG) + 63
+    with path.open('rb') as stream:
+        while chunk := stream.read(1024 * 1024):
+            combined = overlap + chunk
+            for match in pattern.finditer(combined):
+                matches.add(match.group(1).decode('ascii'))
+                if len(matches) > 1:
+                    raise EvidenceError(
+                        f'contact gate ELF has conflicting tagged source inventory values: {path}'
+                    )
+            overlap = combined[-retained:]
+    if len(matches) != 1:
+        raise EvidenceError(f'contact gate ELF lacks tagged source inventory: {path}')
+    return next(iter(matches))
+
+
+def contact_gate_source_inventory(workspace: Path) -> dict[str, Any]:
+    return {
+        'schema_version': 1,
+        'sources': [
+            {'path': path, 'sha256': file_sha256(workspace / path)}
+            for path in CONTACT_GATE_SOURCE_PATHS
+        ],
+    }
+
+
+def contact_gate_build_install_binding(workspace: Path) -> dict[str, Any]:
+    """Bind the compiled contact gate build artifact to its installed ELF."""
+    build_path = (workspace / 'build/robotest_sim/contact_stream_gate').resolve(strict=True)
+    installed_declared_path = workspace / (
+        'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
+    )
+    installed_path = installed_declared_path.resolve(strict=True)
+    if not build_path.is_file() or not installed_path.is_file():
+        raise EvidenceError('contact stream gate build/install artifact is not regular')
+    if not os.access(build_path, os.X_OK) or not os.access(installed_path, os.X_OK):
+        raise EvidenceError('contact stream gate build/install artifact is not executable')
+    build_sha256 = file_sha256(build_path)
+    installed_sha256 = file_sha256(installed_path)
+    build_install_sha256_match = build_sha256 == installed_sha256
+    if not build_install_sha256_match:
+        raise EvidenceError('contact stream gate build/install ELF hashes differ')
+    build_id = _elf_build_id(build_path)
+    installed_build_id = _elf_build_id(installed_path)
+    if build_id != installed_build_id:
+        raise EvidenceError('contact stream gate build/install ELF build IDs differ')
+    source_inventory_sha256 = canonical_sha256(contact_gate_source_inventory(workspace))
+    build_embedded_source = _elf_embedded_source_inventory_sha256(build_path)
+    installed_embedded_source = _elf_embedded_source_inventory_sha256(installed_path)
+    build_embedded_source_match = build_embedded_source == source_inventory_sha256
+    installed_embedded_source_match = installed_embedded_source == source_inventory_sha256
+    if not build_embedded_source_match or not installed_embedded_source_match:
+        raise EvidenceError(
+            'contact stream gate ELF does not embed the current source inventory hash'
+        )
+    return {
+        'build_embedded_source_inventory_match': build_embedded_source_match,
+        'build_embedded_source_inventory_sha256': build_embedded_source,
+        'build_elf_build_id': build_id,
+        'build_regular_executable': True,
+        'build_path': build_path.relative_to(workspace).as_posix(),
+        'build_sha256': build_sha256,
+        'build_install_build_id_match': True,
+        'build_install_sha256_match': build_install_sha256_match,
+        'installed_declared_path': installed_declared_path.relative_to(workspace).as_posix(),
+        'installed_declared_samefile': installed_declared_path.samefile(installed_path),
+        'installed_embedded_source_inventory_match': installed_embedded_source_match,
+        'installed_embedded_source_inventory_sha256': installed_embedded_source,
+        'installed_elf_build_id': installed_build_id,
+        'installed_path': installed_path.relative_to(workspace).as_posix(),
+        'installed_regular_executable': True,
+        'installed_sha256': installed_sha256,
+        'package': 'robotest_sim',
+        'schema_version': 1,
+        'source_inventory_sha256': source_inventory_sha256,
+    }
+
+
 def source_install_correspondence(workspace: Path) -> dict[str, Any]:
     """Prove installed Python/share bytes equal their clean source inputs."""
     records: list[dict[str, Any]] = []
@@ -623,6 +785,7 @@ def build_binding(
     source = tree_manifest(workspace, SOURCE_TREE_ROOTS)
     installed = install_manifest(workspace)
     source_install = source_install_correspondence(workspace)
+    contact_gate_binary = contact_gate_build_install_binding(workspace)
     metrics_contract_sha = file_sha256(workspace / 'docs/architecture/metrics-contract.md')
     target_set_sha = file_sha256(workspace / 'docs/testing/acceptance-criteria.md')
     return {
@@ -630,6 +793,7 @@ def build_binding(
             workspace, COLLECTOR_CONFIGURATION_FILES
         ),
         'created_by': PRODUCER,
+        'contact_gate_binary': contact_gate_binary,
         'git': {
             'dirty': bool(git_status_porcelain),
             'sha': git_sha,
@@ -672,6 +836,9 @@ def validate_build_binding(
         binding.get('source_install'),
         'build_binding.source_install',
     )
+    contact_gate_binary = _require_mapping(
+        binding.get('contact_gate_binary'), 'build_binding.contact_gate_binary'
+    )
     if source.get('aggregate_sha256') != expected['source']['aggregate_sha256']:
         raise EvidenceError('source tree differs from verified build binding')
     if installed.get('aggregate_sha256') != expected['install']['aggregate_sha256']:
@@ -683,6 +850,8 @@ def validate_build_binding(
         raise EvidenceError('source/install correspondence differs from verified binding')
     if binding.get('git') != expected['git']:
         raise EvidenceError('Git state differs from verified build binding')
+    if dict(contact_gate_binary) != expected['contact_gate_binary']:
+        raise EvidenceError('contact gate binary differs from verified build binding')
     return expected
 
 
@@ -786,10 +955,433 @@ def _collision_provenance(
     return result
 
 
+def _contact_stream_manifest_v3(manifest: Mapping[str, Any], workspace: Path) -> Mapping[str, Any]:
+    """Reject legacy manifests and return the hash-bound contact-stream contract."""
+    if manifest.get('schema_version') != 3:
+        raise EvidenceError('collision coverage manifest must be schema_version 3')
+    contact_stream = _require_mapping(manifest.get('contact_stream'), 'contact_stream')
+    if set(contact_stream) != {
+        'gate',
+        'policy',
+        'policy_sha256',
+        'qos',
+        'schema_version',
+        'topics',
+    }:
+        raise EvidenceError('contact stream manifest fields differ from the frozen contract')
+    if contact_stream.get('schema_version') != 1:
+        raise EvidenceError('contact stream manifest must be schema_version 1')
+    topics = _require_mapping(contact_stream.get('topics'), 'contact_stream.topics')
+    if dict(topics) != {
+        'gazebo_raw': CONTACT_PUBLIC_TOPIC,
+        'private_raw_ros': CONTACT_PRIVATE_RAW_TOPIC,
+        'public_ros': CONTACT_PUBLIC_TOPIC,
+    }:
+        raise EvidenceError('contact stream topics differ from the frozen contract')
+    qos = _require_mapping(contact_stream.get('qos'), 'contact_stream.qos')
+    if dict(qos) != {
+        'private_raw_ros': {
+            'depth': 64,
+            'durability': 'VOLATILE',
+            'history': 'KEEP_LAST',
+            'reliability': 'RELIABLE',
+        },
+        'public_ros': {
+            'depth': 10,
+            'durability': 'VOLATILE',
+            'history': 'KEEP_LAST',
+            'reliability': 'RELIABLE',
+        },
+    }:
+        raise EvidenceError('contact stream QoS differs from the frozen contract')
+    gate = _require_mapping(contact_stream.get('gate'), 'contact_stream.gate')
+    if set(gate) != {
+        'executable',
+        'launch_sha256',
+        'package',
+        'source_inventory',
+        'source_inventory_sha256',
+    }:
+        raise EvidenceError('contact stream gate binding fields are invalid')
+    if gate.get('package') != 'robotest_sim' or gate.get('executable') != 'contact_stream_gate':
+        raise EvidenceError('contact stream gate owner differs from the frozen contract')
+    launch_sha256 = require_sha256(gate.get('launch_sha256'), 'contact_stream.gate.launch_sha256')
+    if launch_sha256 != file_sha256(workspace / 'src/robotest_sim/launch/sim.launch.py'):
+        raise EvidenceError('contact stream launch hash differs from workspace source')
+    source_inventory = _require_mapping(
+        gate.get('source_inventory'), 'contact_stream.gate.source_inventory'
+    )
+    if (
+        set(source_inventory) != {'schema_version', 'sources'}
+        or source_inventory.get('schema_version') != 1
+    ):
+        raise EvidenceError('contact stream gate source inventory schema is invalid')
+    sources = source_inventory.get('sources')
+    if not isinstance(sources, list) or len(sources) != len(CONTACT_GATE_SOURCE_PATHS):
+        raise EvidenceError('contact stream gate source inventory length is invalid')
+    for index, (entry_value, expected_path) in enumerate(
+        zip(sources, CONTACT_GATE_SOURCE_PATHS, strict=True)
+    ):
+        entry = _require_mapping(
+            entry_value, f'contact_stream.gate.source_inventory.sources[{index}]'
+        )
+        if set(entry) != {'path', 'sha256'} or entry.get('path') != expected_path:
+            raise EvidenceError('contact stream gate source inventory ordering is invalid')
+        declared_sha256 = require_sha256(
+            entry.get('sha256'), f'contact stream gate source {expected_path}'
+        )
+        if declared_sha256 != file_sha256(workspace / expected_path):
+            raise EvidenceError('contact stream gate source hash differs from workspace')
+    declared_inventory_hash = require_sha256(
+        gate.get('source_inventory_sha256'),
+        'contact_stream.gate.source_inventory_sha256',
+    )
+    if canonical_sha256(source_inventory) != declared_inventory_hash:
+        raise EvidenceError('contact stream gate source inventory hash mismatch')
+    policy = _require_mapping(contact_stream.get('policy'), 'contact_stream.policy')
+    if dict(policy) != EXPECTED_CONTACT_STREAM_POLICY:
+        raise EvidenceError('contact stream policy differs from the frozen v3 contract')
+    declared_policy_hash = require_sha256(
+        contact_stream.get('policy_sha256'), 'contact_stream.policy_sha256'
+    )
+    if canonical_sha256(policy) != declared_policy_hash:
+        raise EvidenceError('contact stream policy hash mismatch')
+    return contact_stream
+
+
+def positive_control_qualified_snapshot_stamp(result: Mapping[str, Any]) -> int:
+    """Return the positive-control release snapshot after validating its binding."""
+    if result.get('schema_version') != 1 or result.get('producer') != (
+        'robotest_scenarios/contact_control_driver'
+    ):
+        raise EvidenceError('positive-control producer/schema is invalid')
+    verdict = _require_mapping(result.get('verdict'), 'positive_control.verdict')
+    if (
+        result.get('status') != 'PASS'
+        or verdict.get('authority') != 'component_only'
+        or verdict.get('benchmark_pass') is not None
+        or verdict.get('exit_code') != 0
+    ):
+        raise EvidenceError('positive-control component did not PASS')
+    control = _require_mapping(result.get('control'), 'positive_control.control')
+    timeline = _require_mapping(control.get('timeline'), 'positive_control.control.timeline')
+    boundary = _require_int(
+        timeline.get('release_required_through_stamp_ns'),
+        'positive_control.release_required_through_stamp_ns',
+        minimum=1,
+    )
+    qualifying = _require_int(
+        timeline.get('release_qualified_snapshot_stamp_ns'),
+        'positive_control.release_qualified_snapshot_stamp_ns',
+        minimum=1,
+    )
+    if qualifying <= boundary:
+        raise EvidenceError(
+            'positive-control release snapshot is not strictly beyond its release boundary'
+        )
+    return qualifying
+
+
+_COMPONENT_CONTACT_SNAPSHOT_FIELDS = {
+    'classified_count',
+    'collector_sequence',
+    'counted_snapshot_records',
+    'delivery_clock_offset_ns',
+    'delivery_clock_stamp_ns',
+    'exact_pair_count',
+    'sim_stamp_ns',
+    'snapshot_record_count',
+}
+_COMPONENT_CONTACT_RECORD_FIELDS = {
+    'collector_sequence',
+    'counterpart_collision',
+    'counterpart_model',
+    'disposition',
+    'normalized_pair',
+    'robot_collision',
+    'sim_stamp_ns',
+    'snapshot_sequence',
+}
+
+
+def _scoped_contact_name(value: Any, label: str) -> str:
+    name = require_bounded_string(value, label)
+    segments = name.split('::')
+    if len(segments) < 3 or any(not segment for segment in segments):
+        raise EvidenceError(f'{label} is not model::link::collision scoped')
+    return name
+
+
+def _normalized_pair(value: Any, label: str) -> tuple[str, str]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise EvidenceError(f'{label} is not a collision pair')
+    pair = tuple(
+        sorted(_scoped_contact_name(item, f'{label}[{index}]') for index, item in enumerate(value))
+    )
+    return pair
+
+
+def _component_contact_projection(
+    contact: Mapping[str, Any],
+    *,
+    expected_pair: tuple[str, str],
+    manifest: Mapping[str, Any],
+    qualifying_stamp_ns: int,
+) -> list[tuple[int, tuple[tuple[str, str], ...]]]:
+    summaries = contact.get('snapshots')
+    records = contact.get('snapshot_records')
+    if not isinstance(summaries, list) or not summaries:
+        raise EvidenceError('positive-control authoritative contact snapshots are missing')
+    if not isinstance(records, list) or not records:
+        raise EvidenceError('positive-control authoritative contact records are missing')
+
+    records_by_summary: dict[int, list[tuple[str, str]]] = {}
+    record_stamps_by_summary: dict[int, set[int]] = {}
+    previous_record_sequence = 0
+    for index, raw_record in enumerate(records):
+        record = _require_mapping(raw_record, f'positive_control.snapshot_records[{index}]')
+        if set(record) != _COMPONENT_CONTACT_RECORD_FIELDS:
+            raise EvidenceError('positive-control snapshot record shape changed')
+        record_sequence = _require_int(
+            record.get('collector_sequence'),
+            f'positive_control.snapshot_records[{index}].collector_sequence',
+            minimum=1,
+        )
+        if record_sequence <= previous_record_sequence:
+            raise EvidenceError('positive-control snapshot record sequence is not strict')
+        previous_record_sequence = record_sequence
+        summary_sequence = _require_int(
+            record.get('snapshot_sequence'),
+            f'positive_control.snapshot_records[{index}].snapshot_sequence',
+            minimum=1,
+        )
+        record_stamp = _require_int(
+            record.get('sim_stamp_ns'),
+            f'positive_control.snapshot_records[{index}].sim_stamp_ns',
+            minimum=1,
+        )
+        pair = _normalized_pair(
+            record.get('normalized_pair'),
+            f'positive_control.snapshot_records[{index}].normalized_pair',
+        )
+        if list(pair) != record.get('normalized_pair'):
+            raise EvidenceError('positive-control snapshot record pair is not normalized')
+        records_by_summary.setdefault(summary_sequence, []).append(pair)
+        record_stamps_by_summary.setdefault(summary_sequence, set()).add(record_stamp)
+
+    projection: list[tuple[int, tuple[tuple[str, str], ...]]] = []
+    seen_summaries: set[int] = set()
+    previous_summary_sequence = 0
+    previous_stamp: int | None = None
+    for index, raw_summary in enumerate(summaries):
+        summary = _require_mapping(raw_summary, f'positive_control.snapshots[{index}]')
+        if set(summary) != _COMPONENT_CONTACT_SNAPSHOT_FIELDS:
+            raise EvidenceError('positive-control snapshot summary shape changed')
+        summary_sequence = _require_int(
+            summary.get('collector_sequence'),
+            f'positive_control.snapshots[{index}].collector_sequence',
+            minimum=1,
+        )
+        stamp = _require_int(
+            summary.get('sim_stamp_ns'),
+            f'positive_control.snapshots[{index}].sim_stamp_ns',
+            minimum=1,
+        )
+        delivery_clock = _require_int(
+            summary.get('delivery_clock_stamp_ns'),
+            f'positive_control.snapshots[{index}].delivery_clock_stamp_ns',
+            minimum=0,
+        )
+        delivery_offset = _require_int(
+            summary.get('delivery_clock_offset_ns'),
+            f'positive_control.snapshots[{index}].delivery_clock_offset_ns',
+        )
+        if (
+            summary_sequence <= previous_summary_sequence
+            or (previous_stamp is not None and stamp <= previous_stamp)
+            or (previous_stamp is not None and stamp - previous_stamp > CONTACT_MAX_CLOCK_LAG_NS)
+            or delivery_clock - stamp != delivery_offset
+            or abs(delivery_offset) > CONTACT_MAX_CLOCK_LAG_NS
+        ):
+            raise EvidenceError('positive-control snapshot ordering/liveness is invalid')
+        snapshot_pairs = records_by_summary.get(summary_sequence, [])
+        if not 1 <= len(snapshot_pairs) <= 16 or _require_int(
+            summary.get('snapshot_record_count'),
+            f'positive_control.snapshots[{index}].snapshot_record_count',
+            minimum=1,
+        ) != len(snapshot_pairs):
+            raise EvidenceError('positive-control snapshot record count does not reconcile')
+        if record_stamps_by_summary.get(summary_sequence) != {stamp}:
+            raise EvidenceError('positive-control snapshot record stamp linkage changed')
+        exact_count = sum(pair == expected_pair for pair in snapshot_pairs)
+        if (
+            _require_int(
+                summary.get('exact_pair_count'),
+                f'positive_control.snapshots[{index}].exact_pair_count',
+                minimum=0,
+            )
+            != exact_count
+        ):
+            raise EvidenceError('positive-control snapshot exact-pair count does not reconcile')
+        seen_summaries.add(summary_sequence)
+        previous_summary_sequence = summary_sequence
+        previous_stamp = stamp
+        projection.append((stamp, tuple(sorted(snapshot_pairs))))
+
+    if set(records_by_summary) != seen_summaries:
+        raise EvidenceError('positive-control snapshot record references a missing summary')
+    qualifying_indexes = [
+        index for index, (stamp, _pairs) in enumerate(projection) if stamp == qualifying_stamp_ns
+    ]
+    if len(qualifying_indexes) != 1:
+        raise EvidenceError(
+            'positive-control qualifying release snapshot is not present exactly once'
+        )
+    qualifying_index = qualifying_indexes[0]
+    suffix = projection[qualifying_index + 1 :]
+    if _captured_contact_episodes(suffix, manifest=manifest):
+        raise EvidenceError('positive-control component observed countable recontact after release')
+    return projection[: qualifying_index + 1]
+
+
+def _captured_contact_projection(
+    captured_contacts: Sequence[Any],
+    *,
+    first_stamp_ns: int,
+    qualifying_stamp_ns: int,
+) -> list[tuple[int, tuple[tuple[str, str], ...]]]:
+    projection: list[tuple[int, tuple[tuple[str, str], ...]]] = []
+    previous_stamp: int | None = None
+    for message_index, raw_message in enumerate(captured_contacts):
+        message = _require_mapping(raw_message, f'captured contacts[{message_index}]')
+        stamp = _require_int(
+            message.get('stamp_ns'), f'captured contacts[{message_index}].stamp_ns', minimum=1
+        )
+        if previous_stamp is not None and stamp <= previous_stamp:
+            raise EvidenceError('captured contact snapshot stamps are not strict')
+        previous_stamp = stamp
+        if message.get('frame_id') != '':
+            raise EvidenceError('captured contact snapshot frame_id must be empty')
+        delivery_clock = _require_int(
+            message.get('delivery_clock_stamp_ns'),
+            f'captured contacts[{message_index}].delivery_clock_stamp_ns',
+            minimum=0,
+        )
+        delivery_offset = _require_int(
+            message.get('delivery_clock_offset_ns'),
+            f'captured contacts[{message_index}].delivery_clock_offset_ns',
+        )
+        if (
+            delivery_clock - stamp != delivery_offset
+            or abs(delivery_offset) > CONTACT_MAX_CLOCK_LAG_NS
+        ):
+            raise EvidenceError('captured contact snapshot delivery /clock bracket is invalid')
+        records = message.get('contacts')
+        if not isinstance(records, list) or not 1 <= len(records) <= 16:
+            raise EvidenceError('captured contact snapshot must contain 1 to 16 records')
+        pairs = tuple(
+            sorted(
+                _normalized_pair(
+                    (
+                        _require_mapping(record, 'captured contact record').get('collision1'),
+                        _require_mapping(record, 'captured contact record').get('collision2'),
+                    ),
+                    f'captured contacts[{message_index}].contacts[{record_index}]',
+                )
+                for record_index, record in enumerate(records)
+            )
+        )
+        if first_stamp_ns <= stamp <= qualifying_stamp_ns:
+            projection.append((stamp, pairs))
+    return projection
+
+
+def _captured_contact_episodes(
+    projection: Sequence[tuple[int, tuple[tuple[str, str], ...]]],
+    *,
+    manifest: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    robot_model = require_bounded_string(manifest.get('robot_model'), 'coverage robot model')
+    robot_collisions = {
+        _scoped_contact_name(
+            _require_mapping(entry, 'coverage robot collision').get('name'),
+            'coverage robot collision name',
+        )
+        for entry in manifest.get('robot_collisions', [])
+    }
+    support_pairs = {
+        _normalized_pair(
+            (
+                _require_mapping(entry, 'coverage support pair').get('robot_collision'),
+                _require_mapping(entry, 'coverage support pair').get('environment_collision'),
+            ),
+            'coverage support pair',
+        )
+        for entry in manifest.get('support_pairs', [])
+    }
+    episodes: list[dict[str, Any]] = []
+    active: dict[str, dict[str, Any]] = {}
+    for stamp, pairs in projection:
+        present: dict[str, list[tuple[str, str]]] = {}
+        for pair in pairs:
+            first_robot = pair[0] in robot_collisions
+            second_robot = pair[1] in robot_collisions
+            for name in pair:
+                if name.split('::', 1)[0] == robot_model and name not in robot_collisions:
+                    raise EvidenceError(
+                        'captured contact references an unknown rendered robot collision'
+                    )
+            if first_robot and second_robot:
+                continue
+            if not first_robot and not second_robot:
+                raise EvidenceError('captured contact snapshot contains a non-robot pair')
+            if pair in support_pairs:
+                continue
+            counterpart = pair[1] if first_robot else pair[0]
+            counterpart_model = counterpart.split('::', 1)[0]
+            if counterpart_model == robot_model:
+                raise EvidenceError('captured contact counterpart cannot be resolved')
+            present.setdefault(counterpart_model, []).append(pair)
+        for counterpart in list(active):
+            if counterpart in present:
+                continue
+            episode = active.pop(counterpart)
+            episode['end_stamp_ns'] = stamp
+            episode['normalized_pairs'] = [
+                list(pair) for pair in sorted(episode['normalized_pairs'])
+            ]
+            episodes.append(episode)
+        for counterpart, counterpart_pairs in present.items():
+            episode = active.get(counterpart)
+            if episode is None:
+                episode = {
+                    'counterpart_model': counterpart,
+                    'normalized_pairs': set(),
+                    'snapshot_record_count': 0,
+                    'start_stamp_ns': stamp,
+                }
+                active[counterpart] = episode
+            episode['normalized_pairs'].update(counterpart_pairs)
+            episode['snapshot_record_count'] += len(counterpart_pairs)
+    if active:
+        raise EvidenceError('positive-control countable contact lacks an absence snapshot')
+    return sorted(
+        episodes,
+        key=lambda episode: (
+            episode['counterpart_model'],
+            episode['start_stamp_ns'],
+            episode['end_stamp_ns'],
+        ),
+    )
+
+
 def reconcile_positive_control(
     *,
+    workspace: Path,
+    build_binding: Mapping[str, Any],
     result_path: Path,
     capture_path: Path,
+    contact_progress_path: Path,
     manifest_path: Path,
     collector_configuration_sha256: str,
     owned_process_group_shutdown: bool,
@@ -800,22 +1392,22 @@ def reconcile_positive_control(
     result = _require_mapping(load_json(result_path), 'positive_control')
     capture = _require_mapping(load_json(capture_path), 'positive_control_capture')
     manifest = load_yaml(manifest_path)
-    if manifest.get('schema_version') != 2:
-        raise EvidenceError('collision coverage manifest must be schema_version 2')
+    contact_stream = _contact_stream_manifest_v3(
+        _require_mapping(manifest, 'coverage_manifest'), workspace
+    )
+    gate = _require_mapping(contact_stream.get('gate'), 'contact_stream.gate')
+    frozen_gate_binary = _require_mapping(
+        build_binding.get('contact_gate_binary'), 'build_binding.contact_gate_binary'
+    )
+    if gate.get('source_inventory_sha256') != frozen_gate_binary.get('source_inventory_sha256'):
+        raise EvidenceError('contact stream source inventory differs from build binding')
     semantic_without_hash = dict(manifest)
     declared_manifest_hash = require_sha256(
         semantic_without_hash.pop('manifest_sha256', None), 'manifest_sha256'
     )
     if canonical_sha256(semantic_without_hash) != declared_manifest_hash:
         raise EvidenceError('collision coverage manifest self-hash mismatch')
-    verdict = _require_mapping(result.get('verdict'), 'positive_control.verdict')
-    if (
-        result.get('status') != 'PASS'
-        or verdict.get('authority') != 'component_only'
-        or verdict.get('benchmark_pass') is not None
-        or verdict.get('exit_code') != 0
-    ):
-        raise EvidenceError('positive-control component did not PASS')
+    qualifying_contact_snapshot_stamp_ns = positive_control_qualified_snapshot_stamp(result)
     identity = _require_mapping(result.get('identity'), 'positive_control.identity')
     run_id = require_bounded_string(identity.get('run_id'), 'positive_control.run_id')
     scenario_hash = require_sha256(
@@ -868,23 +1460,34 @@ def reconcile_positive_control(
         or any(not isinstance(value, str) or not value for value in expected_pair)
     ):
         raise EvidenceError('positive-control expected pair is malformed')
-    normalized_expected = sorted(expected_pair)
-    captured_exact_count = 0
-    captured_exact_stamps: list[int] = []
-    for message in captured_contacts:
-        message = _require_mapping(message, 'captured contact message')
-        stamp = _require_int(message.get('stamp_ns'), 'captured contact stamp', minimum=0)
-        records = message.get('contacts')
-        if not isinstance(records, list):
-            raise EvidenceError('captured contact records are malformed')
-        for record in records:
-            record = _require_mapping(record, 'captured contact record')
-            pair = sorted((record.get('collision1'), record.get('collision2')))
-            if pair == normalized_expected:
-                captured_exact_count += 1
-                captured_exact_stamps.append(stamp)
+    normalized_expected = _normalized_pair(expected_pair, 'positive-control expected pair')
+    component_projection = _component_contact_projection(
+        contact,
+        expected_pair=normalized_expected,
+        manifest=manifest,
+        qualifying_stamp_ns=qualifying_contact_snapshot_stamp_ns,
+    )
+    captured_projection = _captured_contact_projection(
+        captured_contacts,
+        first_stamp_ns=component_projection[0][0],
+        qualifying_stamp_ns=qualifying_contact_snapshot_stamp_ns,
+    )
+    if captured_projection != component_projection:
+        raise EvidenceError(
+            'collector contact snapshot stamp/pair multiset is not bijective with the driver'
+        )
+    captured_exact_count = sum(
+        pairs.count(normalized_expected) for _stamp, pairs in captured_projection
+    )
+    captured_exact_stamps = [
+        stamp
+        for stamp, pairs in captured_projection
+        for _occurrence in range(pairs.count(normalized_expected))
+    ]
     component_exact_count = _require_int(
-        contact.get('exact_pair_raw_count'), 'positive_control.exact_pair_raw_count', minimum=1
+        contact.get('exact_pair_snapshot_record_count'),
+        'positive_control.exact_pair_snapshot_record_count',
+        minimum=1,
     )
     first_contact = _require_mapping(
         contact.get('first_qualifying_contact'), 'positive_control.first_qualifying_contact'
@@ -893,14 +1496,164 @@ def reconcile_positive_control(
         first_contact.get('sim_stamp_ns'), 'positive_control.first_contact_stamp', minimum=1
     )
     if (
-        captured_exact_count < component_exact_count
-        or first_contact_stamp not in captured_exact_stamps
+        captured_exact_count != component_exact_count
+        or not captured_exact_stamps
+        or first_contact_stamp != captured_exact_stamps[0]
     ):
         raise EvidenceError('collector contact evidence does not reconcile with the driver')
+    if first_contact_stamp >= qualifying_contact_snapshot_stamp_ns:
+        raise EvidenceError('positive-control first wall contact is not before release')
+    _capture_contains_qualified_contact_snapshot(capture, qualifying_contact_snapshot_stamp_ns)
+    contact_progress = validate_final_contact_progress(
+        _require_mapping(load_json(contact_progress_path), 'positive_contact_progress'),
+        capture=capture,
+        minimum_retained_stamp_ns=qualifying_contact_snapshot_stamp_ns,
+    )
+    contact_progress_sha256 = file_sha256(contact_progress_path)
+    release_messages = [
+        _require_mapping(item, 'captured release snapshot')
+        for item in captured_contacts
+        if _require_mapping(item, 'captured contact message').get('stamp_ns')
+        == qualifying_contact_snapshot_stamp_ns
+    ]
+    if len(release_messages) != 1:
+        raise EvidenceError('collector did not retain exactly one release snapshot')
+    release_records = release_messages[0].get('contacts')
+    if not isinstance(release_records, list) or not 1 <= len(release_records) <= 16:
+        raise EvidenceError('captured release snapshot must contain 1 to 16 records')
+    release_delivery_clock_stamp_ns = _require_int(
+        release_messages[0].get('delivery_clock_stamp_ns'),
+        'captured release delivery clock stamp',
+        minimum=0,
+    )
+    release_delivery_clock_offset_ns = _require_int(
+        release_messages[0].get('delivery_clock_offset_ns'),
+        'captured release delivery clock offset',
+    )
+    if (
+        release_delivery_clock_offset_ns
+        != release_delivery_clock_stamp_ns - qualifying_contact_snapshot_stamp_ns
+        or not -CONTACT_MAX_CLOCK_LAG_NS
+        <= release_delivery_clock_offset_ns
+        <= CONTACT_MAX_CLOCK_LAG_NS
+    ):
+        raise EvidenceError('positive-control release delivery /clock bracket is invalid')
+    robot_collisions = {
+        require_bounded_string(
+            _require_mapping(entry, 'coverage robot collision').get('name'),
+            'coverage robot collision name',
+        )
+        for entry in manifest.get('robot_collisions', [])
+    }
+    support_pairs = {
+        tuple(
+            sorted(
+                (
+                    require_bounded_string(
+                        _require_mapping(entry, 'coverage support pair').get('robot_collision'),
+                        'coverage support robot collision',
+                    ),
+                    require_bounded_string(
+                        _require_mapping(entry, 'coverage support pair').get(
+                            'environment_collision'
+                        ),
+                        'coverage support environment collision',
+                    ),
+                )
+            )
+        )
+        for entry in manifest.get('support_pairs', [])
+    }
+    release_expected_pair_count = 0
+    for record_value in release_records:
+        record = _require_mapping(record_value, 'captured release contact record')
+        pair = tuple(
+            sorted(
+                (
+                    require_bounded_string(record.get('collision1'), 'captured release collision1'),
+                    require_bounded_string(record.get('collision2'), 'captured release collision2'),
+                )
+            )
+        )
+        if pair == normalized_expected:
+            release_expected_pair_count += 1
+            continue
+        if pair not in support_pairs and not all(name in robot_collisions for name in pair):
+            raise EvidenceError('captured release snapshot contains an unexpected contact pair')
+    if release_expected_pair_count:
+        raise EvidenceError('expected positive-control wall pair remains in release snapshot')
+    captured_episodes = _captured_contact_episodes(
+        captured_projection,
+        manifest=manifest,
+    )
+    component_episode_values = contact.get('episodes')
+    if not isinstance(component_episode_values, list):
+        raise EvidenceError('positive-control component episodes are malformed')
+    component_episodes: list[dict[str, Any]] = []
+    for index, raw_episode in enumerate(component_episode_values):
+        episode = _require_mapping(raw_episode, f'positive_control.episodes[{index}]')
+        if set(episode) != {
+            'counterpart_model',
+            'end_stamp_ns',
+            'normalized_pairs',
+            'snapshot_record_count',
+            'start_stamp_ns',
+        }:
+            raise EvidenceError('positive-control component episode shape changed')
+        normalized_pairs_value = episode.get('normalized_pairs')
+        if not isinstance(normalized_pairs_value, list) or not normalized_pairs_value:
+            raise EvidenceError('positive-control component episode pairs are missing')
+        normalized_pairs = sorted(
+            _normalized_pair(
+                pair,
+                f'positive_control.episodes[{index}].normalized_pairs[{pair_index}]',
+            )
+            for pair_index, pair in enumerate(normalized_pairs_value)
+        )
+        normalized_pair_lists = [list(pair) for pair in normalized_pairs]
+        if normalized_pair_lists != normalized_pairs_value or len(set(normalized_pairs)) != len(
+            normalized_pairs
+        ):
+            raise EvidenceError('positive-control component episode pairs are not canonical')
+        component_episodes.append(
+            {
+                'counterpart_model': require_bounded_string(
+                    episode.get('counterpart_model'),
+                    f'positive_control.episodes[{index}].counterpart_model',
+                ),
+                'end_stamp_ns': _require_int(
+                    episode.get('end_stamp_ns'),
+                    f'positive_control.episodes[{index}].end_stamp_ns',
+                    minimum=1,
+                ),
+                'normalized_pairs': normalized_pair_lists,
+                'snapshot_record_count': _require_int(
+                    episode.get('snapshot_record_count'),
+                    f'positive_control.episodes[{index}].snapshot_record_count',
+                    minimum=1,
+                ),
+                'start_stamp_ns': _require_int(
+                    episode.get('start_stamp_ns'),
+                    f'positive_control.episodes[{index}].start_stamp_ns',
+                    minimum=1,
+                ),
+            }
+        )
+    component_episodes.sort(
+        key=lambda episode: (
+            episode['counterpart_model'],
+            episode['start_stamp_ns'],
+            episode['end_stamp_ns'],
+        )
+    )
+    if len(component_episodes) != 1 or component_episodes != captured_episodes:
+        raise EvidenceError(
+            'collector counterpart episodes do not exactly reconcile with the driver'
+        )
     component_commands = control.get('command_trace')
     if not isinstance(component_commands, list) or not component_commands:
         raise EvidenceError('positive-control component command trace is missing')
-    captured_projection = [
+    captured_command_projection = [
         (
             _require_int(item.get('stamp_ns'), 'captured command stamp', minimum=1),
             _require_number(item.get('linear_x_m_s'), 'captured command linear_x'),
@@ -917,13 +1670,13 @@ def reconcile_positive_control(
         )
         expected_linear = _require_number(command.get('linear_x'), 'component command linear_x')
         expected_angular = _require_number(command.get('angular_z'), 'component command angular_z')
-        while cursor < len(captured_projection) and not (
-            expected_stamp <= captured_projection[cursor][0] <= expected_stamp + 100_000_000
-            and captured_projection[cursor][1] == expected_linear
-            and captured_projection[cursor][2] == expected_angular
+        while cursor < len(captured_command_projection) and not (
+            expected_stamp <= captured_command_projection[cursor][0] <= expected_stamp + 100_000_000
+            and captured_command_projection[cursor][1] == expected_linear
+            and captured_command_projection[cursor][2] == expected_angular
         ):
             cursor += 1
-        if cursor >= len(captured_projection):
+        if cursor >= len(captured_command_projection):
             raise EvidenceError('collector command stream is not a complete component subsequence')
         cursor += 1
     timeline = _require_mapping(control.get('timeline'), 'positive_control.control.timeline')
@@ -935,10 +1688,17 @@ def reconcile_positive_control(
     latest_clock = _require_int(
         clock.get('latest_stamp_ns'), 'positive_capture.clock.latest_stamp_ns', minimum=1
     )
-    if latest_clock < release_boundary:
-        raise EvidenceError('positive-control capture ended before the release boundary')
+    if latest_clock < qualifying_contact_snapshot_stamp_ns:
+        raise EvidenceError('positive-control final /clock did not reach the release snapshot')
     if not owned_process_group_shutdown or not checksum_verified:
         raise EvidenceError('positive-control external process/checksum gate failed')
+    contact_projection_document = [
+        {
+            'normalized_pairs': [list(pair) for pair in pairs],
+            'stamp_ns': stamp,
+        }
+        for stamp, pairs in component_projection
+    ]
     return {
         'benchmark_binding': {
             'benchmark_provenance': provenance,
@@ -955,11 +1715,28 @@ def reconcile_positive_control(
         },
         'capture_sha256': capture_hash,
         'collector_reconciliation': {
-            'captured_command_count': len(captured_projection),
+            'captured_command_count': len(captured_command_projection),
             'captured_exact_pair_count': captured_exact_count,
+            'captured_release_expected_pair_count': release_expected_pair_count,
+            'captured_release_snapshot_count': len(release_messages),
+            'contact_projection_episode_count': len(captured_episodes),
+            'contact_projection_first_stamp_ns': component_projection[0][0],
+            'contact_projection_record_count': sum(
+                len(pairs) for _stamp, pairs in component_projection
+            ),
+            'contact_projection_sha256': canonical_sha256(contact_projection_document),
+            'contact_projection_snapshot_count': len(component_projection),
+            'contact_progress_artifact_sha256': contact_progress_sha256,
+            'contact_progress_latest_retained_stamp_ns': contact_progress[
+                'latest_retained_stamp_ns'
+            ],
+            'contact_progress_retained_message_count': contact_progress['retained_message_count'],
             'component_command_count': len(component_commands),
             'component_exact_pair_count': component_exact_count,
             'latest_clock_stamp_ns': latest_clock,
+            'release_delivery_clock_offset_ns': release_delivery_clock_offset_ns,
+            'release_delivery_clock_stamp_ns': release_delivery_clock_stamp_ns,
+            'release_qualified_snapshot_stamp_ns': (qualifying_contact_snapshot_stamp_ns),
             'release_required_through_stamp_ns': release_boundary,
         },
         'coverage_manifest': dict(manifest),
@@ -1317,6 +2094,14 @@ def make_orchestrator_evidence(
     correspondence_end = _require_mapping(
         build_end.get('source_install'), 'build_end.source_install'
     )
+    contact_gate_binary_start = _require_mapping(
+        build_start.get('contact_gate_binary'), 'build_start.contact_gate_binary'
+    )
+    contact_gate_binary_end = _require_mapping(
+        build_end.get('contact_gate_binary'), 'build_end.contact_gate_binary'
+    )
+    if dict(contact_gate_binary_start) != dict(contact_gate_binary_end):
+        raise EvidenceError('contact gate build/install binding changed during the run')
     identity = {
         key: plan[key]
         for key in (
@@ -1397,6 +2182,7 @@ def make_orchestrator_evidence(
         'schema_version': SCHEMA_VERSION,
         'source_binding': {
             'collector_configuration_sha256': build_start['collector_configuration_sha256'],
+            'contact_gate_binary': dict(contact_gate_binary_start),
             'install_end_sha256': install_end['aggregate_sha256'],
             'install_start_sha256': install_start['aggregate_sha256'],
             'install_unchanged': install_start['aggregate_sha256']
@@ -1417,6 +2203,532 @@ def make_orchestrator_evidence(
     }
 
 
+CONTACT_DRAIN_FIELDS = {
+    'clock_first_stamp_ns',
+    'clock_latest_stamp_ns',
+    'clock_message_count',
+    'clock_minus_qualifying_contact_ns',
+    'clock_regression_count',
+    'contact_message_count',
+    'contact_record_count_violation_count',
+    'contact_stamp_duplicate_count',
+    'contact_stamp_regression_count',
+    'first_contact_stamp_ns',
+    'gate_node_present',
+    'latest_contact_stamp_ns',
+    'limits',
+    'maximum_contact_record_count',
+    'maximum_contact_source_gap_ns',
+    'minimum_contact_record_count',
+    'minimum_same_pair_set_interval_ns',
+    'producer',
+    'public_publisher_nodes',
+    'public_topic',
+    'qualifying_contact_snapshot_stamp_ns',
+    'same_pair_set_interval_violation_count',
+    'schema_version',
+    'target_stamp_ns',
+    'terminal_action_stamp_ns',
+}
+CONTACT_PROGRESS_FIELDS = {
+    'latest_retained_stamp_ns',
+    'producer',
+    'public_topic',
+    'retained_message_count',
+    'schema_version',
+}
+
+CONTACT_GATE_ATTESTATION_FIELDS = {
+    'build_embedded_source_inventory_match',
+    'build_embedded_source_inventory_sha256',
+    'build_elf_build_id',
+    'build_install_build_id_match',
+    'build_install_sha256_match',
+    'build_path',
+    'build_sha256',
+    'exact_live_process_count',
+    'installed_declared_path',
+    'installed_declared_samefile',
+    'installed_device',
+    'installed_embedded_source_inventory_match',
+    'installed_embedded_source_inventory_sha256',
+    'installed_elf_build_id',
+    'installed_inode',
+    'installed_path',
+    'installed_regular_executable',
+    'installed_sha256',
+    'identity_revalidated_after_hashing',
+    'launch_root_pid',
+    'live_cmdline_sha256',
+    'live_device',
+    'live_embedded_source_inventory_match',
+    'live_embedded_source_inventory_sha256',
+    'live_elf_build_id',
+    'live_executable_link',
+    'live_executable_path',
+    'live_executable_sha256',
+    'live_inode',
+    'live_installed_build_id_match',
+    'live_installed_inode_match',
+    'live_installed_sha256_match',
+    'live_pgid',
+    'live_pid',
+    'live_ppid',
+    'live_sid',
+    'live_size_bytes',
+    'live_start_ticks',
+    'observed_gz_partition',
+    'observed_ros_domain_id',
+    'package',
+    'process_identity_match',
+    'schema_version',
+    'source_inventory_sha256',
+    'verdict',
+}
+
+
+def reconcile_contact_gate_reobservation(
+    initial_gate_path: Path,
+    final_gate_path: Path,
+    *,
+    build_binding: Mapping[str, Any],
+    expected_domain_id: int,
+    expected_gz_partition: str,
+) -> dict[str, Any]:
+    """Require one unchanged installed contact-gate process at ready and drain."""
+    initial_sha256 = verify_json_sidecar(initial_gate_path)
+    final_sha256 = verify_json_sidecar(final_gate_path)
+    frozen_binary = _require_mapping(
+        build_binding.get('contact_gate_binary'), 'build_binding.contact_gate_binary'
+    )
+    observations: list[Mapping[str, Any]] = []
+    for label, path in (('initial', initial_gate_path), ('final', final_gate_path)):
+        document = _require_mapping(load_json(path), f'{label}_runtime_gate')
+        if document.get('verdict') != 'PASS':
+            raise EvidenceError(f'{label} runtime gate did not PASS')
+        attestation = _require_mapping(
+            document.get('contact_gate_binary_attestation'),
+            f'{label}_runtime_gate.contact_gate_binary_attestation',
+        )
+        if set(attestation) != CONTACT_GATE_ATTESTATION_FIELDS:
+            raise EvidenceError(f'{label} contact gate attestation fields are invalid')
+        if (
+            attestation.get('schema_version') != 1
+            or attestation.get('package') != 'robotest_sim'
+            or attestation.get('verdict') != 'PASS'
+            or attestation.get('exact_live_process_count') != 1
+            or attestation.get('observed_ros_domain_id') != str(expected_domain_id)
+            or attestation.get('observed_gz_partition') != expected_gz_partition
+            or any(
+                attestation.get(field) is not True
+                for field in (
+                    'build_embedded_source_inventory_match',
+                    'build_install_build_id_match',
+                    'build_install_sha256_match',
+                    'installed_declared_samefile',
+                    'installed_embedded_source_inventory_match',
+                    'installed_regular_executable',
+                    'identity_revalidated_after_hashing',
+                    'live_installed_build_id_match',
+                    'live_embedded_source_inventory_match',
+                    'live_installed_inode_match',
+                    'live_installed_sha256_match',
+                    'process_identity_match',
+                )
+            )
+        ):
+            raise EvidenceError(f'{label} contact gate binary attestation did not PASS')
+        for field in (
+            'launch_root_pid',
+            'live_pid',
+            'live_ppid',
+            'live_pgid',
+            'live_sid',
+            'live_start_ticks',
+            'live_inode',
+            'installed_inode',
+            'live_size_bytes',
+        ):
+            _require_int(attestation.get(field), f'{label}.{field}', minimum=1)
+        for field in ('live_device', 'installed_device'):
+            _require_int(attestation.get(field), f'{label}.{field}', minimum=0)
+        if not (
+            attestation.get('live_pgid') == attestation.get('launch_root_pid')
+            and attestation.get('live_sid') == attestation.get('launch_root_pid')
+            and attestation.get('live_device') == attestation.get('installed_device')
+            and attestation.get('live_inode') == attestation.get('installed_inode')
+            and attestation.get('live_executable_sha256') == attestation.get('installed_sha256')
+            and attestation.get('live_elf_build_id') == attestation.get('installed_elf_build_id')
+            and attestation.get('live_executable_link') == attestation.get('live_executable_path')
+        ):
+            raise EvidenceError(f'{label} contact gate process identity fields conflict')
+        for field in (
+            'build_embedded_source_inventory_sha256',
+            'build_sha256',
+            'installed_embedded_source_inventory_sha256',
+            'installed_sha256',
+            'live_embedded_source_inventory_sha256',
+            'live_executable_sha256',
+            'source_inventory_sha256',
+        ):
+            require_sha256(attestation.get(field), f'{label}.{field}')
+        if (
+            attestation.get('build_sha256') != frozen_binary.get('build_sha256')
+            or attestation.get('installed_sha256') != frozen_binary.get('installed_sha256')
+            or attestation.get('build_elf_build_id') != frozen_binary.get('build_elf_build_id')
+            or attestation.get('installed_elf_build_id')
+            != frozen_binary.get('installed_elf_build_id')
+            or attestation.get('source_inventory_sha256')
+            != frozen_binary.get('source_inventory_sha256')
+            or attestation.get('build_embedded_source_inventory_sha256')
+            != frozen_binary.get('build_embedded_source_inventory_sha256')
+            or attestation.get('installed_embedded_source_inventory_sha256')
+            != frozen_binary.get('installed_embedded_source_inventory_sha256')
+            or attestation.get('live_embedded_source_inventory_sha256')
+            != frozen_binary.get('installed_embedded_source_inventory_sha256')
+            or attestation.get('build_path') != frozen_binary.get('build_path')
+            or attestation.get('installed_declared_path')
+            != frozen_binary.get('installed_declared_path')
+            or attestation.get('installed_path') != frozen_binary.get('installed_path')
+            or frozen_binary.get('build_regular_executable') is not True
+            or frozen_binary.get('installed_regular_executable') is not True
+            or frozen_binary.get('build_install_build_id_match') is not True
+            or frozen_binary.get('build_install_sha256_match') is not True
+            or frozen_binary.get('build_embedded_source_inventory_match') is not True
+            or frozen_binary.get('installed_embedded_source_inventory_match') is not True
+            or frozen_binary.get('installed_declared_samefile') is not True
+        ):
+            raise EvidenceError(
+                f'{label} contact gate binary differs from the prelaunch build binding'
+            )
+        observations.append(attestation)
+    stable_fields = (
+        'build_elf_build_id',
+        'build_embedded_source_inventory_sha256',
+        'build_path',
+        'build_sha256',
+        'installed_device',
+        'installed_elf_build_id',
+        'installed_embedded_source_inventory_sha256',
+        'installed_inode',
+        'installed_path',
+        'installed_sha256',
+        'launch_root_pid',
+        'live_cmdline_sha256',
+        'live_device',
+        'live_elf_build_id',
+        'live_embedded_source_inventory_sha256',
+        'live_executable_link',
+        'live_executable_path',
+        'live_executable_sha256',
+        'live_inode',
+        'live_pgid',
+        'live_pid',
+        'live_ppid',
+        'live_sid',
+        'live_size_bytes',
+        'live_start_ticks',
+        'observed_gz_partition',
+        'observed_ros_domain_id',
+        'source_inventory_sha256',
+    )
+    initial, final = observations
+    if any(initial.get(field) != final.get(field) for field in stable_fields):
+        raise EvidenceError('contact gate process/binary identity changed before final drain')
+    return {
+        'final_gate_artifact_sha256': final_sha256,
+        'frozen_contact_gate_binary_sha256': canonical_sha256(frozen_binary),
+        'initial_gate_artifact_sha256': initial_sha256,
+        'live_executable_sha256': initial['live_executable_sha256'],
+        'live_inode': initial['live_inode'],
+        'live_pid': initial['live_pid'],
+        'live_start_ticks': initial['live_start_ticks'],
+        'producer': PRODUCER,
+        'schema_version': 1,
+        'stable_identity': True,
+    }
+
+
+def validate_contact_progress(
+    evidence: Mapping[str, Any], *, minimum_retained_stamp_ns: int
+) -> dict[str, Any]:
+    """Validate the collector's atomic retained-contact progress marker."""
+    if set(evidence) != CONTACT_PROGRESS_FIELDS:
+        raise EvidenceError('contact progress fields do not match schema version 1')
+    if evidence.get('schema_version') != 1 or evidence.get('producer') != (
+        'robotest_metrics/metrics_collector'
+    ):
+        raise EvidenceError('contact progress producer/schema is invalid')
+    if evidence.get('public_topic') != CONTACT_PUBLIC_TOPIC:
+        raise EvidenceError('contact progress public topic differs from the frozen contract')
+    latest = _require_int(
+        evidence.get('latest_retained_stamp_ns'),
+        'contact_progress.latest_retained_stamp_ns',
+        minimum=1,
+    )
+    if latest < minimum_retained_stamp_ns:
+        raise EvidenceError('collector has not retained the qualifying contact snapshot yet')
+    if (
+        _require_int(
+            evidence.get('retained_message_count'),
+            'contact_progress.retained_message_count',
+            minimum=1,
+        )
+        < 1
+    ):
+        raise EvidenceError('collector contact progress count is empty')
+    return dict(evidence)
+
+
+def validate_final_contact_progress(
+    evidence: Mapping[str, Any],
+    *,
+    capture: Mapping[str, Any],
+    minimum_retained_stamp_ns: int,
+) -> dict[str, Any]:
+    """Bind the collector's final ACK exactly to its retained contact capture."""
+    validated = validate_contact_progress(
+        evidence, minimum_retained_stamp_ns=minimum_retained_stamp_ns
+    )
+    streams = _require_mapping(capture.get('streams'), 'capture.streams')
+    contacts = _require_mapping(streams.get('contacts'), 'capture.streams.contacts')
+    items = contacts.get('items')
+    if not isinstance(items, list) or not items:
+        raise EvidenceError('capture contact stream is empty')
+    final_item = _require_mapping(items[-1], 'capture final contact snapshot')
+    final_stamp_ns = _require_int(
+        final_item.get('stamp_ns'), 'capture final contact snapshot stamp', minimum=1
+    )
+    if validated['latest_retained_stamp_ns'] != final_stamp_ns:
+        raise EvidenceError('contact progress latest stamp differs from the final capture')
+    if validated['retained_message_count'] != len(items):
+        raise EvidenceError('contact progress count differs from the retained capture length')
+    return validated
+
+
+def _capture_contains_qualified_contact_snapshot(
+    capture: Mapping[str, Any], qualifying_stamp_ns: int
+) -> None:
+    """Fail closed unless the collector retained the exact authoritative snapshot."""
+    streams = _require_mapping(capture.get('streams'), 'capture.streams')
+    contact_stream = _require_mapping(streams.get('contacts'), 'capture.streams.contacts')
+    items = contact_stream.get('items')
+    if not isinstance(items, list) or not items:
+        raise EvidenceError('capture contact stream is empty')
+    previous_stamp: int | None = None
+    previous_pair_set: frozenset[tuple[str, str]] | None = None
+    qualifying_count = 0
+    for index, raw_item in enumerate(items):
+        item = _require_mapping(raw_item, f'capture.contacts.items[{index}]')
+        stamp = _require_int(item.get('stamp_ns'), f'capture.contacts.items[{index}].stamp_ns')
+        if stamp <= 0:
+            raise EvidenceError('capture contact snapshot stamp must be positive')
+        delivery_clock_stamp_ns = _require_int(
+            item.get('delivery_clock_stamp_ns'),
+            f'capture.contacts.items[{index}].delivery_clock_stamp_ns',
+            minimum=0,
+        )
+        delivery_clock_offset_ns = _require_int(
+            item.get('delivery_clock_offset_ns'),
+            f'capture.contacts.items[{index}].delivery_clock_offset_ns',
+        )
+        if (
+            delivery_clock_offset_ns != delivery_clock_stamp_ns - stamp
+            or not -CONTACT_MAX_CLOCK_LAG_NS <= delivery_clock_offset_ns <= CONTACT_MAX_CLOCK_LAG_NS
+        ):
+            raise EvidenceError('capture contact snapshot delivery /clock bracket is invalid')
+        if item.get('frame_id') != '':
+            raise EvidenceError('capture public contact snapshot frame_id must be empty')
+        contacts = item.get('contacts')
+        if not isinstance(contacts, list) or not 1 <= len(contacts) <= 16:
+            raise EvidenceError('capture contact snapshot must contain 1 to 16 records')
+        pairs: set[tuple[str, str]] = set()
+        for contact_index, raw_contact in enumerate(contacts):
+            contact = _require_mapping(
+                raw_contact,
+                f'capture.contacts.items[{index}].contacts[{contact_index}]',
+            )
+            first = require_bounded_string(
+                contact.get('collision1'),
+                f'capture.contacts.items[{index}].contacts[{contact_index}].collision1',
+            )
+            second = require_bounded_string(
+                contact.get('collision2'),
+                f'capture.contacts.items[{index}].contacts[{contact_index}].collision2',
+            )
+            if any(
+                len(name.split('::')) < 3 or any(not segment for segment in name.split('::'))
+                for name in (first, second)
+            ):
+                raise EvidenceError('capture contact snapshot contains a malformed scoped name')
+            pairs.add(tuple(sorted((first, second))))
+        pair_set = frozenset(pairs)
+        if previous_stamp is not None:
+            delta_ns = stamp - previous_stamp
+            if delta_ns <= 0:
+                raise EvidenceError('capture contact snapshot stamps are not strictly increasing')
+            if delta_ns > CONTACT_MAX_PUBLIC_GAP_NS:
+                raise EvidenceError('capture contact snapshot source gap exceeded 220 ms')
+            if pair_set == previous_pair_set and delta_ns < CONTACT_HEARTBEAT_NS:
+                raise EvidenceError(
+                    'capture unchanged contact pair set repeated before the 200 ms heartbeat'
+                )
+        if stamp == qualifying_stamp_ns:
+            qualifying_count += 1
+        previous_stamp = stamp
+        previous_pair_set = pair_set
+    if qualifying_count != 1:
+        raise EvidenceError(
+            'collector did not retain exactly one qualifying terminal contact snapshot'
+        )
+
+
+def validate_contact_drain_evidence(
+    evidence: Mapping[str, Any],
+    *,
+    terminal_action_stamp_ns: int,
+    capture: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the sidecar-protected drain bracket and collector retention."""
+    if set(evidence) != CONTACT_DRAIN_FIELDS:
+        raise EvidenceError('contact drain evidence fields do not match schema version 3')
+    if evidence.get('schema_version') != 3 or evidence.get('producer') != (
+        'robotest_phase3/contact_drain_observer'
+    ):
+        raise EvidenceError('contact drain producer/schema is invalid')
+    if evidence.get('public_topic') != CONTACT_PUBLIC_TOPIC:
+        raise EvidenceError('contact drain public topic differs from the frozen contract')
+    if evidence.get('gate_node_present') is not True or evidence.get('public_publisher_nodes') != [
+        CONTACT_GATE_NODE
+    ]:
+        raise EvidenceError('contact stream gate survival evidence is invalid')
+    terminal = _require_int(
+        evidence.get('terminal_action_stamp_ns'),
+        'contact_drain.terminal_action_stamp_ns',
+        minimum=1,
+    )
+    if terminal != terminal_action_stamp_ns:
+        raise EvidenceError('contact drain terminal stamp does not match the mission')
+    target = _require_int(evidence.get('target_stamp_ns'), 'contact_drain.target_stamp_ns')
+    if target != terminal + CONTACT_DRAIN_NS:
+        raise EvidenceError('contact drain target is not terminal + 250 ms')
+    qualifying = _require_int(
+        evidence.get('qualifying_contact_snapshot_stamp_ns'),
+        'contact_drain.qualifying_contact_snapshot_stamp_ns',
+        minimum=1,
+    )
+    if qualifying <= target:
+        raise EvidenceError('qualifying contact snapshot is not strictly beyond the drain target')
+    first_contact = _require_int(
+        evidence.get('first_contact_stamp_ns'), 'contact_drain.first_contact_stamp_ns', minimum=1
+    )
+    latest_contact = _require_int(
+        evidence.get('latest_contact_stamp_ns'),
+        'contact_drain.latest_contact_stamp_ns',
+        minimum=1,
+    )
+    if not first_contact <= qualifying <= latest_contact:
+        raise EvidenceError('qualifying contact snapshot is outside the observed contact span')
+    if (
+        _require_int(
+            evidence.get('contact_message_count'),
+            'contact_drain.contact_message_count',
+        )
+        < 1
+    ):
+        raise EvidenceError('contact drain observed no public snapshots')
+    minimum_record_count = _require_int(
+        evidence.get('minimum_contact_record_count'),
+        'contact_drain.minimum_contact_record_count',
+        minimum=1,
+    )
+    maximum_record_count = _require_int(
+        evidence.get('maximum_contact_record_count'),
+        'contact_drain.maximum_contact_record_count',
+        minimum=1,
+    )
+    if maximum_record_count > 16 or minimum_record_count > maximum_record_count:
+        raise EvidenceError('contact drain record-count bounds are invalid')
+    if (
+        _require_int(
+            evidence.get('contact_record_count_violation_count'),
+            'contact_drain.contact_record_count_violation_count',
+        )
+        != 0
+    ):
+        raise EvidenceError('contact drain observed a snapshot outside the 1 to 16 record bound')
+    if (
+        _require_int(
+            evidence.get('contact_stamp_regression_count'),
+            'contact_drain.contact_stamp_regression_count',
+        )
+        != 0
+        or _require_int(
+            evidence.get('contact_stamp_duplicate_count'),
+            'contact_drain.contact_stamp_duplicate_count',
+        )
+        != 0
+    ):
+        raise EvidenceError('contact drain public snapshot stamps were not strictly increasing')
+    maximum_gap = _require_int(
+        evidence.get('maximum_contact_source_gap_ns'),
+        'contact_drain.maximum_contact_source_gap_ns',
+        minimum=0,
+    )
+    if maximum_gap > CONTACT_MAX_PUBLIC_GAP_NS:
+        raise EvidenceError('contact drain public source gap exceeded 220 ms')
+    minimum_same_pair_interval = evidence.get('minimum_same_pair_set_interval_ns')
+    if (
+        minimum_same_pair_interval is not None
+        and _require_int(
+            minimum_same_pair_interval,
+            'contact_drain.minimum_same_pair_set_interval_ns',
+            minimum=CONTACT_HEARTBEAT_NS,
+        )
+        < CONTACT_HEARTBEAT_NS
+    ):
+        raise EvidenceError('contact drain heartbeat interval is below 200 ms')
+    if (
+        _require_int(
+            evidence.get('same_pair_set_interval_violation_count'),
+            'contact_drain.same_pair_set_interval_violation_count',
+        )
+        != 0
+    ):
+        raise EvidenceError('contact drain observed an early unchanged-pair heartbeat')
+    limits = _require_mapping(evidence.get('limits'), 'contact_drain.limits')
+    if dict(limits) != {
+        'heartbeat_period_ns': CONTACT_HEARTBEAT_NS,
+        'max_clock_lag_ns': CONTACT_MAX_CLOCK_LAG_NS,
+        'max_public_gap_ns': CONTACT_MAX_PUBLIC_GAP_NS,
+        'release_gap_ns': CONTACT_DRAIN_NS,
+    }:
+        raise EvidenceError('contact drain limits differ from the frozen contract')
+    latest_clock = _require_int(
+        evidence.get('clock_latest_stamp_ns'), 'contact_drain.clock_latest_stamp_ns'
+    )
+    _require_int(evidence.get('clock_first_stamp_ns'), 'contact_drain.clock_first_stamp_ns')
+    if _require_int(evidence.get('clock_message_count'), 'contact_drain.clock_message_count') < 1:
+        raise EvidenceError('contact drain observed no clock samples')
+    if (
+        _require_int(evidence.get('clock_regression_count'), 'contact_drain.clock_regression_count')
+        != 0
+    ):
+        raise EvidenceError('contact drain clock regressed')
+    lag = _require_int(
+        evidence.get('clock_minus_qualifying_contact_ns'),
+        'contact_drain.clock_minus_qualifying_contact_ns',
+    )
+    if (
+        latest_clock < qualifying
+        or lag != latest_clock - qualifying
+        or not (0 <= lag <= CONTACT_MAX_CLOCK_LAG_NS)
+    ):
+        raise EvidenceError('contact drain clock bracket is invalid')
+    _capture_contains_qualified_contact_snapshot(capture, qualifying)
+    return dict(evidence)
+
+
 def compose_analysis_request(
     *,
     workspace: Path,
@@ -1426,7 +2738,8 @@ def compose_analysis_request(
     capture_path: Path,
     positive_binding_path: Path,
     orchestrator_path: Path,
-    drain_completed_stamp_ns: int,
+    contact_drain_path: Path,
+    contact_progress_path: Path,
     lifecycle_snapshot_path: Path | None,
 ) -> dict[str, Any]:
     """Compose one exact Phase 3 metrics-analysis request."""
@@ -1437,9 +2750,44 @@ def compose_analysis_request(
     orchestrator = _require_mapping(load_json(orchestrator_path), 'orchestrator')
     build = _require_mapping(orchestrator.get('source_binding'), 'orchestrator.source_binding')
     manifest = _require_mapping(positive.get('coverage_manifest'), 'coverage_manifest')
+    contact_stream = _contact_stream_manifest_v3(manifest, workspace)
     benchmark_binding = _require_mapping(positive.get('benchmark_binding'), 'benchmark_binding')
     positive_result = _require_mapping(positive.get('positive_control'), 'positive_control')
     scenario_id = _require_int(plan.get('scenario_id'), 'scenario_id')
+    mission_measurements = _require_mapping(
+        mission.get('measurements'), 'mission_result.measurements'
+    )
+    terminal_action_stamp_ns = _require_int(
+        mission_measurements.get('terminal_action_stamp_ns'),
+        'mission_result.measurements.terminal_action_stamp_ns',
+        minimum=1,
+    )
+    contact_gate_binary = _require_mapping(
+        build.get('contact_gate_binary'), 'orchestrator.source_binding.contact_gate_binary'
+    )
+    contact_gate = _require_mapping(contact_stream.get('gate'), 'contact_stream.gate')
+    if contact_gate.get('source_inventory_sha256') != contact_gate_binary.get(
+        'source_inventory_sha256'
+    ):
+        raise EvidenceError('contact stream source inventory differs from trial build binding')
+    verify_json_sidecar(contact_drain_path)
+    contact_drain = validate_contact_drain_evidence(
+        _require_mapping(load_json(contact_drain_path), 'contact_drain'),
+        terminal_action_stamp_ns=terminal_action_stamp_ns,
+        capture=capture,
+    )
+    contact_progress = validate_final_contact_progress(
+        _require_mapping(load_json(contact_progress_path), 'contact_progress'),
+        capture=capture,
+        minimum_retained_stamp_ns=contact_drain['qualifying_contact_snapshot_stamp_ns'],
+    )
+    contact_drain_ack = {
+        **contact_progress,
+        'artifact_sha256': file_sha256(contact_progress_path),
+    }
+    topics = _require_mapping(contact_stream.get('topics'), 'contact_stream.topics')
+    if contact_drain['public_topic'] != topics.get('public_ros'):
+        raise EvidenceError('contact drain topic does not match the coverage manifest')
     identity = {
         'candidate_id': plan['candidate_id'],
         'cold_stack': True,
@@ -1473,9 +2821,9 @@ def compose_analysis_request(
         'collision': {
             'benchmark_binding': dict(benchmark_binding),
             'coverage_manifest': dict(manifest),
-            'drain_completed_stamp_ns': _require_int(
-                drain_completed_stamp_ns, 'drain_completed_stamp_ns', minimum=1
-            ),
+            'contact_drain': contact_drain,
+            'contact_drain_ack': contact_drain_ack,
+            'drain_completed_stamp_ns': contact_drain['qualifying_contact_snapshot_stamp_ns'],
             'positive_control': dict(positive_result),
         },
         'fault': fault,

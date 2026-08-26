@@ -21,6 +21,8 @@
       "additionalProperties": false,
       "required": [
         "benchmark_binding",
+        "contact_drain",
+        "contact_drain_ack",
         "coverage_manifest",
         "drain_completed_stamp_ns",
         "positive_control"
@@ -61,6 +63,8 @@
             "positive_control_scenario_sha256": {"$ref": "#/$defs/sha256"}
           }
         },
+        "contact_drain": {"$ref": "#/$defs/contactDrain"},
+        "contact_drain_ack": {"$ref": "#/$defs/contactDrainAck"},
         "coverage_manifest": {"type": "object"},
         "drain_completed_stamp_ns": {"type": "integer", "minimum": 0},
         "positive_control": {
@@ -262,6 +266,120 @@
       },
       "additionalProperties": false
     },
+    "contactDrain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clock_first_stamp_ns",
+        "clock_latest_stamp_ns",
+        "clock_message_count",
+        "clock_minus_qualifying_contact_ns",
+        "clock_regression_count",
+        "contact_message_count",
+        "contact_record_count_violation_count",
+        "contact_stamp_duplicate_count",
+        "contact_stamp_regression_count",
+        "first_contact_stamp_ns",
+        "gate_node_present",
+        "latest_contact_stamp_ns",
+        "limits",
+        "maximum_contact_record_count",
+        "maximum_contact_source_gap_ns",
+        "minimum_contact_record_count",
+        "minimum_same_pair_set_interval_ns",
+        "producer",
+        "public_publisher_nodes",
+        "public_topic",
+        "qualifying_contact_snapshot_stamp_ns",
+        "same_pair_set_interval_violation_count",
+        "schema_version",
+        "target_stamp_ns",
+        "terminal_action_stamp_ns"
+      ],
+      "properties": {
+        "clock_first_stamp_ns": {"type": "integer", "minimum": 0},
+        "clock_latest_stamp_ns": {"type": "integer", "minimum": 1},
+        "clock_message_count": {"type": "integer", "minimum": 1},
+        "clock_minus_qualifying_contact_ns": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 220000000
+        },
+        "clock_regression_count": {"const": 0},
+        "contact_message_count": {"type": "integer", "minimum": 1},
+        "contact_record_count_violation_count": {"const": 0},
+        "contact_stamp_duplicate_count": {"const": 0},
+        "contact_stamp_regression_count": {"const": 0},
+        "first_contact_stamp_ns": {"type": "integer", "minimum": 1},
+        "gate_node_present": {"const": true},
+        "latest_contact_stamp_ns": {"type": "integer", "minimum": 1},
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "heartbeat_period_ns",
+            "max_clock_lag_ns",
+            "max_public_gap_ns",
+            "release_gap_ns"
+          ],
+          "properties": {
+            "heartbeat_period_ns": {"const": 200000000},
+            "max_clock_lag_ns": {"const": 220000000},
+            "max_public_gap_ns": {"const": 220000000},
+            "release_gap_ns": {"const": 250000000}
+          }
+        },
+        "maximum_contact_record_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "maximum_contact_source_gap_ns": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 220000000
+        },
+        "minimum_contact_record_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "minimum_same_pair_set_interval_ns": {
+          "anyOf": [
+            {"type": "null"},
+            {"type": "integer", "minimum": 200000000}
+          ]
+        },
+        "producer": {"const": "robotest_phase3/contact_drain_observer"},
+        "public_publisher_nodes": {"const": ["/robotest/contact_stream_gate"]},
+        "public_topic": {"const": "/robotest/validation/contacts"},
+        "qualifying_contact_snapshot_stamp_ns": {"type": "integer", "minimum": 1},
+        "same_pair_set_interval_violation_count": {"const": 0},
+        "schema_version": {"const": 3},
+        "target_stamp_ns": {"type": "integer", "minimum": 1},
+        "terminal_action_stamp_ns": {"type": "integer", "minimum": 1}
+      }
+    },
+    "contactDrainAck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_sha256",
+        "latest_retained_stamp_ns",
+        "producer",
+        "public_topic",
+        "retained_message_count",
+        "schema_version"
+      ],
+      "properties": {
+        "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "latest_retained_stamp_ns": {"type": "integer", "minimum": 1},
+        "producer": {"const": "robotest_metrics/metrics_collector"},
+        "public_topic": {"const": "/robotest/validation/contacts"},
+        "retained_message_count": {"type": "integer", "minimum": 1},
+        "schema_version": {"const": 1}
+      }
+    },
     "collisionProvenance": {
       "type": "object",
       "additionalProperties": false,
@@ -331,6 +449,7 @@
           "additionalProperties": false,
           "required": [
             "collector_configuration_sha256",
+            "contact_gate_binary",
             "install_end_sha256",
             "install_start_sha256",
             "install_unchanged",
@@ -344,6 +463,58 @@
           ],
           "properties": {
             "collector_configuration_sha256": {"$ref": "#/$defs/sha256"},
+            "contact_gate_binary": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "build_embedded_source_inventory_match",
+                "build_embedded_source_inventory_sha256",
+                "build_elf_build_id",
+                "build_install_build_id_match",
+                "build_install_sha256_match",
+                "build_path",
+                "build_regular_executable",
+                "build_sha256",
+                "installed_declared_path",
+                "installed_declared_samefile",
+                "installed_embedded_source_inventory_match",
+                "installed_embedded_source_inventory_sha256",
+                "installed_elf_build_id",
+                "installed_path",
+                "installed_regular_executable",
+                "installed_sha256",
+                "package",
+                "schema_version",
+                "source_inventory_sha256"
+              ],
+              "properties": {
+                "build_embedded_source_inventory_match": {"const": true},
+                "build_embedded_source_inventory_sha256": {"$ref": "#/$defs/sha256"},
+                "build_elf_build_id": {"type": "string", "pattern": "^[0-9a-f]+$"},
+                "build_install_build_id_match": {"const": true},
+                "build_install_sha256_match": {"const": true},
+                "build_path": {"const": "build/robotest_sim/contact_stream_gate"},
+                "build_regular_executable": {"const": true},
+                "build_sha256": {"$ref": "#/$defs/sha256"},
+                "installed_declared_path": {
+                  "const": "install/robotest_sim/lib/robotest_sim/contact_stream_gate"
+                },
+                "installed_declared_samefile": {"const": true},
+                "installed_embedded_source_inventory_match": {"const": true},
+                "installed_embedded_source_inventory_sha256": {
+                  "$ref": "#/$defs/sha256"
+                },
+                "installed_elf_build_id": {"type": "string", "pattern": "^[0-9a-f]+$"},
+                "installed_path": {
+                  "const": "install/robotest_sim/lib/robotest_sim/contact_stream_gate"
+                },
+                "installed_regular_executable": {"const": true},
+                "installed_sha256": {"$ref": "#/$defs/sha256"},
+                "package": {"const": "robotest_sim"},
+                "schema_version": {"const": 1},
+                "source_inventory_sha256": {"$ref": "#/$defs/sha256"}
+              }
+            },
             "install_end_sha256": {"$ref": "#/$defs/sha256"},
             "install_start_sha256": {"$ref": "#/$defs/sha256"},
             "install_unchanged": {"type": "boolean"},

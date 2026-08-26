@@ -20,7 +20,6 @@ import math
 import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +29,10 @@ from robotest_scenarios.constants import (
     ACTOR_YAW_TOLERANCE_RAD,
     CONTROL_ROBOT_START,
     CONTROL_WALL_POSE,
+)
+from robotest_scenarios.contact_evidence import (
+    EXPECTED_CONTACT_GATE_SOURCE_PATHS,
+    EXPECTED_CONTACT_STREAM_POLICY,
 )
 from robotest_scenarios.geometry import shortest_yaw_error
 from robotest_scenarios.provenance import (
@@ -64,7 +67,7 @@ _POSITIVE_CONTROL_CRITERIA = (
     'graph_isolated',
     'hold_completed',
     'overflow_free',
-    'raw_expected_contact_observed',
+    'expected_contact_snapshot_observed',
     'release_completed',
     'release_source_spanned',
     'reverse_completed',
@@ -76,10 +79,10 @@ _POSITIVE_CONTROL_CRITERIA = (
 _POSITIVE_BUFFER_CAPACITIES = {
     'actor_state': 1_024,
     'command': 4_096,
-    'contact_records': CONTACT_RECORD_CAPACITY,
-    'contact_summaries': 8_192,
+    'contact_snapshot_records': CONTACT_RECORD_CAPACITY,
+    'contact_snapshots': 8_192,
     'ground_truth': 8_192,
-    'raw_contact_stream': CONTACT_RECORD_CAPACITY,
+    'public_contact_snapshot_stream': CONTACT_RECORD_CAPACITY,
 }
 _CONTROL_CONTACT_DEADLINE_NS = 12_000_000_000
 _CONTROL_HOLD_NS = 250_000_000
@@ -116,12 +119,13 @@ _CONTACT_RECORD_FIELDS = {
     'normalized_pair',
     'robot_collision',
     'sim_stamp_ns',
+    'snapshot_sequence',
 }
 _CONTACT_DISPOSITIONS = {
     'allowlisted_support_contact': 'support_ground_excluded',
     'robot_internal': 'robot_internal_excluded',
-    'unrelated_environment_contact': 'non_robot_pair_ignored',
 }
+_MAX_CONTACT_SNAPSHOT_GAP_NS = 220_000_000
 
 
 def _sha256(value: Any, name: str) -> str:
@@ -167,6 +171,64 @@ def _require_bounded_buffer(
     }
 
 
+def _validate_contact_graph_snapshot(value: Any, label: str) -> None:
+    if not isinstance(value, Mapping) or set(value) != {
+        'private_raw_publishers',
+        'private_raw_subscribers',
+        'public_snapshot_publishers',
+        'topics',
+    }:
+        raise MetricUnavailable(f'{label} contact graph snapshot is invalid')
+    if value.get('topics') != {
+        'private_raw_contact_topic': '/robotest/internal/raw_contacts',
+        'public_contact_snapshot_topic': '/robotest/validation/contacts',
+    }:
+        raise MetricUnavailable(f'{label} contact graph topics changed')
+    expected = {
+        'private_raw_publishers': ('/robotest/parameter_bridge', 64),
+        'private_raw_subscribers': ('/robotest/contact_stream_gate', 64),
+        'public_snapshot_publishers': ('/robotest/contact_stream_gate', 10),
+    }
+    for key, (node_fqn, expected_depth) in expected.items():
+        endpoints = value.get(key)
+        if not isinstance(endpoints, list) or len(endpoints) != 1:
+            raise MetricUnavailable(f'{label}.{key} cardinality is not exactly one')
+        endpoint = endpoints[0]
+        if not isinstance(endpoint, Mapping) or set(endpoint) != {
+            'endpoint_gid',
+            'node_fqn',
+            'qos',
+            'qos_status',
+            'topic_type',
+        }:
+            raise MetricUnavailable(f'{label}.{key} endpoint is invalid')
+        qos = endpoint.get('qos')
+        if not isinstance(qos, Mapping) or set(qos) != {
+            'depth',
+            'durability',
+            'history',
+            'reliability',
+        }:
+            raise MetricUnavailable(f'{label}.{key} QoS is invalid')
+        depth = require_int(qos.get('depth'), f'{label}.{key}.qos.depth')
+        expected_status = {
+            'depth_matches_or_unknown': depth <= 0 or depth == expected_depth,
+            'durability_volatile': qos.get('durability') == 'VOLATILE',
+            'history_keep_last_or_unknown': qos.get('history')
+            in {'KEEP_LAST', 'SYSTEM_DEFAULT', 'UNKNOWN'},
+            'reliability_reliable': qos.get('reliability') == 'RELIABLE',
+        }
+        if (
+            not isinstance(endpoint.get('endpoint_gid'), str)
+            or re.fullmatch(r'[0-9a-f]{48}', endpoint['endpoint_gid']) is None
+            or endpoint.get('node_fqn') != node_fqn
+            or endpoint.get('topic_type') != 'ros_gz_interfaces/msg/Contacts'
+            or endpoint.get('qos_status') != expected_status
+            or not all(expected_status.values())
+        ):
+            raise MetricUnavailable(f'{label}.{key} owner/type/QoS changed')
+
+
 def _reconcile_contact_records(
     records: Any,
     manifest: Mapping[str, Any],
@@ -180,18 +242,25 @@ def _reconcile_contact_records(
     previous_stamp = 0
     for index, value in enumerate(records):
         if not isinstance(value, Mapping) or set(value) != _CONTACT_RECORD_FIELDS:
-            raise MetricUnavailable(f'positive-control contact.records[{index}] is invalid')
+            raise MetricUnavailable(
+                f'positive-control contact.snapshot_records[{index}] is invalid'
+            )
         sequence = require_int(
             value.get('collector_sequence'),
-            f'positive_control.contact.records[{index}].collector_sequence',
+            f'positive_control.contact.snapshot_records[{index}].collector_sequence',
         )
         stamp = require_int(
             value.get('sim_stamp_ns'),
-            f'positive_control.contact.records[{index}].sim_stamp_ns',
+            f'positive_control.contact.snapshot_records[{index}].sim_stamp_ns',
         )
         pair = value.get('normalized_pair')
+        snapshot_sequence = require_int(
+            value.get('snapshot_sequence'),
+            f'positive_control.contact.snapshot_records[{index}].snapshot_sequence',
+        )
         if (
             sequence <= previous_sequence
+            or snapshot_sequence < 1
             or stamp <= 0
             or stamp < previous_stamp
             or not isinstance(pair, list)
@@ -227,11 +296,152 @@ def _reconcile_contact_records(
     return counted, exact, exact[0]
 
 
+def _reconcile_contact_snapshots(
+    snapshots: Any,
+    records: Sequence[Mapping[str, Any]],
+    manifest: Mapping[str, Any],
+    expected: tuple[str, str],
+) -> tuple[list[dict[str, Any]], dict[int, list[Mapping[str, Any]]]]:
+    """Validate v3 snapshot summaries and recompute presence/absence episodes."""
+    if not isinstance(snapshots, list) or not snapshots:
+        raise MetricUnavailable('positive-control authoritative contact snapshots are missing')
+    records_by_snapshot: dict[int, list[Mapping[str, Any]]] = {}
+    for record in records:
+        snapshot_sequence = require_int(
+            record.get('snapshot_sequence'), 'positive_control.snapshot_record.snapshot_sequence'
+        )
+        records_by_snapshot.setdefault(snapshot_sequence, []).append(record)
+
+    previous_stamp: int | None = None
+    previous_sequence = 0
+    active: dict[str, dict[str, Any]] = {}
+    episodes: list[dict[str, Any]] = []
+    seen_summary_sequences: set[int] = set()
+    summary_fields = {
+        'classified_count',
+        'collector_sequence',
+        'counted_snapshot_records',
+        'delivery_clock_offset_ns',
+        'delivery_clock_stamp_ns',
+        'exact_pair_count',
+        'sim_stamp_ns',
+        'snapshot_record_count',
+    }
+    for index, summary in enumerate(snapshots):
+        if not isinstance(summary, Mapping) or set(summary) != summary_fields:
+            raise MetricUnavailable(f'positive-control contact.snapshots[{index}] is invalid')
+        sequence = require_int(
+            summary.get('collector_sequence'),
+            f'positive_control.contact.snapshots[{index}].collector_sequence',
+        )
+        stamp = require_int(
+            summary.get('sim_stamp_ns'),
+            f'positive_control.contact.snapshots[{index}].sim_stamp_ns',
+        )
+        delivery_clock = require_int(
+            summary.get('delivery_clock_stamp_ns'),
+            f'positive_control.contact.snapshots[{index}].delivery_clock_stamp_ns',
+        )
+        delivery_offset = require_int(
+            summary.get('delivery_clock_offset_ns'),
+            f'positive_control.contact.snapshots[{index}].delivery_clock_offset_ns',
+        )
+        if (
+            sequence <= previous_sequence
+            or stamp <= 0
+            or (
+                previous_stamp is not None and stamp - previous_stamp > _MAX_CONTACT_SNAPSHOT_GAP_NS
+            )
+            or (previous_stamp is not None and stamp <= previous_stamp)
+            or delivery_clock - stamp != delivery_offset
+            or abs(delivery_offset) > _MAX_CONTACT_SNAPSHOT_GAP_NS
+        ):
+            raise MetricUnavailable(
+                'positive-control contact snapshot ordering/liveness is invalid'
+            )
+        previous_sequence = sequence
+        previous_stamp = stamp
+        seen_summary_sequences.add(sequence)
+        snapshot_records = records_by_snapshot.get(sequence, [])
+        if any(
+            record.get('sim_stamp_ns') != stamp
+            or require_int(record.get('collector_sequence'), 'snapshot record sequence') <= sequence
+            for record in snapshot_records
+        ):
+            raise MetricUnavailable('positive-control snapshot record linkage is invalid')
+        counted_records = [
+            record for record in snapshot_records if record.get('disposition') == 'counted'
+        ]
+        exact_records = [
+            record
+            for record in counted_records
+            if tuple(record.get('normalized_pair', ())) == expected
+        ]
+        expected_counted_summary = [
+            {
+                'counterpart_model': record['counterpart_model'],
+                'normalized_pair': record['normalized_pair'],
+                'record_sequence': record['collector_sequence'],
+                'snapshot_sequence': sequence,
+            }
+            for record in counted_records
+        ]
+        if (
+            not 1 <= len(snapshot_records) <= 16
+            or require_int(summary.get('snapshot_record_count'), 'snapshot_record_count')
+            != len(snapshot_records)
+            or require_int(summary.get('classified_count'), 'classified_count')
+            != len(counted_records)
+            or require_int(summary.get('exact_pair_count'), 'exact_pair_count')
+            != len(exact_records)
+            or summary.get('counted_snapshot_records') != expected_counted_summary
+        ):
+            raise MetricUnavailable('positive-control contact snapshot summary does not reconcile')
+
+        present: dict[str, list[Mapping[str, Any]]] = {}
+        for record in counted_records:
+            present.setdefault(str(record['counterpart_model']), []).append(record)
+        for counterpart in list(active):
+            if counterpart in present:
+                continue
+            episode = active.pop(counterpart)
+            episode['end_stamp_ns'] = stamp
+            episodes.append(episode)
+        for counterpart, present_records in present.items():
+            episode = active.get(counterpart)
+            if episode is None:
+                episode = {
+                    'counterpart_model': counterpart,
+                    'normalized_pairs': set(),
+                    'snapshot_record_count': 0,
+                    'start_stamp_ns': stamp,
+                }
+                active[counterpart] = episode
+            episode['normalized_pairs'].update(
+                tuple(record['normalized_pair']) for record in present_records
+            )
+            episode['snapshot_record_count'] += len(present_records)
+
+    if not set(records_by_snapshot).issubset(seen_summary_sequences):
+        raise MetricUnavailable('positive-control snapshot record references a missing summary')
+    if active:
+        raise MetricUnavailable('positive-control contact episode lacks an absence snapshot')
+    normalized_episodes = [
+        {
+            **episode,
+            'normalized_pairs': [list(pair) for pair in sorted(episode['normalized_pairs'])],
+        }
+        for episode in episodes
+    ]
+    return normalized_episodes, records_by_snapshot
+
+
 def _validate_command_trace(
     commands: Any,
     *,
     control_started_stamp: int,
     first_contact_sequence: int,
+    qualifying_snapshot_max_record_sequence: int,
     stop_command_stamp: int,
     reverse_start_stamp: int,
     final_zero_stamp: int,
@@ -301,7 +511,7 @@ def _validate_command_trace(
         or 'REVERSE' not in phases
         or commands[0]['sim_stamp_ns'] != control_started_stamp
         or stop_command['sim_stamp_ns'] != stop_command_stamp
-        or stop_command['collector_sequence'] != first_contact_sequence + 1
+        or stop_command['collector_sequence'] != qualifying_snapshot_max_record_sequence + 1
         or next(item['sim_stamp_ns'] for item in commands if item['phase'] == 'REVERSE')
         != reverse_start_stamp
         or any(
@@ -314,6 +524,89 @@ def _validate_command_trace(
 
 
 def _collision_names(manifest: Mapping[str, Any]) -> tuple[str, set[str], set[tuple[str, str]]]:
+    if manifest.get('schema_version') != 3:
+        raise MetricUnavailable('coverage manifest must use authoritative contact schema v3')
+    contact_stream = manifest.get('contact_stream')
+    if not isinstance(contact_stream, Mapping) or contact_stream.get('schema_version') != 1:
+        raise MetricUnavailable('coverage manifest contact_stream v1 is missing')
+    topics = contact_stream.get('topics')
+    if (
+        topics
+        != {
+            'gazebo_raw': '/robotest/validation/contacts',
+            'private_raw_ros': '/robotest/internal/raw_contacts',
+            'public_ros': '/robotest/validation/contacts',
+        }
+        or manifest.get('contact_topic') != '/robotest/validation/contacts'
+    ):
+        raise MetricUnavailable('coverage manifest contact topology is not frozen v3')
+    policy = contact_stream.get('policy')
+    if policy != EXPECTED_CONTACT_STREAM_POLICY:
+        raise MetricUnavailable('coverage manifest contact snapshot policy is not frozen v3')
+    try:
+        policy_sha256 = canonical_sha256(policy)
+    except ArtifactError as exc:
+        raise MetricUnavailable('coverage contact policy is not canonicalizable') from exc
+    if contact_stream.get('policy_sha256') != policy_sha256:
+        raise MetricUnavailable('coverage contact policy hash mismatch')
+    if contact_stream.get('qos') != {
+        'private_raw_ros': {
+            'depth': 64,
+            'durability': 'VOLATILE',
+            'history': 'KEEP_LAST',
+            'reliability': 'RELIABLE',
+        },
+        'public_ros': {
+            'depth': 10,
+            'durability': 'VOLATILE',
+            'history': 'KEEP_LAST',
+            'reliability': 'RELIABLE',
+        },
+    }:
+        raise MetricUnavailable('coverage contact QoS is not frozen v3')
+    gate = contact_stream.get('gate')
+    if (
+        not isinstance(gate, Mapping)
+        or set(gate)
+        != {
+            'executable',
+            'launch_sha256',
+            'package',
+            'source_inventory',
+            'source_inventory_sha256',
+        }
+        or gate.get('package') != 'robotest_sim'
+        or gate.get('executable') != 'contact_stream_gate'
+    ):
+        raise MetricUnavailable('coverage contact gate ownership is invalid')
+    _sha256(gate.get('launch_sha256'), 'coverage.contact_stream.gate.launch_sha256')
+    inventory_sha = _sha256(
+        gate.get('source_inventory_sha256'),
+        'coverage.contact_stream.gate.source_inventory_sha256',
+    )
+    inventory = gate.get('source_inventory')
+    if (
+        not isinstance(inventory, Mapping)
+        or set(inventory) != {'schema_version', 'sources'}
+        or inventory.get('schema_version') != 1
+        or not isinstance(inventory.get('sources'), list)
+        or [item.get('path') for item in inventory['sources'] if isinstance(item, Mapping)]
+        != list(EXPECTED_CONTACT_GATE_SOURCE_PATHS)
+        or any(
+            not isinstance(item, Mapping)
+            or set(item) != {'path', 'sha256'}
+            or not isinstance(item.get('sha256'), str)
+            or _SHA256.fullmatch(item['sha256']) is None
+            for item in inventory.get('sources', [])
+        )
+    ):
+        raise MetricUnavailable('coverage contact gate source inventory is invalid')
+    try:
+        calculated_inventory_sha = canonical_sha256(inventory)
+    except ArtifactError as exc:
+        raise MetricUnavailable('coverage contact gate source inventory is not canonical') from exc
+    if inventory_sha != calculated_inventory_sha:
+        raise MetricUnavailable('coverage contact gate source inventory hash mismatch')
     robot_model = manifest.get('robot_model')
     if not isinstance(robot_model, str) or not robot_model:
         raise MetricUnavailable('coverage manifest robot_model is missing')
@@ -686,25 +979,28 @@ def _positive_control_evidence(
     if classification.get('counted') is not True:
         raise MetricUnavailable('positive-control expected pair is excluded by classification')
     counted_records, exact_records, first_exact_record = _reconcile_contact_records(
-        contact.get('records'), manifest, expected
+        contact.get('snapshot_records'), manifest, expected
+    )
+    computed_episodes, _records_by_snapshot = _reconcile_contact_snapshots(
+        contact.get('snapshots'), contact['snapshot_records'], manifest, expected
     )
     exact_count = require_int(
-        contact.get('exact_pair_raw_count'),
-        'positive_control.exact_pair_raw_count',
+        contact.get('exact_pair_snapshot_record_count'),
+        'positive_control.exact_pair_snapshot_record_count',
     )
-    raw_count = require_int(
-        contact.get('raw_contact_record_count'),
-        'positive_control.raw_contact_record_count',
+    snapshot_record_count = require_int(
+        contact.get('snapshot_contact_record_count'),
+        'positive_control.snapshot_contact_record_count',
     )
     classified_count = require_int(
         contact.get('classified_record_count'),
         'positive_control.classified_record_count',
     )
     if (
-        raw_count != len(contact['records'])
+        snapshot_record_count != len(contact['snapshot_records'])
         or classified_count != len(counted_records)
         or exact_count != len(exact_records)
-        or not 0 < exact_count <= classified_count <= raw_count
+        or not 0 < exact_count <= classified_count <= snapshot_record_count
     ):
         raise MetricUnavailable('positive-control contact record counters do not reconcile')
     counterpart_models = {record['counterpart_model'] for record in counted_records}
@@ -723,34 +1019,60 @@ def _positive_control_evidence(
     ):
         raise MetricUnavailable('positive-control counterpart tracker did not close exactly once')
     first_contact = contact.get('first_qualifying_contact')
-    first_observed_stamp = (
-        first_contact.get('observed_sim_stamp_ns') if isinstance(first_contact, Mapping) else None
-    )
     if (
         not isinstance(first_contact, Mapping)
         or set(first_contact)
         != {
-            'clock_delivery_offset_ns',
+            'callback_clock_offset_ns',
+            'callback_clock_stamp_ns',
             'collector_sequence',
             'normalized_pair',
-            'observed_sim_stamp_ns',
             'sim_stamp_ns',
+            'stop_latency_clock_stamp_ns',
+            'stop_latency_upper_bound_ns',
         }
         or first_contact.get('collector_sequence') != first_exact_record['collector_sequence']
         or first_contact.get('normalized_pair') != list(expected)
         or first_contact.get('sim_stamp_ns') != first_exact_record['sim_stamp_ns']
         or require_int(
-            first_observed_stamp,
-            'positive_control.first_qualifying_contact.observed_sim_stamp_ns',
+            first_contact.get('callback_clock_stamp_ns'),
+            'positive_control.first_qualifying_contact.callback_clock_stamp_ns',
+        )
+        - first_exact_record['sim_stamp_ns']
+        != require_int(
+            first_contact.get('callback_clock_offset_ns'),
+            'positive_control.first_qualifying_contact.callback_clock_offset_ns',
+        )
+        or require_int(
+            first_contact.get('stop_latency_clock_stamp_ns'),
+            'positive_control.first_qualifying_contact.stop_latency_clock_stamp_ns',
         )
         < first_exact_record['sim_stamp_ns']
-        or require_int(
-            first_contact.get('clock_delivery_offset_ns'),
-            'positive_control.first_qualifying_contact.clock_delivery_offset_ns',
-        )
-        != first_observed_stamp - first_exact_record['sim_stamp_ns']
     ):
         raise MetricUnavailable('positive-control first qualifying contact is missing')
+    callback_clock_stamp = require_int(
+        first_contact.get('callback_clock_stamp_ns'),
+        'positive_control.first_qualifying_contact.callback_clock_stamp_ns',
+    )
+    callback_clock_offset = require_int(
+        first_contact.get('callback_clock_offset_ns'),
+        'positive_control.first_qualifying_contact.callback_clock_offset_ns',
+    )
+    stop_latency_clock_stamp = require_int(
+        first_contact.get('stop_latency_clock_stamp_ns'),
+        'positive_control.first_qualifying_contact.stop_latency_clock_stamp_ns',
+    )
+    stop_latency_upper_bound = require_int(
+        first_contact.get('stop_latency_upper_bound_ns'),
+        'positive_control.first_qualifying_contact.stop_latency_upper_bound_ns',
+    )
+    if (
+        callback_clock_stamp - first_exact_record['sim_stamp_ns'] != callback_clock_offset
+        or abs(callback_clock_offset) > _MAX_CONTACT_SNAPSHOT_GAP_NS
+        or stop_latency_clock_stamp - first_exact_record['sim_stamp_ns'] != stop_latency_upper_bound
+        or not 0 <= stop_latency_upper_bound <= _CONTROL_STOP_DEADLINE_NS
+    ):
+        raise MetricUnavailable('positive-control contact delivery/stop bracket is invalid')
     first_contact_sequence = require_int(
         first_contact.get('collector_sequence'),
         'positive_control.first_qualifying_contact.collector_sequence',
@@ -762,22 +1084,9 @@ def _positive_control_evidence(
     episodes = contact.get('episodes')
     if not isinstance(episodes, list) or len(episodes) != 1:
         raise MetricUnavailable('positive-control must contain exactly one contact episode')
-    episode = episodes[0]
-    counted_stamps = [record['sim_stamp_ns'] for record in counted_records]
-    if any(
-        later - earlier >= CONTACT_RELEASE_GAP_NS for earlier, later in pairwise(counted_stamps)
-    ):
-        raise MetricUnavailable('positive-control counted records imply multiple episodes')
-    normalized_pairs = sorted({tuple(record['normalized_pair']) for record in counted_records})
-    expected_episode = {
-        'counterpart_model': classification['counterpart_model'],
-        'end_stamp_ns': max(counted_stamps) + CONTACT_RELEASE_GAP_NS,
-        'normalized_pairs': [list(pair) for pair in normalized_pairs],
-        'sample_count': len(counted_records),
-        'start_stamp_ns': min(counted_stamps),
-    }
-    if not isinstance(episode, Mapping) or dict(episode) != expected_episode:
+    if computed_episodes != episodes:
         raise MetricUnavailable('positive-control episode boundaries do not reconcile')
+    expected_episode = computed_episodes[0]
     timeline = control.get('timeline')
     if not isinstance(timeline, Mapping):
         raise MetricUnavailable('positive-control timeline is missing')
@@ -802,36 +1111,129 @@ def _positive_control_evidence(
         'positive_control.timeline.release_complete_stamp_ns',
     )
     stop_latency = require_int(timeline.get('stop_latency_ns'), 'positive_control.stop_latency_ns')
+    timeline_stop_latency_clock = require_int(
+        timeline.get('stop_latency_clock_stamp_ns'),
+        'positive_control.stop_latency_clock_stamp_ns',
+    )
     release_start_count = require_int(
-        timeline.get('release_contact_message_start_count'),
-        'positive_control.release_contact_message_start_count',
+        timeline.get('release_contact_snapshot_start_count'),
+        'positive_control.release_contact_snapshot_start_count',
     )
     release_end_count = require_int(
-        timeline.get('release_contact_message_end_count'),
-        'positive_control.release_contact_message_end_count',
+        timeline.get('release_contact_snapshot_end_count'),
+        'positive_control.release_contact_snapshot_end_count',
+    )
+    release_observed_clock_stamp = require_int(
+        timeline.get('release_observed_clock_stamp_ns'),
+        'positive_control.release_observed_clock_stamp_ns',
+    )
+    release_qualified_snapshot_stamp = require_int(
+        timeline.get('release_qualified_snapshot_stamp_ns'),
+        'positive_control.release_qualified_snapshot_stamp_ns',
     )
     release_required_stamp = require_int(
         timeline.get('release_required_through_stamp_ns'),
         'positive_control.release_required_through_stamp_ns',
     )
-    expected_release_stamp = max(
-        final_zero_stamp + CONTACT_RELEASE_GAP_NS,
-        expected_episode['end_stamp_ns'],
+    expected_release_stamp = final_zero_stamp + CONTACT_RELEASE_GAP_NS
+    release_snapshot = contact.get('release_snapshot')
+    contact_clock_bracket = contact.get('contact_clock_bracket')
+    if (
+        not isinstance(release_snapshot, Mapping)
+        or set(release_snapshot) != {'collector_sequence', 'sim_stamp_ns'}
+        or not isinstance(contact_clock_bracket, Mapping)
+        or set(contact_clock_bracket)
+        != {'clock_stamp_ns', 'lag_ns', 'limit_ns', 'snapshot_stamp_ns'}
+    ):
+        raise MetricUnavailable('positive-control release snapshot/bracket is missing')
+    release_snapshot_sequence = require_int(
+        release_snapshot.get('collector_sequence'),
+        'positive_control.release_snapshot.collector_sequence',
     )
+    release_snapshot_stamp = require_int(
+        release_snapshot.get('sim_stamp_ns'),
+        'positive_control.release_snapshot.sim_stamp_ns',
+    )
+    release_summary = next(
+        (
+            summary
+            for summary in contact['snapshots']
+            if summary.get('collector_sequence') == release_snapshot_sequence
+        ),
+        None,
+    )
+    bracket_clock = require_int(
+        contact_clock_bracket.get('clock_stamp_ns'),
+        'positive_control.contact_clock_bracket.clock_stamp_ns',
+    )
+    bracket_lag = require_int(
+        contact_clock_bracket.get('lag_ns'),
+        'positive_control.contact_clock_bracket.lag_ns',
+    )
+    bracket_limit = require_int(
+        contact_clock_bracket.get('limit_ns'),
+        'positive_control.contact_clock_bracket.limit_ns',
+    )
+    bracket_snapshot = require_int(
+        contact_clock_bracket.get('snapshot_stamp_ns'),
+        'positive_control.contact_clock_bracket.snapshot_stamp_ns',
+    )
+    qualifying_snapshot_sequence = require_int(
+        first_exact_record.get('snapshot_sequence'),
+        'positive_control.first_qualifying_contact.snapshot_sequence',
+    )
+    qualifying_snapshot_records = [
+        record
+        for record in contact['snapshot_records']
+        if record.get('snapshot_sequence') == qualifying_snapshot_sequence
+    ]
+    if not qualifying_snapshot_records:
+        raise MetricUnavailable('positive-control qualifying snapshot records are missing')
+    qualifying_snapshot_max_record_sequence = max(
+        require_int(record.get('collector_sequence'), 'qualifying snapshot record sequence')
+        for record in qualifying_snapshot_records
+    )
+    absence_span_summaries = [
+        summary
+        for summary in contact['snapshots']
+        if expected_episode['end_stamp_ns']
+        <= require_int(summary.get('sim_stamp_ns'), 'absence snapshot stamp')
+        <= release_snapshot_stamp
+    ]
     if (
         control_started_stamp <= 0
         or wall_stamp > control_started_stamp
         or not control_started_stamp
         <= first_contact_stamp
         <= control_started_stamp + _CONTROL_CONTACT_DEADLINE_NS
-        or first_observed_stamp != stop_command_stamp
-        or stop_latency != max(0, stop_command_stamp - first_contact_stamp)
-        or stop_latency > _CONTROL_STOP_DEADLINE_NS
-        or hold_complete_stamp - stop_command_stamp < _CONTROL_HOLD_NS
+        or callback_clock_stamp != stop_command_stamp
+        or stop_latency != stop_latency_upper_bound
+        or timeline_stop_latency_clock != stop_latency_clock_stamp
+        or hold_complete_stamp - timeline_stop_latency_clock < _CONTROL_HOLD_NS
         or reverse_start_stamp != hold_complete_stamp
         or final_zero_stamp - reverse_start_stamp < _CONTROL_REVERSE_NS
         or release_required_stamp != expected_release_stamp
-        or release_complete_stamp < release_required_stamp
+        or release_snapshot_stamp <= release_required_stamp
+        or release_complete_stamp != release_snapshot_stamp
+        or release_qualified_snapshot_stamp != release_snapshot_stamp
+        or not first_contact_stamp < expected_episode['end_stamp_ns'] <= release_snapshot_stamp
+        or not absence_span_summaries
+        or any(
+            item.get('counterpart_model') == classification['counterpart_model']
+            for summary in absence_span_summaries
+            for item in summary.get('counted_snapshot_records', [])
+        )
+        or release_summary is None
+        or release_summary.get('sim_stamp_ns') != release_snapshot_stamp
+        or any(
+            item.get('counterpart_model') == classification['counterpart_model']
+            for item in release_summary.get('counted_snapshot_records', [])
+        )
+        or release_observed_clock_stamp != bracket_clock
+        or bracket_snapshot != release_snapshot_stamp
+        or bracket_lag != bracket_clock - bracket_snapshot
+        or bracket_limit != _MAX_CONTACT_SNAPSHOT_GAP_NS
+        or not 0 <= bracket_lag <= bracket_limit
         or release_start_count < 1
         or release_end_count <= release_start_count
     ):
@@ -841,6 +1243,7 @@ def _positive_control_evidence(
         commands,
         control_started_stamp=control_started_stamp,
         first_contact_sequence=first_contact_sequence,
+        qualifying_snapshot_max_record_sequence=qualifying_snapshot_max_record_sequence,
         stop_command_stamp=stop_command_stamp,
         reverse_start_stamp=reverse_start_stamp,
         final_zero_stamp=final_zero_stamp,
@@ -924,14 +1327,13 @@ def _positive_control_evidence(
         wall_sequence,
         start_sequence,
         *(command['collector_sequence'] for command in commands),
-        *(record['collector_sequence'] for record in contact['records']),
+        *(record['collector_sequence'] for record in contact['snapshot_records']),
+        *(summary['collector_sequence'] for summary in contact['snapshots']),
     )
     if (
         cleanup_request_sequence <= max_pre_cleanup_sequence
-        or cleanup_request_sequence
-        < commands[-1]['collector_sequence'] + (release_end_count - release_start_count) + 1
         or cleanup_response_sequence <= cleanup_request_sequence
-        or cleanup_request_stamp != release_complete_stamp
+        or cleanup_request_stamp != release_observed_clock_stamp
         or cleanup_response_stamp < cleanup_request_stamp
         or cleanup_quiet_until != cleanup_response_stamp + ACTOR_CLEANUP_QUIET_NS
         or cleanup_latest_pose_stamp < cleanup_quiet_until
@@ -975,6 +1377,41 @@ def _positive_control_evidence(
         raise MetricUnavailable('positive-control graph/protocol counters are invalid')
     if quality.get('forbidden_nodes') != []:
         raise MetricUnavailable('positive-control forbidden navigation nodes were present')
+    topology = quality.get('contact_graph_topology')
+    if not isinstance(topology, Mapping) or set(topology) != {
+        'audit_count',
+        'first_sha256',
+        'first_snapshot',
+        'last_sha256',
+        'last_snapshot',
+    }:
+        raise MetricUnavailable('positive-control contact graph audit is missing')
+    first_graph_snapshot = topology.get('first_snapshot')
+    last_graph_snapshot = topology.get('last_snapshot')
+    _validate_contact_graph_snapshot(first_graph_snapshot, 'positive_control.first_graph')
+    _validate_contact_graph_snapshot(last_graph_snapshot, 'positive_control.last_graph')
+    try:
+        first_graph_sha = canonical_sha256(first_graph_snapshot)
+        last_graph_sha = canonical_sha256(last_graph_snapshot)
+    except ArtifactError as exc:
+        raise MetricUnavailable('positive-control contact graph snapshot is not canonical') from exc
+    if (
+        require_int(topology.get('audit_count'), 'positive_control.contact_graph.audit_count') < 2
+        or topology.get('first_sha256') != first_graph_sha
+        or topology.get('last_sha256') != last_graph_sha
+    ):
+        raise MetricUnavailable('positive-control contact graph audit hash/count is invalid')
+    endpoint_groups = (
+        'private_raw_publishers',
+        'private_raw_subscribers',
+        'public_snapshot_publishers',
+    )
+    if any(
+        first_graph_snapshot[group][0]['endpoint_gid']
+        != last_graph_snapshot[group][0]['endpoint_gid']
+        for group in endpoint_groups
+    ):
+        raise MetricUnavailable('positive-control contact graph endpoint identity changed')
     source_publishers = quality.get('source_publisher_counts')
     if not isinstance(source_publishers, Mapping) or set(source_publishers) != {
         'contacts',
@@ -995,12 +1432,13 @@ def _positive_control_evidence(
         'positive_control.source_publisher_counts.entity_pose',
     ):
         raise MetricUnavailable('positive-control cleanup/source publishers differ')
-    heartbeat = quality.get('contact_message_heartbeat')
+    heartbeat = quality.get('public_contact_snapshot_heartbeat')
     if not isinstance(heartbeat, Mapping) or set(heartbeat) != {
         'first_stamp_ns',
+        'future_delivery_count',
         'latest_stamp_ns',
         'max_gap_ns',
-        'message_count',
+        'snapshot_count',
     }:
         raise MetricUnavailable('positive-control contact heartbeat is incomplete')
     heartbeat_first = require_int(
@@ -1010,19 +1448,29 @@ def _positive_control_evidence(
         heartbeat.get('latest_stamp_ns'), 'positive_control.contact_heartbeat.latest_stamp_ns'
     )
     heartbeat_count = require_int(
-        heartbeat.get('message_count'), 'positive_control.contact_heartbeat.message_count'
+        heartbeat.get('snapshot_count'), 'positive_control.contact_heartbeat.snapshot_count'
     )
     heartbeat_gap = require_int(
         heartbeat.get('max_gap_ns'), 'positive_control.contact_heartbeat.max_gap_ns'
     )
+    heartbeat_future_count = require_int(
+        heartbeat.get('future_delivery_count'),
+        'positive_control.contact_heartbeat.future_delivery_count',
+    )
+    expected_future_count = sum(
+        summary['delivery_clock_offset_ns'] < 0 for summary in contact['snapshots']
+    )
     if (
         heartbeat_first < 0
         or heartbeat_latest < heartbeat_first
-        or heartbeat_first > min(record['sim_stamp_ns'] for record in contact['records'])
+        or heartbeat_first != contact['snapshots'][0]['sim_stamp_ns']
+        or heartbeat_latest != contact['snapshots'][-1]['sim_stamp_ns']
         or not heartbeat_first <= first_contact_stamp <= heartbeat_latest
-        or heartbeat_latest < release_required_stamp
+        or heartbeat_latest < release_snapshot_stamp
         or heartbeat_count != release_end_count
-        or heartbeat_gap < 0
+        or heartbeat_count != len(contact['snapshots'])
+        or heartbeat_future_count != expected_future_count
+        or not 0 <= heartbeat_gap <= _MAX_CONTACT_SNAPSHOT_GAP_NS
     ):
         raise MetricUnavailable('positive-control contact heartbeat does not span release')
     clock = quality.get('clock')
@@ -1044,8 +1492,8 @@ def _positive_control_evidence(
     if not isinstance(buffers, Mapping) or set(buffers) != {
         'actor_state',
         'command',
-        'contact_records',
-        'contact_summaries',
+        'contact_snapshot_records',
+        'contact_snapshots',
         'ground_truth',
     }:
         raise MetricUnavailable('positive-control bounded-buffer evidence is incomplete')
@@ -1057,17 +1505,17 @@ def _positive_control_evidence(
         )
         for name, buffer in buffers.items()
     }
-    raw_stream = _require_bounded_buffer(
-        quality.get('raw_contact_stream'),
-        'raw_contact_stream',
+    public_snapshot_stream = _require_bounded_buffer(
+        quality.get('public_contact_snapshot_stream'),
+        'public_contact_snapshot_stream',
         retain_every_accepted_item=True,
     )
     if (
         buffer_counts['command']['retained_count'] != len(commands)
-        or buffer_counts['contact_records']['retained_count'] != raw_count
-        or raw_stream['retained_count'] != raw_count
-        or raw_stream != buffer_counts['contact_records']
-        or buffer_counts['contact_summaries']['retained_count'] != heartbeat_count
+        or buffer_counts['contact_snapshot_records']['retained_count'] != snapshot_record_count
+        or public_snapshot_stream['retained_count'] != snapshot_record_count
+        or public_snapshot_stream != buffer_counts['contact_snapshot_records']
+        or buffer_counts['contact_snapshots']['retained_count'] != heartbeat_count
         or buffer_counts['ground_truth']['retained_count'] < 1
         or buffer_counts['actor_state']['retained_count'] < 1
     ):
@@ -1202,8 +1650,12 @@ def validate_collision_qualification(
 
 
 def _top_model(scoped_collision: str) -> str:
-    stripped = scoped_collision.strip('/')
-    return stripped.split('::', maxsplit=1)[0]
+    if not isinstance(scoped_collision, str):
+        raise MetricUnavailable('contact collision name must be a string')
+    segments = scoped_collision.split('::')
+    if len(segments) < 3 or any(not segment for segment in segments):
+        raise MetricUnavailable('contact collision name is not model::link::collision scoped')
+    return segments[0]
 
 
 def classify_contact_pair(
@@ -1232,12 +1684,18 @@ def _classify_contact_pair_resolved(
     """Classify against a manifest that was already validated and resolved."""
     if not isinstance(collision1, str) or not isinstance(collision2, str):
         raise MetricUnavailable('contact collision names must be strings')
+    first_model = _top_model(collision1)
+    second_model = _top_model(collision2)
+    if (first_model == robot_model and collision1 not in robot_names) or (
+        second_model == robot_model and collision2 not in robot_names
+    ):
+        raise MetricUnavailable('contact references an unknown rendered robot collision')
     first_robot = collision1 in robot_names
     second_robot = collision2 in robot_names
     if first_robot and second_robot:
         return {'counted': False, 'reason': 'robot_internal'}
     if not first_robot and not second_robot:
-        return {'counted': False, 'reason': 'unrelated_environment_contact'}
+        raise MetricUnavailable('manifest-v3 contact snapshot contains a non-robot pair')
     robot_collision = collision1 if first_robot else collision2
     counterpart_collision = collision2 if first_robot else collision1
     if (robot_collision, counterpart_collision) in support_pairs:
@@ -1253,19 +1711,6 @@ def _classify_contact_pair_resolved(
     }
 
 
-def _maximum_optional(values: Any, name: str) -> float | None:
-    if values is None:
-        return None
-    if not isinstance(values, list):
-        raise MetricUnavailable(f'{name} must be a list')
-    if not values:
-        return None
-    normalized = [require_finite(value, name) for value in values]
-    if any(value < 0.0 for value in normalized):
-        raise MetricUnavailable(f'{name} cannot contain negative depths')
-    return max(normalized)
-
-
 def analyze_collisions(
     messages: Sequence[Mapping[str, Any]],
     accepted_goal_stamp_ns: int,
@@ -1277,38 +1722,43 @@ def analyze_collisions(
     *,
     release_gap_ns: int = CONTACT_RELEASE_GAP_NS,
 ) -> dict[str, Any]:
-    """Classify and de-duplicate collision episodes through terminal drain."""
+    """Analyze authoritative v3 active-pair snapshots through the proven drain."""
     qualification = validate_collision_qualification(manifest, positive_control, benchmark_binding)
     robot_model, robot_names, support_pairs = _collision_names(manifest)
     start = require_int(accepted_goal_stamp_ns, 'accepted_goal_stamp_ns')
     terminal = require_int(terminal_action_stamp_ns, 'terminal_action_stamp_ns')
+    # Compatibility scalar: v3 freezes this as the exact retained qualifying
+    # public snapshot stamp, never a synthesized terminal+gap target.
     drain = require_int(drain_completed_stamp_ns, 'drain_completed_stamp_ns')
     if terminal <= start:
         raise MetricUnavailable('terminal action stamp must be after accepted goal stamp')
     if release_gap_ns <= 0:
         raise ValueError('release_gap_ns must be positive')
     required_drain = terminal + release_gap_ns
-    if drain < required_drain:
-        raise MetricUnavailable('contact terminal drain is incomplete')
+    if drain <= required_drain:
+        raise MetricUnavailable(
+            'contact terminal drain lacks a snapshot strictly beyond terminal + release gap'
+        )
     active: dict[str, dict[str, Any]] = {}
     events: list[dict[str, Any]] = []
     exclusions: Counter[str] = Counter()
-    pre_action_contacts = 0
-    post_terminal_contacts = 0
-    previous_order: tuple[int, int] | None = None
-    contact_record_count = 0
-    in_action_message_count = 0
+    pre_action_snapshot_records = 0
+    post_terminal_snapshot_records = 0
+    previous_sequence = 0
+    previous_stamp: int | None = None
+    maximum_public_gap_ns = 0
+    snapshot_contact_record_count = 0
+    public_snapshot_count = 0
+    in_action_snapshot_count = 0
+    drain_snapshot_observed = False
+    latest_snapshot_at_or_before_start: int | None = None
 
-    def close_stale(now_ns: int) -> None:
-        for key, event in list(active.items()):
-            if now_ns - event['last_contact_stamp_ns'] >= release_gap_ns:
-                event['end_stamp_ns'] = event['last_contact_stamp_ns'] + release_gap_ns
-                event['duration_s'] = (
-                    event['end_stamp_ns'] - event['start_stamp_ns']
-                ) / 1_000_000_000
-                event['censored_at_drain'] = False
-                events.append(event)
-                del active[key]
+    def close_absent(counterpart: str, stamp_ns: int) -> None:
+        event = active.pop(counterpart)
+        event['end_stamp_ns'] = stamp_ns
+        event['duration_s'] = (stamp_ns - event['start_stamp_ns']) / 1_000_000_000
+        event['censored_at_drain'] = False
+        events.append(event)
 
     for message_index, message in enumerate(messages):
         stamp = require_int(message.get('stamp_ns'), f'messages[{message_index}].stamp_ns')
@@ -1316,26 +1766,64 @@ def analyze_collisions(
             message.get('collector_sequence'),
             f'messages[{message_index}].collector_sequence',
         )
-        order = (stamp, sequence)
-        if previous_order is not None and order <= previous_order:
-            raise MetricUnavailable('contact messages are not in collector order')
-        previous_order = order
+        if stamp <= 0 or sequence <= previous_sequence:
+            raise MetricUnavailable('contact snapshot collector ordering is invalid')
+        if previous_stamp is not None:
+            if stamp <= previous_stamp:
+                raise MetricUnavailable(
+                    'authoritative contact snapshot stamps are not strictly increasing'
+                )
+            gap_ns = stamp - previous_stamp
+            maximum_public_gap_ns = max(maximum_public_gap_ns, gap_ns)
+            if gap_ns > _MAX_CONTACT_SNAPSHOT_GAP_NS:
+                raise MetricUnavailable('authoritative contact snapshot gap exceeded 220 ms')
+        previous_sequence = sequence
+        previous_stamp = stamp
+        if message.get('frame_id') != '':
+            raise MetricUnavailable('authoritative contact snapshot frame_id must be empty')
+        delivery_clock_stamp = require_int(
+            message.get('delivery_clock_stamp_ns'),
+            f'messages[{message_index}].delivery_clock_stamp_ns',
+        )
+        delivery_clock_offset = require_int(
+            message.get('delivery_clock_offset_ns'),
+            f'messages[{message_index}].delivery_clock_offset_ns',
+        )
+        if (
+            delivery_clock_stamp - stamp != delivery_clock_offset
+            or abs(delivery_clock_offset) > _MAX_CONTACT_SNAPSHOT_GAP_NS
+        ):
+            raise MetricUnavailable(
+                'authoritative contact snapshot delivery clock bracket is invalid'
+            )
+        contacts = message.get('contacts')
+        if not isinstance(contacts, list) or not 1 <= len(contacts) <= 16:
+            raise MetricUnavailable(
+                'authoritative contact snapshot must contain between one and 16 records'
+            )
+        public_snapshot_count += 1
+        snapshot_contact_record_count += len(contacts)
+        if snapshot_contact_record_count > CONTACT_RECORD_CAPACITY:
+            raise MetricUnavailable('normalized contact snapshot record capacity exceeded')
+        if stamp == drain:
+            drain_snapshot_observed = True
+        if stamp <= start:
+            latest_snapshot_at_or_before_start = stamp
         if stamp > drain:
             continue
         if start <= stamp <= terminal:
-            in_action_message_count += 1
-        close_stale(stamp)
-        contacts = message.get('contacts')
-        if not isinstance(contacts, list):
-            raise MetricUnavailable('contact message contacts must be a list')
-        contact_record_count += len(contacts)
-        if contact_record_count > CONTACT_RECORD_CAPACITY:
-            raise MetricUnavailable('normalized contact record capacity exceeded')
+            in_action_snapshot_count += 1
         grouped: dict[str, dict[str, Any]] = {}
         for contact_index, contact in enumerate(contacts):
-            if not isinstance(contact, Mapping):
+            if not isinstance(contact, Mapping) or set(contact) != {
+                'collision1',
+                'collision2',
+                'maximum_normal_force_n',
+                'maximum_penetration_depth_m',
+            }:
                 raise MetricUnavailable(
-                    f'messages[{message_index}].contacts[{contact_index}] must be an object'
+                    f'messages[{message_index}].contacts[{contact_index}] is not a v3 '
+                    'snapshot record'
                 )
             classification = _classify_contact_pair_resolved(
                 contact.get('collision1'),
@@ -1351,8 +1839,8 @@ def analyze_collisions(
             group = grouped.setdefault(
                 counterpart,
                 {
-                    'maximum_normal_force_n': None,
-                    'maximum_penetration_depth_m': None,
+                    'maximum_delivered_snapshot_normal_force_n': None,
+                    'maximum_delivered_snapshot_penetration_depth_m': None,
                     'pairs': set(),
                     'record_count': 0,
                 },
@@ -1364,64 +1852,78 @@ def analyze_collisions(
                 )
             )
             group['record_count'] += 1
-            if 'maximum_penetration_depth_m' in contact:
-                depth_value = contact.get('maximum_penetration_depth_m')
-                depth = (
-                    None
-                    if depth_value is None
-                    else require_finite(depth_value, 'contact.maximum_penetration_depth_m')
-                )
-                if depth is not None and depth < 0.0:
-                    raise MetricUnavailable('contact depth cannot be negative')
-            else:
-                depth = _maximum_optional(contact.get('depths_m'), 'contact.depths_m')
+            depth_value = contact.get('maximum_penetration_depth_m')
+            depth = (
+                None
+                if depth_value is None
+                else require_finite(depth_value, 'contact.maximum_penetration_depth_m')
+            )
+            if depth is not None and depth < 0.0:
+                raise MetricUnavailable('contact depth cannot be negative')
             force = contact.get('maximum_normal_force_n')
             if force is not None:
                 force = require_finite(force, 'contact.maximum_normal_force_n')
                 if force < 0.0:
                     raise MetricUnavailable('contact force cannot be negative')
             if depth is not None:
-                group['maximum_penetration_depth_m'] = max(
+                group['maximum_delivered_snapshot_penetration_depth_m'] = max(
                     depth,
-                    group['maximum_penetration_depth_m'] or 0.0,
+                    group['maximum_delivered_snapshot_penetration_depth_m'] or 0.0,
                 )
             if force is not None:
-                group['maximum_normal_force_n'] = max(
+                group['maximum_delivered_snapshot_normal_force_n'] = max(
                     force,
-                    group['maximum_normal_force_n'] or 0.0,
+                    group['maximum_delivered_snapshot_normal_force_n'] or 0.0,
                 )
+        for counterpart in sorted(set(active) - set(grouped)):
+            close_absent(counterpart, stamp)
         if stamp < start:
-            pre_action_contacts += sum(group['record_count'] for group in grouped.values())
+            pre_action_snapshot_records += sum(group['record_count'] for group in grouped.values())
         for counterpart, group in grouped.items():
             if stamp > terminal and counterpart not in active:
-                post_terminal_contacts += group['record_count']
+                post_terminal_snapshot_records += group['record_count']
                 continue
             event = active.get(counterpart)
             if event is None:
                 event = {
                     'counterpart_model': counterpart,
-                    'last_contact_stamp_ns': stamp,
-                    'maximum_normal_force_n': group['maximum_normal_force_n'],
-                    'maximum_penetration_depth_m': group['maximum_penetration_depth_m'],
+                    'last_snapshot_stamp_ns': stamp,
+                    'maximum_delivered_snapshot_normal_force_n': group[
+                        'maximum_delivered_snapshot_normal_force_n'
+                    ],
+                    'maximum_delivered_snapshot_penetration_depth_m': group[
+                        'maximum_delivered_snapshot_penetration_depth_m'
+                    ],
                     'pairs': set(group['pairs']),
-                    'post_terminal_sample_count': 0,
-                    'sample_count': group['record_count'],
+                    'post_terminal_sampled_snapshot_record_count': 0,
+                    'sampled_snapshot_record_count': group['record_count'],
                     'start_stamp_ns': stamp,
                 }
                 active[counterpart] = event
             else:
-                event['last_contact_stamp_ns'] = stamp
+                event['last_snapshot_stamp_ns'] = stamp
                 event['pairs'].update(group['pairs'])
-                event['sample_count'] += group['record_count']
-                for field in ('maximum_normal_force_n', 'maximum_penetration_depth_m'):
+                event['sampled_snapshot_record_count'] += group['record_count']
+                for field in (
+                    'maximum_delivered_snapshot_normal_force_n',
+                    'maximum_delivered_snapshot_penetration_depth_m',
+                ):
                     value = group[field]
                     if value is not None:
                         event[field] = max(value, event[field] or 0.0)
             if stamp > terminal:
-                event['post_terminal_sample_count'] += group['record_count']
-    if in_action_message_count == 0:
-        raise MetricUnavailable('contact stream is silent during the mission interval')
-    close_stale(drain)
+                event['post_terminal_sampled_snapshot_record_count'] += group['record_count']
+    if not drain_snapshot_observed:
+        raise MetricUnavailable('capture does not contain the exact qualifying drain snapshot')
+    if (
+        latest_snapshot_at_or_before_start is None
+        or start - latest_snapshot_at_or_before_start > _MAX_CONTACT_SNAPSHOT_GAP_NS
+    ):
+        raise MetricUnavailable(
+            'accepted-goal T0 lacks a fresh authoritative snapshot at or before T0'
+        )
+    if in_action_snapshot_count == 0:
+        raise MetricUnavailable('contact snapshot stream is silent during the mission interval')
     for event in active.values():
         event['end_stamp_ns'] = drain
         event['duration_s'] = (drain - event['start_stamp_ns']) / 1_000_000_000
@@ -1444,13 +1946,17 @@ def analyze_collisions(
         )
     return {
         'collision_count': len(normalized_events),
-        'contact_record_count': contact_record_count,
+        'contact_stream_semantics': 'authoritative_delivered_active_pair_snapshot',
         'drain_completed_stamp_ns': drain,
         'events': normalized_events,
         'excluded_contact_counts': dict(sorted(exclusions.items())),
-        'in_action_message_count': in_action_message_count,
-        'pre_action_contact_record_count': pre_action_contacts,
-        'post_terminal_contact_record_count': post_terminal_contacts,
+        'in_action_snapshot_count': in_action_snapshot_count,
+        'maximum_public_snapshot_gap_ns': maximum_public_gap_ns,
+        'post_terminal_snapshot_record_count': post_terminal_snapshot_records,
+        'pre_action_snapshot_record_count': pre_action_snapshot_records,
+        'public_snapshot_count': public_snapshot_count,
         'qualification': qualification,
+        'qualifying_contact_snapshot_stamp_ns': drain,
         'required_drain_stamp_ns': required_drain,
+        'snapshot_contact_record_count': snapshot_contact_record_count,
     }

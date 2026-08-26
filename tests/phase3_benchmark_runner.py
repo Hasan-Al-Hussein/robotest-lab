@@ -48,11 +48,15 @@ from phase3_orchestration import (
     make_orchestrator_evidence,
     make_trial_context,
     PRODUCER,
+    positive_control_qualified_snapshot_stamp,
     reconcile_goal_binding,
+    reconcile_contact_gate_reobservation,
     reconcile_positive_control,
     safe_candidate_id,
     suite_document,
     summarize_resources,
+    validate_contact_drain_evidence,
+    validate_contact_progress,
     validate_build_binding,
     verify_component_manifest,
     verify_json_sidecar,
@@ -696,6 +700,77 @@ def _wait_for_file(
     )
 
 
+def _wait_for_contact_progress(
+    path: Path,
+    *,
+    qualifying_stamp_ns: int,
+    timeout_s: float,
+    watched: Sequence[BoundedProcess],
+    stage: str = 'contact_drain',
+) -> dict[str, Any]:
+    """Wait until the collector acknowledges retaining at least the drain stamp."""
+    deadline = time.monotonic() + timeout_s
+    last_error: str | None = None
+    while time.monotonic() < deadline:
+        if path.is_file():
+            try:
+                return validate_contact_progress(
+                    load_json(path), minimum_retained_stamp_ns=qualifying_stamp_ns
+                )
+            except (EvidenceError, OSError) as exc:
+                last_error = str(exc)
+        for process in watched:
+            status = process.poll()
+            if status is not None:
+                process.wait(1.0)
+                raise StageFailure(
+                    stage,
+                    'progress_process_exit',
+                    f'{process.role} exited with status {status} before contact retention ack',
+                    exit_code=status,
+                    evidence=load_json(process.metadata_path),
+                )
+        time.sleep(READY_POLL_S)
+    raise StageFailure(
+        stage,
+        'progress_timeout',
+        f'collector did not acknowledge contact stamp {qualifying_stamp_ns} within '
+        f'{timeout_s:.1f}s',
+        exit_code=124,
+        wall_timed_out=True,
+        evidence={'last_error': last_error, 'path': str(path)},
+    )
+
+
+def _metrics_collector_command(
+    *,
+    capture_path: Path,
+    ready_path: Path,
+    stop_path: Path,
+    contact_progress_path: Path,
+) -> list[str]:
+    """Build the collector command around its one producer/consumer ACK path."""
+    return [
+        'ros2',
+        'run',
+        'robotest_metrics',
+        'metrics_collector',
+        '--output',
+        str(capture_path),
+        '--ready-file',
+        str(ready_path),
+        '--stop-file',
+        str(stop_path),
+        '--contact-progress-file',
+        str(contact_progress_path),
+        '--wall-timeout-s',
+        '360',
+        '--ros-args',
+        '-r',
+        '__ns:=/robotest',
+    ]
+
+
 def _environment(domain_id: int, partition: str) -> dict[str, str]:
     env = dict(os.environ)
     env.update(
@@ -743,6 +818,9 @@ def _runtime_gate_command(
     output: Path,
     *,
     watch_pid: int | None,
+    launch_pid: int | None,
+    expected_domain_id: int | None,
+    expected_gz_partition: str | None,
     wall_timeout_s: float,
 ) -> list[str]:
     command = [
@@ -752,11 +830,19 @@ def _runtime_gate_command(
         mode,
         '--output',
         str(output),
+        '--workspace',
+        str(workspace),
         '--wall-timeout-s',
         str(wall_timeout_s),
     ]
     if watch_pid is not None:
         command.extend(['--watch-pid', str(watch_pid)])
+    if launch_pid is not None:
+        command.extend(['--launch-pid', str(launch_pid)])
+    if expected_domain_id is not None:
+        command.extend(['--expected-domain-id', str(expected_domain_id)])
+    if expected_gz_partition is not None:
+        command.extend(['--expected-gz-partition', expected_gz_partition])
     return command
 
 
@@ -918,6 +1004,9 @@ class BenchmarkRunner:
                     'empty',
                     run_dir / 'domain-preflight.json',
                     watch_pid=None,
+                    launch_pid=None,
+                    expected_domain_id=None,
+                    expected_gz_partition=None,
                     wall_timeout_s=10.0,
                 ),
                 wall_timeout_s=15.0,
@@ -951,26 +1040,16 @@ class BenchmarkRunner:
             )
             collector_ready = run_dir / 'metrics.ready.json'
             collector_stop = run_dir / 'metrics.stop'
+            contact_progress_path = run_dir / 'contact-progress.json'
             capture_path = run_dir / 'capture.json'
             collector = registry.start(
                 'metrics_collector',
-                [
-                    'ros2',
-                    'run',
-                    'robotest_metrics',
-                    'metrics_collector',
-                    '--output',
-                    str(capture_path),
-                    '--ready-file',
-                    str(collector_ready),
-                    '--stop-file',
-                    str(collector_stop),
-                    '--wall-timeout-s',
-                    '360',
-                    '--ros-args',
-                    '-r',
-                    '__ns:=/robotest',
-                ],
+                _metrics_collector_command(
+                    capture_path=capture_path,
+                    ready_path=collector_ready,
+                    stop_path=collector_stop,
+                    contact_progress_path=contact_progress_path,
+                ),
                 wall_timeout_s=370.0,
             )
             _wait_for_file(
@@ -1017,6 +1096,9 @@ class BenchmarkRunner:
                     'positive-control',
                     run_dir / 'runtime-gate.json',
                     watch_pid=driver.pid,
+                    launch_pid=launch.pid,
+                    expected_domain_id=stage['ros_domain_id'],
+                    expected_gz_partition=stage['gz_partition'],
                     wall_timeout_s=20.0,
                 ),
                 wall_timeout_s=25.0,
@@ -1031,6 +1113,43 @@ class BenchmarkRunner:
                     exit_code=driver_status,
                     evidence=load_json(driver.metadata_path),
                 )
+            verify_json_sidecar(result_path)
+            positive_qualifying_stamp_ns = positive_control_qualified_snapshot_stamp(
+                load_json(result_path)
+            )
+            _wait_for_contact_progress(
+                contact_progress_path,
+                qualifying_stamp_ns=positive_qualifying_stamp_ns,
+                timeout_s=5.0,
+                watched=(launch, collector),
+                stage='positive_contact_retention',
+            )
+            registry.run_checked(
+                'contact_stream_final_gate',
+                _runtime_gate_command(
+                    self.workspace,
+                    'contact-stream',
+                    run_dir / 'contact-stream-final-gate.json',
+                    watch_pid=launch.pid,
+                    launch_pid=launch.pid,
+                    expected_domain_id=stage['ros_domain_id'],
+                    expected_gz_partition=stage['gz_partition'],
+                    wall_timeout_s=10.0,
+                ),
+                wall_timeout_s=15.0,
+                stage='positive_contact_stream_final_gate',
+            )
+            atomic_write_json(
+                run_dir / 'contact-gate-revalidation.json',
+                reconcile_contact_gate_reobservation(
+                    run_dir / 'runtime-gate.json',
+                    run_dir / 'contact-stream-final-gate.json',
+                    build_binding=binding,
+                    expected_domain_id=stage['ros_domain_id'],
+                    expected_gz_partition=stage['gz_partition'],
+                ),
+                sidecar=True,
+            )
             atomic_write_bytes(collector_stop, b'positive-control-complete\n', 256)
             collector_status = collector.wait(30.0)
             if collector_status != 0:
@@ -1049,6 +1168,9 @@ class BenchmarkRunner:
                     'empty',
                     run_dir / 'domain-cleanup.json',
                     watch_pid=None,
+                    launch_pid=None,
+                    expected_domain_id=None,
+                    expected_gz_partition=None,
                     wall_timeout_s=15.0,
                 ),
                 wall_timeout_s=20.0,
@@ -1095,8 +1217,11 @@ class BenchmarkRunner:
             atomic_write_json(run_dir / 'component-manifest.json', checksum_document, sidecar=True)
             checksum_verified = verify_component_manifest(checksum_document, run_dir)
             positive = reconcile_positive_control(
+                workspace=self.workspace,
+                build_binding=binding,
                 result_path=result_path,
                 capture_path=capture_path,
+                contact_progress_path=contact_progress_path,
                 manifest_path=self.workspace / 'config/collision-coverage.yaml',
                 collector_configuration_sha256=binding['collector_configuration_sha256'],
                 owned_process_group_shutdown=cleanup_ok,
@@ -1259,6 +1384,9 @@ class BenchmarkRunner:
                     'empty',
                     run_dir / 'domain-preflight.json',
                     watch_pid=None,
+                    launch_pid=None,
+                    expected_domain_id=None,
+                    expected_gz_partition=None,
                     wall_timeout_s=10.0,
                 ),
                 wall_timeout_s=15.0,
@@ -1359,26 +1487,16 @@ class BenchmarkRunner:
             )
             collector_ready = run_dir / 'metrics.ready.json'
             collector_stop = run_dir / 'metrics.stop'
+            contact_progress_path = run_dir / 'contact-progress.json'
             capture_path = run_dir / 'capture.json'
             collector = registry.start(
                 'metrics_collector',
-                [
-                    'ros2',
-                    'run',
-                    'robotest_metrics',
-                    'metrics_collector',
-                    '--output',
-                    str(capture_path),
-                    '--ready-file',
-                    str(collector_ready),
-                    '--stop-file',
-                    str(collector_stop),
-                    '--wall-timeout-s',
-                    '360',
-                    '--ros-args',
-                    '-r',
-                    '__ns:=/robotest',
-                ],
+                _metrics_collector_command(
+                    capture_path=capture_path,
+                    ready_path=collector_ready,
+                    stop_path=collector_stop,
+                    contact_progress_path=contact_progress_path,
+                ),
                 wall_timeout_s=370.0,
             )
             _wait_for_file(
@@ -1462,6 +1580,9 @@ class BenchmarkRunner:
                     'candidate',
                     run_dir / 'runtime-gate.json',
                     watch_pid=launch.pid,
+                    launch_pid=launch.pid,
+                    expected_domain_id=plan['ros_domain_id'],
+                    expected_gz_partition=plan['gz_partition'],
                     wall_timeout_s=60.0,
                 ),
                 wall_timeout_s=70.0,
@@ -1588,20 +1709,22 @@ class BenchmarkRunner:
                 load_json(scenario_result),
             )
             atomic_write_json(run_dir / 'goal-binding-reconciliation.json', binding_evidence)
+            contact_drain_path = run_dir / 'contact-drain.json'
+            terminal: int
             if mission_result.is_file():
                 mission_document = load_json(mission_result)
                 terminal = mission_document.get('measurements', {}).get('terminal_action_stamp_ns')
                 if isinstance(terminal, int) and terminal > 0:
                     registry.run_checked(
-                        'clock_drain',
+                        'contact_drain',
                         [
                             'python3',
                             str(self.workspace / 'tests/phase3_runtime_observer.py'),
-                            'wait-clock',
-                            '--target-stamp-ns',
-                            str(terminal + CONTACT_DRAIN_NS),
+                            'wait-contact-drain',
+                            '--terminal-action-stamp-ns',
+                            str(terminal),
                             '--output',
-                            str(run_dir / 'clock-drain.json'),
+                            str(contact_drain_path),
                             '--watch-pid',
                             str(launch.pid),
                             '--wall-timeout-s',
@@ -1611,18 +1734,64 @@ class BenchmarkRunner:
                             '__ns:=/robotest',
                         ],
                         wall_timeout_s=35.0,
-                        stage='clock_drain',
+                        stage='contact_drain',
+                    )
+                    verify_json_sidecar(contact_drain_path)
+                    drain_document = load_json(contact_drain_path)
+                    qualifying_stamp_ns = drain_document.get('qualifying_contact_snapshot_stamp_ns')
+                    if (
+                        isinstance(qualifying_stamp_ns, bool)
+                        or not isinstance(qualifying_stamp_ns, int)
+                        or qualifying_stamp_ns <= terminal + CONTACT_DRAIN_NS
+                    ):
+                        raise StageFailure(
+                            'contact_drain',
+                            'invalid_qualifying_stamp',
+                            'contact drain artifact lacks a strict qualifying snapshot stamp',
+                            evidence=drain_document,
+                        )
+                    _wait_for_contact_progress(
+                        contact_progress_path,
+                        qualifying_stamp_ns=qualifying_stamp_ns,
+                        timeout_s=5.0,
+                        watched=(launch, collector),
+                    )
+                    registry.run_checked(
+                        'contact_stream_final_gate',
+                        _runtime_gate_command(
+                            self.workspace,
+                            'contact-stream',
+                            run_dir / 'contact-stream-final-gate.json',
+                            watch_pid=launch.pid,
+                            launch_pid=launch.pid,
+                            expected_domain_id=plan['ros_domain_id'],
+                            expected_gz_partition=plan['gz_partition'],
+                            wall_timeout_s=10.0,
+                        ),
+                        wall_timeout_s=15.0,
+                        stage='contact_stream_final_gate',
+                    )
+                    atomic_write_json(
+                        run_dir / 'contact-gate-revalidation.json',
+                        reconcile_contact_gate_reobservation(
+                            run_dir / 'runtime-gate.json',
+                            run_dir / 'contact-stream-final-gate.json',
+                            build_binding=build_start,
+                            expected_domain_id=plan['ros_domain_id'],
+                            expected_gz_partition=plan['gz_partition'],
+                        ),
+                        sidecar=True,
                     )
                 else:
                     raise StageFailure(
-                        'clock_drain',
+                        'contact_drain',
                         'missing_terminal_stamp',
                         'mission artifact lacks a positive terminal action stamp',
                         evidence=mission_document,
                     )
             else:
                 raise StageFailure(
-                    'clock_drain',
+                    'contact_drain',
                     'missing_mission_artifact',
                     'mission result is absent, so terminal drain cannot be proven',
                 )
@@ -1647,6 +1816,19 @@ class BenchmarkRunner:
                     exit_code=collector_status,
                     evidence=load_json(collector.metadata_path),
                 )
+            try:
+                validate_contact_drain_evidence(
+                    load_json(contact_drain_path),
+                    terminal_action_stamp_ns=terminal,
+                    capture=load_json(capture_path),
+                )
+            except EvidenceError as exc:
+                raise StageFailure(
+                    'contact_drain',
+                    'collector_retention',
+                    str(exc),
+                    evidence=load_json(contact_drain_path),
+                ) from exc
         except StageFailure as exc:
             stage_failure = exc
         except (
@@ -1674,6 +1856,9 @@ class BenchmarkRunner:
                         'empty',
                         run_dir / 'domain-cleanup.json',
                         watch_pid=None,
+                        launch_pid=None,
+                        expected_domain_id=None,
+                        expected_gz_partition=None,
                         wall_timeout_s=15.0,
                     ),
                     wall_timeout_s=20.0,
@@ -1880,7 +2065,6 @@ class BenchmarkRunner:
         request_path = run_dir / 'analysis-request.json'
         try:
             mission_document = load_json(run_dir / 'mission-result.json')
-            terminal = mission_document['measurements']['terminal_action_stamp_ns']
             request = compose_analysis_request(
                 workspace=self.workspace,
                 plan=plan,
@@ -1890,7 +2074,8 @@ class BenchmarkRunner:
                 positive_binding_path=self.candidate_root
                 / 'positive-control/positive-binding.json',
                 orchestrator_path=orchestrator_path,
-                drain_completed_stamp_ns=terminal + CONTACT_DRAIN_NS,
+                contact_drain_path=run_dir / 'contact-drain.json',
+                contact_progress_path=run_dir / 'contact-progress.json',
                 lifecycle_snapshot_path=(
                     run_dir / 'lifecycle-snapshot.json' if plan['scenario_id'] == 4 else None
                 ),

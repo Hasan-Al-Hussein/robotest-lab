@@ -21,7 +21,7 @@ import hashlib
 import math
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -185,7 +185,7 @@ class ContactControlNode(Node):
         self.clock_regression_count = 0
         self.last_contact_stamp_ns: int | None = None
         self.contact_first_stamp_ns: int | None = None
-        self.contact_message_count = 0
+        self.contact_snapshot_count = 0
         self.contact_max_gap_ns = 0
         self.fatal_error: RobotestScenarioError | None = None
         self.cleanup_mode = False
@@ -206,24 +206,29 @@ class ContactControlNode(Node):
         self.first_qualifying_contact: dict[str, Any] | None = None
         self.stop_command_stamp_ns: int | None = None
         self.stop_latency_ns: int | None = None
-        self.exact_pair_raw_count = 0
-        self.raw_contact_record_count = 0
-        self.raw_contact_accepted_count = 0
-        self.raw_contact_invalid_count = 0
-        self.raw_contact_overflow_count = 0
-        self.raw_contact_first_overflow_sequence: int | None = None
-        self.raw_contact_first_overflow_stamp_ns: int | None = None
+        self.stop_latency_clock_stamp_ns: int | None = None
+        self.pending_stop_contact_stamp_ns: int | None = None
+        self.future_snapshot_delivery_count = 0
+        self.release_required_through_stamp_ns: int | None = None
+        self.qualified_release_snapshot: dict[str, int] | None = None
+        self.exact_pair_snapshot_record_count = 0
+        self.snapshot_contact_record_count = 0
+        self.snapshot_contact_accepted_count = 0
+        self.snapshot_contact_invalid_count = 0
+        self.snapshot_contact_overflow_count = 0
+        self.snapshot_contact_first_overflow_sequence: int | None = None
+        self.snapshot_contact_first_overflow_stamp_ns: int | None = None
         self.classified_contact_record_count = 0
         self.latest_ground_truth: dict[str, Any] | None = None
         self.motion_active = False
         self.phase = 'PREPARE'
         self.counterpart_trackers = {WALL_NAME: ContactEpisodeTracker(WALL_NAME)}
         self.tracker = self.counterpart_trackers[WALL_NAME]
-        self.contact_summaries = PrefixBuffer[dict[str, Any]](
-            'contact_summaries', CONTACT_SUMMARY_CAPACITY
+        self.contact_snapshots = PrefixBuffer[dict[str, Any]](
+            'contact_snapshots', CONTACT_SUMMARY_CAPACITY
         )
-        self.contact_records = PrefixBuffer[dict[str, Any]](
-            'contact_records', CONTACT_RECORD_CAPACITY
+        self.contact_snapshot_records = PrefixBuffer[dict[str, Any]](
+            'contact_snapshot_records', CONTACT_RECORD_CAPACITY
         )
         self.commands = PrefixBuffer[dict[str, Any]]('commands', COMMAND_CAPACITY)
         self.actor_state = PrefixBuffer[dict[str, Any]]('actor_state', ACTOR_STATE_CAPACITY)
@@ -319,8 +324,18 @@ class ContactControlNode(Node):
         self.clock_sample_count += 1
         self.current_sim_stamp_ns = stamp_ns
         self.clock_seen = True
-        for tracker in self.counterpart_trackers.values():
-            tracker.advance(stamp_ns)
+        if (
+            self.pending_stop_contact_stamp_ns is not None
+            and stamp_ns >= self.pending_stop_contact_stamp_ns
+        ):
+            self.stop_latency_clock_stamp_ns = stamp_ns
+            self.stop_latency_ns = stamp_ns - self.pending_stop_contact_stamp_ns
+            self.pending_stop_contact_stamp_ns = None
+            if self.first_qualifying_contact is not None:
+                self.first_qualifying_contact['stop_latency_clock_stamp_ns'] = stamp_ns
+                self.first_qualifying_contact['stop_latency_upper_bound_ns'] = self.stop_latency_ns
+            if self.stop_latency_ns > CONTROL_STOP_DEADLINE_NS:
+                raise ScenarioFailureError('contact stop command missed its 0.10 s deadline')
 
     @staticmethod
     def _collision_name(value: object) -> str:
@@ -329,31 +344,50 @@ class ContactControlNode(Node):
         return value
 
     def _on_contacts(self, message: Contacts) -> None:
+        if message.header.frame_id != '':
+            self.contact_snapshots.reject_invalid()
+            raise ProtocolError('authoritative contact snapshot frame_id must be empty')
+        if not 1 <= len(message.contacts) <= 16:
+            self.contact_snapshots.reject_invalid()
+            raise ProtocolError(
+                'authoritative contact snapshot must contain between one and 16 records'
+            )
         stamp_ns = stamp_to_ns(message.header.stamp, positive=True)
-        if self.last_contact_stamp_ns is not None and stamp_ns < self.last_contact_stamp_ns:
-            self.contact_summaries.reject_invalid()
-            raise ProtocolError('contact message stamp regressed')
+        delivery_clock_offset_ns = self.current_sim_stamp_ns - stamp_ns
+        if abs(delivery_clock_offset_ns) > self.manifest.contact_snapshot_max_clock_lag_ns:
+            self.contact_snapshots.reject_invalid()
+            raise ProtocolError('authoritative contact snapshot delivery skew exceeded 220 ms')
+        if delivery_clock_offset_ns < 0:
+            self.future_snapshot_delivery_count += 1
+        if self.last_contact_stamp_ns is not None and stamp_ns <= self.last_contact_stamp_ns:
+            self.contact_snapshots.reject_invalid()
+            raise ProtocolError('authoritative contact snapshot stamp did not strictly advance')
         if self.contact_first_stamp_ns is None:
             self.contact_first_stamp_ns = stamp_ns
         elif self.last_contact_stamp_ns is not None:
-            self.contact_max_gap_ns = max(
-                self.contact_max_gap_ns, stamp_ns - self.last_contact_stamp_ns
-            )
+            gap_ns = stamp_ns - self.last_contact_stamp_ns
+            self.contact_max_gap_ns = max(self.contact_max_gap_ns, gap_ns)
+            if gap_ns > self.manifest.contact_snapshot_max_gap_ns:
+                self.contact_snapshots.reject_invalid()
+                raise ProtocolError('authoritative contact snapshot gap exceeded 220 ms')
         self.last_contact_stamp_ns = stamp_ns
-        self.contact_message_count += 1
+        self.contact_snapshot_count += 1
         summary_sequence = self._next_sequence()
         classified_count = 0
         exact_count = 0
+        counted_snapshot_records: list[dict[str, Any]] = []
+        snapshot_pairs: dict[str, list[tuple[str, str]]] = {}
+        qualifying_candidate: dict[str, Any] | None = None
         for contact in message.contacts:
-            self.raw_contact_record_count += 1
+            self.snapshot_contact_record_count += 1
             try:
                 collision_a = self._collision_name(contact.collision1.name)
                 collision_b = self._collision_name(contact.collision2.name)
                 classification = self.manifest.classify(collision_a, collision_b)
             except ProtocolError:
-                self.raw_contact_invalid_count += 1
-                self.contact_records.reject_invalid()
-                self.contact_summaries.reject_invalid()
+                self.snapshot_contact_invalid_count += 1
+                self.contact_snapshot_records.reject_invalid()
+                self.contact_snapshots.reject_invalid()
                 raise
             normalized_pair = tuple(sorted((collision_a, collision_b)))
             if classification is not None:
@@ -366,7 +400,12 @@ class ContactControlNode(Node):
             elif frozenset((collision_a, collision_b)) in self.manifest.support_exclusions:
                 disposition = 'support_ground_excluded'
             else:
-                disposition = 'non_robot_pair_ignored'
+                self.snapshot_contact_invalid_count += 1
+                self.contact_snapshot_records.reject_invalid()
+                self.contact_snapshots.reject_invalid()
+                raise ProtocolError(
+                    'manifest-v3 public snapshot contains an impossible non-robot pair'
+                )
             record_sequence = self._next_sequence()
             record = {
                 'collector_sequence': record_sequence,
@@ -382,19 +421,22 @@ class ContactControlNode(Node):
                     classification['robot_collision'] if classification is not None else None
                 ),
                 'sim_stamp_ns': stamp_ns,
+                'snapshot_sequence': summary_sequence,
             }
             try:
-                self.contact_records.add(record, sequence=record_sequence, stamp_ns=stamp_ns)
-            except ProtocolError:
-                self.raw_contact_overflow_count = self.contact_records.overflow_count
-                self.raw_contact_first_overflow_sequence = (
-                    self.contact_records.first_overflow_sequence
+                self.contact_snapshot_records.add(
+                    record, sequence=record_sequence, stamp_ns=stamp_ns
                 )
-                self.raw_contact_first_overflow_stamp_ns = (
-                    self.contact_records.first_overflow_stamp_ns
+            except ProtocolError:
+                self.snapshot_contact_overflow_count = self.contact_snapshot_records.overflow_count
+                self.snapshot_contact_first_overflow_sequence = (
+                    self.contact_snapshot_records.first_overflow_sequence
+                )
+                self.snapshot_contact_first_overflow_stamp_ns = (
+                    self.contact_snapshot_records.first_overflow_stamp_ns
                 )
                 raise
-            self.raw_contact_accepted_count += 1
+            self.snapshot_contact_accepted_count += 1
             if classification is None:
                 continue
             classified_count += 1
@@ -408,48 +450,85 @@ class ContactControlNode(Node):
                     raise ProtocolError('contact counterpart tracker capacity overflowed')
                 tracker = ContactEpisodeTracker(counterpart)
                 self.counterpart_trackers[counterpart] = tracker
-            tracker.observe(stamp_ns, normalized_pair)
+            snapshot_pairs.setdefault(counterpart, []).append(normalized_pair)
+            counted_snapshot_records.append(
+                {
+                    'counterpart_model': counterpart,
+                    'normalized_pair': list(normalized_pair),
+                    'record_sequence': record_sequence,
+                    'snapshot_sequence': summary_sequence,
+                }
+            )
             if counterpart != WALL_NAME:
                 continue
             if normalized_pair != self.manifest.expected_control_pair:
                 continue
             exact_count += 1
-            self.exact_pair_raw_count += 1
-            if self.first_qualifying_contact is not None:
+            self.exact_pair_snapshot_record_count += 1
+            if self.first_qualifying_contact is not None or qualifying_candidate is not None:
                 continue
             if self.control_started_stamp_ns is None or not self.motion_active:
                 raise ProtocolError('qualifying control contact preceded forward motion')
             if stamp_ns < self.control_started_stamp_ns:
                 raise ProtocolError('qualifying contact stamp preceded forward command')
-            if self.contact_deadline_ns is not None and stamp_ns > self.contact_deadline_ns:
-                self.publish_command(0.0, phase='LATE_CONTACT_FAIL_SAFE_ZERO')
-                self.motion_active = False
-                raise ScenarioFailureError('qualifying contact stamp exceeded the 12.0 s deadline')
-            self.first_qualifying_contact = {
-                'clock_delivery_offset_ns': self.current_sim_stamp_ns - stamp_ns,
+            qualifying_candidate = {
+                'callback_clock_offset_ns': self.current_sim_stamp_ns - stamp_ns,
+                'callback_clock_stamp_ns': self.current_sim_stamp_ns,
                 'collector_sequence': record_sequence,
                 'normalized_pair': list(normalized_pair),
-                'observed_sim_stamp_ns': self.current_sim_stamp_ns,
                 'sim_stamp_ns': stamp_ns,
             }
-            self.publish_command(0.0, phase='CONTACT_STOP')
-            self.stop_command_stamp_ns = self.current_sim_stamp_ns
-            self.stop_latency_ns = max(0, self.stop_command_stamp_ns - stamp_ns)
-            self.motion_active = False
-            self.phase = 'HOLD'
-            if not 0 <= self.stop_latency_ns <= CONTROL_STOP_DEADLINE_NS:
-                raise ScenarioFailureError('contact stop command missed its 0.10 s deadline')
-        self.contact_summaries.add(
+        for counterpart, tracker in self.counterpart_trackers.items():
+            tracker.observe_snapshot(stamp_ns, snapshot_pairs.get(counterpart, []))
+        self.contact_snapshots.add(
             {
                 'classified_count': classified_count,
                 'collector_sequence': summary_sequence,
+                'counted_snapshot_records': counted_snapshot_records,
                 'exact_pair_count': exact_count,
-                'raw_count': len(message.contacts),
+                'delivery_clock_offset_ns': delivery_clock_offset_ns,
+                'delivery_clock_stamp_ns': self.current_sim_stamp_ns,
+                'snapshot_record_count': len(message.contacts),
                 'sim_stamp_ns': stamp_ns,
             },
             sequence=summary_sequence,
             stamp_ns=stamp_ns,
         )
+        if (
+            self.release_required_through_stamp_ns is not None
+            and self.qualified_release_snapshot is None
+            and stamp_ns > self.release_required_through_stamp_ns
+            and WALL_NAME not in snapshot_pairs
+        ):
+            self.qualified_release_snapshot = {
+                'collector_sequence': summary_sequence,
+                'sim_stamp_ns': stamp_ns,
+            }
+        if qualifying_candidate is not None:
+            if self.contact_deadline_ns is not None and stamp_ns > self.contact_deadline_ns:
+                self.publish_command(0.0, phase='LATE_CONTACT_FAIL_SAFE_ZERO')
+                self.motion_active = False
+                raise ScenarioFailureError('qualifying contact stamp exceeded the 12.0 s deadline')
+            self.first_qualifying_contact = qualifying_candidate
+            self.publish_command(0.0, phase='CONTACT_STOP')
+            self.stop_command_stamp_ns = self.current_sim_stamp_ns
+            if self.stop_command_stamp_ns >= stamp_ns:
+                self.stop_latency_clock_stamp_ns = self.stop_command_stamp_ns
+                self.stop_latency_ns = self.stop_command_stamp_ns - stamp_ns
+            else:
+                self.pending_stop_contact_stamp_ns = stamp_ns
+                self.stop_latency_clock_stamp_ns = None
+                self.stop_latency_ns = None
+            self.first_qualifying_contact['stop_latency_clock_stamp_ns'] = (
+                self.stop_latency_clock_stamp_ns
+            )
+            self.first_qualifying_contact['stop_latency_upper_bound_ns'] = self.stop_latency_ns
+            self.motion_active = False
+            self.phase = 'HOLD'
+            if self.stop_latency_ns is not None and not (
+                0 <= self.stop_latency_ns <= CONTROL_STOP_DEADLINE_NS
+            ):
+                raise ScenarioFailureError('contact stop command missed its 0.10 s deadline')
 
     def _on_entity_poses(self, message: TFMessage) -> None:
         self.entity_pose_message_count += 1
@@ -582,13 +661,19 @@ class ContactControlNode(Node):
         self.motion_active = True
         self.phase = 'FORWARD'
 
-    def quality(self, *, publisher_count: int, forbidden_nodes: Sequence[str]) -> dict[str, Any]:
+    def quality(
+        self,
+        *,
+        publisher_count: int,
+        forbidden_nodes: Sequence[str],
+        contact_graph_topology: Mapping[str, Any],
+    ) -> dict[str, Any]:
         """Return bounded collection and graph-isolation evidence."""
         buffers = {
             'actor_state': self.actor_state.quality(),
             'command': self.commands.quality(),
-            'contact_records': self.contact_records.quality(),
-            'contact_summaries': self.contact_summaries.quality(),
+            'contact_snapshot_records': self.contact_snapshot_records.quality(),
+            'contact_snapshots': self.contact_snapshots.quality(),
             'ground_truth': self.ground_truth.quality(),
         }
         source_publisher_counts = {
@@ -607,27 +692,29 @@ class ContactControlNode(Node):
                 'sample_count': self.clock_sample_count,
             },
             'collision_monitor_absent': 'collision_monitor' not in forbidden_nodes,
+            'contact_graph_topology': dict(contact_graph_topology),
             'forbidden_nodes': sorted(forbidden_nodes),
             'nav2_absent': not forbidden_nodes,
-            'overflow_free': self.raw_contact_overflow_count == 0
+            'overflow_free': self.snapshot_contact_overflow_count == 0
             and all(not item['overflow'] for item in buffers.values()),
             'protocol_error_count': self.protocol_error_count,
-            'raw_contact_stream': {
-                'accepted_count': self.raw_contact_accepted_count,
+            'public_contact_snapshot_stream': {
+                'accepted_count': self.snapshot_contact_accepted_count,
                 'capacity': CONTACT_RECORD_CAPACITY,
-                'first_overflow_sequence': self.raw_contact_first_overflow_sequence,
-                'first_overflow_stamp_ns': self.raw_contact_first_overflow_stamp_ns,
-                'ingress_count': self.raw_contact_record_count,
-                'invalid_count': self.raw_contact_invalid_count,
-                'overflow': self.raw_contact_overflow_count > 0,
-                'overflow_count': self.raw_contact_overflow_count,
-                'retained_count': len(self.contact_records.items),
+                'first_overflow_sequence': self.snapshot_contact_first_overflow_sequence,
+                'first_overflow_stamp_ns': self.snapshot_contact_first_overflow_stamp_ns,
+                'ingress_count': self.snapshot_contact_record_count,
+                'invalid_count': self.snapshot_contact_invalid_count,
+                'overflow': self.snapshot_contact_overflow_count > 0,
+                'overflow_count': self.snapshot_contact_overflow_count,
+                'retained_count': len(self.contact_snapshot_records.items),
             },
-            'contact_message_heartbeat': {
+            'public_contact_snapshot_heartbeat': {
                 'first_stamp_ns': self.contact_first_stamp_ns,
+                'future_delivery_count': self.future_snapshot_delivery_count,
                 'latest_stamp_ns': self.last_contact_stamp_ns,
                 'max_gap_ns': self.contact_max_gap_ns,
-                'message_count': self.contact_message_count,
+                'snapshot_count': self.contact_snapshot_count,
             },
             'relative_project_names': True,
             'sole_cmd_vel_publisher': publisher_count == 1,
@@ -675,12 +762,19 @@ class ContactControlApp:
             'entity_pose': 0,
             'ground_truth': 0,
         }
+        self.contact_graph_audit_count = 0
+        self.contact_graph_first_snapshot: dict[str, Any] | None = None
+        self.contact_graph_last_snapshot: dict[str, Any] | None = None
+        self.contact_graph_first_sha256: str | None = None
+        self.contact_graph_last_sha256: str | None = None
         self.forbidden_nodes: list[str] = []
         self.hold_complete_stamp_ns: int | None = None
         self.reverse_start_stamp_ns: int | None = None
         self.final_zero_stamp_ns: int | None = None
         self.release_complete_stamp_ns: int | None = None
-        self.release_contact_message_start_count: int | None = None
+        self.release_observed_clock_stamp_ns: int | None = None
+        self.contact_clock_bracket: dict[str, int] | None = None
+        self.release_contact_snapshot_start_count: int | None = None
         self.observed_start: dict[str, Any] | None = None
         self.setup_evidence: dict[str, Any] = {
             'observed_robot_start': None,
@@ -724,6 +818,142 @@ class ContactControlApp:
         }
         return publisher_count, sorted(names)
 
+    @staticmethod
+    def _endpoint_qos_name(value: Any) -> str:
+        name = getattr(value, 'name', None)
+        return name if isinstance(name, str) else str(value).rsplit('.', 1)[-1]
+
+    @classmethod
+    def _endpoint_evidence(
+        cls,
+        endpoint: Any,
+        *,
+        expected_depth: int,
+    ) -> dict[str, Any]:
+        namespace = str(endpoint.node_namespace).rstrip('/')
+        node_fqn = f'{namespace}/{endpoint.node_name}' if namespace else f'/{endpoint.node_name}'
+        qos = endpoint.qos_profile
+        durability = cls._endpoint_qos_name(qos.durability)
+        history = cls._endpoint_qos_name(qos.history)
+        reliability = cls._endpoint_qos_name(qos.reliability)
+        depth = int(qos.depth)
+        try:
+            endpoint_gid = bytes(endpoint.endpoint_gid).hex()
+        except (AttributeError, TypeError, ValueError):
+            endpoint_gid = ''
+        return {
+            'endpoint_gid': endpoint_gid,
+            'node_fqn': node_fqn,
+            'qos': {
+                'depth': depth,
+                'durability': durability,
+                'history': history,
+                'reliability': reliability,
+            },
+            'qos_status': {
+                'depth_matches_or_unknown': depth <= 0 or depth == expected_depth,
+                'durability_volatile': durability == 'VOLATILE',
+                'history_keep_last_or_unknown': history
+                in {
+                    'KEEP_LAST',
+                    'SYSTEM_DEFAULT',
+                    'UNKNOWN',
+                },
+                'reliability_reliable': reliability == 'RELIABLE',
+            },
+            'topic_type': str(endpoint.topic_type),
+        }
+
+    def _contact_graph_snapshot(self) -> dict[str, Any]:
+        node = self._node
+        public_topic = self.manifest.public_contact_snapshot_topic
+        private_topic = self.manifest.private_raw_contact_topic
+
+        def normalized(
+            endpoints: Sequence[Any],
+            *,
+            expected_depth: int,
+        ) -> list[dict[str, Any]]:
+            return sorted(
+                (
+                    self._endpoint_evidence(endpoint, expected_depth=expected_depth)
+                    for endpoint in endpoints
+                ),
+                key=lambda item: (
+                    item['node_fqn'],
+                    item['topic_type'],
+                    item['endpoint_gid'],
+                    canonical_json_bytes(item['qos']),
+                ),
+            )
+
+        return {
+            'private_raw_publishers': normalized(
+                node.get_publishers_info_by_topic(private_topic), expected_depth=64
+            ),
+            'private_raw_subscribers': normalized(
+                node.get_subscriptions_info_by_topic(private_topic), expected_depth=64
+            ),
+            'public_snapshot_publishers': normalized(
+                node.get_publishers_info_by_topic(public_topic), expected_depth=10
+            ),
+            'topics': {
+                'private_raw_contact_topic': private_topic,
+                'public_contact_snapshot_topic': public_topic,
+            },
+        }
+
+    def _contact_graph_is_exact(self, snapshot: Mapping[str, Any]) -> bool:
+        expected_nodes = {
+            'private_raw_publishers': '/robotest/parameter_bridge',
+            'private_raw_subscribers': '/robotest/contact_stream_gate',
+            'public_snapshot_publishers': '/robotest/contact_stream_gate',
+        }
+        if snapshot.get('topics') != {
+            'private_raw_contact_topic': self.manifest.private_raw_contact_topic,
+            'public_contact_snapshot_topic': self.manifest.public_contact_snapshot_topic,
+        }:
+            return False
+        for key, expected_node in expected_nodes.items():
+            endpoints = snapshot.get(key)
+            if not isinstance(endpoints, list) or len(endpoints) != 1:
+                return False
+            endpoint = endpoints[0]
+            if not isinstance(endpoint, Mapping):
+                return False
+            endpoint_gid = endpoint.get('endpoint_gid', '')
+            if (
+                len(endpoint_gid) != 48
+                or any(character not in '0123456789abcdef' for character in endpoint_gid)
+                or endpoint.get('node_fqn') != expected_node
+                or endpoint.get('topic_type') != 'ros_gz_interfaces/msg/Contacts'
+                or not isinstance(endpoint.get('qos_status'), Mapping)
+                or not all(endpoint['qos_status'].values())
+            ):
+                return False
+        return True
+
+    def _contact_graph_evidence(self) -> dict[str, Any]:
+        return {
+            'audit_count': self.contact_graph_audit_count,
+            'first_sha256': self.contact_graph_first_sha256,
+            'first_snapshot': self.contact_graph_first_snapshot,
+            'last_sha256': self.contact_graph_last_sha256,
+            'last_snapshot': self.contact_graph_last_snapshot,
+        }
+
+    def _audit_contact_graph(self) -> None:
+        snapshot = self._contact_graph_snapshot()
+        if not self._contact_graph_is_exact(snapshot):
+            raise InfrastructureError('contact stream graph ownership, type, or QoS changed')
+        sha256 = hashlib.sha256(canonical_json_bytes(snapshot)).hexdigest()
+        self.contact_graph_audit_count += 1
+        if self.contact_graph_first_snapshot is None:
+            self.contact_graph_first_snapshot = snapshot
+            self.contact_graph_first_sha256 = sha256
+        self.contact_graph_last_snapshot = snapshot
+        self.contact_graph_last_sha256 = sha256
+
     def _enforce_graph_isolation(self) -> None:
         publisher_count, forbidden = self._graph_state()
         self.last_publisher_count = publisher_count
@@ -749,6 +979,7 @@ class ContactControlApp:
             raise InfrastructureError(
                 'positive-control observation sources disappeared: ' + ', '.join(missing_sources)
             )
+        self._audit_contact_graph()
 
     def _spin_once(self, timeout_s: float = 0.02, *, check_fatal: bool = True) -> None:
         if time.monotonic() >= self.wall_deadline:
@@ -836,6 +1067,7 @@ class ContactControlApp:
         publisher_count, forbidden = self._graph_state()
         self.last_publisher_count = publisher_count
         self.forbidden_nodes = forbidden
+        graph_snapshot = self._contact_graph_snapshot()
         return (
             publisher_count == 1
             and not forbidden
@@ -845,7 +1077,14 @@ class ContactControlApp:
             and node.latest_ground_truth is not None
             and node.spawn_client.service_is_ready()
             and node.delete_client.service_is_ready()
-            and node.resolve_topic_name(CONTACT_TOPIC) == self.manifest.raw_contact_topic
+            and node.resolve_topic_name(CONTACT_TOPIC)
+            == self.manifest.public_contact_snapshot_topic
+            and node.contact_snapshot_count >= 1
+            and node.last_contact_stamp_ns is not None
+            and node.current_sim_stamp_ns >= node.last_contact_stamp_ns
+            and node.current_sim_stamp_ns - node.last_contact_stamp_ns
+            <= self.manifest.contact_snapshot_max_clock_lag_ns
+            and self._contact_graph_is_exact(graph_snapshot)
         )
 
     def _spawn_wall(self) -> dict[str, Any]:
@@ -1060,16 +1299,31 @@ class ContactControlApp:
 
     def _hold_zero(self) -> None:
         node = self._node
-        if node.stop_command_stamp_ns is None:
+        if node.stop_command_stamp_ns is None or node.stop_latency_clock_stamp_ns is None:
             raise ProtocolError('zero-command anchor is unavailable after contact')
-        hold_until_ns = node.stop_command_stamp_ns + CONTROL_HOLD_NS
-        next_publish_ns = node.stop_command_stamp_ns + CONTROL_COMMAND_PERIOD_NS
+        hold_until_ns = node.stop_latency_clock_stamp_ns + CONTROL_HOLD_NS
+        next_publish_ns = node.stop_latency_clock_stamp_ns + CONTROL_COMMAND_PERIOD_NS
         while node.current_sim_stamp_ns < hold_until_ns:
             self._spin_once()
             if node.current_sim_stamp_ns >= next_publish_ns:
                 node.publish_command(0.0, phase='HOLD')
                 next_publish_ns = self._advance_schedule(next_publish_ns, node.current_sim_stamp_ns)
         self.hold_complete_stamp_ns = node.current_sim_stamp_ns
+
+    def _settle_contact_stop_latency(self) -> None:
+        node = self._node
+        first = node.first_qualifying_contact
+        if first is None:
+            raise ProtocolError('qualifying contact is unavailable for stop-latency settlement')
+        contact_stamp_ns = int(first['sim_stamp_ns'])
+        self._wait_for(
+            lambda: node.stop_latency_ns is not None,
+            reason='contact stop latency did not settle against /clock within 0.10 s',
+            sim_deadline_ns=contact_stamp_ns + CONTROL_STOP_DEADLINE_NS,
+        )
+        assert node.stop_latency_ns is not None
+        if not 0 <= node.stop_latency_ns <= CONTROL_STOP_DEADLINE_NS:
+            raise ScenarioFailureError('contact stop command missed its 0.10 s deadline')
 
     def _reverse_and_release(self) -> None:
         node = self._node
@@ -1085,51 +1339,47 @@ class ContactControlApp:
                 next_publish_ns = self._advance_schedule(next_publish_ns, node.current_sim_stamp_ns)
         final = node.publish_command(0.0, phase='FINAL_ZERO')
         self.final_zero_stamp_ns = int(final['sim_stamp_ns'])
-        self.release_contact_message_start_count = node.contact_message_count
+        node.release_required_through_stamp_ns = self.final_zero_stamp_ns + CONTACT_RELEASE_GAP_NS
+        node.qualified_release_snapshot = None
+        self.release_contact_snapshot_start_count = node.contact_snapshot_count
         node.phase = 'RELEASE'
 
         def released() -> bool:
-            node.tracker.advance(node.current_sim_stamp_ns)
             minimum = self._release_boundary_ns()
             assert minimum is not None
-            source_spanned = (
-                self.release_contact_message_start_count is not None
-                and node.contact_message_count > self.release_contact_message_start_count
-                and node.last_contact_stamp_ns is not None
-                and node.last_contact_stamp_ns >= minimum
-            )
-            return (
-                node.current_sim_stamp_ns >= minimum
-                and node.tracker.active_start_ns is None
-                and source_spanned
-            )
+            release_snapshot = node.qualified_release_snapshot
+            if release_snapshot is None or node.tracker.active_start_ns is not None:
+                return False
+            snapshot_stamp_ns = release_snapshot['sim_stamp_ns']
+            if snapshot_stamp_ns <= minimum or node.current_sim_stamp_ns < snapshot_stamp_ns:
+                return False
+            lag_ns = node.current_sim_stamp_ns - snapshot_stamp_ns
+            if lag_ns > self.manifest.contact_snapshot_max_clock_lag_ns:
+                raise ProtocolError('qualified release snapshot exceeded the 220 ms /clock bracket')
+            return True
 
         self._wait_for(released, reason='full 0.25 s contact-release gap was not observed')
-        self.release_complete_stamp_ns = node.current_sim_stamp_ns
+        assert node.qualified_release_snapshot is not None
+        self.release_complete_stamp_ns = node.qualified_release_snapshot['sim_stamp_ns']
+        self.release_observed_clock_stamp_ns = node.current_sim_stamp_ns
+        self.contact_clock_bracket = {
+            'clock_stamp_ns': node.current_sim_stamp_ns,
+            'lag_ns': node.current_sim_stamp_ns - self.release_complete_stamp_ns,
+            'limit_ns': self.manifest.contact_snapshot_max_clock_lag_ns,
+            'snapshot_stamp_ns': self.release_complete_stamp_ns,
+        }
         node.phase = 'DONE'
 
     def _release_boundary_ns(self) -> int | None:
-        if self.final_zero_stamp_ns is None:
-            return None
-        boundary = self.final_zero_stamp_ns + CONTACT_RELEASE_GAP_NS
-        if self._node.tracker.last_contact_ns is not None:
-            boundary = max(
-                boundary,
-                self._node.tracker.last_contact_ns + CONTACT_RELEASE_GAP_NS,
-            )
-        if self._node.tracker.episodes:
-            boundary = max(
-                boundary,
-                int(self._node.tracker.episodes[-1]['end_stamp_ns']),
-            )
-        return boundary
+        return self._node.release_required_through_stamp_ns
 
     def _run_control(self) -> None:
         self._drive_until_contact()
+        self._settle_contact_stop_latency()
         self._hold_zero()
         self._reverse_and_release()
         node = self._node
-        if node.exact_pair_raw_count < 1:
+        if node.exact_pair_snapshot_record_count < 1:
             raise ScenarioFailureError('expected rendered chassis-wall pair was not observed')
         episodes = node.closed_episodes()
         if len(episodes) != 1 or node.active_counterpart_count() != 0:
@@ -1240,8 +1490,37 @@ class ContactControlApp:
         quality = node.quality(
             publisher_count=self.last_publisher_count,
             forbidden_nodes=self.forbidden_nodes,
+            contact_graph_topology=self._contact_graph_evidence(),
         )
         release_boundary_ns = self._release_boundary_ns()
+        topology = quality['contact_graph_topology']
+        topology_complete = (
+            topology['audit_count'] >= 2
+            and topology['first_snapshot'] is not None
+            and topology['last_snapshot'] is not None
+            and topology['first_sha256']
+            == hashlib.sha256(canonical_json_bytes(topology['first_snapshot'])).hexdigest()
+            and topology['last_sha256']
+            == hashlib.sha256(canonical_json_bytes(topology['last_snapshot'])).hexdigest()
+            and self._contact_graph_is_exact(topology['first_snapshot'])
+            and self._contact_graph_is_exact(topology['last_snapshot'])
+            and {
+                key: topology['first_snapshot'][key][0]['endpoint_gid']
+                for key in (
+                    'private_raw_publishers',
+                    'private_raw_subscribers',
+                    'public_snapshot_publishers',
+                )
+            }
+            == {
+                key: topology['last_snapshot'][key][0]['endpoint_gid']
+                for key in (
+                    'private_raw_publishers',
+                    'private_raw_subscribers',
+                    'public_snapshot_publishers',
+                )
+            }
+        )
         return {
             'contact_before_deadline': (
                 node.first_qualifying_contact is not None
@@ -1259,21 +1538,32 @@ class ContactControlApp:
             and node.commands.items[-1]['angular_z'] == 0.0,
             'graph_isolated': quality['nav2_absent']
             and quality['collision_monitor_absent']
-            and quality['source_streams_live'],
+            and quality['source_streams_live']
+            and topology_complete,
             'hold_completed': (
                 self.hold_complete_stamp_ns is not None
-                and node.stop_command_stamp_ns is not None
-                and self.hold_complete_stamp_ns - node.stop_command_stamp_ns >= CONTROL_HOLD_NS
+                and node.stop_latency_clock_stamp_ns is not None
+                and self.hold_complete_stamp_ns - node.stop_latency_clock_stamp_ns
+                >= CONTROL_HOLD_NS
             ),
             'overflow_free': bool(quality['overflow_free']),
-            'raw_expected_contact_observed': node.exact_pair_raw_count >= 1,
-            'release_completed': self.release_complete_stamp_ns is not None,
+            'expected_contact_snapshot_observed': node.exact_pair_snapshot_record_count >= 1,
+            'release_completed': (
+                self.release_complete_stamp_ns is not None
+                and node.qualified_release_snapshot is not None
+                and self.release_complete_stamp_ns
+                == node.qualified_release_snapshot['sim_stamp_ns']
+                and self.contact_clock_bracket is not None
+                and 0
+                <= self.contact_clock_bracket['lag_ns']
+                <= self.manifest.contact_snapshot_max_clock_lag_ns
+            ),
             'release_source_spanned': (
-                self.release_contact_message_start_count is not None
-                and node.contact_message_count > self.release_contact_message_start_count
+                self.release_contact_snapshot_start_count is not None
+                and node.contact_snapshot_count > self.release_contact_snapshot_start_count
                 and release_boundary_ns is not None
-                and node.last_contact_stamp_ns is not None
-                and node.last_contact_stamp_ns >= release_boundary_ns
+                and node.qualified_release_snapshot is not None
+                and node.qualified_release_snapshot['sim_stamp_ns'] > release_boundary_ns
             ),
             'robot_start_verified': self.observed_start is not None,
             'reverse_completed': (
@@ -1299,13 +1589,16 @@ class ContactControlApp:
             'contact': {
                 'active_counterpart_count': node.active_counterpart_count(),
                 'classified_record_count': node.classified_contact_record_count,
+                'contact_clock_bracket': self.contact_clock_bracket,
                 'counterpart_tracker_count': len(node.counterpart_trackers),
                 'episodes': node.closed_episodes(),
-                'exact_pair_raw_count': node.exact_pair_raw_count,
+                'exact_pair_snapshot_record_count': node.exact_pair_snapshot_record_count,
                 'expected_pair': list(node.manifest.expected_control_pair),
                 'first_qualifying_contact': node.first_qualifying_contact,
-                'raw_contact_record_count': node.raw_contact_record_count,
-                'records': list(node.contact_records.items),
+                'snapshot_contact_record_count': node.snapshot_contact_record_count,
+                'snapshot_records': list(node.contact_snapshot_records.items),
+                'release_snapshot': node.qualified_release_snapshot,
+                'snapshots': list(node.contact_snapshots.items),
             },
             'criteria': self._criteria(),
             'metrics_owned': {
@@ -1320,11 +1613,14 @@ class ContactControlApp:
                 'final_zero_stamp_ns': self.final_zero_stamp_ns,
                 'hold_complete_stamp_ns': self.hold_complete_stamp_ns,
                 'release_complete_stamp_ns': self.release_complete_stamp_ns,
-                'release_contact_message_start_count': (self.release_contact_message_start_count),
-                'release_contact_message_end_count': node.contact_message_count,
+                'release_observed_clock_stamp_ns': self.release_observed_clock_stamp_ns,
+                'release_qualified_snapshot_stamp_ns': self.release_complete_stamp_ns,
+                'release_contact_snapshot_start_count': (self.release_contact_snapshot_start_count),
+                'release_contact_snapshot_end_count': node.contact_snapshot_count,
                 'release_required_through_stamp_ns': self._release_boundary_ns(),
                 'reverse_start_stamp_ns': self.reverse_start_stamp_ns,
                 'stop_command_stamp_ns': node.stop_command_stamp_ns,
+                'stop_latency_clock_stamp_ns': node.stop_latency_clock_stamp_ns,
                 'stop_latency_ns': node.stop_latency_ns,
             },
         }
@@ -1374,6 +1670,7 @@ class ContactControlApp:
             'quality': self._node.quality(
                 publisher_count=self.last_publisher_count,
                 forbidden_nodes=self.forbidden_nodes,
+                contact_graph_topology=self._contact_graph_evidence(),
             ),
             'schema_version': 1,
             'status': status,
@@ -1454,6 +1751,7 @@ class ContactControlApp:
                 'quality': self._node.quality(
                     publisher_count=self.last_publisher_count,
                     forbidden_nodes=self.forbidden_nodes,
+                    contact_graph_topology=self._contact_graph_evidence(),
                 ),
                 'schema_version': 1,
                 'status': 'FAIL',

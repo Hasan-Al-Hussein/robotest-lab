@@ -381,8 +381,14 @@ the exact rendered collision manifest and contact configuration used by the
 candidate suite. The control is not one of the 15 mission trials and its
 intentional collision is not added to a mission collision count.
 
-The frozen control uses the same world, built robot, rendered-SDF hash, contact
-bridge, collector, and collision-coverage manifest. It starts the robot at
+The frozen control uses the same world, built robot, rendered-SDF hash, private
+raw contact bridge, compiled contact-stream gate, collector, and schema-v3
+collision-coverage manifest. The manifest binds the gate CMake/header/source/
+node inventory, and the uniquely tagged digest in the running ELF must match
+that inventory. The sole private bridge publisher feeds only the gate; the
+gate is the sole public publisher. It suppresses its first finalized raw stamp,
+then provides a seeded, strictly increasing authoritative delivered active-pair
+snapshot stream before motion. The control starts the robot at
 `(0.0, -3.5, 0.0)` with Nav2 and the collision monitor absent. A dedicated
 `contact_control_driver` is the sole publisher of the final Gazebo command
 topic for this isolated fixture. It spawns:
@@ -400,16 +406,22 @@ The wall's near face is `x=0.65`; the current chassis front begins at
 `angular.z=0` until the first qualifying contact or a `12.0 s` simulation
 deadline. Missing contact fails the control. On contact it publishes zero
 within `0.10 s`, holds for `0.25 s`, reverses at `-0.05 m/s` for
-`1.0 s`, publishes final zero, and observes the full `0.25 s` contact-release
-gap. A `30 s` steady-wall escape bounds the complete fixture.
+`1.0 s`, and publishes final zero. Release completes only on an actually
+retained authoritative snapshot `q` with the wall absent and
+`q > final_zero_stamp + 0.25 s`; equality and a clock-only target do not close
+the episode. The collector acknowledges and retains that exact `q`. A `30 s`
+steady-wall escape bounds the complete fixture.
 
 The expected non-excluded pair is the coverage manifest's exact rendered
 chassis collision and
-`phase3_contact_control_wall::link::collision`. At least one raw contact and
+`phase3_contact_control_wall::link::collision`. At least one retained public
+snapshot record and
 exactly one de-duplicated counterpart episode must be observed, named, closed,
-and reconciled. The test also requires the final command to be zero, all
-collector overflows to be false, the actor to be deleted, and both owned
-process groups to terminate.
+and reconciled from snapshot presence/absence. The test also requires public
+source gaps and delivery clock brackets within `0.22 s`, exact graph endpoint
+cardinality/GID continuity, the final command to be zero, all collector
+overflows to be false, the actor to be deleted, and both owned process groups
+to terminate.
 
 The coverage manifest, not this one chassis contact alone, must enumerate and
 bind every rendered robot collision geometry. A chassis-only production
@@ -475,7 +487,7 @@ The metrics contract's prefix-retaining capacities apply per trial:
 | Raw and validated scan metadata | 2,048 per stream |
 | Final velocity command | 4,096 samples |
 | Global plans | 1,024 messages and 65,536 poses total |
-| Contact evidence | 8,192 summaries and 32,768 normalized records |
+| Contact snapshot evidence | 8,192 summaries and 32,768 normalized snapshot records |
 | World statistics | 4,096 samples |
 | Mission/lifecycle/obstacle/process state | 1,024 transitions |
 | Fault-control/application events | 512 events |
@@ -495,9 +507,10 @@ complete aggregate/report directory. Actual sizes, configured limits, ingress
 counts, retained counts, invalid counts, first-overflow evidence, and
 checksums are machine-readable. Exceeding any cap fails the affected run.
 
-Contact collection continues through `T_terminal + 0.25 s` and must close its
-full simulation-time drain; its wall escape is `5.0 s`. Only events beginning
-in `[T0, T_terminal]` count, but post-terminal samples remain diagnostic.
+Contact collection continues until it retains and acknowledges a public
+snapshot strictly later than `T_terminal + 0.25 s`; its wall escape is `5.0 s`.
+Only episodes beginning in `[T0, T_terminal]` count, but post-terminal
+snapshot records remain diagnostic.
 Failure to advance, drain, or close evidence makes collision count null and the
 trial fail.
 

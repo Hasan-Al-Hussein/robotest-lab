@@ -102,7 +102,7 @@ The Phase 3 collector uses prefix-retaining buffers with these hard capacities:
 | Raw and validated scan | 2,048 samples per stream |
 | Final velocity command | 4,096 samples |
 | Global plans | 1,024 messages and 65,536 poses total |
-| Contact messages | 8,192 message summaries and 32,768 normalized contact records total |
+| Public contact snapshots | 8,192 snapshot summaries and 32,768 normalized snapshot records total |
 | World statistics | 4,096 samples |
 | Mission, lifecycle, obstacle, and process state transitions | 1,024 events |
 | Fault-control and fault-application events | 512 events |
@@ -119,10 +119,12 @@ truncated prefix. Exceeding either the global-plan message limit or the total
 plan-pose limit is overflow.
 
 A retained scan sample is bounded metadata (stamp, frame, range count, and
-payload hash), not a copy of an unbounded range array. Contact messages are
-normalized on receipt; the collector does not retain the transport message
-after extracting its bounded summary and records. Crossing either contact
-limit is overflow. Variable-length strings are UTF-8 validated and capped at
+payload hash), not a copy of an unbounded range array. Public contact snapshots
+contain 1--16 records and are normalized on receipt; the collector retains the
+snapshot stamp, empty frame, callback-time clock bracket, names, and delivered
+snapshot force/depth maxima. It does not claim to retain every raw physics
+sample or an intermediate peak. Crossing either contact limit is overflow.
+Variable-length strings are UTF-8 validated and capped at
 4,096 bytes per field; an over-limit field is invalid evidence and is never
 truncated into a misleading value.
 
@@ -260,14 +262,25 @@ ratios are null with a reason.
 
 ### Coverage and exclusions
 
-Zero contact messages do not by themselves prove zero collisions. Before a
+Zero contact snapshots do not by themselves prove zero collisions. Before a
 benchmark candidate is accepted, the rendered SDF is inspected and a canonical
 coverage manifest lists every collision geometry in the `robotest` model. For
 the current model that set includes the chassis, both wheels, both casters,
 LiDAR body, and IMU body after fixed-joint lumping/name conversion. The manifest
 stores every exact scoped Gazebo collision name, its semantic role, the contact
 source that covers it, the rendered-SDF SHA-256, and the source Xacro/world and
-bridge hashes.
+bridge hashes. Revision 3 additionally binds the private raw bridge, compiled
+gate source/CMake inventory, public gate owner, QoS, batching, heartbeat,
+expiry, liveness, and bounded-state policy. Revision-2 raw evidence is not
+interpreted as authoritative snapshot evidence.
+
+The `ros_gz_interfaces/Contacts` IDL is itself unbounded. The gate's record,
+array, string, and active-state caps apply after DDS has deserialized a callback
+from the proven sole private `parameter_bridge` publisher. Exact private-topic
+cardinality, endpoint identity, type/QoS, source provenance, and gate survival
+therefore form an explicit trusted-ingress boundary; the contract does not
+claim bounded memory against an arbitrary hostile DDS writer admitted before
+deserialization.
 
 The contact pipeline must observe robot-versus-environment contacts involving
 **any** member of that complete set. A chassis-only sensor is insufficient.
@@ -295,7 +308,7 @@ Each benchmark set is bound to a separate, bounded positive-control contact
 run made from the same built source and contact configuration. The control run
 uses a hash-identified scenario to drive the robot conservatively into one
 named test counterpart, observes at least one correctly named non-excluded
-contact event, publishes a final zero command, and shuts down its owned process
+snapshot record, publishes a final zero command, and shuts down its owned process
 group. The positive-control contact is intentional test evidence and is never
 included in a mission's `collision_count`.
 
@@ -308,33 +321,55 @@ does not match, or any source/rendered/configuration hash differs between the
 control and benchmark candidates. In those cases `collision_count` is null and
 the benchmark fails; a silent mission contact topic cannot be reported as zero.
 
+The component and metrics collector are independent observers of the public
+snapshot stream. Their retained traces are reconciled bijectively from the
+component's first snapshot through the exact qualified release snapshot `q`:
+strict snapshot stamps and the sorted multiset of every normalized pair must
+match at every stamp. This includes support, robot-internal, and counted records
+and preserves duplicate multiplicity. Collector prefix data before the component
+subscribes is outside the join, and suffix data in either retained trace after
+`q` is truncated from the bijection. The full component suffix remains
+validated and any post-`q` countable recontact fails the positive criterion;
+support or robot-internal suffix snapshots are permitted while `/clock` catches
+up. Independent callback-clock stamps are validated separately rather than
+compared for equality.
+
 ### Event de-duplication
 
-Gazebo may publish many contact records during one physical contact. Normalize
-scoped collision names, identify the non-robot counterpart's top-level model,
-and group simultaneous robot-geometry records for that counterpart. A
-collision event begins with the first non-excluded contact for a counterpart
-model. It ends only after the frozen 0.25 s `contact_release_gap_s` has elapsed
-without another non-excluded contact for that same counterpart. A later contact
-starts a new event. Simultaneous contacts with two distinct counterpart models
-are distinct events.
+The gate batches private raw messages by exact simulation stamp and publishes a
+strictly increasing, complete snapshot of its delivered active-pair state. A
+collision episode begins when a counterpart is present in an authoritative
+snapshot and ends at the first later authoritative snapshot where that
+counterpart is absent. The gate omits a pair only when a completed absent stamp
+is strictly greater than its last delivered raw sighting plus 0.25 s; equality
+remains continuous. Offline analysis never infers release from elapsed clock
+time. Pair migration for one counterpart remains one episode; simultaneous
+distinct counterpart models remain distinct episodes.
 
-Contact collection remains active until simulation time reaches
-`T_terminal + 0.25 s`. This drain admits delayed delivery of records stamped on
-or before `T_terminal` and allows an event active at the terminal boundary to
-close. Only events with a first contact stamp in `[T0, T_terminal]` contribute
+Snapshot records are grouped in canonical normalized-pair order. Duplicate
+records within one pair retain the sole private bridge's delivered callback
+order; deterministic here means deterministic for that delivered ordered
+batch, not permutation-invariant sorting of nested force/depth payloads. Each
+retained nested `Contact` record remains field-exact.
+
+Contact collection remains active until it retains an actual authoritative
+snapshot with stamp strictly greater than `T_terminal + 0.25 s`. The exact
+qualifying stamp is collector-acknowledged and present in the final capture;
+the target timestamp alone is never fabricated as completion. Only episodes
+with a first snapshot stamp in `[T0, T_terminal]` contribute
 to the mission count; later-stamped contacts are retained as post-terminal
 diagnostics. Failure to advance and complete the full drain, a stamp regression,
 or collector overflow invalidates `collision_count` rather than treating the
 undrained stream as quiet.
 
 Store event start/end, counterpart model, every robot/counterpart collision
-pair seen, sample count, maximum penetration depth, maximum reported normal
-force when available, and duration. No counted event is deleted because it is
-short or low force.
+pair seen, sampled snapshot-record count, maximum delivered-snapshot
+penetration depth, maximum delivered-snapshot reported normal force when
+available, and duration. These maxima do not claim unseen raw-physics peaks.
+No counted event is deleted because it is short or low force.
 
 `collision_count` is the number of de-duplicated counterpart episodes, not the
-number of contact messages, contact points, or collision pairs.
+number of public snapshots, contact points, or collision pairs.
 
 ## Localization error
 

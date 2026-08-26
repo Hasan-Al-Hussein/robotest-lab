@@ -46,13 +46,18 @@ must compare them with the live endpoints using `ros2 topic info -v`.
 | `/robotest/cmd_vel_behavior_unused` | `geometry_msgs/msg/Twist` | Isolated Nav2 behavior-server output | None; this topic is not bridged or connected to an actuator path | RELIABLE, VOLATILE, KEEP_LAST(1) |
 | `/robotest/collision_monitor_state` | `nav2_msgs/msg/CollisionMonitorState` | Collision monitor | Metrics and evidence probes | RELIABLE, VOLATILE, KEEP_LAST(10) |
 | `/robotest/validation/ground_truth` | `nav_msgs/msg/Odometry` | Gazebo model truth -> bridge | Metrics, validation tests, evidence recorder | RELIABLE, VOLATILE, KEEP_LAST(10) |
-| `/robotest/validation/contacts` | `ros_gz_interfaces/msg/Contacts` | Gazebo contact sensor -> bridge | Metrics and validation tests | RELIABLE, VOLATILE, KEEP_LAST(10) |
+| `/robotest/internal/raw_contacts` | `ros_gz_interfaces/msg/Contacts` | Gazebo contact sensors -> sole `parameter_bridge` publisher | Compiled `contact_stream_gate` only | RELIABLE, VOLATILE, KEEP_LAST(64) |
+| `/robotest/validation/contacts` | `ros_gz_interfaces/msg/Contacts` | Sole compiled `contact_stream_gate` publisher; authoritative delivered active-pair snapshots | Metrics and validation tests | RELIABLE, VOLATILE, KEEP_LAST(10) |
 | `/robotest/validation/world_stats` | `ros_gz_interfaces/msg/WorldStatistics` | Gazebo world statistics -> bridge | Metrics and resource recorder | RELIABLE, VOLATILE, KEEP_LAST(10) |
 | `/robotest/faults/events` | `robotest_interfaces/msg/FaultEvent` | Fault proxy | Metrics and evidence recorder | RELIABLE, VOLATILE, KEEP_LAST(100) |
 
-The bridge for `/clock`, sensors, validation truth, and world statistics is
-Gazebo-to-ROS only. The final velocity bridge is ROS-to-Gazebo only.
-Bidirectional bridges are not used where direction is known.
+The bridge for `/clock`, sensors, validation truth, private raw contacts, and
+world statistics is Gazebo-to-ROS only. Raw contacts are never bridged directly
+to the public validation topic: the gate batches exact simulation stamps,
+publishes complete nonempty delivered-state snapshots with strictly increasing
+stamps, and fails closed on structural, semantic, capacity, or liveness
+violations. The final velocity bridge is ROS-to-Gazebo only. Bidirectional
+bridges are not used where direction is known.
 
 ### Command ownership by phase
 

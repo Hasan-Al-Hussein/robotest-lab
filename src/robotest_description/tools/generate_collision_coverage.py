@@ -34,11 +34,14 @@ import xml.etree.ElementTree as ET
 
 import yaml
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 ROBOT_MODEL = 'robotest'
-CONTACT_TOPIC = '/robotest/validation/contacts'
+GAZEBO_CONTACT_TOPIC = '/robotest/validation/contacts'
+PRIVATE_RAW_CONTACT_TOPIC = '/robotest/internal/raw_contacts'
+PUBLIC_CONTACT_TOPIC = '/robotest/validation/contacts'
+CONTACT_TOPIC = PUBLIC_CONTACT_TOPIC
 GROUND_COLLISION = 'ground_plane::ground_link::ground_collision'
-CONTACT_UPDATE_RATE_HZ = 5.0
+DECLARED_CONTACT_UPDATE_RATE_HZ = 5.0
 RENDER_ARGUMENTS = {
     'enable_ground_truth': 'true',
     'namespace': '/robotest',
@@ -55,14 +58,66 @@ ROLE_BINDINGS = (
 )
 SUPPORT_ROLES = ('left_wheel', 'right_wheel', 'front_caster', 'rear_caster')
 BRIDGE_CONTACT_ENTRY = {
-    'ros_topic_name': 'validation/contacts',
-    'gz_topic_name': CONTACT_TOPIC,
+    'ros_topic_name': 'internal/raw_contacts',
+    'gz_topic_name': GAZEBO_CONTACT_TOPIC,
     'ros_type_name': 'ros_gz_interfaces/msg/Contacts',
     'gz_type_name': 'gz.msgs.Contacts',
     'direction': 'GZ_TO_ROS',
-    'publisher_queue': 10,
-    'subscriber_queue': 10,
+    'publisher_queue': 64,
+    'subscriber_queue': 64,
     'qos_profile': 'SERVICES',
+}
+CONTACT_GATE_SOURCE_PATHS = (
+    'src/robotest_sim/CMakeLists.txt',
+    'src/robotest_sim/include/robotest_sim/contact_stream_gate.hpp',
+    'src/robotest_sim/src/contact_stream_gate.cpp',
+    'src/robotest_sim/src/contact_stream_gate_node.cpp',
+)
+CONTACT_STREAM_POLICY = {
+    'active_pair_expiry_ns': 250_000_000,
+    'active_pair_scope': 'support_robot_internal_and_countable_robot_external',
+    'accepted_run_scope': 'continuous_sensed_support_contact_required',
+    'capacity_claim_scope': 'unchanged_pair_set_heartbeat_only',
+    'completed_stamp_batching': 'finalize_on_strictly_greater_raw_stamp',
+    'delivery_semantics': 'authoritative_delivered_active_pair_snapshot',
+    'emission_policy': 'immediate_active_pair_set_transition_else_heartbeat_at_or_after_200ms',
+    'heartbeat_period_ns': 200_000_000,
+    'initial_finalized_stamp_suppressed': True,
+    'ingress_memory_bound_scope': '_'.join(
+        ('post_dds_deserialization_of_trusted_sole', 'private_bridge_input')
+    ),
+    'max_pending_batch_clock_lag_ns': 220_000_000,
+    'max_public_snapshot_gap_ns': 220_000_000,
+    'max_public_snapshot_clock_lag_ns': 220_000_000,
+    'max_raw_clock_lag_ns': 220_000_000,
+    'public_snapshots_require_nonempty_contacts': True,
+    'public_snapshot_cardinality': 'required_nonempty_1_to_16',
+    'public_snapshots_per_finalized_stamp': 'at_most_one',
+    'limits': {
+        'max_active_contact_pairs': 16,
+        'max_active_contact_records': 16,
+        'max_active_string_bytes': 65_536,
+        'max_body_name_bytes': 4_096,
+        'max_collision_name_bytes': 4_096,
+        'max_contact_points_per_record': 64,
+        'max_contact_records_per_pair': 4,
+        'max_contact_string_bytes': 8_192,
+        'max_frame_id_bytes': 256,
+        'max_raw_contact_records': 16,
+        'max_raw_messages_per_completed_stamp': 7,
+        'max_raw_stamp_advance_ns': 20_000_000,
+        'max_raw_string_bytes_per_completed_stamp': 65_536,
+    },
+    'release_comparison': 'completed_absent_stamp_strictly_greater_than_last_seen_plus_gap',
+    'raw_contact_positions': 'required_nonempty_1_to_64',
+    'raw_stamp_gap_semantics': 'greater_than_20ms_is_invalid_not_zero_contact',
+    'raw_messages_require_nonempty_contacts': True,
+    'required_raw_frame_id': '',
+    'retained_contact_payload': 'exact_nested_contact_record_copy',
+    'semantic_fatal_delivery': 'best_effort_diagnostic_snapshot_before_process_failure',
+    'string_budget_accounting': ('payload_strings_plus_normalized_pair_key_once_per_stored_pair'),
+    'synthesized_envelope': ['container', 'current_completed_header', 'normalized_pair_order'],
+    'synchronization': 'second_finalized_stamp_seeds_public_stream',
 }
 
 
@@ -179,7 +234,9 @@ def render_robot_sdf(repository_root: Path) -> bytes:
     return rendered
 
 
-def extract_rendered_coverage(rendered_sdf: bytes) -> tuple[list[dict[str, str]], str]:
+def extract_rendered_coverage(
+    rendered_sdf: bytes,
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
     """Validate rendered collisions/contact sensors and return their exact projection."""
     try:
         root = ET.fromstring(rendered_sdf)
@@ -231,10 +288,10 @@ def extract_rendered_coverage(rendered_sdf: bytes) -> tuple[list[dict[str, str]]
             raise CoverageGenerationError(f'{sensor_name} update rate is invalid') from exc
         if (
             target_collision != collision_name
-            or topic != CONTACT_TOPIC
+            or topic != GAZEBO_CONTACT_TOPIC
             or sensor.findtext('always_on') != 'true'
             or not math.isfinite(update_rate)
-            or update_rate != CONTACT_UPDATE_RATE_HZ
+            or update_rate != DECLARED_CONTACT_UPDATE_RATE_HZ
         ):
             raise CoverageGenerationError(
                 f'{sensor_name} does not exactly cover its collision on the frozen topic/rate'
@@ -244,7 +301,7 @@ def extract_rendered_coverage(rendered_sdf: bytes) -> tuple[list[dict[str, str]]
             {
                 'name': scoped_name,
                 'role': role,
-                'source': CONTACT_TOPIC,
+                'source': GAZEBO_CONTACT_TOPIC,
                 'link': link_name,
                 'collision': collision_name,
                 'contact_sensor': sensor_name,
@@ -255,19 +312,86 @@ def extract_rendered_coverage(rendered_sdf: bytes) -> tuple[list[dict[str, str]]
                 'collision': collision_name,
                 'contact_sensor': sensor_name,
                 'link': link_name,
-                'source': CONTACT_TOPIC,
-                'update_rate_hz': update_rate,
+                'declared_update_rate_hz': update_rate,
+                'source': GAZEBO_CONTACT_TOPIC,
             }
         )
     if len({item['name'] for item in geometries}) != len(ROLE_BINDINGS):
         raise CoverageGenerationError('rendered scoped collision names are not unique')
-    contact_configuration = {
-        'contact_topic': CONTACT_TOPIC,
-        'robot_model': ROBOT_MODEL,
+    return geometries, contact_projection
+
+
+def contact_gate_source_inventory(repository_root: Path) -> dict[str, Any]:
+    """Return the canonical compiled contact-gate source/link inventory."""
+    return {
         'schema_version': 1,
-        'sensors': contact_projection,
+        'sources': [
+            {
+                'path': relative_path,
+                'sha256': file_sha256(repository_root / relative_path),
+            }
+            for relative_path in CONTACT_GATE_SOURCE_PATHS
+        ],
     }
-    return geometries, canonical_sha256(contact_configuration)
+
+
+def contact_gate_source_sha256(repository_root: Path) -> str:
+    """Hash the complete compiled contact-gate source/link inventory."""
+    return canonical_sha256(contact_gate_source_inventory(repository_root))
+
+
+def contact_stream_configuration(repository_root: Path) -> dict[str, Any]:
+    """Bind the private bridge, compiled gate, and public snapshot contract."""
+    launch_path = repository_root / 'src' / 'robotest_sim' / 'launch' / 'sim.launch.py'
+    try:
+        launch_source = launch_path.read_text(encoding='utf-8')
+    except (OSError, UnicodeError) as exc:
+        raise CoverageGenerationError(f'cannot read contact gate launch source: {exc}') from exc
+    required_launch_tokens = (
+        "package='robotest_sim'",
+        "executable='contact_stream_gate'",
+        'namespace=namespace',
+        "name='contact_stream_gate'",
+        "on_exit=Shutdown(reason='contact stream gate exited')",
+        "on_exit=Shutdown(reason='parameter bridge exited')",
+    )
+    if any(token not in launch_source for token in required_launch_tokens):
+        raise CoverageGenerationError(
+            ' '.join(('contact gate launch wiring differs from the', 'frozen topology'))
+        )
+    policy = dict(CONTACT_STREAM_POLICY)
+    source_inventory = contact_gate_source_inventory(repository_root)
+    return {
+        'schema_version': 1,
+        'topics': {
+            'gazebo_raw': GAZEBO_CONTACT_TOPIC,
+            'private_raw_ros': PRIVATE_RAW_CONTACT_TOPIC,
+            'public_ros': PUBLIC_CONTACT_TOPIC,
+        },
+        'qos': {
+            'private_raw_ros': {
+                'depth': 64,
+                'durability': 'VOLATILE',
+                'history': 'KEEP_LAST',
+                'reliability': 'RELIABLE',
+            },
+            'public_ros': {
+                'depth': 10,
+                'durability': 'VOLATILE',
+                'history': 'KEEP_LAST',
+                'reliability': 'RELIABLE',
+            },
+        },
+        'gate': {
+            'executable': 'contact_stream_gate',
+            'launch_sha256': file_sha256(launch_path),
+            'package': 'robotest_sim',
+            'source_inventory': source_inventory,
+            'source_inventory_sha256': canonical_sha256(source_inventory),
+        },
+        'policy': policy,
+        'policy_sha256': canonical_sha256(policy),
+    }
 
 
 def bridge_sha256(repository_root: Path) -> str:
@@ -285,7 +409,8 @@ def bridge_sha256(repository_root: Path) -> str:
         if isinstance(entry, Mapping)
         and (
             entry.get('ros_topic_name') == BRIDGE_CONTACT_ENTRY['ros_topic_name']
-            or entry.get('gz_topic_name') == CONTACT_TOPIC
+            or entry.get('ros_topic_name') == 'validation/contacts'
+            or entry.get('gz_topic_name') == GAZEBO_CONTACT_TOPIC
         )
     ]
     if len(contact_entries) != 1 or dict(contact_entries[0]) != BRIDGE_CONTACT_ENTRY:
@@ -324,13 +449,23 @@ def build_manifest(repository_root: Path) -> dict[str, Any]:
     """Derive the complete manifest from current rendered/source evidence."""
     root = repository_root.expanduser().resolve(strict=True)
     rendered_sdf = render_robot_sdf(root)
-    geometries, contact_configuration_hash = extract_rendered_coverage(rendered_sdf)
+    geometries, sensor_projection = extract_rendered_coverage(rendered_sdf)
+    contact_stream = contact_stream_configuration(root)
+    contact_configuration = {
+        'contact_stream': contact_stream,
+        'declared_sensor_update_rate_authoritative': False,
+        'gazebo_contact_topic': GAZEBO_CONTACT_TOPIC,
+        'robot_model': ROBOT_MODEL,
+        'schema_version': 2,
+        'sensors': sensor_projection,
+    }
     names = [item['name'] for item in geometries]
     by_role = {item['role']: item['name'] for item in geometries}
     manifest: dict[str, Any] = {
         'schema_version': SCHEMA_VERSION,
         'robot_model': ROBOT_MODEL,
-        'contact_topic': CONTACT_TOPIC,
+        'contact_topic': PUBLIC_CONTACT_TOPIC,
+        'contact_stream': contact_stream,
         'robot_collisions': geometries,
         'covered_collisions': list(names),
         'rendered_robot_collisions': list(names),
@@ -342,7 +477,7 @@ def build_manifest(repository_root: Path) -> dict[str, Any]:
             for role in SUPPORT_ROLES
         ],
         'bridge_sha256': bridge_sha256(root),
-        'contact_configuration_sha256': contact_configuration_hash,
+        'contact_configuration_sha256': canonical_sha256(contact_configuration),
         'rendered_sdf_sha256': hashlib.sha256(rendered_sdf).hexdigest(),
         'robot_description_sha256': robot_description_sha256(root),
         'world_source_sha256': world_source_sha256(root),

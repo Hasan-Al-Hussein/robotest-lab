@@ -49,13 +49,29 @@ def _contact(counterpart: str, *, depth: float = 0.01, force: float = 2.0) -> di
     return {
         'collision1': 'robotest::base_link::base_collision',
         'collision2': counterpart,
-        'depths_m': [depth],
+        'maximum_penetration_depth_m': depth,
         'maximum_normal_force_n': force,
     }
 
 
+def _support_contact() -> dict[str, Any]:
+    return {
+        'collision1': 'robotest::left_wheel_link::left_wheel_collision',
+        'collision2': 'ground_plane::ground_link::ground_collision',
+        'maximum_penetration_depth_m': 0.001,
+        'maximum_normal_force_n': 1.0,
+    }
+
+
 def _message(stamp: int, sequence: int, *contacts: dict[str, Any]) -> dict[str, Any]:
-    return {'collector_sequence': sequence, 'contacts': list(contacts), 'stamp_ns': stamp}
+    return {
+        'collector_sequence': sequence,
+        'contacts': [_support_contact(), *contacts],
+        'delivery_clock_offset_ns': 0,
+        'delivery_clock_stamp_ns': stamp,
+        'frame_id': '',
+        'stamp_ns': stamp,
+    }
 
 
 def test_coverage_requires_exact_complete_collision_union() -> None:
@@ -85,11 +101,13 @@ def test_positive_control_is_hash_bound_and_must_pass() -> None:
         lambda positive: positive['control']['command_trace'][0].pop('phase'),
         lambda positive: positive['control']['contact'].__setitem__('first_qualifying_contact', {}),
         lambda positive: positive['control'].__setitem__('command_trace', []),
-        lambda positive: positive['control']['contact'].__setitem__('records', []),
+        lambda positive: positive['control']['contact'].__setitem__('snapshot_records', []),
         lambda positive: positive['control']['contact'].__setitem__(
             'first_qualifying_contact', None
         ),
-        lambda positive: positive['control']['contact'].__setitem__('exact_pair_raw_count', 0),
+        lambda positive: positive['control']['contact'].__setitem__(
+            'exact_pair_snapshot_record_count', 0
+        ),
         lambda positive: positive['control'].__setitem__(
             'command_trace',
             [
@@ -175,7 +193,7 @@ def test_positive_control_start_and_buffer_proofs_fail_closed(
         (('control', 'setup', 'observed_wall'), None, 'setup'),
         (('quality', 'source_streams_live'), False, 'source_streams_live'),
         (
-            ('quality', 'contact_message_heartbeat', 'latest_stamp_ns'),
+            ('quality', 'public_contact_snapshot_heartbeat', 'latest_stamp_ns'),
             3_000_000_000,
             'heartbeat',
         ),
@@ -352,10 +370,14 @@ def test_positive_control_default_wall_asset_ignores_evidence_path_redirection(
                 positive['control']['contact']['first_qualifying_contact'].__setitem__(
                     'collector_sequence', 6
                 ),
-                positive['control']['contact']['records'][0].__setitem__('collector_sequence', 6),
+                next(
+                    record
+                    for record in positive['control']['contact']['snapshot_records']
+                    if record['disposition'] == 'counted'
+                ).__setitem__('collector_sequence', 6),
                 positive['control']['command_trace'][1].__setitem__('collector_sequence', 7),
             ),
-            'setup/control sequence',
+            'contact record ordering',
         ),
     ],
 )
@@ -394,7 +416,7 @@ def test_positive_control_rejects_rebound_command_trace_without_hold() -> None:
     ('mutation', 'message'),
     [
         (
-            lambda positive: positive['control']['contact'].__setitem__('records', []),
+            lambda positive: positive['control']['contact'].__setitem__('snapshot_records', []),
             'retained contact records',
         ),
         (
@@ -417,12 +439,12 @@ def test_positive_control_rejects_rebound_command_trace_without_hold() -> None:
         ),
         (
             lambda positive: positive['control']['timeline'].__setitem__(
-                'release_contact_message_start_count', 0
+                'release_contact_snapshot_start_count', 0
             ),
             'timeline',
         ),
         (
-            lambda positive: positive['quality']['contact_message_heartbeat'].__setitem__(
+            lambda positive: positive['quality']['public_contact_snapshot_heartbeat'].__setitem__(
                 'first_stamp_ns', 2_500_000_000
             ),
             'heartbeat',
@@ -443,7 +465,11 @@ def test_positive_control_derived_evidence_relations_fail_closed(
 
 def test_positive_control_contact_records_are_reclassified_from_retained_bytes() -> None:
     manifest, positive, binding = collision_fixture()
-    record = positive['control']['contact']['records'][0]
+    record = next(
+        record
+        for record in positive['control']['contact']['snapshot_records']
+        if record['disposition'] == 'counted'
+    )
     record.update(
         {
             'counterpart_collision': None,
@@ -455,7 +481,7 @@ def test_positive_control_contact_records_are_reclassified_from_retained_bytes()
     )
     binding['positive_control_json_sha256'] = canonical_sha256(positive)
 
-    with pytest.raises(MetricUnavailable, match='retained expected contact'):
+    with pytest.raises(MetricUnavailable, match='non-robot pair'):
         validate_collision_qualification(manifest, positive, binding)
 
 
@@ -477,13 +503,21 @@ def test_pair_classification_has_only_exact_frozen_exclusions() -> None:
         classify_contact_pair(wheel, manifest['robot_collisions'][0]['name'], manifest)['reason']
         == 'robot_internal'
     )
-    assert (
-        classify_contact_pair('box::a::collision', 'wall::b::collision', manifest)['reason']
-        == 'unrelated_environment_contact'
-    )
+    with pytest.raises(MetricUnavailable, match='non-robot pair'):
+        classify_contact_pair('box::a::collision', 'wall::b::collision', manifest)
     counted = classify_contact_pair(wheel, 'wall::link::collision', manifest)
     assert counted['counted'] is True
     assert counted['counterpart_model'] == 'wall'
+
+
+@pytest.mark.parametrize(
+    'invalid_name',
+    ['model::collision', 'a::::b', '::a::b', 'a::b::'],
+)
+def test_pair_classification_rejects_impossible_scoped_names(invalid_name: str) -> None:
+    manifest, _, _ = collision_fixture()
+    with pytest.raises(MetricUnavailable, match='model::link::collision scoped'):
+        classify_contact_pair(manifest['robot_collisions'][0]['name'], invalid_name, manifest)
 
 
 def test_support_allowlist_rejects_chassis_or_non_ground_exclusions() -> None:
@@ -513,16 +547,18 @@ def test_contact_episode_dedup_release_and_pre_action_diagnostics() -> None:
         _message(200, 3, _contact(wall, depth=0.02, force=3.0)),
         _message(450, 4, _contact(wall, depth=0.03, force=4.0)),
         _message(500, 5),
+        _message(800, 6),
     ]
     result = analyze_collisions(
-        messages, 100, 500, 750, manifest, positive, binding, release_gap_ns=250
+        messages, 100, 500, 800, manifest, positive, binding, release_gap_ns=250
     )
-    assert result['collision_count'] == 2
-    assert result['pre_action_contact_record_count'] == 1
-    assert result['events'][0]['sample_count'] == 2
-    assert result['events'][0]['end_stamp_ns'] == 450
-    assert result['events'][0]['maximum_penetration_depth_m'] == pytest.approx(0.02)
-    assert result['events'][1]['start_stamp_ns'] == 450
+    assert result['collision_count'] == 1
+    assert result['pre_action_snapshot_record_count'] == 1
+    assert result['events'][0]['sampled_snapshot_record_count'] == 3
+    assert result['events'][0]['end_stamp_ns'] == 500
+    assert result['events'][0]['maximum_delivered_snapshot_penetration_depth_m'] == pytest.approx(
+        0.03
+    )
 
 
 def test_contact_episode_that_began_before_t0_remains_diagnostic() -> None:
@@ -533,16 +569,17 @@ def test_contact_episode_that_began_before_t0_remains_diagnostic() -> None:
             _message(50, 1, _contact(wall)),
             _message(100, 2, _contact(wall)),
             _message(200, 3, _contact(wall)),
+            _message(451, 4),
         ],
         100,
         200,
-        450,
+        451,
         manifest,
         positive,
         binding,
         release_gap_ns=250,
     )
-    assert result['pre_action_contact_record_count'] == 1
+    assert result['pre_action_snapshot_record_count'] == 1
     assert result['collision_count'] == 0
 
 
@@ -556,9 +593,10 @@ def test_simultaneous_counterpart_models_are_distinct_events() -> None:
             _contact('box::link::collision'),
         ),
         _message(200, 2),
+        _message(451, 3),
     ]
     result = analyze_collisions(
-        messages, 100, 200, 450, manifest, positive, binding, release_gap_ns=250
+        messages, 100, 200, 451, manifest, positive, binding, release_gap_ns=250
     )
     assert result['collision_count'] == 2
     assert {event['counterpart_model'] for event in result['events']} == {'box', 'wall'}
@@ -569,12 +607,13 @@ def test_post_terminal_contacts_do_not_start_counted_events() -> None:
     messages = [
         _message(100, 1),
         _message(201, 2, _contact('wall::link::collision')),
+        _message(451, 3),
     ]
     result = analyze_collisions(
-        messages, 100, 200, 450, manifest, positive, binding, release_gap_ns=250
+        messages, 100, 200, 451, manifest, positive, binding, release_gap_ns=250
     )
     assert result['collision_count'] == 0
-    assert result['post_terminal_contact_record_count'] == 1
+    assert result['post_terminal_snapshot_record_count'] == 1
 
 
 def test_post_terminal_continuation_without_full_release_is_censored_at_drain() -> None:
@@ -584,11 +623,11 @@ def test_post_terminal_continuation_without_full_release_is_censored_at_drain() 
         [
             _message(100, 1),
             _message(300, 2, _contact(wall)),
-            _message(301, 3, _contact(wall)),
+            _message(551, 3, _contact(wall)),
         ],
         100,
         300,
-        550,
+        551,
         manifest,
         positive,
         binding,
@@ -596,24 +635,33 @@ def test_post_terminal_continuation_without_full_release_is_censored_at_drain() 
     )
     assert result['collision_count'] == 1
     assert result['events'][0]['censored_at_drain'] is True
-    assert result['events'][0]['end_stamp_ns'] == 550
+    assert result['events'][0]['end_stamp_ns'] == 551
 
 
 def test_collision_requires_full_drain_and_non_silent_mission_topic() -> None:
     manifest, positive, binding = collision_fixture()
     with pytest.raises(MetricUnavailable, match='drain'):
         analyze_collisions(
-            [_message(100, 1)],
+            [_message(100, 1), _message(450, 2)],
             100,
             200,
-            449,
+            450,
             manifest,
             positive,
             binding,
             release_gap_ns=250,
         )
     with pytest.raises(MetricUnavailable, match='silent'):
-        analyze_collisions([], 100, 200, 450, manifest, positive, binding, release_gap_ns=250)
+        analyze_collisions(
+            [_message(99, 1), _message(451, 2)],
+            100,
+            200,
+            451,
+            manifest,
+            positive,
+            binding,
+            release_gap_ns=250,
+        )
 
 
 def test_collision_rejects_negative_depth_and_record_overflow(
@@ -622,10 +670,13 @@ def test_collision_rejects_negative_depth_and_record_overflow(
     manifest, positive, binding = collision_fixture()
     with pytest.raises(MetricUnavailable, match='negative'):
         analyze_collisions(
-            [_message(100, 1, _contact('wall::link::collision', depth=-0.1))],
+            [
+                _message(100, 1, _contact('wall::link::collision', depth=-0.1)),
+                _message(451, 2),
+            ],
             100,
             200,
-            450,
+            451,
             manifest,
             positive,
             binding,
@@ -640,13 +691,80 @@ def test_collision_rejects_negative_depth_and_record_overflow(
                     1,
                     _contact('wall::link::collision'),
                     _contact('box::link::collision'),
-                )
+                ),
+                _message(451, 2),
             ],
             100,
             200,
-            450,
+            451,
             manifest,
             positive,
             binding,
             release_gap_ns=250,
         )
+
+
+def test_snapshot_presence_equality_pair_migration_and_absence_recontact() -> None:
+    manifest, positive, binding = collision_fixture()
+    wall = 'wall::link::collision'
+    chassis = 'robotest::base_link::base_collision'
+    wheel = 'robotest::left_wheel_link::left_wheel_collision'
+    migrated = _contact(wall)
+    migrated['collision1'] = wheel
+    result = analyze_collisions(
+        [
+            _message(100, 1, _contact(wall)),
+            _message(350, 2, migrated),
+            _message(351, 3),
+            _message(600, 4, _contact(wall)),
+            _message(601, 5),
+            _message(951, 6),
+        ],
+        100,
+        700,
+        951,
+        manifest,
+        positive,
+        binding,
+        release_gap_ns=250,
+    )
+    assert result['collision_count'] == 2
+    assert result['events'][0]['start_stamp_ns'] == 100
+    assert result['events'][0]['end_stamp_ns'] == 351
+    assert result['events'][0]['sampled_snapshot_record_count'] == 2
+    assert result['events'][0]['pairs'] == [
+        {'counterpart_collision': wall, 'robot_collision': chassis},
+        {'counterpart_collision': wall, 'robot_collision': wheel},
+    ]
+    assert result['events'][1]['start_stamp_ns'] == 600
+    assert result['events'][1]['end_stamp_ns'] == 601
+
+
+def test_public_snapshot_shape_ordering_and_delivery_bracket_fail_closed() -> None:
+    manifest, positive, binding = collision_fixture()
+    base = [_message(100, 1), _message(451, 2)]
+    duplicate = copy.deepcopy(base)
+    duplicate[1]['stamp_ns'] = 100
+    duplicate[1]['delivery_clock_stamp_ns'] = 100
+    with pytest.raises(MetricUnavailable, match='strictly increasing'):
+        analyze_collisions(
+            duplicate, 100, 200, 451, manifest, positive, binding, release_gap_ns=250
+        )
+
+    empty = copy.deepcopy(base)
+    empty[0]['contacts'] = []
+    with pytest.raises(MetricUnavailable, match='between one and 16'):
+        analyze_collisions(empty, 100, 200, 451, manifest, positive, binding, release_gap_ns=250)
+
+    oversized = copy.deepcopy(base)
+    oversized[0]['contacts'] = [_support_contact() for _ in range(17)]
+    with pytest.raises(MetricUnavailable, match='between one and 16'):
+        analyze_collisions(
+            oversized, 100, 200, 451, manifest, positive, binding, release_gap_ns=250
+        )
+
+    stale = copy.deepcopy(base)
+    stale[0]['delivery_clock_stamp_ns'] = 220_000_101
+    stale[0]['delivery_clock_offset_ns'] = 220_000_001
+    with pytest.raises(MetricUnavailable, match='delivery clock bracket'):
+        analyze_collisions(stale, 100, 200, 451, manifest, positive, binding, release_gap_ns=250)

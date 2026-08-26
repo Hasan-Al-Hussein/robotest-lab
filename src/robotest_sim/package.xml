@@ -15,8 +15,14 @@
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
+  <depend>builtin_interfaces</depend>
+  <depend>geometry_msgs</depend>
+  <depend>rclcpp</depend>
+  <depend>ros_gz_interfaces</depend>
+  <depend>rosgraph_msgs</depend>
+  <depend>std_msgs</depend>
+
   <exec_depend>ament_index_python</exec_depend>
-  <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
@@ -26,9 +32,7 @@
   <exec_depend>robotest_faults</exec_depend>
   <exec_depend>robotest_interfaces</exec_depend>
   <exec_depend>ros_gz_bridge</exec_depend>
-  <exec_depend>ros_gz_interfaces</exec_depend>
   <exec_depend>ros_gz_sim</exec_depend>
-  <exec_depend>rosgraph_msgs</exec_depend>
   <exec_depend>rqt_plot</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
@@ -37,6 +41,7 @@
   <exec_depend>xacro</exec_depend>
 
   <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
   <test_depend>python3-pytest</test_depend>
   <test_depend>python3-yaml</test_depend>
 

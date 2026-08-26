@@ -432,6 +432,56 @@ def test_checksum_manifest_is_exact_and_detects_tampering(tmp_path: Path) -> Non
         validate_checksum_manifest(run)
 
 
+def test_phase5_source_install_and_contact_gate_binding_validators_fail_closed() -> None:
+    source_record = {
+        'binding_type': 'python_module',
+        'installed_path': 'install/robotest_metrics/module.py',
+        'installed_sha256': '1' * 64,
+        'matches': True,
+        'package': 'robotest_metrics',
+        'source_path': 'src/robotest_metrics/module.py',
+        'source_sha256': '1' * 64,
+    }
+    source_install = {
+        'aggregate_sha256': release_module._canonical_sha256([source_record]),
+        'all_match': True,
+        'file_count': 1,
+        'records': [source_record],
+    }
+    release_module._validate_source_install(source_install)
+    forged_source_install = copy.deepcopy(source_install)
+    forged_source_install['records'][0]['installed_sha256'] = '2' * 64
+    with pytest.raises(EvidenceError, match='source/install record'):
+        release_module._validate_source_install(forged_source_install)
+
+    gate_binding = {
+        'build_embedded_source_inventory_match': True,
+        'build_embedded_source_inventory_sha256': '3' * 64,
+        'build_elf_build_id': 'a1',
+        'build_install_build_id_match': True,
+        'build_install_sha256_match': True,
+        'build_path': 'build/robotest_sim/contact_stream_gate',
+        'build_regular_executable': True,
+        'build_sha256': '4' * 64,
+        'installed_declared_path': 'install/robotest_sim/lib/robotest_sim/contact_stream_gate',
+        'installed_declared_samefile': True,
+        'installed_elf_build_id': 'a1',
+        'installed_embedded_source_inventory_match': True,
+        'installed_embedded_source_inventory_sha256': '3' * 64,
+        'installed_path': 'install/robotest_sim/lib/robotest_sim/contact_stream_gate',
+        'installed_regular_executable': True,
+        'installed_sha256': '4' * 64,
+        'package': 'robotest_sim',
+        'schema_version': 1,
+        'source_inventory_sha256': '3' * 64,
+    }
+    release_module._validate_contact_gate_binary_binding(gate_binding)
+    forged_gate_binding = copy.deepcopy(gate_binding)
+    forged_gate_binding['installed_embedded_source_inventory_sha256'] = '6' * 64
+    with pytest.raises(EvidenceError, match='embedded source or build/install hash'):
+        release_module._validate_contact_gate_binary_binding(forged_gate_binding)
+
+
 def test_remote_checksum_sidecar_detects_tampering(tmp_path: Path) -> None:
     evidence = tmp_path / 'remote.json'
     manifest = tmp_path / 'remote.SHA256SUMS'
@@ -983,6 +1033,93 @@ def _phase3_fault_event(
     return event
 
 
+def _write_phase3_contact_gate_reobservation(
+    repository: Path,
+    directory: Path,
+    *,
+    orchestration: object,
+    build_binding: dict,
+    ros_domain_id: int,
+    gz_partition: str,
+) -> None:
+    frozen = build_binding['contact_gate_binary']
+    installed_path = (repository / frozen['installed_path']).resolve(strict=True)
+    installed_stat = installed_path.stat()
+    launch_pid = 40_000 + ros_domain_id
+    attestation = {
+        'build_embedded_source_inventory_match': True,
+        'build_embedded_source_inventory_sha256': frozen['build_embedded_source_inventory_sha256'],
+        'build_elf_build_id': frozen['build_elf_build_id'],
+        'build_install_build_id_match': True,
+        'build_install_sha256_match': True,
+        'build_path': frozen['build_path'],
+        'build_sha256': frozen['build_sha256'],
+        'exact_live_process_count': 1,
+        'identity_revalidated_after_hashing': True,
+        'installed_declared_path': frozen['installed_declared_path'],
+        'installed_declared_samefile': True,
+        'installed_device': installed_stat.st_dev,
+        'installed_embedded_source_inventory_match': True,
+        'installed_embedded_source_inventory_sha256': frozen[
+            'installed_embedded_source_inventory_sha256'
+        ],
+        'installed_elf_build_id': frozen['installed_elf_build_id'],
+        'installed_inode': installed_stat.st_ino,
+        'installed_path': frozen['installed_path'],
+        'installed_regular_executable': True,
+        'installed_sha256': frozen['installed_sha256'],
+        'launch_root_pid': launch_pid,
+        'live_cmdline_sha256': hashlib.sha256(
+            f'{installed_path}\0--ros-args\0'.encode()
+        ).hexdigest(),
+        'live_device': installed_stat.st_dev,
+        'live_elf_build_id': frozen['installed_elf_build_id'],
+        'live_embedded_source_inventory_match': True,
+        'live_embedded_source_inventory_sha256': frozen[
+            'installed_embedded_source_inventory_sha256'
+        ],
+        'live_executable_link': str(installed_path),
+        'live_executable_path': str(installed_path),
+        'live_executable_sha256': frozen['installed_sha256'],
+        'live_inode': installed_stat.st_ino,
+        'live_installed_build_id_match': True,
+        'live_installed_inode_match': True,
+        'live_installed_sha256_match': True,
+        'live_pgid': launch_pid,
+        'live_pid': launch_pid + 1,
+        'live_ppid': launch_pid,
+        'live_sid': launch_pid,
+        'live_size_bytes': installed_stat.st_size,
+        'live_start_ticks': 1_000_000 + ros_domain_id,
+        'observed_gz_partition': gz_partition,
+        'observed_ros_domain_id': str(ros_domain_id),
+        'package': 'robotest_sim',
+        'process_identity_match': True,
+        'schema_version': 1,
+        'source_inventory_sha256': frozen['source_inventory_sha256'],
+        'verdict': 'PASS',
+    }
+    gate_document = {
+        'contact_gate_binary_attestation': attestation,
+        'verdict': 'PASS',
+    }
+    initial_path = directory / 'runtime-gate.json'
+    final_path = directory / 'contact-stream-final-gate.json'
+    _canonical_file(initial_path, gate_document, sidecar=True)
+    _canonical_file(final_path, gate_document, sidecar=True)
+    _canonical_file(
+        directory / 'contact-gate-revalidation.json',
+        orchestration.reconcile_contact_gate_reobservation(
+            initial_path,
+            final_path,
+            build_binding=build_binding,
+            expected_domain_id=ros_domain_id,
+            expected_gz_partition=gz_partition,
+        ),
+        sidecar=True,
+    )
+
+
 def _phase3_capture_fixture(
     metrics_fixture: object,
     *,
@@ -992,6 +1129,7 @@ def _phase3_capture_fixture(
     terminal_action_stamp_ns: int,
     fault_events: list[dict],
     fault: dict | None,
+    support_pair: tuple[str, str],
 ) -> dict:
     core = metrics_fixture.CollectorCore()
     activation = (
@@ -1142,8 +1280,28 @@ def _phase3_capture_fixture(
             'stamp_ns': 11_000_000_000,
         }
     )
-    core.record('contacts', {'contacts': [], 'stamp_ns': accepted_goal_stamp_ns + 100_000_000})
-    core.record('contacts', {'contacts': [], 'stamp_ns': terminal_action_stamp_ns - 100_000_000})
+    support_contact = {
+        'collision1': support_pair[0],
+        'collision2': support_pair[1],
+        'maximum_normal_force_n': 5.0,
+        'maximum_penetration_depth_m': 0.01,
+    }
+    contact_drain_stamp_ns = terminal_action_stamp_ns + 400_000_000
+    for stamp_ns in range(
+        accepted_goal_stamp_ns,
+        contact_drain_stamp_ns + 1,
+        200_000_000,
+    ):
+        core.record(
+            'contacts',
+            {
+                'contacts': [support_contact],
+                'delivery_clock_offset_ns': 0,
+                'delivery_clock_stamp_ns': stamp_ns,
+                'frame_id': '',
+                'stamp_ns': stamp_ns,
+            },
+        )
     for index, stamp_ns in enumerate(
         (accepted_goal_stamp_ns, 18_000_000_000, terminal_action_stamp_ns)
     ):
@@ -1203,7 +1361,7 @@ def _phase3_capture_fixture(
             )
     for event in fault_events:
         core.record('fault_events', {**event, 'stamp_ns': event['header_stamp_ns']})
-    for stamp_ns in (0, 18_000_000_000, terminal_action_stamp_ns):
+    for stamp_ns in (0, 18_000_000_000, terminal_action_stamp_ns, contact_drain_stamp_ns):
         core.observe_clock(stamp_ns)
     capture = core.snapshot()
     capture.update(
@@ -1352,6 +1510,14 @@ def _phase3_bundle(
         terminal_action_stamp_ns=terminal_action_stamp_ns,
         fault_events=fault_events,
         fault=fault,
+        support_pair=(
+            yaml.safe_load(
+                (repository / 'config/collision-coverage.yaml').read_text(encoding='utf-8')
+            )['support_pairs'][0]['robot_collision'],
+            yaml.safe_load(
+                (repository / 'config/collision-coverage.yaml').read_text(encoding='utf-8')
+            )['support_pairs'][0]['environment_collision'],
+        ),
     )
     if scenario_id in {2, 3}:
         scenario_fixture = release_module._load_repository_module(
@@ -1411,6 +1577,7 @@ def _phase3_bundle(
     orchestrator['source_binding'].update(
         {
             'collector_configuration_sha256': build_binding['collector_configuration_sha256'],
+            'contact_gate_binary': build_binding['contact_gate_binary'],
             'install_end_sha256': build_binding['install']['aggregate_sha256'],
             'install_start_sha256': build_binding['install']['aggregate_sha256'],
             'metrics_contract_sha256': build_binding['metrics_contract_sha256'],
@@ -1432,6 +1599,59 @@ def _phase3_bundle(
         (orchestrator_path, orchestrator),
     ):
         _canonical_file(path, document, sidecar=True)
+    contact_items = capture['streams']['contacts']['items']
+    qualifying_contact_stamp_ns = contact_items[-1]['stamp_ns']
+    contact_drain = {
+        'clock_first_stamp_ns': 0,
+        'clock_latest_stamp_ns': qualifying_contact_stamp_ns,
+        'clock_message_count': 4,
+        'clock_minus_qualifying_contact_ns': 0,
+        'clock_regression_count': 0,
+        'contact_message_count': len(contact_items),
+        'contact_record_count_violation_count': 0,
+        'contact_stamp_duplicate_count': 0,
+        'contact_stamp_regression_count': 0,
+        'first_contact_stamp_ns': contact_items[0]['stamp_ns'],
+        'gate_node_present': True,
+        'latest_contact_stamp_ns': qualifying_contact_stamp_ns,
+        'limits': {
+            'heartbeat_period_ns': 200_000_000,
+            'max_clock_lag_ns': 220_000_000,
+            'max_public_gap_ns': 220_000_000,
+            'release_gap_ns': 250_000_000,
+        },
+        'maximum_contact_record_count': 1,
+        'maximum_contact_source_gap_ns': 200_000_000,
+        'minimum_contact_record_count': 1,
+        'minimum_same_pair_set_interval_ns': 200_000_000,
+        'producer': 'robotest_phase3/contact_drain_observer',
+        'public_publisher_nodes': ['/robotest/contact_stream_gate'],
+        'public_topic': '/robotest/validation/contacts',
+        'qualifying_contact_snapshot_stamp_ns': qualifying_contact_stamp_ns,
+        'same_pair_set_interval_violation_count': 0,
+        'schema_version': 3,
+        'target_stamp_ns': terminal_action_stamp_ns + 250_000_000,
+        'terminal_action_stamp_ns': terminal_action_stamp_ns,
+    }
+    _canonical_file(run_root / 'contact-drain.json', contact_drain, sidecar=True)
+    _canonical_file(
+        run_root / 'contact-progress.json',
+        {
+            'latest_retained_stamp_ns': qualifying_contact_stamp_ns,
+            'producer': 'robotest_metrics/metrics_collector',
+            'public_topic': '/robotest/validation/contacts',
+            'retained_message_count': len(contact_items),
+            'schema_version': 1,
+        },
+    )
+    _write_phase3_contact_gate_reobservation(
+        repository,
+        run_root,
+        orchestration=orchestration,
+        build_binding=build_binding,
+        ros_domain_id=plan['ros_domain_id'],
+        gz_partition=plan['gz_partition'],
+    )
     lifecycle_path = None
     if scenario_id == 4:
         lifecycle_stamps = [13_000_000_000, 14_000_000_000]
@@ -1533,7 +1753,8 @@ def _phase3_bundle(
         capture_path=capture_path,
         positive_binding_path=positive_binding_path,
         orchestrator_path=orchestrator_path,
-        drain_completed_stamp_ns=terminal_action_stamp_ns + 250_000_000,
+        contact_drain_path=run_root / 'contact-drain.json',
+        contact_progress_path=run_root / 'contact-progress.json',
         lifecycle_snapshot_path=lifecycle_path,
     )
     _canonical_file(run_root / 'trial-context.json', trial_context, sidecar=True)
@@ -1541,8 +1762,6 @@ def _phase3_bundle(
     from robotest_metrics.analysis import analyze_run
 
     result = analyze_run(analysis_request)
-    if result['verdict']['automated_status'] != 'PASS':
-        print(json.dumps({'quality': result['quality'], 'verdict': result['verdict']}, indent=2))
     assert result['verdict']['automated_status'] == 'PASS', {
         'quality': result['quality'],
         'verdict': result['verdict'],
@@ -1700,8 +1919,11 @@ def _rebind_phase3_positive_raw(candidate_root: Path, repository: Path) -> None:
     build_binding = json.loads((candidate_root / 'build-binding.json').read_text(encoding='utf-8'))
     positive_binding_path = positive_directory / 'positive-binding.json'
     binding = orchestration.reconcile_positive_control(
+        workspace=repository,
+        build_binding=build_binding,
         result_path=positive_directory / 'contact-control-result.json',
         capture_path=positive_directory / 'capture.json',
+        contact_progress_path=positive_directory / 'contact-progress.json',
         manifest_path=repository / 'config/collision-coverage.yaml',
         collector_configuration_sha256=build_binding['collector_configuration_sha256'],
         owned_process_group_shutdown=True,
@@ -1829,6 +2051,10 @@ def _producer_collision_fixture(repository: Path) -> tuple[dict, dict, dict]:
     )
     wall = 'phase3_contact_control_wall::link::collision'
     expected_pair = sorted((chassis, wall))
+    support_entry = manifest['support_pairs'][0]
+    support_pair = sorted(
+        (support_entry['robot_collision'], support_entry['environment_collision'])
+    )
     positive_control['configuration']['coverage_manifest_sha256'] = coverage_sha
     positive_control['configuration']['coverage_manifest_provenance'] = {
         field: manifest[field]
@@ -1852,14 +2078,26 @@ def _producer_collision_fixture(repository: Path) -> tuple[dict, dict, dict]:
     contact['expected_pair'] = expected_pair
     contact['first_qualifying_contact']['normalized_pair'] = expected_pair
     contact['episodes'][0]['normalized_pairs'] = [expected_pair]
-    contact['records'][0].update(
-        {
-            'counterpart_collision': wall,
-            'counterpart_model': 'phase3_contact_control_wall',
-            'normalized_pair': expected_pair,
-            'robot_collision': chassis,
-        }
-    )
+    for record in contact['snapshot_records']:
+        if record['disposition'] == 'counted':
+            record.update(
+                {
+                    'counterpart_collision': wall,
+                    'counterpart_model': 'phase3_contact_control_wall',
+                    'normalized_pair': expected_pair,
+                    'robot_collision': chassis,
+                }
+            )
+        elif record['disposition'] == 'support_ground_excluded':
+            record['normalized_pair'] = support_pair
+    for snapshot in contact['snapshots']:
+        for record in snapshot['counted_snapshot_records']:
+            record.update(
+                {
+                    'counterpart_model': 'phase3_contact_control_wall',
+                    'normalized_pair': expected_pair,
+                }
+            )
     for name in ('benchmark_provenance', 'positive_control_provenance'):
         benchmark_binding[name].update(
             {
@@ -1904,6 +2142,15 @@ def _build_release_fixture(tmp_path: Path) -> dict[str, Path | str]:
             shutil.copytree(python_source, site_packages / package)
     for name in ('.editorconfig', '.gitattributes', 'LICENSE', 'README.md', 'pyproject.toml'):
         shutil.copy2(REPOSITORY / name, repository / name)
+    gate_fixture_source = Path(sys.executable).resolve(strict=True)
+    gate_build = repository / 'build/robotest_sim/contact_stream_gate'
+    gate_install = repository / 'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
+    gate_build.parent.mkdir(parents=True, exist_ok=True)
+    gate_install.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(gate_fixture_source, gate_build)
+    shutil.copy2(gate_fixture_source, gate_install)
+    gate_build.chmod(0o755)
+    gate_install.chmod(0o755)
     phase0_version = repository / 'artifacts/evidence/phase0/phase0-versions.json'
     _canonical_file(phase0_version, {'checked_at': 'before', 'schema_version': 1})
     call_log = tmp_path / 'release-calls.jsonl'
@@ -1945,6 +2192,17 @@ PY
         'tests/phase3_orchestration.py',
         'Phase 3 production orchestration fixture',
     )
+    gate_source_inventory_sha256 = orchestration.canonical_sha256(
+        orchestration.contact_gate_source_inventory(repository)
+    )
+    embedded_gate_source = (
+        b'ROBOTEST_CONTACT_GATE_SOURCE_INVENTORY_SHA256='
+        + gate_source_inventory_sha256.encode('ascii')
+        + b'\0'
+    )
+    for gate_path in (gate_build, gate_install):
+        with gate_path.open('ab') as stream:
+            stream.write(embedded_gate_source)
     build_binding = orchestration.build_binding(
         repository,
         git_sha=candidate_sha,
@@ -2004,7 +2262,7 @@ PY
 
     candidate_id = 'candidate-1'
     candidate_root = repository / f'artifacts/evidence/phase3-benchmarks/{candidate_id}'
-    _, positive_control, benchmark_binding = _producer_collision_fixture(repository)
+    coverage_manifest, positive_control, benchmark_binding = _producer_collision_fixture(repository)
     for name in ('benchmark_provenance', 'positive_control_provenance'):
         benchmark_binding[name]['collector_configuration_sha256'] = build_binding[
             'collector_configuration_sha256'
@@ -2093,15 +2351,36 @@ PY
     )
     core = metrics_fixture.CollectorCore()
     expected_pair = positive_control['control']['contact']['expected_pair']
-    for stamp_ns, contacts in (
-        (1_000_000_000, []),
-        (
-            2_000_000_000,
-            [{'collision1': expected_pair[0], 'collision2': expected_pair[1]}],
-        ),
-        (3_500_000_000, []),
-    ):
-        core.record('contacts', {'contacts': contacts, 'stamp_ns': stamp_ns})
+    support_entry = coverage_manifest['support_pairs'][0]
+    support_contact = {
+        'collision1': support_entry['robot_collision'],
+        'collision2': support_entry['environment_collision'],
+        'maximum_normal_force_n': 5.0,
+        'maximum_penetration_depth_m': 0.01,
+    }
+    for snapshot in positive_control['control']['contact']['snapshots']:
+        stamp_ns = snapshot['sim_stamp_ns']
+        contacts = [support_contact]
+        if snapshot['exact_pair_count']:
+            contacts.append(
+                {
+                    'collision1': expected_pair[0],
+                    'collision2': expected_pair[1],
+                    'maximum_normal_force_n': 2.0,
+                    'maximum_penetration_depth_m': 0.005,
+                }
+            )
+        core.observe_clock(stamp_ns)
+        core.record(
+            'contacts',
+            {
+                'contacts': contacts,
+                'delivery_clock_offset_ns': 0,
+                'delivery_clock_stamp_ns': stamp_ns,
+                'frame_id': '',
+                'stamp_ns': stamp_ns,
+            },
+        )
     for command in positive_control['control']['command_trace']:
         core.record(
             'cmd_vel',
@@ -2112,8 +2391,7 @@ PY
                 'stamp_ns': command['sim_stamp_ns'],
             },
         )
-    for stamp_ns in (0, 1_000_000_000, 2_000_000_000, 3_500_000_000):
-        core.observe_clock(stamp_ns)
+    core.observe_clock(3_500_000_000)
     positive_capture = core.snapshot()
     positive_capture.update(
         {
@@ -2124,6 +2402,25 @@ PY
         }
     )
     _canonical_file(positive_capture_path, positive_capture, sidecar=True)
+    positive_contact_items = positive_capture['streams']['contacts']['items']
+    _canonical_file(
+        positive_directory / 'contact-progress.json',
+        {
+            'latest_retained_stamp_ns': positive_contact_items[-1]['stamp_ns'],
+            'producer': 'robotest_metrics/metrics_collector',
+            'public_topic': '/robotest/validation/contacts',
+            'retained_message_count': len(positive_contact_items),
+            'schema_version': 1,
+        },
+    )
+    _write_phase3_contact_gate_reobservation(
+        repository,
+        positive_directory,
+        orchestration=orchestration,
+        build_binding=build_binding,
+        ros_domain_id=115,
+        gz_partition=f'robotest_p3_{candidate_id}_positive_control',
+    )
     resource_path = positive_directory / 'resources.jsonl'
     resource_samples = [
         {
@@ -2172,8 +2469,11 @@ PY
     _canonical_file(component_manifest_path, component_document, sidecar=True)
     assert orchestration.verify_component_manifest(component_document, positive_directory)
     positive_binding_document = orchestration.reconcile_positive_control(
+        workspace=repository,
+        build_binding=build_binding,
         result_path=positive_result_path,
         capture_path=positive_capture_path,
+        contact_progress_path=positive_directory / 'contact-progress.json',
         manifest_path=repository / 'config/collision-coverage.yaml',
         collector_configuration_sha256=build_binding['collector_configuration_sha256'],
         owned_process_group_shutdown=True,
@@ -2525,8 +2825,11 @@ def _relocate_phase3_evidence(
     _canonical_file(component_manifest_path, component_manifest, sidecar=True)
     positive_binding_path = positive_directory / 'positive-binding.json'
     positive_binding = orchestration.reconcile_positive_control(
+        workspace=repository,
+        build_binding=build_binding,
         result_path=positive_result_path,
         capture_path=positive_directory / 'capture.json',
+        contact_progress_path=positive_directory / 'contact-progress.json',
         manifest_path=repository / 'config/collision-coverage.yaml',
         collector_configuration_sha256=build_binding['collector_configuration_sha256'],
         owned_process_group_shutdown=True,
@@ -2553,10 +2856,6 @@ def _relocate_phase3_evidence(
             build=build_binding,
             positive=positive_binding,
         )
-        mission = json.loads((run_root / 'mission-result.json').read_text(encoding='utf-8'))
-        drain_stamp = int(mission['measurements']['terminal_action_stamp_ns']) + int(
-            orchestration.CONTACT_DRAIN_NS
-        )
         request = orchestration.compose_analysis_request(
             workspace=repository,
             plan=plan,
@@ -2565,7 +2864,8 @@ def _relocate_phase3_evidence(
             capture_path=run_root / 'capture.json',
             positive_binding_path=positive_binding_path,
             orchestrator_path=run_root / 'orchestrator.json',
-            drain_completed_stamp_ns=drain_stamp,
+            contact_drain_path=run_root / 'contact-drain.json',
+            contact_progress_path=run_root / 'contact-progress.json',
             lifecycle_snapshot_path=(lifecycle_path if int(plan['scenario_id']) == 4 else None),
         )
         _canonical_file(run_root / 'trial-context.json', context, sidecar=True)
@@ -3466,7 +3766,7 @@ def test_release_evidence_rejects_rebound_phase3_drain_stamp(tmp_path: Path) -> 
     _canonical_file(result_path, analysis.analyze_run(request))
     _refresh_phase3_bundle(result_path.parent)
 
-    with pytest.raises(EvidenceError, match='drain stamp is not derived'):
+    with pytest.raises(EvidenceError, match='strict authoritative post-terminal snapshot'):
         _validate_release_fixture(fixture)
 
 
@@ -3549,7 +3849,7 @@ def test_release_evidence_rejects_missing_collision_coverage_sha(tmp_path: Path)
         binding['benchmark_binding'][name]['bridge_sha256'] = None
     _refresh_phase3_positive_binding(candidate_root, binding, rebind_coverage=True)
 
-    with pytest.raises(EvidenceError, match='collision qualification failed'):
+    with pytest.raises(EvidenceError, match='Phase 3 collision qualification failed'):
         _validate_release_fixture(fixture)
 
 
@@ -3574,7 +3874,7 @@ def test_release_evidence_rejects_rebound_positive_control_raw_forgery(
     candidate_root = Path(fixture['candidate_root'])
     result_path = candidate_root / 'positive-control/contact-control-result.json'
     result = json.loads(result_path.read_text(encoding='utf-8'))
-    record = result['control']['contact']['records'][0]
+    record = result['control']['contact']['snapshot_records'][0]
     record.update(
         {
             'counterpart_collision': None,
@@ -3586,7 +3886,7 @@ def test_release_evidence_rejects_rebound_positive_control_raw_forgery(
     _canonical_file(result_path, result, sidecar=True)
     _rebind_phase3_positive_raw(candidate_root, repository)
 
-    with pytest.raises(EvidenceError, match='collision qualification failed'):
+    with pytest.raises(EvidenceError, match='positive-control result schema failed'):
         _validate_release_fixture(fixture)
 
 

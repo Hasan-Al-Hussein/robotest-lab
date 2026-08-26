@@ -11,6 +11,7 @@ import importlib.util
 from itertools import pairwise
 import json
 from pathlib import Path
+import shutil
 import sys
 
 from jsonschema import Draft202012Validator
@@ -23,6 +24,74 @@ assert SPEC is not None and SPEC.loader is not None
 orchestration = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = orchestration
 SPEC.loader.exec_module(orchestration)
+
+OBSERVER_PATH = Path(__file__).with_name('phase3_runtime_observer.py')
+OBSERVER_SPEC = importlib.util.spec_from_file_location('phase3_runtime_observer', OBSERVER_PATH)
+assert OBSERVER_SPEC is not None and OBSERVER_SPEC.loader is not None
+runtime_observer = importlib.util.module_from_spec(OBSERVER_SPEC)
+sys.modules[OBSERVER_SPEC.name] = runtime_observer
+OBSERVER_SPEC.loader.exec_module(runtime_observer)
+
+RUNTIME_GATE_PATH = Path(__file__).with_name('phase3_runtime_gate.py')
+RUNTIME_GATE_SPEC = importlib.util.spec_from_file_location('phase3_runtime_gate', RUNTIME_GATE_PATH)
+assert RUNTIME_GATE_SPEC is not None and RUNTIME_GATE_SPEC.loader is not None
+runtime_gate = importlib.util.module_from_spec(RUNTIME_GATE_SPEC)
+sys.modules[RUNTIME_GATE_SPEC.name] = runtime_gate
+RUNTIME_GATE_SPEC.loader.exec_module(runtime_gate)
+
+
+def _contact_stream_contract() -> dict:
+    workspace = Path(__file__).parents[1]
+    policy = copy.deepcopy(orchestration.EXPECTED_CONTACT_STREAM_POLICY)
+    source_paths = [
+        'src/robotest_sim/CMakeLists.txt',
+        'src/robotest_sim/include/robotest_sim/contact_stream_gate.hpp',
+        'src/robotest_sim/src/contact_stream_gate.cpp',
+        'src/robotest_sim/src/contact_stream_gate_node.cpp',
+    ]
+    source_inventory = {
+        'schema_version': 1,
+        'sources': [
+            {
+                'path': path,
+                'sha256': orchestration.file_sha256(workspace / path),
+            }
+            for path in source_paths
+        ],
+    }
+    return {
+        'gate': {
+            'executable': 'contact_stream_gate',
+            'launch_sha256': orchestration.file_sha256(
+                workspace / 'src/robotest_sim/launch/sim.launch.py'
+            ),
+            'package': 'robotest_sim',
+            'source_inventory': source_inventory,
+            'source_inventory_sha256': orchestration.canonical_sha256(source_inventory),
+        },
+        'policy': policy,
+        'policy_sha256': orchestration.canonical_sha256(policy),
+        'qos': {
+            'private_raw_ros': {
+                'depth': 64,
+                'durability': 'VOLATILE',
+                'history': 'KEEP_LAST',
+                'reliability': 'RELIABLE',
+            },
+            'public_ros': {
+                'depth': 10,
+                'durability': 'VOLATILE',
+                'history': 'KEEP_LAST',
+                'reliability': 'RELIABLE',
+            },
+        },
+        'schema_version': 1,
+        'topics': {
+            'gazebo_raw': '/robotest/validation/contacts',
+            'private_raw_ros': '/robotest/internal/raw_contacts',
+            'public_ros': '/robotest/validation/contacts',
+        },
+    }
 
 
 def _scenario(path: Path, scenario_id: int, scenario_name: str) -> None:
@@ -94,10 +163,380 @@ def test_canonical_json_is_strict_and_newline_terminated() -> None:
         orchestration.canonical_json_bytes({'bad': float('nan')})
 
 
+def test_contact_stream_manifest_requires_exact_v3_contract() -> None:
+    workspace = Path(__file__).parents[1]
+    manifest = {'schema_version': 3, 'contact_stream': _contact_stream_contract()}
+    assert (
+        orchestration._contact_stream_manifest_v3(manifest, workspace) == manifest['contact_stream']
+    )
+
+    with pytest.raises(orchestration.EvidenceError, match='schema_version 3'):
+        orchestration._contact_stream_manifest_v3(
+            {'schema_version': 2, 'contact_stream': _contact_stream_contract()},
+            workspace,
+        )
+
+    mutations = []
+    changed_policy = copy.deepcopy(manifest)
+    changed_policy['contact_stream']['policy']['heartbeat_period_ns'] = 200_000_001
+    changed_policy['contact_stream']['policy_sha256'] = orchestration.canonical_sha256(
+        changed_policy['contact_stream']['policy']
+    )
+    mutations.append(changed_policy)
+    changed_release = copy.deepcopy(manifest)
+    changed_release['contact_stream']['policy']['release_comparison'] = (
+        'completed_absent_stamp_greater_than_or_equal_to_last_seen_plus_gap'
+    )
+    changed_release['contact_stream']['policy_sha256'] = orchestration.canonical_sha256(
+        changed_release['contact_stream']['policy']
+    )
+    mutations.append(changed_release)
+    changed_topic = copy.deepcopy(manifest)
+    changed_topic['contact_stream']['topics']['private_raw_ros'] = '/robotest/raw_contacts'
+    mutations.append(changed_topic)
+    changed_qos = copy.deepcopy(manifest)
+    changed_qos['contact_stream']['qos']['public_ros']['depth'] = 11
+    mutations.append(changed_qos)
+    changed_owner = copy.deepcopy(manifest)
+    changed_owner['contact_stream']['gate']['executable'] = 'legacy_contact_gate'
+    mutations.append(changed_owner)
+    changed_source = copy.deepcopy(manifest)
+    changed_source['contact_stream']['gate']['source_inventory']['sources'][0]['sha256'] = '0' * 64
+    changed_source['contact_stream']['gate']['source_inventory_sha256'] = (
+        orchestration.canonical_sha256(changed_source['contact_stream']['gate']['source_inventory'])
+    )
+    mutations.append(changed_source)
+
+    for changed in mutations:
+        with pytest.raises(orchestration.EvidenceError):
+            orchestration._contact_stream_manifest_v3(changed, workspace)
+
+
+def test_generated_contact_stream_configuration_round_trips_v3_contract() -> None:
+    workspace = Path(__file__).parents[1]
+    generator_path = workspace / 'src/robotest_description/tools/generate_collision_coverage.py'
+    spec = importlib.util.spec_from_file_location('collision_coverage_generator_v3', generator_path)
+    assert spec is not None and spec.loader is not None
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+    contact_stream = generator.contact_stream_configuration(workspace)
+    manifest = {'schema_version': 3, 'contact_stream': contact_stream}
+    assert orchestration._contact_stream_manifest_v3(manifest, workspace) == contact_stream
+
+
+def test_contact_gate_reobservation_binds_build_and_rejects_rebound(
+    tmp_path: Path,
+) -> None:
+    attestation = {field: 0 for field in orchestration.CONTACT_GATE_ATTESTATION_FIELDS}
+    attestation.update(
+        {
+            'build_embedded_source_inventory_match': True,
+            'build_embedded_source_inventory_sha256': '4' * 64,
+            'build_elf_build_id': 'a1',
+            'build_install_build_id_match': True,
+            'build_install_sha256_match': True,
+            'build_path': 'build/robotest_sim/contact_stream_gate',
+            'build_sha256': '2' * 64,
+            'exact_live_process_count': 1,
+            'identity_revalidated_after_hashing': True,
+            'installed_declared_path': 'install/robotest_sim/lib/robotest_sim/contact_stream_gate',
+            'installed_declared_samefile': True,
+            'installed_device': 7,
+            'installed_embedded_source_inventory_match': True,
+            'installed_embedded_source_inventory_sha256': '4' * 64,
+            'installed_elf_build_id': 'a1',
+            'installed_inode': 8,
+            'installed_path': 'install/robotest_sim/lib/robotest_sim/contact_stream_gate',
+            'installed_regular_executable': True,
+            'installed_sha256': '2' * 64,
+            'launch_root_pid': 100,
+            'live_cmdline_sha256': '3' * 64,
+            'live_device': 7,
+            'live_embedded_source_inventory_match': True,
+            'live_embedded_source_inventory_sha256': '4' * 64,
+            'live_elf_build_id': 'a1',
+            'live_executable_link': (
+                '/workspace/install/robotest_sim/lib/robotest_sim/contact_stream_gate'
+            ),
+            'live_executable_path': (
+                '/workspace/install/robotest_sim/lib/robotest_sim/contact_stream_gate'
+            ),
+            'live_executable_sha256': '2' * 64,
+            'live_inode': 8,
+            'live_installed_build_id_match': True,
+            'live_installed_inode_match': True,
+            'live_installed_sha256_match': True,
+            'live_pgid': 100,
+            'live_pid': 101,
+            'live_ppid': 100,
+            'live_sid': 100,
+            'live_size_bytes': 1_000,
+            'live_start_ticks': 1234,
+            'observed_gz_partition': 'robotest_p3_candidate_trial',
+            'observed_ros_domain_id': '100',
+            'package': 'robotest_sim',
+            'process_identity_match': True,
+            'schema_version': 1,
+            'source_inventory_sha256': '4' * 64,
+            'verdict': 'PASS',
+        }
+    )
+    initial_path = tmp_path / 'runtime-gate.json'
+    final_path = tmp_path / 'contact-stream-final-gate.json'
+    document = {'contact_gate_binary_attestation': attestation, 'verdict': 'PASS'}
+    orchestration.atomic_write_json(initial_path, document, sidecar=True)
+    orchestration.atomic_write_json(final_path, document, sidecar=True)
+    build_binding = {
+        'contact_gate_binary': {
+            'build_embedded_source_inventory_match': True,
+            'build_embedded_source_inventory_sha256': '4' * 64,
+            'build_elf_build_id': 'a1',
+            'build_install_build_id_match': True,
+            'build_install_sha256_match': True,
+            'build_path': 'build/robotest_sim/contact_stream_gate',
+            'build_regular_executable': True,
+            'build_sha256': '2' * 64,
+            'installed_declared_path': (
+                'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
+            ),
+            'installed_declared_samefile': True,
+            'installed_embedded_source_inventory_match': True,
+            'installed_embedded_source_inventory_sha256': '4' * 64,
+            'installed_elf_build_id': 'a1',
+            'installed_path': 'install/robotest_sim/lib/robotest_sim/contact_stream_gate',
+            'installed_regular_executable': True,
+            'installed_sha256': '2' * 64,
+            'source_inventory_sha256': '4' * 64,
+        }
+    }
+    evidence = orchestration.reconcile_contact_gate_reobservation(
+        initial_path,
+        final_path,
+        build_binding=build_binding,
+        expected_domain_id=100,
+        expected_gz_partition='robotest_p3_candidate_trial',
+    )
+    assert evidence['stable_identity'] is True
+
+    rebound = copy.deepcopy(document)
+    rebound['contact_gate_binary_attestation']['live_start_ticks'] = 1235
+    orchestration.atomic_write_json(final_path, rebound, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='identity changed'):
+        orchestration.reconcile_contact_gate_reobservation(
+            initial_path,
+            final_path,
+            build_binding=build_binding,
+            expected_domain_id=100,
+            expected_gz_partition='robotest_p3_candidate_trial',
+        )
+
+    orchestration.atomic_write_json(final_path, document, sidecar=True)
+    forged_build = copy.deepcopy(build_binding)
+    forged_build['contact_gate_binary']['installed_sha256'] = '9' * 64
+    with pytest.raises(orchestration.EvidenceError, match='prelaunch build binding'):
+        orchestration.reconcile_contact_gate_reobservation(
+            initial_path,
+            final_path,
+            build_binding=forged_build,
+            expected_domain_id=100,
+            expected_gz_partition='robotest_p3_candidate_trial',
+        )
+
+
+@pytest.mark.parametrize(
+    'extractor',
+    (
+        orchestration._elf_embedded_source_inventory_sha256,
+        runtime_gate._elf_embedded_source_inventory_sha256,
+    ),
+)
+def test_contact_gate_tagged_digest_extraction_is_distinct_and_chunk_safe(
+    tmp_path: Path, extractor: object
+) -> None:
+    tag = b'ROBOTEST_CONTACT_GATE_SOURCE_INVENTORY_SHA256='
+    first = b'1' * 64
+    second = b'2' * 64
+    path = tmp_path / 'gate.elf'
+
+    path.write_bytes(tag + first + b'\0debug-copy\0' + tag + first)
+    assert extractor(path) == first.decode('ascii')
+
+    path.write_bytes(tag + first + b'\0' + tag + second)
+    with pytest.raises(orchestration.EvidenceError, match='conflicting tagged'):
+        extractor(path)
+
+    path.write_bytes(b'x' * (1024 * 1024 - 10) + tag + first + b'\0')
+    assert extractor(path) == first.decode('ascii')
+
+
+def test_contact_gate_build_install_rejects_same_build_id_with_appended_byte(
+    tmp_path: Path,
+) -> None:
+    for relative in orchestration.CONTACT_GATE_SOURCE_PATHS:
+        source = tmp_path / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(f'{relative}\n', encoding='utf-8')
+    inventory_sha256 = orchestration.canonical_sha256(
+        orchestration.contact_gate_source_inventory(tmp_path)
+    )
+    build = tmp_path / 'build/robotest_sim/contact_stream_gate'
+    installed = tmp_path / 'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
+    build.parent.mkdir(parents=True)
+    installed.parent.mkdir(parents=True)
+    tagged_elf = Path(sys.executable).read_bytes() + (
+        b'\0ROBOTEST_CONTACT_GATE_SOURCE_INVENTORY_SHA256='
+        + inventory_sha256.encode('ascii')
+        + b'\0'
+    )
+    build.write_bytes(tagged_elf)
+    shutil.copymode(sys.executable, build)
+    shutil.copy2(build, installed)
+    binding = orchestration.contact_gate_build_install_binding(tmp_path)
+    assert binding['build_install_sha256_match'] is True
+
+    with installed.open('ab') as stream:
+        stream.write(b'x')
+    assert orchestration._elf_build_id(build) == orchestration._elf_build_id(installed)
+    assert orchestration._elf_embedded_source_inventory_sha256(
+        build
+    ) == orchestration._elf_embedded_source_inventory_sha256(installed)
+    with pytest.raises(orchestration.EvidenceError, match='hashes differ'):
+        orchestration.contact_gate_build_install_binding(tmp_path)
+
+
 def test_utf8_string_bound_is_bytes_not_codepoints() -> None:
     assert orchestration.require_bounded_string('x' * 4096, 'value')
     with pytest.raises(orchestration.EvidenceError):
         orchestration.require_bounded_string('\u00e9' * 4096, 'value')
+
+
+def test_contact_episode_projection_groups_all_pairs_by_external_counterpart() -> None:
+    manifest = yaml.safe_load(
+        (Path(__file__).parents[1] / 'config/collision-coverage.yaml').read_text(encoding='utf-8')
+    )
+    first_robot, second_robot = [entry['name'] for entry in manifest['robot_collisions'][:2]]
+    wall_pair_a = tuple(sorted((first_robot, 'wall::link::collision')))
+    wall_pair_b = tuple(sorted((second_robot, 'wall::link::collision')))
+    support = manifest['support_pairs'][0]
+    support_pair = tuple(sorted((support['robot_collision'], support['environment_collision'])))
+
+    simultaneous = orchestration._captured_contact_episodes(
+        [
+            (100, tuple(sorted((wall_pair_a, wall_pair_b)))),
+            (200, (support_pair,)),
+        ],
+        manifest=manifest,
+    )
+    assert simultaneous == [
+        {
+            'counterpart_model': 'wall',
+            'end_stamp_ns': 200,
+            'normalized_pairs': [list(pair) for pair in sorted((wall_pair_a, wall_pair_b))],
+            'snapshot_record_count': 2,
+            'start_stamp_ns': 100,
+        }
+    ]
+
+    migration = orchestration._captured_contact_episodes(
+        [(100, (wall_pair_a,)), (200, (wall_pair_b,)), (300, (support_pair,))],
+        manifest=manifest,
+    )
+    assert len(migration) == 1
+    assert migration[0]['start_stamp_ns'] == 100
+    assert migration[0]['end_stamp_ns'] == 300
+    assert migration[0]['snapshot_record_count'] == 2
+    assert migration[0]['normalized_pairs'] == [
+        list(pair) for pair in sorted((wall_pair_a, wall_pair_b))
+    ]
+
+    distinct_counterparts = orchestration._captured_contact_episodes(
+        [
+            (
+                100,
+                tuple(
+                    sorted(
+                        (
+                            wall_pair_a,
+                            tuple(sorted((second_robot, 'box::link::collision'))),
+                        )
+                    )
+                ),
+            ),
+            (200, (support_pair,)),
+        ],
+        manifest=manifest,
+    )
+    assert [episode['counterpart_model'] for episode in distinct_counterparts] == [
+        'box',
+        'wall',
+    ]
+
+
+def test_contact_drain_requires_strict_snapshot_and_clock_catch_up() -> None:
+    state = runtime_observer.ContactDrainObserver(1_000_000_000)
+    pair_a = frozenset({('robot::link::collision', 'wall::link::collision')})
+    pair_b = frozenset({('robot::link::collision', 'box::link::collision')})
+    state.observe_contact(stamp_ns=1_250_000_000, frame_id='', pair_set=pair_a, record_count=1)
+    assert state.qualifying_contact_snapshot_stamp_ns is None
+    state.observe_contact(stamp_ns=1_250_000_001, frame_id='', pair_set=pair_b, record_count=1)
+    assert state.qualifying_contact_snapshot_stamp_ns == 1_250_000_001
+    state.observe_clock(1_250_000_000)
+    assert state.complete() is False
+    state.observe_clock(1_470_000_001)
+    assert state.complete() is True
+    assert state.evidence()['clock_minus_qualifying_contact_ns'] == 220_000_000
+
+
+def test_contact_drain_source_gap_and_clock_lag_boundaries() -> None:
+    pair = frozenset({('robot::link::collision', 'wall::link::collision')})
+    accepted = runtime_observer.ContactDrainObserver(100_000_000)
+    accepted.observe_contact(stamp_ns=300_000_000, frame_id='', pair_set=pair, record_count=1)
+    accepted.observe_contact(stamp_ns=520_000_000, frame_id='', pair_set=pair, record_count=1)
+    accepted.observe_clock(740_000_000)
+    assert accepted.complete() is True
+
+    gap_failure = runtime_observer.ContactDrainObserver(1)
+    gap_failure.observe_contact(stamp_ns=300_000_000, frame_id='', pair_set=pair, record_count=1)
+    with pytest.raises(orchestration.EvidenceError, match='source gap'):
+        gap_failure.observe_contact(
+            stamp_ns=520_000_001, frame_id='', pair_set=pair, record_count=1
+        )
+
+    lag_failure = runtime_observer.ContactDrainObserver(1)
+    lag_failure.observe_contact(stamp_ns=300_000_000, frame_id='', pair_set=pair, record_count=1)
+    lag_failure.observe_clock(520_000_001)
+    with pytest.raises(orchestration.EvidenceError, match='220 ms'):
+        lag_failure.complete()
+
+
+def test_contact_drain_rejects_duplicate_regression_frame_and_early_heartbeat() -> None:
+    pair = frozenset({('robot::link::collision', 'wall::link::collision')})
+    duplicate = runtime_observer.ContactDrainObserver(1)
+    duplicate.observe_contact(stamp_ns=300_000_000, frame_id='', pair_set=pair, record_count=1)
+    with pytest.raises(orchestration.EvidenceError, match='duplicated'):
+        duplicate.observe_contact(stamp_ns=300_000_000, frame_id='', pair_set=pair, record_count=1)
+
+    regression = runtime_observer.ContactDrainObserver(1)
+    regression.observe_contact(stamp_ns=300_000_000, frame_id='', pair_set=pair, record_count=1)
+    with pytest.raises(orchestration.EvidenceError, match='regressed'):
+        regression.observe_contact(stamp_ns=299_999_999, frame_id='', pair_set=pair, record_count=1)
+
+    frame = runtime_observer.ContactDrainObserver(1)
+    with pytest.raises(orchestration.EvidenceError, match='frame_id'):
+        frame.observe_contact(stamp_ns=300_000_000, frame_id='world', pair_set=pair, record_count=1)
+
+    heartbeat = runtime_observer.ContactDrainObserver(1)
+    heartbeat.observe_contact(stamp_ns=300_000_000, frame_id='', pair_set=pair, record_count=1)
+    with pytest.raises(orchestration.EvidenceError, match='before 200 ms'):
+        heartbeat.observe_contact(stamp_ns=499_999_999, frame_id='', pair_set=pair, record_count=1)
+
+    records = runtime_observer.ContactDrainObserver(1)
+    with pytest.raises(orchestration.EvidenceError, match='1 to 16'):
+        records.observe_contact(
+            stamp_ns=300_000_000, frame_id='', pair_set=frozenset(), record_count=0
+        )
+    with pytest.raises(orchestration.EvidenceError, match='1 to 16'):
+        records.observe_contact(stamp_ns=300_000_001, frame_id='', pair_set=pair, record_count=17)
 
 
 def test_lifecycle_schedule_has_exact_absolute_dense_window() -> None:
@@ -239,19 +678,33 @@ def test_resource_summary_rejects_a_bounded_child_affinity_escape(tmp_path: Path
 def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path) -> None:
     unsigned = {
         'bridge_sha256': '1' * 64,
+        'contact_stream': _contact_stream_contract(),
         'contact_configuration_sha256': '2' * 64,
         'contact_topic': '/robotest/validation/contacts',
         'covered_collisions': [],
         'rendered_robot_collisions': [],
         'rendered_sdf_sha256': '3' * 64,
-        'robot_collisions': [],
+        'robot_collisions': [
+            {'name': 'robotest::base::collision'},
+            {'name': 'robotest::wheel::collision'},
+        ],
         'robot_description_sha256': '4' * 64,
         'robot_model': 'robotest',
-        'schema_version': 2,
-        'support_pairs': [],
+        'schema_version': 3,
+        'support_pairs': [
+            {
+                'environment_collision': 'ground::plane::collision',
+                'robot_collision': 'robotest::wheel::collision',
+            }
+        ],
         'world_source_sha256': '5' * 64,
     }
     manifest = {**unsigned, 'manifest_sha256': orchestration.canonical_sha256(unsigned)}
+    positive_build_binding = {
+        'contact_gate_binary': {
+            'source_inventory_sha256': manifest['contact_stream']['gate']['source_inventory_sha256']
+        }
+    }
     manifest_path = tmp_path / 'coverage.yaml'
     manifest_path.write_text(yaml.safe_dump(manifest, sort_keys=True), encoding='utf-8')
     result = {
@@ -288,11 +741,88 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                 },
             ],
             'contact': {
-                'exact_pair_raw_count': 1,
-                'expected_pair': ['robotest::base', 'wall::collision'],
-                'first_qualifying_contact': {'sim_stamp_ns': 15},
+                'episodes': [
+                    {
+                        'counterpart_model': 'wall',
+                        'end_stamp_ns': 300_000_000,
+                        'normalized_pairs': [
+                            ['robotest::base::collision', 'wall::link::collision']
+                        ],
+                        'snapshot_record_count': 1,
+                        'start_stamp_ns': 100_000_000,
+                    }
+                ],
+                'exact_pair_snapshot_record_count': 1,
+                'expected_pair': [
+                    'robotest::base::collision',
+                    'wall::link::collision',
+                ],
+                'first_qualifying_contact': {'sim_stamp_ns': 100_000_000},
+                'snapshot_records': [
+                    {
+                        'collector_sequence': 2,
+                        'counterpart_collision': 'wall::link::collision',
+                        'counterpart_model': 'wall',
+                        'disposition': 'counted',
+                        'normalized_pair': [
+                            'robotest::base::collision',
+                            'wall::link::collision',
+                        ],
+                        'robot_collision': 'robotest::base::collision',
+                        'sim_stamp_ns': 100_000_000,
+                        'snapshot_sequence': 1,
+                    },
+                    {
+                        'collector_sequence': 4,
+                        'counterpart_collision': None,
+                        'counterpart_model': None,
+                        'disposition': 'support_ground_excluded',
+                        'normalized_pair': [
+                            'ground::plane::collision',
+                            'robotest::wheel::collision',
+                        ],
+                        'robot_collision': None,
+                        'sim_stamp_ns': 300_000_000,
+                        'snapshot_sequence': 3,
+                    },
+                ],
+                'snapshots': [
+                    {
+                        'classified_count': 1,
+                        'collector_sequence': 1,
+                        'counted_snapshot_records': [
+                            {
+                                'counterpart_model': 'wall',
+                                'normalized_pair': [
+                                    'robotest::base::collision',
+                                    'wall::link::collision',
+                                ],
+                                'record_sequence': 2,
+                                'snapshot_sequence': 1,
+                            }
+                        ],
+                        'delivery_clock_offset_ns': 0,
+                        'delivery_clock_stamp_ns': 100_000_000,
+                        'exact_pair_count': 1,
+                        'sim_stamp_ns': 100_000_000,
+                        'snapshot_record_count': 1,
+                    },
+                    {
+                        'classified_count': 0,
+                        'collector_sequence': 3,
+                        'counted_snapshot_records': [],
+                        'delivery_clock_offset_ns': 200_000_000,
+                        'delivery_clock_stamp_ns': 500_000_000,
+                        'exact_pair_count': 0,
+                        'sim_stamp_ns': 300_000_000,
+                        'snapshot_record_count': 1,
+                    },
+                ],
             },
-            'timeline': {'release_required_through_stamp_ns': 25},
+            'timeline': {
+                'release_qualified_snapshot_stamp_ns': 300_000_000,
+                'release_required_through_stamp_ns': 250_000_000,
+            },
         },
         'identity': {'run_id': 'positive', 'scenario_sha256': '6' * 64},
         'producer': 'robotest_scenarios/contact_control_driver',
@@ -309,7 +839,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     result_path = tmp_path / 'contact-control-result.json'
     orchestration.atomic_write_json(result_path, result, sidecar=True)
     capture = {
-        'clock': {'latest_stamp_ns': 30, 'regression_count': 0},
+        'clock': {'latest_stamp_ns': 600_000_000, 'regression_count': 0},
         'quality': {'collector_overflow': False},
         'stop_reason': 'stop_file',
         'streams': {
@@ -332,21 +862,48 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                     {
                         'contacts': [
                             {
-                                'collision1': 'robotest::base',
-                                'collision2': 'wall::collision',
+                                'collision1': 'robotest::base::collision',
+                                'collision2': 'wall::link::collision',
                             }
                         ],
-                        'stamp_ns': 15,
-                    }
+                        'delivery_clock_offset_ns': 0,
+                        'delivery_clock_stamp_ns': 100_000_000,
+                        'frame_id': '',
+                        'stamp_ns': 100_000_000,
+                    },
+                    {
+                        'contacts': [
+                            {
+                                'collision1': 'robotest::wheel::collision',
+                                'collision2': 'ground::plane::collision',
+                            }
+                        ],
+                        'delivery_clock_offset_ns': 200_000_000,
+                        'delivery_clock_stamp_ns': 500_000_000,
+                        'frame_id': '',
+                        'stamp_ns': 300_000_000,
+                    },
                 ]
             },
         },
     }
     capture_path = tmp_path / 'capture.json'
     orchestration.atomic_write_json(capture_path, capture)
+    contact_progress_path = tmp_path / 'contact-progress.json'
+    contact_progress = {
+        'latest_retained_stamp_ns': 300_000_000,
+        'producer': 'robotest_metrics/metrics_collector',
+        'public_topic': '/robotest/validation/contacts',
+        'retained_message_count': 2,
+        'schema_version': 1,
+    }
+    orchestration.atomic_write_json(contact_progress_path, contact_progress)
     bound = orchestration.reconcile_positive_control(
+        workspace=Path(__file__).parents[1],
+        build_binding=positive_build_binding,
         result_path=result_path,
         capture_path=capture_path,
+        contact_progress_path=contact_progress_path,
         manifest_path=manifest_path,
         collector_configuration_sha256='7' * 64,
         owned_process_group_shutdown=True,
@@ -357,13 +914,277 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         bound['benchmark_binding']['benchmark_provenance']['coverage_manifest_sha256']
         == manifest['manifest_sha256']
     )
+    assert bound['collector_reconciliation'] == {
+        'captured_command_count': 2,
+        'captured_exact_pair_count': 1,
+        'captured_release_expected_pair_count': 0,
+        'captured_release_snapshot_count': 1,
+        'contact_projection_episode_count': 1,
+        'contact_projection_first_stamp_ns': 100_000_000,
+        'contact_projection_record_count': 2,
+        'contact_projection_sha256': orchestration.canonical_sha256(
+            [
+                {
+                    'normalized_pairs': [['robotest::base::collision', 'wall::link::collision']],
+                    'stamp_ns': 100_000_000,
+                },
+                {
+                    'normalized_pairs': [
+                        ['ground::plane::collision', 'robotest::wheel::collision']
+                    ],
+                    'stamp_ns': 300_000_000,
+                },
+            ]
+        ),
+        'contact_projection_snapshot_count': 2,
+        'contact_progress_artifact_sha256': orchestration.file_sha256(contact_progress_path),
+        'contact_progress_latest_retained_stamp_ns': 300_000_000,
+        'contact_progress_retained_message_count': 2,
+        'component_command_count': 2,
+        'component_exact_pair_count': 1,
+        'latest_clock_stamp_ns': 600_000_000,
+        'release_delivery_clock_offset_ns': 200_000_000,
+        'release_delivery_clock_stamp_ns': 500_000_000,
+        'release_qualified_snapshot_stamp_ns': 300_000_000,
+        'release_required_through_stamp_ns': 250_000_000,
+    }
+
+    result_with_support_suffix = copy.deepcopy(result)
+    result_with_support_suffix['control']['contact']['snapshot_records'].append(
+        {
+            'collector_sequence': 6,
+            'counterpart_collision': None,
+            'counterpart_model': None,
+            'disposition': 'robot_internal_excluded',
+            'normalized_pair': [
+                'robotest::base::collision',
+                'robotest::wheel::collision',
+            ],
+            'robot_collision': None,
+            'sim_stamp_ns': 500_000_000,
+            'snapshot_sequence': 5,
+        }
+    )
+    result_with_support_suffix['control']['contact']['snapshots'].append(
+        {
+            'classified_count': 0,
+            'collector_sequence': 5,
+            'counted_snapshot_records': [],
+            'delivery_clock_offset_ns': 0,
+            'delivery_clock_stamp_ns': 500_000_000,
+            'exact_pair_count': 0,
+            'sim_stamp_ns': 500_000_000,
+            'snapshot_record_count': 1,
+        }
+    )
+    capture_with_support_suffix = copy.deepcopy(capture)
+    capture_with_support_suffix['streams']['contacts']['items'].append(
+        {
+            'contacts': [
+                {
+                    'collision1': 'robotest::base::collision',
+                    'collision2': 'robotest::wheel::collision',
+                }
+            ],
+            'delivery_clock_offset_ns': 0,
+            'delivery_clock_stamp_ns': 500_000_000,
+            'frame_id': '',
+            'stamp_ns': 500_000_000,
+        }
+    )
+    support_suffix_progress = {
+        **contact_progress,
+        'latest_retained_stamp_ns': 500_000_000,
+        'retained_message_count': 3,
+    }
+    orchestration.atomic_write_json(result_path, result_with_support_suffix, sidecar=True)
+    orchestration.atomic_write_json(capture_path, capture_with_support_suffix)
+    orchestration.atomic_write_json(contact_progress_path, support_suffix_progress)
+    support_suffix_bound = orchestration.reconcile_positive_control(
+        workspace=Path(__file__).parents[1],
+        build_binding=positive_build_binding,
+        result_path=result_path,
+        capture_path=capture_path,
+        contact_progress_path=contact_progress_path,
+        manifest_path=manifest_path,
+        collector_configuration_sha256='7' * 64,
+        owned_process_group_shutdown=True,
+        checksum_verified=True,
+    )
+    assert (
+        support_suffix_bound['collector_reconciliation']['contact_projection_snapshot_count'] == 2
+    )
+    assert (
+        support_suffix_bound['collector_reconciliation'][
+            'contact_progress_latest_retained_stamp_ns'
+        ]
+        == 500_000_000
+    )
+
+    missing_qualified = copy.deepcopy(result)
+    missing_qualified['control']['contact']['snapshots'][1]['sim_stamp_ns'] = 301_000_000
+    missing_qualified['control']['contact']['snapshots'][1]['delivery_clock_stamp_ns'] = 501_000_000
+    missing_qualified['control']['contact']['snapshot_records'][1]['sim_stamp_ns'] = 301_000_000
+    orchestration.atomic_write_json(result_path, missing_qualified, sidecar=True)
+    orchestration.atomic_write_json(capture_path, capture)
+    orchestration.atomic_write_json(contact_progress_path, contact_progress)
+    with pytest.raises(orchestration.EvidenceError, match='not present exactly once'):
+        orchestration.reconcile_positive_control(
+            workspace=Path(__file__).parents[1],
+            build_binding=positive_build_binding,
+            result_path=result_path,
+            capture_path=capture_path,
+            contact_progress_path=contact_progress_path,
+            manifest_path=manifest_path,
+            collector_configuration_sha256='7' * 64,
+            owned_process_group_shutdown=True,
+            checksum_verified=True,
+        )
+
+    duplicated_qualified = copy.deepcopy(result_with_support_suffix)
+    duplicated_qualified['control']['contact']['snapshots'][2]['sim_stamp_ns'] = 300_000_000
+    duplicated_qualified['control']['contact']['snapshots'][2]['delivery_clock_stamp_ns'] = (
+        300_000_000
+    )
+    duplicated_qualified['control']['contact']['snapshot_records'][2]['sim_stamp_ns'] = 300_000_000
+    orchestration.atomic_write_json(result_path, duplicated_qualified, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='ordering/liveness'):
+        orchestration.reconcile_positive_control(
+            workspace=Path(__file__).parents[1],
+            build_binding=positive_build_binding,
+            result_path=result_path,
+            capture_path=capture_path,
+            contact_progress_path=contact_progress_path,
+            manifest_path=manifest_path,
+            collector_configuration_sha256='7' * 64,
+            owned_process_group_shutdown=True,
+            checksum_verified=True,
+        )
+
+    countable_recontact = copy.deepcopy(result_with_support_suffix)
+    countable_recontact_record = countable_recontact['control']['contact']['snapshot_records'][2]
+    countable_recontact_record.update(
+        {
+            'counterpart_collision': 'second_wall::link::collision',
+            'counterpart_model': 'second_wall',
+            'disposition': 'counted',
+            'normalized_pair': [
+                'robotest::wheel::collision',
+                'second_wall::link::collision',
+            ],
+            'robot_collision': 'robotest::wheel::collision',
+        }
+    )
+    orchestration.atomic_write_json(result_path, countable_recontact, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='countable contact'):
+        orchestration.reconcile_positive_control(
+            workspace=Path(__file__).parents[1],
+            build_binding=positive_build_binding,
+            result_path=result_path,
+            capture_path=capture_path,
+            contact_progress_path=contact_progress_path,
+            manifest_path=manifest_path,
+            collector_configuration_sha256='7' * 64,
+            owned_process_group_shutdown=True,
+            checksum_verified=True,
+        )
+
+    orchestration.atomic_write_json(result_path, result, sidecar=True)
+    orchestration.atomic_write_json(capture_path, capture)
+    orchestration.atomic_write_json(contact_progress_path, contact_progress)
+
+    delivery_ahead = copy.deepcopy(capture)
+    delivery_ahead['streams']['contacts']['items'][1]['delivery_clock_stamp_ns'] = 520_000_001
+    delivery_ahead['streams']['contacts']['items'][1]['delivery_clock_offset_ns'] = 220_000_001
+    orchestration.atomic_write_json(capture_path, delivery_ahead)
+    with pytest.raises(orchestration.EvidenceError, match='delivery /clock bracket'):
+        orchestration.reconcile_positive_control(
+            workspace=Path(__file__).parents[1],
+            build_binding=positive_build_binding,
+            result_path=result_path,
+            capture_path=capture_path,
+            contact_progress_path=contact_progress_path,
+            manifest_path=manifest_path,
+            collector_configuration_sha256='7' * 64,
+            owned_process_group_shutdown=True,
+            checksum_verified=True,
+        )
+
+    projection_mutations = []
+    extra_recontact = copy.deepcopy(capture)
+    extra_recontact['streams']['contacts']['items'][1]['contacts'][0]['collision2'] = (
+        'wall::link::collision'
+    )
+    projection_mutations.append(extra_recontact)
+    missing_snapshot = copy.deepcopy(capture)
+    missing_snapshot['streams']['contacts']['items'].pop(0)
+    projection_mutations.append(missing_snapshot)
+    membership_mismatch = copy.deepcopy(capture)
+    membership_mismatch['streams']['contacts']['items'][1]['contacts'][0]['collision2'] = (
+        'robotest::other::collision'
+    )
+    projection_mutations.append(membership_mismatch)
+    duplicate_multiplicity = copy.deepcopy(capture)
+    duplicate_multiplicity['streams']['contacts']['items'][0]['contacts'].append(
+        copy.deepcopy(duplicate_multiplicity['streams']['contacts']['items'][0]['contacts'][0])
+    )
+    projection_mutations.append(duplicate_multiplicity)
+    for changed_capture in projection_mutations:
+        orchestration.atomic_write_json(capture_path, changed_capture)
+        with pytest.raises(orchestration.EvidenceError, match='not bijective'):
+            orchestration.reconcile_positive_control(
+                workspace=Path(__file__).parents[1],
+                build_binding=positive_build_binding,
+                result_path=result_path,
+                capture_path=capture_path,
+                contact_progress_path=contact_progress_path,
+                manifest_path=manifest_path,
+                collector_configuration_sha256='7' * 64,
+                owned_process_group_shutdown=True,
+                checksum_verified=True,
+            )
+    orchestration.atomic_write_json(capture_path, capture)
+
+    rebound_progress = {**contact_progress, 'latest_retained_stamp_ns': 300_000_001}
+    orchestration.atomic_write_json(contact_progress_path, rebound_progress)
+    with pytest.raises(orchestration.EvidenceError, match='final capture'):
+        orchestration.reconcile_positive_control(
+            workspace=Path(__file__).parents[1],
+            build_binding=positive_build_binding,
+            result_path=result_path,
+            capture_path=capture_path,
+            contact_progress_path=contact_progress_path,
+            manifest_path=manifest_path,
+            collector_configuration_sha256='7' * 64,
+            owned_process_group_shutdown=True,
+            checksum_verified=True,
+        )
+    count_mismatch = {**contact_progress, 'retained_message_count': 3}
+    orchestration.atomic_write_json(contact_progress_path, count_mismatch)
+    with pytest.raises(orchestration.EvidenceError, match='capture length'):
+        orchestration.reconcile_positive_control(
+            workspace=Path(__file__).parents[1],
+            build_binding=positive_build_binding,
+            result_path=result_path,
+            capture_path=capture_path,
+            contact_progress_path=contact_progress_path,
+            manifest_path=manifest_path,
+            collector_configuration_sha256='7' * 64,
+            owned_process_group_shutdown=True,
+            checksum_verified=True,
+        )
+    orchestration.atomic_write_json(contact_progress_path, contact_progress)
+
     tampered = copy.deepcopy(manifest)
     tampered['bridge_sha256'] = '8' * 64
     manifest_path.write_text(yaml.safe_dump(tampered, sort_keys=True), encoding='utf-8')
     with pytest.raises(orchestration.EvidenceError):
         orchestration.reconcile_positive_control(
+            workspace=Path(__file__).parents[1],
+            build_binding=positive_build_binding,
             result_path=result_path,
             capture_path=capture_path,
+            contact_progress_path=contact_progress_path,
             manifest_path=manifest_path,
             collector_configuration_sha256='7' * 64,
             owned_process_group_shutdown=True,
@@ -457,6 +1278,29 @@ def test_orchestrator_evidence_matches_metrics_schema(tmp_path: Path) -> None:
     }
     build = {
         'collector_configuration_sha256': '2' * 64,
+        'contact_gate_binary': {
+            'build_embedded_source_inventory_match': True,
+            'build_embedded_source_inventory_sha256': '8' * 64,
+            'build_elf_build_id': 'a1',
+            'build_install_build_id_match': True,
+            'build_install_sha256_match': True,
+            'build_path': 'build/robotest_sim/contact_stream_gate',
+            'build_regular_executable': True,
+            'build_sha256': '9' * 64,
+            'installed_declared_path': (
+                'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
+            ),
+            'installed_declared_samefile': True,
+            'installed_embedded_source_inventory_match': True,
+            'installed_embedded_source_inventory_sha256': '8' * 64,
+            'installed_elf_build_id': 'a1',
+            'installed_path': 'install/robotest_sim/lib/robotest_sim/contact_stream_gate',
+            'installed_regular_executable': True,
+            'installed_sha256': '9' * 64,
+            'package': 'robotest_sim',
+            'schema_version': 1,
+            'source_inventory_sha256': '8' * 64,
+        },
         'install': {'aggregate_sha256': '3' * 64},
         'metrics_contract_sha256': '4' * 64,
         'source': {'aggregate_sha256': '5' * 64},

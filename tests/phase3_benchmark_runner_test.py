@@ -171,6 +171,39 @@ def test_failure_reason_is_bounded_by_utf8_bytes() -> None:
     assert len(value.encode('utf-8')) <= 4096
 
 
+def test_trial_collector_and_drain_wait_share_exact_contact_progress_path(
+    tmp_path: Path,
+) -> None:
+    contact_progress_path = tmp_path / 'contact-progress.json'
+    command = runner._metrics_collector_command(
+        capture_path=tmp_path / 'capture.json',
+        ready_path=tmp_path / 'metrics.ready.json',
+        stop_path=tmp_path / 'metrics.stop',
+        contact_progress_path=contact_progress_path,
+    )
+    progress_option = command.index('--contact-progress-file')
+    assert command[progress_option + 1] == str(contact_progress_path)
+    assert command.count(str(contact_progress_path)) == 1
+
+    orchestration.atomic_write_json(
+        contact_progress_path,
+        {
+            'latest_retained_stamp_ns': 600_000_000,
+            'producer': 'robotest_metrics/metrics_collector',
+            'public_topic': '/robotest/validation/contacts',
+            'retained_message_count': 3,
+            'schema_version': 1,
+        },
+    )
+    progress = runner._wait_for_contact_progress(
+        contact_progress_path,
+        qualifying_stamp_ns=500_000_000,
+        timeout_s=0.1,
+        watched=(),
+    )
+    assert progress['latest_retained_stamp_ns'] == 600_000_000
+
+
 def test_positive_control_allows_sim_fault_proxy_but_forbids_navigation() -> None:
     assert 'fault_proxy' not in runtime_gate.POSITIVE_FORBIDDEN_NODES
     assert 'collision_monitor' in runtime_gate.POSITIVE_FORBIDDEN_NODES
@@ -220,3 +253,25 @@ def test_runtime_qos_explicit_keep_all_is_rejected() -> None:
     status = runtime_gate._qos_status(record, ('RELIABLE', 'VOLATILE', 10))
     assert status['explicit_keep_all'] is True
     assert status['policy_contract_pass'] is False
+
+
+def test_runtime_gate_rejects_duplicate_endpoints_with_the_same_fqn() -> None:
+    endpoint = {
+        'gid': '01',
+        'node': '/robotest/contact_stream_gate',
+        'topic_type': runtime_gate.CONTACT_MESSAGE_TYPE,
+    }
+    assert runtime_gate._exact_endpoint_owners(
+        [endpoint],
+        {'/robotest/contact_stream_gate'},
+        expected_type=runtime_gate.CONTACT_MESSAGE_TYPE,
+    )
+    assert not runtime_gate._exact_endpoint_owners(
+        [endpoint, {**endpoint, 'gid': '02'}],
+        {'/robotest/contact_stream_gate'},
+        expected_type=runtime_gate.CONTACT_MESSAGE_TYPE,
+    )
+
+
+def test_runtime_gate_proc_stat_parser_handles_parentheses_in_comm() -> None:
+    assert runtime_gate._proc_parent_pid('123 (gate ) worker) S 42 7 7 0') == 42

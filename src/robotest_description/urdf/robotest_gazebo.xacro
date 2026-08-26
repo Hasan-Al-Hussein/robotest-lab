@@ -10,9 +10,10 @@
       <sensor name="${sensor_name}" type="contact">
         <always_on>true</always_on>
         <!--
-          Five hertz keeps four normal support-contact streams below the
-          Phase 3 bounded collector budget while still resolving the frozen
-          0.25 s contact-release gap.
+          This remains a declared sensor rate for source provenance only.
+          Gazebo Sim 8's Contact system does not enforce it; the compiled ROS
+          gate supplies a 5 Hz steady-state heartbeat, publishes pair-set
+          transitions immediately, and fails closed on bounded-state overflow.
         -->
         <update_rate>5</update_rate>
         <contact>

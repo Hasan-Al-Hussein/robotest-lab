@@ -50,6 +50,11 @@ MINIMUM_RTF_WINDOWS = 5
 RTF_WINDOW_SAMPLE_SPAN = 5
 DEFAULT_TRACE_CAPACITY = 8192
 MAXIMUM_TF_EDGES = 256
+CONTACT_PUBLIC_HEARTBEAT_NS = 200_000_000
+CONTACT_PUBLIC_MAX_GAP_NS = 220_000_000
+CONTACT_PUBLIC_MAX_CLOCK_LAG_NS = 220_000_000
+CONTACT_CLOCK_BRACKET_WALL_TIMEOUT_S = 2.0
+CONTACT_PUBLIC_MAX_RECORDS = 16
 
 # Gazebo advances this world in 2 ms steps at a configured target RTF of 1.0.
 # /clock is unthrottled, BEST_EFFORT, and KEEP_LAST(1), so a subscriber may skip
@@ -123,8 +128,12 @@ STATIC_QOS_DEPTH_CONTRACT: dict[str, dict[str, dict[str, int]]] = {
         'subscribers': {PROBE_NODE: 10},
     },
     '/robotest/validation/contacts': {
-        'publishers': {'/robotest/parameter_bridge': 10},
+        'publishers': {'/robotest/contact_stream_gate': 10},
         'subscribers': {PROBE_NODE: 10},
+    },
+    '/robotest/internal/raw_contacts': {
+        'publishers': {'/robotest/parameter_bridge': 64},
+        'subscribers': {'/robotest/contact_stream_gate': 64},
     },
     '/robotest/validation/world_stats': {
         'publishers': {'/robotest/parameter_bridge': 10},
@@ -228,6 +237,23 @@ def exact_endpoint_failure(
     return None
 
 
+def valid_scoped_collision_name(value: Any) -> bool:
+    """Require at least model, link, and collision scoped-name segments."""
+    if not isinstance(value, str) or not value:
+        return False
+    segments = value.split('::')
+    return len(segments) >= 3 and all(segments)
+
+
+def valid_public_contact_record_count(value: Any) -> bool:
+    """Require the bounded, nonempty v3 public snapshot cardinality."""
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 1 <= value <= CONTACT_PUBLIC_MAX_RECORDS
+    )
+
+
 def serialize_result(result: dict[str, Any]) -> str:
     """Serialize evidence while rejecting non-standard NaN/Infinity JSON."""
     return (
@@ -316,20 +342,23 @@ class StampTracker:
                 )
 
     def evidence(self, latest_clock: int | None) -> dict[str, Any]:
-        final_age = None
+        final_age_ns = None
         if latest_clock is not None and self.latest_stamp_ns is not None:
-            final_age = (latest_clock - self.latest_stamp_ns) / 1e9
+            final_age_ns = latest_clock - self.latest_stamp_ns
         return {
             'sample_count': self.sample_count,
             'first_stamp_ns': self.first_stamp_ns,
             'latest_stamp_ns': self.latest_stamp_ns,
             'regression_count': self.regression_count,
             'duplicate_count': self.duplicate_count,
+            'maximum_forward_gap_ns': self.maximum_forward_gap_ns,
             'maximum_forward_gap_s': self.maximum_forward_gap_ns / 1e9,
+            'maximum_receipt_age_ns': self.maximum_receipt_age_ns,
             'maximum_receipt_age_s': self.maximum_receipt_age_ns / 1e9,
             'future_relative_to_clock_count': self.future_relative_to_clock_count,
             'maximum_future_offset_s': self.maximum_future_offset_ns / 1e9,
-            'final_age_s': final_age,
+            'final_age_ns': final_age_ns,
+            'final_age_s': None if final_age_ns is None else final_age_ns / 1e9,
             'wall_inter_receipt_interval_count': self.wall_inter_receipt_interval_count,
             'maximum_wall_inter_receipt_gap_s': (
                 self.maximum_wall_inter_receipt_gap_s
@@ -355,6 +384,14 @@ class Phase2RuntimeProbe(Node):
         self.last_sim_ns: dict[str, int] = {}
         self.latest_clock_ns: int | None = None
         self.stamp_trackers: dict[str, StampTracker] = defaultdict(StampTracker)
+        self.contact_frame_id_violation_count = 0
+        self.contact_name_violation_count = 0
+        self.contact_record_count_violation_count = 0
+        self.contact_same_pair_set_interval_violation_count = 0
+        self.contact_minimum_same_pair_set_interval_ns: int | None = None
+        self.previous_contact_pair_set: frozenset[tuple[str, str]] | None = None
+        self.previous_contact_pair_set_stamp_ns: int | None = None
+        self.contact_clock_bracket: dict[str, Any] | None = None
         self.numeric_rejections: Counter[str] = Counter()
         self.world_samples: deque[tuple[int, float, bool, float]] = deque(maxlen=4096)
         self.world_samples_dropped = 0
@@ -550,8 +587,38 @@ class Phase2RuntimeProbe(Node):
             }
         )
 
-    def _on_contacts(self, _message: Contacts) -> None:
-        self._record('contacts')
+    def _on_contacts(self, message: Contacts) -> None:
+        simulation_stamp = stamp_ns(message)
+        self._record('contacts', simulation_stamp)
+        if message.header.frame_id:
+            self.contact_frame_id_violation_count += 1
+        if not valid_public_contact_record_count(len(message.contacts)):
+            self.contact_record_count_violation_count += 1
+        pairs: set[tuple[str, str]] = set()
+        for contact in message.contacts:
+            first = contact.collision1.name
+            second = contact.collision2.name
+            if not valid_scoped_collision_name(first) or not valid_scoped_collision_name(second):
+                self.contact_name_violation_count += 1
+                continue
+            pairs.add(tuple(sorted((first, second))))
+        pair_set = frozenset(pairs)
+        if (
+            self.previous_contact_pair_set is not None
+            and self.previous_contact_pair_set_stamp_ns is not None
+            and pair_set == self.previous_contact_pair_set
+            and simulation_stamp > self.previous_contact_pair_set_stamp_ns
+        ):
+            interval_ns = simulation_stamp - self.previous_contact_pair_set_stamp_ns
+            self.contact_minimum_same_pair_set_interval_ns = (
+                interval_ns
+                if self.contact_minimum_same_pair_set_interval_ns is None
+                else min(self.contact_minimum_same_pair_set_interval_ns, interval_ns)
+            )
+            if interval_ns < CONTACT_PUBLIC_HEARTBEAT_NS:
+                self.contact_same_pair_set_interval_violation_count += 1
+        self.previous_contact_pair_set = pair_set
+        self.previous_contact_pair_set_stamp_ns = simulation_stamp
 
     def _on_fault_event(self, _message: FaultEvent) -> None:
         self._record('fault_events')
@@ -622,6 +689,50 @@ class Phase2RuntimeProbe(Node):
         deadline = time.monotonic() + wall_seconds
         while time.monotonic() < deadline and not self.stop_requested:
             rclpy.spin_once(self, timeout_sec=0.05)
+
+    def wait_for_contact_clock_bracket(self) -> None:
+        """Bind the latest public snapshot to a caught-up clock sample."""
+        deadline = time.monotonic() + CONTACT_CLOCK_BRACKET_WALL_TIMEOUT_S
+        while time.monotonic() < deadline and not self.stop_requested:
+            latest_contact = self.stamp_trackers['contacts'].latest_stamp_ns
+            latest_clock = self.latest_clock_ns
+            if (
+                latest_contact is not None
+                and latest_clock is not None
+                and latest_clock >= latest_contact
+            ):
+                lag_ns = latest_clock - latest_contact
+                if lag_ns <= CONTACT_PUBLIC_MAX_CLOCK_LAG_NS:
+                    self.contact_clock_bracket = {
+                        'clock_stamp_ns': latest_clock,
+                        'clock_minus_public_latest_ns': lag_ns,
+                        'limits': {
+                            'maximum_clock_lag_ns': CONTACT_PUBLIC_MAX_CLOCK_LAG_NS,
+                            'maximum_public_gap_ns': CONTACT_PUBLIC_MAX_GAP_NS,
+                        },
+                        'public_latest_stamp_ns': latest_contact,
+                    }
+                    return
+            rclpy.spin_once(self, timeout_sec=0.02)
+        latest_contact = self.stamp_trackers['contacts'].latest_stamp_ns
+        latest_clock = self.latest_clock_ns
+        self.contact_clock_bracket = {
+            'clock_stamp_ns': latest_clock,
+            'clock_minus_public_latest_ns': (
+                latest_clock - latest_contact
+                if latest_clock is not None and latest_contact is not None
+                else None
+            ),
+            'limits': {
+                'maximum_clock_lag_ns': CONTACT_PUBLIC_MAX_CLOCK_LAG_NS,
+                'maximum_public_gap_ns': CONTACT_PUBLIC_MAX_GAP_NS,
+            },
+            'public_latest_stamp_ns': latest_contact,
+        }
+        self.failures.append(
+            'contact public snapshot did not obtain a caught-up /clock bracket within '
+            f'{CONTACT_CLOCK_BRACKET_WALL_TIMEOUT_S:.1f} s'
+        )
 
     def endpoint_snapshot(self, topic: str) -> dict[str, Any]:
         def encode(endpoint: Any) -> dict[str, Any]:
@@ -837,8 +948,11 @@ class Phase2RuntimeProbe(Node):
         evidence['limits'] = {
             'minimum_simulation_rate_hz': minimum_simulation_rate,
             'maximum_gap_s': maximum_gap_s,
+            'maximum_gap_ns': round(maximum_gap_s * NANOSECONDS_PER_SECOND),
             'maximum_final_age_s': maximum_final_age_s,
+            'maximum_final_age_ns': round(maximum_final_age_s * NANOSECONDS_PER_SECOND),
             'maximum_receipt_age_s': maximum_receipt_age_s,
+            'maximum_receipt_age_ns': round(maximum_receipt_age_s * NANOSECONDS_PER_SECOND),
             'maximum_future_offset_s': maximum_future_offset_s,
             'minimum_simulation_span_s': minimum_simulation_span_s,
             'minimum_sample_count': minimum_sample_count,
@@ -863,12 +977,12 @@ class Phase2RuntimeProbe(Node):
             self.failures.append(
                 f'{topic} simulation-time rate {rate} below {minimum_simulation_rate} Hz'
             )
-        if evidence['maximum_forward_gap_s'] > maximum_gap_s:
+        if evidence['maximum_forward_gap_ns'] > evidence['limits']['maximum_gap_ns']:
             self.failures.append(
                 f'{topic} maximum stamp gap {evidence["maximum_forward_gap_s"]} '
                 f'exceeds {maximum_gap_s} s'
             )
-        if evidence['maximum_receipt_age_s'] > maximum_receipt_age_s:
+        if evidence['maximum_receipt_age_ns'] > evidence['limits']['maximum_receipt_age_ns']:
             self.failures.append(
                 f'{topic} maximum receipt age {evidence["maximum_receipt_age_s"]} '
                 f'exceeds {maximum_receipt_age_s} s'
@@ -879,10 +993,11 @@ class Phase2RuntimeProbe(Node):
                 f'exceeds {maximum_future_offset_s} s'
             )
         final_age = evidence['final_age_s']
+        final_age_ns = evidence['final_age_ns']
         if (
-            final_age is None
-            or final_age > maximum_final_age_s
-            or final_age < -maximum_future_offset_s
+            final_age_ns is None
+            or final_age_ns > evidence['limits']['maximum_final_age_ns']
+            or final_age_ns < -round(maximum_future_offset_s * NANOSECONDS_PER_SECOND)
         ):
             self.failures.append(
                 f'{topic} final stamp age {final_age} outside '
@@ -927,6 +1042,7 @@ class Phase2RuntimeProbe(Node):
             '/robotest/cmd_vel_behavior_unused': ('RELIABLE', 'VOLATILE'),
             '/robotest/validation/ground_truth': ('RELIABLE', 'VOLATILE'),
             '/robotest/validation/contacts': ('RELIABLE', 'VOLATILE'),
+            '/robotest/internal/raw_contacts': ('RELIABLE', 'VOLATILE'),
             '/robotest/validation/world_stats': ('RELIABLE', 'VOLATILE'),
             '/robotest/faults/events': ('RELIABLE', 'VOLATILE'),
             '/tf': ('RELIABLE', 'VOLATILE'),
@@ -947,6 +1063,17 @@ class Phase2RuntimeProbe(Node):
                 static_depths,
                 require_subscribers=(topic != '/robotest/cmd_vel_behavior_unused'),
             )
+        if self.contact_frame_id_violation_count:
+            self.failures.append('public contact snapshot frame_id must be empty')
+        if self.contact_name_violation_count:
+            self.failures.append('public contact snapshot contains a malformed scoped name')
+        if self.contact_record_count_violation_count:
+            self.failures.append('public contact snapshots must contain 1 to 16 records')
+        if self.contact_same_pair_set_interval_violation_count:
+            self.failures.append(
+                'public contact snapshot repeated an unchanged pair set before the 200 ms '
+                'heartbeat interval'
+            )
 
         expected_publishers = {
             '/clock': {'/robotest/parameter_bridge'},
@@ -963,7 +1090,8 @@ class Phase2RuntimeProbe(Node):
             '/robotest/cmd_vel': {'/robotest/collision_monitor'},
             '/robotest/cmd_vel_behavior_unused': {'/robotest/behavior_server'},
             '/robotest/validation/ground_truth': {'/robotest/parameter_bridge'},
-            '/robotest/validation/contacts': {'/robotest/parameter_bridge'},
+            '/robotest/validation/contacts': {'/robotest/contact_stream_gate'},
+            '/robotest/internal/raw_contacts': {'/robotest/parameter_bridge'},
             '/robotest/validation/world_stats': {'/robotest/parameter_bridge'},
             '/robotest/faults/events': {'/robotest/fault_proxy'},
             '/tf': {
@@ -984,6 +1112,7 @@ class Phase2RuntimeProbe(Node):
             '/robotest/cmd_vel_smoothed': {'/robotest/collision_monitor'},
             '/robotest/cmd_vel': {'/robotest/parameter_bridge'},
             '/robotest/cmd_vel_behavior_unused': set(),
+            '/robotest/internal/raw_contacts': {'/robotest/contact_stream_gate'},
         }
         for topic, expected in connected_subscribers.items():
             actual = [
@@ -1118,6 +1247,15 @@ class Phase2RuntimeProbe(Node):
                 0.50,
                 0.25,
             ),
+            '/robotest/validation/contacts': self._check_stamp_stream(
+                '/robotest/validation/contacts',
+                'contacts',
+                4.0,
+                0.22,
+                0.22,
+                0.22,
+                0.25,
+            ),
             '/robotest/validation/world_stats': self._check_stamp_stream(
                 '/robotest/validation/world_stats',
                 'world_stats',
@@ -1132,6 +1270,20 @@ class Phase2RuntimeProbe(Node):
                 maximum_wall_inter_receipt_gap_s=(WORLD_STATS_MAXIMUM_WALL_INTER_RECEIPT_GAP_S),
             ),
         }
+        stamp_evidence['/robotest/validation/contacts'].update(
+            {
+                'clock_bracket': self.contact_clock_bracket,
+                'frame_id_violation_count': self.contact_frame_id_violation_count,
+                'name_violation_count': self.contact_name_violation_count,
+                'record_count_violation_count': (self.contact_record_count_violation_count),
+                'minimum_same_pair_set_interval_ns': (
+                    self.contact_minimum_same_pair_set_interval_ns
+                ),
+                'same_pair_set_interval_violation_count': (
+                    self.contact_same_pair_set_interval_violation_count
+                ),
+            }
+        )
         if self.counts.get('map', 0) < 1:
             self.failures.append('no map message observed')
         if self.counts.get('plan', 0) < 1:
@@ -1397,6 +1549,14 @@ def run_self_test() -> int:
     assert full_node_name('/robotest', 'controller_server') == '/robotest/controller_server'
     assert exact_endpoint_failure('/topic', 'publisher', ['/a'], {'/a'}) is None
     assert exact_endpoint_failure('/topic', 'publisher', ['/a', '/a'], {'/a'}) is not None
+    assert valid_scoped_collision_name('model::link::collision')
+    assert valid_scoped_collision_name('world::model::link::collision')
+    assert not valid_scoped_collision_name('model::collision')
+    assert not valid_scoped_collision_name('model::::collision')
+    assert valid_public_contact_record_count(1)
+    assert valid_public_contact_record_count(16)
+    assert not valid_public_contact_record_count(0)
+    assert not valid_public_contact_record_count(17)
     tracker = StampTracker()
     tracker.observe(1_000_000_000, 1_100_000_000, receipt_wall_s=10.0)
     tracker.observe(2_000_000_000, 2_100_000_000, receipt_wall_s=10.1)
@@ -1508,6 +1668,7 @@ def main() -> int:
             probe.failures.append('probe reached its steady-wall hard deadline')
         elif args.stop_file.is_file() and not probe.stop_requested:
             probe.spin_for(args.stop_grace_wall_seconds)
+        probe.wait_for_contact_clock_bracket()
         result = probe.evaluate()
         exit_code = 0 if result['verdict'] == 'PASS' else 1
     except Exception as error:

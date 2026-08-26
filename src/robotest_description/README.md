@@ -56,8 +56,15 @@ regenerate it atomically with `--mode write` and review the complete diff.
 The generator expands the exact launch arguments, converts the URDF with
 `gz sdf --precision 17 -p`, and proves that every one of the seven rendered
 collision geometries has exactly one 5 Hz contact sensor on the frozen topic.
+The 5 Hz value is declared source metadata only: Gazebo Sim 8 does not enforce
+it. The raw Gazebo topic is bridged privately to
+`/robotest/internal/raw_contacts`; the compiled `contact_stream_gate` owns the
+public `/robotest/validation/contacts` stream. It publishes complete delivered
+active-pair snapshots at a 5 Hz unchanged-state heartbeat and immediately on
+pair-set transitions, with strict bounds and fail-closed overflow behavior.
 
-The manifest binds raw bridge and world bytes, a canonical inventory of every
+The manifest binds raw bridge and world bytes, the gate's CMake/header/source
+inventory and launch wiring, a canonical inventory of every
 Xacro source plus render arguments, the printed rendered SDF bytes, and a
 canonical semantic projection of the seven contact sensors. Its declared
 `manifest_sha256` is SHA-256 over sorted compact UTF-8 JSON plus LF with the

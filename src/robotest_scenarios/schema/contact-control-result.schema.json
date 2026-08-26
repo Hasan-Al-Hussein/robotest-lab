@@ -79,21 +79,26 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "active_counterpart_count", "classified_record_count", "counterpart_tracker_count", "episodes", "exact_pair_raw_count",
-            "expected_pair", "first_qualifying_contact", "raw_contact_record_count", "records"
+            "active_counterpart_count", "classified_record_count", "contact_clock_bracket",
+            "counterpart_tracker_count", "episodes", "exact_pair_snapshot_record_count",
+            "expected_pair", "first_qualifying_contact", "release_snapshot",
+            "snapshot_contact_record_count", "snapshot_records", "snapshots"
           ],
           "properties": {
             "active_counterpart_count": {"type": "integer", "minimum": 0},
             "classified_record_count": {"type": "integer", "minimum": 0},
+            "contact_clock_bracket": {"anyOf": [{"$ref": "#/$defs/contactClockBracket"}, {"type": "null"}]},
             "counterpart_tracker_count": {"type": "integer", "minimum": 1, "maximum": 32768},
             "episodes": {"type": "array", "maxItems": 32768, "items": {"$ref": "#/$defs/episode"}},
-            "exact_pair_raw_count": {"type": "integer", "minimum": 0},
+            "exact_pair_snapshot_record_count": {"type": "integer", "minimum": 0},
             "expected_pair": {"$ref": "#/$defs/pair"},
             "first_qualifying_contact": {
               "anyOf": [{"$ref": "#/$defs/firstQualifyingContact"}, {"type": "null"}]
             },
-            "raw_contact_record_count": {"type": "integer", "minimum": 0},
-            "records": {"type": "array", "maxItems": 32768, "items": {"$ref": "#/$defs/rawContactRecord"}}
+            "release_snapshot": {"anyOf": [{"$ref": "#/$defs/releaseSnapshot"}, {"type": "null"}]},
+            "snapshot_contact_record_count": {"type": "integer", "minimum": 0},
+            "snapshot_records": {"type": "array", "maxItems": 32768, "items": {"$ref": "#/$defs/snapshotContactRecord"}},
+            "snapshots": {"type": "array", "maxItems": 8192, "items": {"$ref": "#/$defs/contactSnapshot"}}
           }
         },
         "criteria": {
@@ -103,7 +108,7 @@
             "contact_before_deadline", "episode_reconciled",
             "exactly_one_counterpart_episode", "final_command_zero",
             "graph_isolated", "hold_completed", "overflow_free",
-            "raw_expected_contact_observed", "release_completed", "release_source_spanned",
+            "expected_contact_snapshot_observed", "release_completed", "release_source_spanned",
             "reverse_completed", "robot_start_verified", "sole_cmd_vel_publisher", "stop_within_100ms",
             "wall_deleted"
           ],
@@ -115,7 +120,7 @@
             "graph_isolated": {"type": "boolean"},
             "hold_completed": {"type": "boolean"},
             "overflow_free": {"type": "boolean"},
-            "raw_expected_contact_observed": {"type": "boolean"},
+            "expected_contact_snapshot_observed": {"type": "boolean"},
             "release_completed": {"type": "boolean"},
             "release_source_spanned": {"type": "boolean"},
             "reverse_completed": {"type": "boolean"},
@@ -155,19 +160,24 @@
           "additionalProperties": false,
           "required": [
             "control_started_stamp_ns", "final_zero_stamp_ns", "hold_complete_stamp_ns",
-            "release_complete_stamp_ns", "release_contact_message_start_count", "release_contact_message_end_count", "release_required_through_stamp_ns", "reverse_start_stamp_ns",
-            "stop_command_stamp_ns", "stop_latency_ns"
+            "release_complete_stamp_ns", "release_contact_snapshot_start_count", "release_contact_snapshot_end_count",
+            "release_observed_clock_stamp_ns", "release_qualified_snapshot_stamp_ns",
+            "release_required_through_stamp_ns", "reverse_start_stamp_ns",
+            "stop_command_stamp_ns", "stop_latency_clock_stamp_ns", "stop_latency_ns"
           ],
           "properties": {
             "control_started_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
             "final_zero_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
             "hold_complete_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
             "release_complete_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
-            "release_contact_message_start_count": {"type": ["integer", "null"], "minimum": 0},
-            "release_contact_message_end_count": {"type": "integer", "minimum": 0},
+            "release_contact_snapshot_start_count": {"type": ["integer", "null"], "minimum": 0},
+            "release_contact_snapshot_end_count": {"type": "integer", "minimum": 0},
+            "release_observed_clock_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+            "release_qualified_snapshot_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
             "release_required_through_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
             "reverse_start_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
             "stop_command_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+            "stop_latency_clock_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
             "stop_latency_ns": {"type": ["integer", "null"]}
           }
         }
@@ -189,42 +199,49 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "all_buffers_bounded", "buffers", "collision_monitor_absent",
+        "all_buffers_bounded", "buffers", "collision_monitor_absent", "contact_graph_topology",
         "forbidden_nodes", "nav2_absent", "overflow_free", "protocol_error_count",
-        "clock", "contact_message_heartbeat", "raw_contact_stream", "relative_project_names", "sole_cmd_vel_publisher", "source_publisher_counts", "source_streams_live", "cmd_vel_publisher_count"
+        "clock", "public_contact_snapshot_heartbeat", "public_contact_snapshot_stream",
+        "relative_project_names", "sole_cmd_vel_publisher", "source_publisher_counts",
+        "source_streams_live", "cmd_vel_publisher_count"
       ],
       "properties": {
         "all_buffers_bounded": {"const": true},
         "buffers": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["actor_state", "command", "contact_records", "contact_summaries", "ground_truth"],
+          "required": ["actor_state", "command", "contact_snapshot_records", "contact_snapshots", "ground_truth"],
           "properties": {
             "actor_state": {"$ref": "#/$defs/buffer"},
             "command": {"$ref": "#/$defs/buffer"},
-            "contact_records": {"$ref": "#/$defs/buffer"},
-            "contact_summaries": {"$ref": "#/$defs/buffer"},
+            "contact_snapshot_records": {"$ref": "#/$defs/buffer"},
+            "contact_snapshots": {"$ref": "#/$defs/buffer"},
             "ground_truth": {"$ref": "#/$defs/buffer"}
           }
         },
         "collision_monitor_absent": {"type": "boolean"},
+        "contact_graph_topology": {"$ref": "#/$defs/contactGraphTopologyEvidence"},
         "clock": {"$ref": "#/$defs/clock"},
-        "contact_message_heartbeat": {
+        "public_contact_snapshot_heartbeat": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["first_stamp_ns", "latest_stamp_ns", "max_gap_ns", "message_count"],
+          "required": [
+            "first_stamp_ns", "future_delivery_count", "latest_stamp_ns", "max_gap_ns",
+            "snapshot_count"
+          ],
           "properties": {
             "first_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+            "future_delivery_count": {"type": "integer", "minimum": 0},
             "latest_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
             "max_gap_ns": {"type": "integer", "minimum": 0},
-            "message_count": {"type": "integer", "minimum": 0}
+            "snapshot_count": {"type": "integer", "minimum": 0}
           }
         },
         "forbidden_nodes": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
         "nav2_absent": {"type": "boolean"},
         "overflow_free": {"type": "boolean"},
         "protocol_error_count": {"type": "integer", "minimum": 0},
-        "raw_contact_stream": {"$ref": "#/$defs/buffer"},
+        "public_contact_snapshot_stream": {"$ref": "#/$defs/buffer"},
         "relative_project_names": {"const": true},
         "sole_cmd_vel_publisher": {"type": "boolean"},
         "source_publisher_counts": {
@@ -282,10 +299,13 @@
                 "properties": {
                   "classified_record_count": {"minimum": 1},
                   "episodes": {"minItems": 1},
-                  "exact_pair_raw_count": {"minimum": 1},
+                  "contact_clock_bracket": {"$ref": "#/$defs/contactClockBracket"},
+                  "exact_pair_snapshot_record_count": {"minimum": 1},
                   "first_qualifying_contact": {"$ref": "#/$defs/firstQualifyingContact"},
-                  "raw_contact_record_count": {"minimum": 1},
-                  "records": {"minItems": 1}
+                  "release_snapshot": {"$ref": "#/$defs/releaseSnapshot"},
+                  "snapshot_contact_record_count": {"minimum": 1},
+                  "snapshot_records": {"minItems": 1},
+                  "snapshots": {"minItems": 1}
                 }
               },
               "criteria": {"$ref": "#/$defs/passingCriteria"},
@@ -310,8 +330,10 @@
               },
               "timeline": {
                 "properties": {
-                  "release_contact_message_end_count": {"minimum": 2},
-                  "release_contact_message_start_count": {"type": "integer", "minimum": 1}
+                  "release_contact_snapshot_end_count": {"minimum": 2},
+                  "release_contact_snapshot_start_count": {"type": "integer", "minimum": 1},
+                  "release_observed_clock_stamp_ns": {"type": "integer", "minimum": 1},
+                  "release_qualified_snapshot_stamp_ns": {"type": "integer", "minimum": 1}
                 }
               }
             }
@@ -319,6 +341,15 @@
           "quality": {
             "properties": {
               "collision_monitor_absent": {"const": true},
+              "contact_graph_topology": {
+                "properties": {
+                  "audit_count": {"minimum": 2},
+                  "first_sha256": {"$ref": "#/$defs/sha256"},
+                  "first_snapshot": {"$ref": "#/$defs/contactGraphSnapshot"},
+                  "last_sha256": {"$ref": "#/$defs/sha256"},
+                  "last_snapshot": {"$ref": "#/$defs/contactGraphSnapshot"}
+                }
+              },
               "nav2_absent": {"const": true},
               "overflow_free": {"const": true},
               "protocol_error_count": {"const": 0},
@@ -472,13 +503,151 @@
     "episode": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["counterpart_model", "end_stamp_ns", "normalized_pairs", "sample_count", "start_stamp_ns"],
+      "required": ["counterpart_model", "end_stamp_ns", "normalized_pairs", "snapshot_record_count", "start_stamp_ns"],
       "properties": {
         "counterpart_model": {"type": "string", "minLength": 1, "maxLength": 4096},
         "end_stamp_ns": {"type": "integer", "minimum": 1},
         "normalized_pairs": {"type": "array", "minItems": 1, "maxItems": 32768, "uniqueItems": true, "items": {"$ref": "#/$defs/pair"}},
-        "sample_count": {"type": "integer", "minimum": 1},
+        "snapshot_record_count": {"type": "integer", "minimum": 1},
         "start_stamp_ns": {"type": "integer", "minimum": 1}
+      }
+    },
+    "contactClockBracket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["clock_stamp_ns", "lag_ns", "limit_ns", "snapshot_stamp_ns"],
+      "properties": {
+        "clock_stamp_ns": {"type": "integer", "minimum": 1},
+        "lag_ns": {"type": "integer", "minimum": 0, "maximum": 220000000},
+        "limit_ns": {"const": 220000000},
+        "snapshot_stamp_ns": {"type": "integer", "minimum": 1}
+      }
+    },
+    "contactGraphTopologyEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "audit_count", "first_sha256", "first_snapshot", "last_sha256", "last_snapshot"
+      ],
+      "properties": {
+        "audit_count": {"type": "integer", "minimum": 0},
+        "first_sha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "first_snapshot": {"anyOf": [{"$ref": "#/$defs/contactGraphSnapshot"}, {"type": "null"}]},
+        "last_sha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "last_snapshot": {"anyOf": [{"$ref": "#/$defs/contactGraphSnapshot"}, {"type": "null"}]}
+      }
+    },
+    "contactGraphSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "private_raw_publishers", "private_raw_subscribers", "public_snapshot_publishers",
+        "topics"
+      ],
+      "properties": {
+        "private_raw_publishers": {
+          "type": "array", "minItems": 1, "maxItems": 1,
+          "items": {"$ref": "#/$defs/contactGraphEndpoint"}
+        },
+        "private_raw_subscribers": {
+          "type": "array", "minItems": 1, "maxItems": 1,
+          "items": {"$ref": "#/$defs/contactGraphEndpoint"}
+        },
+        "public_snapshot_publishers": {
+          "type": "array", "minItems": 1, "maxItems": 1,
+          "items": {"$ref": "#/$defs/contactGraphEndpoint"}
+        },
+        "topics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["private_raw_contact_topic", "public_contact_snapshot_topic"],
+          "properties": {
+            "private_raw_contact_topic": {"const": "/robotest/internal/raw_contacts"},
+            "public_contact_snapshot_topic": {"const": "/robotest/validation/contacts"}
+          }
+        }
+      }
+    },
+    "contactGraphEndpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["endpoint_gid", "node_fqn", "qos", "qos_status", "topic_type"],
+      "properties": {
+        "endpoint_gid": {"type": "string", "pattern": "^[0-9a-f]{48}$"},
+        "node_fqn": {"enum": ["/robotest/contact_stream_gate", "/robotest/parameter_bridge"]},
+        "qos": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["depth", "durability", "history", "reliability"],
+          "properties": {
+            "depth": {"type": "integer", "minimum": 0},
+            "durability": {"const": "VOLATILE"},
+            "history": {"enum": ["KEEP_LAST", "SYSTEM_DEFAULT", "UNKNOWN"]},
+            "reliability": {"const": "RELIABLE"}
+          }
+        },
+        "qos_status": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "depth_matches_or_unknown", "durability_volatile",
+            "history_keep_last_or_unknown", "reliability_reliable"
+          ],
+          "properties": {
+            "depth_matches_or_unknown": {"const": true},
+            "durability_volatile": {"const": true},
+            "history_keep_last_or_unknown": {"const": true},
+            "reliability_reliable": {"const": true}
+          }
+        },
+        "topic_type": {"const": "ros_gz_interfaces/msg/Contacts"}
+      }
+    },
+    "releaseSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["collector_sequence", "sim_stamp_ns"],
+      "properties": {
+        "collector_sequence": {"type": "integer", "minimum": 1},
+        "sim_stamp_ns": {"type": "integer", "minimum": 1}
+      }
+    },
+    "contactSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "classified_count", "collector_sequence", "counted_snapshot_records",
+        "delivery_clock_offset_ns", "delivery_clock_stamp_ns", "exact_pair_count",
+        "sim_stamp_ns", "snapshot_record_count"
+      ],
+      "properties": {
+        "classified_count": {"type": "integer", "minimum": 0, "maximum": 16},
+        "collector_sequence": {"type": "integer", "minimum": 1},
+        "counted_snapshot_records": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "counterpart_model", "normalized_pair", "record_sequence",
+              "snapshot_sequence"
+            ],
+            "properties": {
+              "counterpart_model": {"type": "string", "minLength": 1, "maxLength": 4096},
+              "normalized_pair": {"$ref": "#/$defs/pair"},
+              "record_sequence": {"type": "integer", "minimum": 1},
+              "snapshot_sequence": {"type": "integer", "minimum": 1}
+            }
+          }
+        },
+        "delivery_clock_offset_ns": {
+          "type": "integer", "minimum": -220000000, "maximum": 220000000
+        },
+        "delivery_clock_stamp_ns": {"type": "integer", "minimum": 0},
+        "exact_pair_count": {"type": "integer", "minimum": 0, "maximum": 16},
+        "sim_stamp_ns": {"type": "integer", "minimum": 1},
+        "snapshot_record_count": {"type": "integer", "minimum": 1, "maximum": 16}
       }
     },
     "passingCriteria": {
@@ -491,7 +660,7 @@
         "graph_isolated": {"const": true},
         "hold_completed": {"const": true},
         "overflow_free": {"const": true},
-        "raw_expected_contact_observed": {"const": true},
+        "expected_contact_snapshot_observed": {"const": true},
         "release_completed": {"const": true},
         "release_source_spanned": {"const": true},
         "reverse_completed": {"const": true},
@@ -501,18 +670,19 @@
         "wall_deleted": {"const": true}
       }
     },
-    "rawContactRecord": {
+    "snapshotContactRecord": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["collector_sequence", "counterpart_collision", "counterpart_model", "disposition", "normalized_pair", "robot_collision", "sim_stamp_ns"],
+      "required": ["collector_sequence", "counterpart_collision", "counterpart_model", "disposition", "normalized_pair", "robot_collision", "sim_stamp_ns", "snapshot_sequence"],
       "properties": {
         "collector_sequence": {"type": "integer", "minimum": 1},
         "counterpart_collision": {"type": ["string", "null"], "maxLength": 4096},
         "counterpart_model": {"type": ["string", "null"], "maxLength": 4096},
-        "disposition": {"enum": ["counted", "non_robot_pair_ignored", "robot_internal_excluded", "support_ground_excluded"]},
+        "disposition": {"enum": ["counted", "robot_internal_excluded", "support_ground_excluded"]},
         "normalized_pair": {"$ref": "#/$defs/pair"},
         "robot_collision": {"type": ["string", "null"], "maxLength": 4096},
-        "sim_stamp_ns": {"type": "integer", "minimum": 1}
+        "sim_stamp_ns": {"type": "integer", "minimum": 1},
+        "snapshot_sequence": {"type": "integer", "minimum": 1}
       }
     },
     "sourceBinding": {
@@ -542,15 +712,22 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "clock_delivery_offset_ns", "collector_sequence", "normalized_pair",
-        "observed_sim_stamp_ns", "sim_stamp_ns"
+        "callback_clock_offset_ns", "callback_clock_stamp_ns", "collector_sequence",
+        "normalized_pair", "sim_stamp_ns", "stop_latency_clock_stamp_ns",
+        "stop_latency_upper_bound_ns"
       ],
       "properties": {
-        "clock_delivery_offset_ns": {"type": "integer", "minimum": 0},
+        "callback_clock_offset_ns": {
+          "type": "integer", "minimum": -220000000, "maximum": 220000000
+        },
+        "callback_clock_stamp_ns": {"type": "integer", "minimum": 0},
         "collector_sequence": {"type": "integer", "minimum": 1},
         "normalized_pair": {"$ref": "#/$defs/pair"},
-        "observed_sim_stamp_ns": {"type": "integer", "minimum": 1},
-        "sim_stamp_ns": {"type": "integer", "minimum": 1}
+        "sim_stamp_ns": {"type": "integer", "minimum": 1},
+        "stop_latency_clock_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+        "stop_latency_upper_bound_ns": {
+          "type": ["integer", "null"], "minimum": 0, "maximum": 100000000
+        }
       }
     },
     "clock": {

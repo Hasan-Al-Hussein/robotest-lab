@@ -9,14 +9,19 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+import hashlib
+import json
 import os
 from pathlib import Path
+import re
+import subprocess
 import time
 from typing import Any
 
 from phase3_orchestration import atomic_write_json, EvidenceError
 
 MAX_ENDPOINTS = 4096
+CONTACT_MESSAGE_TYPE = 'ros_gz_interfaces/msg/Contacts'
 MAX_ATTEMPTS = 4096
 
 AUTONOMY_NODE_NAMES = {
@@ -58,6 +63,7 @@ QOS_CONTRACTS: dict[str, tuple[str, str, int]] = {
     '/robotest/collision_monitor_state': ('RELIABLE', 'VOLATILE', 10),
     '/robotest/validation/ground_truth': ('RELIABLE', 'VOLATILE', 10),
     '/robotest/validation/contacts': ('RELIABLE', 'VOLATILE', 10),
+    '/robotest/internal/raw_contacts': ('RELIABLE', 'VOLATILE', 64),
     '/robotest/validation/world_stats': ('RELIABLE', 'VOLATILE', 10),
     '/robotest/validation/scenario_entity_poses': ('RELIABLE', 'VOLATILE', 10),
     '/robotest/faults/events': ('RELIABLE', 'VOLATILE', 100),
@@ -67,6 +73,7 @@ QOS_CONTRACTS: dict[str, tuple[str, str, int]] = {
 
 CANDIDATE_REQUIRED_NODES = AUTONOMY_NODE_NAMES - {'mission_runner'} | {
     'metrics_collector',
+    'contact_stream_gate',
     'parameter_bridge',
     'phase3_goal_observer',
     'robot_state_publisher',
@@ -92,7 +99,8 @@ CANDIDATE_EXPECTED_PUBLISHERS: dict[str, set[str]] = {
     '/robotest/cmd_vel_behavior_unused': {'/robotest/behavior_server'},
     '/robotest/collision_monitor_state': {'/robotest/collision_monitor'},
     '/robotest/validation/ground_truth': {'/robotest/parameter_bridge'},
-    '/robotest/validation/contacts': {'/robotest/parameter_bridge'},
+    '/robotest/validation/contacts': {'/robotest/contact_stream_gate'},
+    '/robotest/internal/raw_contacts': {'/robotest/parameter_bridge'},
     '/robotest/validation/world_stats': {'/robotest/parameter_bridge'},
     '/robotest/validation/scenario_entity_poses': {'/robotest/parameter_bridge'},
     '/robotest/faults/events': {'/robotest/fault_proxy'},
@@ -109,6 +117,10 @@ CANDIDATE_EXPECTED_COMMAND_SUBSCRIBERS: dict[str, set[str]] = {
     '/robotest/cmd_vel_smoothed': {'/robotest/collision_monitor'},
     '/robotest/cmd_vel': {'/robotest/parameter_bridge'},
     '/robotest/cmd_vel_behavior_unused': set(),
+}
+
+CANDIDATE_EXPECTED_CONTACT_SUBSCRIBERS: dict[str, set[str]] = {
+    '/robotest/internal/raw_contacts': {'/robotest/contact_stream_gate'},
 }
 
 SCENARIO_SERVICES = (
@@ -130,6 +142,287 @@ def _pid_alive(pid: int | None) -> bool:
     return True
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _contact_gate_source_inventory_sha256(workspace: Path) -> str:
+    paths = [
+        'src/robotest_sim/CMakeLists.txt',
+        'src/robotest_sim/include/robotest_sim/contact_stream_gate.hpp',
+        'src/robotest_sim/src/contact_stream_gate.cpp',
+        'src/robotest_sim/src/contact_stream_gate_node.cpp',
+    ]
+    inventory = {
+        'schema_version': 1,
+        'sources': [{'path': path, 'sha256': _sha256(workspace / path)} for path in paths],
+    }
+    payload = (
+        json.dumps(
+            inventory,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(',', ':'),
+            sort_keys=True,
+        ).encode('utf-8')
+        + b'\n'
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _elf_build_id(path: Path) -> str | None:
+    result = subprocess.run(
+        ['readelf', '-n', str(path)],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=10.0,
+    )
+    for line in result.stdout.splitlines():
+        if 'Build ID:' in line:
+            return line.split('Build ID:', 1)[1].strip()
+    return None
+
+
+CONTACT_GATE_SOURCE_TAG = b'ROBOTEST_CONTACT_GATE_SOURCE_INVENTORY_SHA256='
+
+
+def _elf_embedded_source_inventory_sha256(path: Path) -> str:
+    pattern = re.compile(re.escape(CONTACT_GATE_SOURCE_TAG) + rb'([0-9a-f]{64})')
+    overlap = b''
+    matches: set[str] = set()
+    retained = len(CONTACT_GATE_SOURCE_TAG) + 63
+    with path.open('rb') as stream:
+        while chunk := stream.read(1024 * 1024):
+            combined = overlap + chunk
+            for match in pattern.finditer(combined):
+                matches.add(match.group(1).decode('ascii'))
+                if len(matches) > 1:
+                    raise EvidenceError(
+                        f'contact gate ELF has conflicting tagged source inventory values: {path}'
+                    )
+            overlap = combined[-retained:]
+    if len(matches) != 1:
+        raise EvidenceError(f'contact gate ELF lacks tagged source inventory: {path}')
+    return next(iter(matches))
+
+
+def _proc_parent_pid(stat_text: str) -> int:
+    closing = stat_text.rfind(')')
+    fields = stat_text[closing + 2 :].split() if closing >= 0 else []
+    if len(fields) < 2:
+        raise ValueError('malformed /proc stat')
+    return int(fields[1])
+
+
+def _descendant_pids(root_pid: int) -> set[int]:
+    parents: dict[int, int] = {}
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            parents[int(entry.name)] = _proc_parent_pid(
+                (entry / 'stat').read_text(encoding='ascii')
+            )
+        except (FileNotFoundError, PermissionError, UnicodeError, ValueError):
+            continue
+    descendants = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, parent in parents.items():
+            if parent in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    return descendants
+
+
+def _contact_gate_binary_attestation(
+    workspace: Path,
+    launch_pid: int,
+    expected_domain_id: int,
+    expected_gz_partition: str,
+) -> dict[str, Any]:
+    """Bind the one live gate process to the exact installed and built ELF."""
+    workspace = workspace.resolve(strict=True)
+    build_relative_path = Path('build/robotest_sim/contact_stream_gate')
+    installed_relative_path = Path('install/robotest_sim/lib/robotest_sim/contact_stream_gate')
+    build_declared_path = workspace / build_relative_path
+    installed_declared_path = workspace / installed_relative_path
+    try:
+        build_path = build_declared_path.resolve(strict=True)
+        installed_path = installed_declared_path.resolve(strict=True)
+        descendants = _descendant_pids(launch_pid)
+        candidates: list[tuple[int, Path]] = []
+        for pid in sorted(descendants):
+            try:
+                executable = Path(f'/proc/{pid}/exe').resolve(strict=True)
+            except (FileNotFoundError, PermissionError, OSError):
+                continue
+            if executable.name == 'contact_stream_gate':
+                candidates.append((pid, executable))
+        if len(candidates) != 1:
+            raise EvidenceError(
+                f'expected exactly one live contact_stream_gate process, found {len(candidates)}'
+            )
+        live_pid, live_path = candidates[0]
+        stat_text = Path(f'/proc/{live_pid}/stat').read_text(encoding='ascii')
+        closing = stat_text.rfind(')')
+        stat_fields = stat_text[closing + 2 :].split() if closing >= 0 else []
+        if len(stat_fields) < 20:
+            raise EvidenceError('live contact gate /proc stat is malformed')
+        live_ppid = int(stat_fields[1])
+        live_pgid = int(stat_fields[2])
+        live_sid = int(stat_fields[3])
+        live_start_ticks = int(stat_fields[19])
+        live_stat_before = Path(f'/proc/{live_pid}/exe').stat()
+        cmdline = Path(f'/proc/{live_pid}/cmdline').read_bytes()
+        environment_entries = Path(f'/proc/{live_pid}/environ').read_bytes().split(b'\0')
+        environment = {
+            key.decode('utf-8', errors='strict'): value.decode('utf-8', errors='strict')
+            for entry in environment_entries
+            if entry
+            for key, separator, value in [entry.partition(b'=')]
+            if separator
+        }
+        observed_domain_id = environment.get('ROS_DOMAIN_ID')
+        observed_gz_partition = environment.get('GZ_PARTITION')
+        source_inventory_sha256 = _contact_gate_source_inventory_sha256(workspace)
+        build_hash = _sha256(build_path)
+        installed_hash = _sha256(installed_path)
+        live_hash = _sha256(Path(f'/proc/{live_pid}/exe'))
+        build_id = _elf_build_id(build_path)
+        installed_build_id = _elf_build_id(installed_path)
+        live_build_id = _elf_build_id(Path(f'/proc/{live_pid}/exe'))
+        installed_stat = installed_path.stat()
+        live_stat = Path(f'/proc/{live_pid}/exe').stat()
+        final_stat_text = Path(f'/proc/{live_pid}/stat').read_text(encoding='ascii')
+        final_closing = final_stat_text.rfind(')')
+        final_fields = final_stat_text[final_closing + 2 :].split() if final_closing >= 0 else []
+        identity_revalidated_after_hashing = (
+            len(final_fields) >= 20
+            and int(final_fields[19]) == live_start_ticks
+            and live_stat_before.st_dev == live_stat.st_dev
+            and live_stat_before.st_ino == live_stat.st_ino
+        )
+        installed_regular_executable = installed_path.is_file() and os.access(
+            installed_path, os.X_OK
+        )
+        installed_declared_samefile = installed_declared_path.samefile(installed_path)
+        build_install_match = (
+            build_id is not None
+            and installed_build_id is not None
+            and build_id == installed_build_id
+        )
+        build_install_sha256_match = build_hash == installed_hash
+        live_installed_inode_match = (
+            live_stat.st_dev == installed_stat.st_dev and live_stat.st_ino == installed_stat.st_ino
+        )
+        live_installed_sha256_match = live_hash == installed_hash
+        live_installed_build_id_match = (
+            live_build_id is not None and live_build_id == installed_build_id
+        )
+        build_embedded_source_inventory_sha256 = _elf_embedded_source_inventory_sha256(build_path)
+        installed_embedded_source_inventory_sha256 = _elf_embedded_source_inventory_sha256(
+            installed_path
+        )
+        live_embedded_source_inventory_sha256 = _elf_embedded_source_inventory_sha256(
+            Path(f'/proc/{live_pid}/exe')
+        )
+        build_embedded_source_inventory_match = (
+            build_embedded_source_inventory_sha256 == source_inventory_sha256
+        )
+        installed_embedded_source_inventory_match = (
+            installed_embedded_source_inventory_sha256 == source_inventory_sha256
+        )
+        live_embedded_source_inventory_match = (
+            live_embedded_source_inventory_sha256 == source_inventory_sha256
+        )
+        process_identity_match = (
+            live_pgid == launch_pid
+            and live_sid == launch_pid
+            and observed_domain_id == str(expected_domain_id)
+            and observed_gz_partition == expected_gz_partition
+        )
+        passed = (
+            build_install_match
+            and build_install_sha256_match
+            and installed_regular_executable
+            and installed_declared_samefile
+            and live_installed_inode_match
+            and live_installed_sha256_match
+            and live_installed_build_id_match
+            and build_embedded_source_inventory_match
+            and installed_embedded_source_inventory_match
+            and live_embedded_source_inventory_match
+            and process_identity_match
+            and identity_revalidated_after_hashing
+        )
+        return {
+            'build_embedded_source_inventory_match': (build_embedded_source_inventory_match),
+            'build_embedded_source_inventory_sha256': (build_embedded_source_inventory_sha256),
+            'build_elf_build_id': build_id,
+            'build_install_build_id_match': build_install_match,
+            'build_install_sha256_match': build_install_sha256_match,
+            'build_path': build_relative_path.as_posix(),
+            'build_sha256': build_hash,
+            'exact_live_process_count': len(candidates),
+            'installed_device': installed_stat.st_dev,
+            'installed_declared_path': installed_relative_path.as_posix(),
+            'installed_declared_samefile': installed_declared_samefile,
+            'installed_embedded_source_inventory_match': (
+                installed_embedded_source_inventory_match
+            ),
+            'installed_embedded_source_inventory_sha256': (
+                installed_embedded_source_inventory_sha256
+            ),
+            'installed_elf_build_id': installed_build_id,
+            'installed_inode': installed_stat.st_ino,
+            'installed_path': installed_path.relative_to(workspace).as_posix(),
+            'installed_regular_executable': installed_regular_executable,
+            'installed_sha256': installed_hash,
+            'identity_revalidated_after_hashing': identity_revalidated_after_hashing,
+            'launch_root_pid': launch_pid,
+            'live_cmdline_sha256': hashlib.sha256(cmdline).hexdigest(),
+            'live_device': live_stat.st_dev,
+            'live_elf_build_id': live_build_id,
+            'live_embedded_source_inventory_match': live_embedded_source_inventory_match,
+            'live_embedded_source_inventory_sha256': live_embedded_source_inventory_sha256,
+            'live_executable_link': os.readlink(f'/proc/{live_pid}/exe'),
+            'live_executable_path': str(live_path),
+            'live_executable_sha256': live_hash,
+            'live_inode': live_stat.st_ino,
+            'live_installed_build_id_match': live_installed_build_id_match,
+            'live_installed_inode_match': live_installed_inode_match,
+            'live_installed_sha256_match': live_installed_sha256_match,
+            'live_pgid': live_pgid,
+            'live_pid': live_pid,
+            'live_ppid': live_ppid,
+            'live_sid': live_sid,
+            'live_size_bytes': live_stat.st_size,
+            'live_start_ticks': live_start_ticks,
+            'observed_gz_partition': observed_gz_partition,
+            'observed_ros_domain_id': observed_domain_id,
+            'package': 'robotest_sim',
+            'process_identity_match': process_identity_match,
+            'schema_version': 1,
+            'source_inventory_sha256': source_inventory_sha256,
+            'verdict': 'PASS' if passed else 'FAIL',
+        }
+    except (EvidenceError, OSError, subprocess.SubprocessError, ValueError) as exc:
+        return {
+            'error': str(exc)[:4096],
+            'launch_root_pid': launch_pid,
+            'package': 'robotest_sim',
+            'schema_version': 1,
+            'verdict': 'FAIL',
+        }
+
+
 def _fq_node_name(info: Any) -> str:
     namespace = str(info.node_namespace).rstrip('/')
     return f'{namespace}/{info.node_name}' if namespace else f'/{info.node_name}'
@@ -146,10 +439,31 @@ def _endpoint_record(info: Any) -> dict[str, Any]:
         'depth': int(qos.depth),
         'durability': _policy_name(qos.durability),
         'history': _policy_name(qos.history),
+        'gid': bytes(info.endpoint_gid).hex(),
         'node': _fq_node_name(info),
         'reliability': _policy_name(qos.reliability),
         'topic_type': str(info.topic_type),
     }
+
+
+def _exact_endpoint_owners(
+    endpoints: list[dict[str, Any]],
+    expected_nodes: set[str],
+    *,
+    expected_type: str | None = None,
+) -> bool:
+    """Require exact endpoint cardinality, identity, type, and distinct GIDs."""
+    nodes = [item['node'] for item in endpoints]
+    gids = [item['gid'] for item in endpoints]
+    return (
+        len(endpoints) == len(expected_nodes)
+        and set(nodes) == expected_nodes
+        and len(set(gids)) == len(gids)
+        and all(gids)
+        and (
+            expected_type is None or all(item['topic_type'] == expected_type for item in endpoints)
+        )
+    )
 
 
 def _qos_status(record: dict[str, Any], expected: tuple[str, str, int]) -> dict[str, Any]:
@@ -241,12 +555,26 @@ def _candidate_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
     services = _service_snapshot(node)
     topics = {name: _topic_evidence(node, name) for name in QOS_CONTRACTS}
     publisher_ownership = {
-        topic: sorted({item['node'] for item in topics[topic]['publishers']}) == sorted(expected)
+        topic: _exact_endpoint_owners(
+            topics[topic]['publishers'],
+            expected,
+            expected_type=(
+                CONTACT_MESSAGE_TYPE
+                if topic in {'/robotest/internal/raw_contacts', '/robotest/validation/contacts'}
+                else None
+            ),
+        )
         for topic, expected in CANDIDATE_EXPECTED_PUBLISHERS.items()
     }
     command_subscriber_ownership = {
-        topic: sorted({item['node'] for item in topics[topic]['subscribers']}) == sorted(expected)
+        topic: _exact_endpoint_owners(topics[topic]['subscribers'], expected)
         for topic, expected in CANDIDATE_EXPECTED_COMMAND_SUBSCRIBERS.items()
+    }
+    contact_subscriber_ownership = {
+        topic: _exact_endpoint_owners(
+            topics[topic]['subscribers'], expected, expected_type=CONTACT_MESSAGE_TYPE
+        )
+        for topic, expected in CANDIDATE_EXPECTED_CONTACT_SUBSCRIBERS.items()
     }
     cmd_owner_pass = publisher_ownership['/robotest/cmd_vel']
     autonomy_leaks: list[dict[str, str]] = []
@@ -292,6 +620,7 @@ def _candidate_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
         and cmd_owner_pass
         and all(publisher_ownership.values())
         and all(command_subscriber_ownership.values())
+        and all(contact_subscriber_ownership.values())
         and not autonomy_leaks
         and namespace_pass
         and qos_pass
@@ -301,6 +630,7 @@ def _candidate_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
         'bounded_depth_live_proven_for_all_endpoints': bounded_depth_live_proven,
         'cmd_vel_owner_pass': cmd_owner_pass,
         'command_subscriber_ownership': command_subscriber_ownership,
+        'contact_subscriber_ownership': contact_subscriber_ownership,
         'exact_static_qos_depth_contract': {
             topic: evidence['expected'] for topic, evidence in topics.items()
         },
@@ -328,6 +658,7 @@ def _positive_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
         for name in (
             '/clock',
             '/robotest/cmd_vel',
+            '/robotest/internal/raw_contacts',
             '/robotest/validation/contacts',
             '/robotest/validation/ground_truth',
             '/robotest/validation/scenario_entity_poses',
@@ -338,8 +669,24 @@ def _positive_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
     cmd_owner_pass = len(cmd_publishers) == 1 and cmd_publishers[0]['node'].endswith(
         '/contact_control_driver'
     )
+    contact_publisher_ownership = {
+        topic: _exact_endpoint_owners(
+            relevant[topic]['publishers'],
+            CANDIDATE_EXPECTED_PUBLISHERS[topic],
+            expected_type=CONTACT_MESSAGE_TYPE,
+        )
+        for topic in ('/robotest/internal/raw_contacts', '/robotest/validation/contacts')
+    }
+    contact_subscriber_ownership = {
+        '/robotest/internal/raw_contacts': _exact_endpoint_owners(
+            relevant['/robotest/internal/raw_contacts']['subscribers'],
+            {'/robotest/contact_stream_gate'},
+            expected_type=CONTACT_MESSAGE_TYPE,
+        )
+    }
     required_nodes = {
         'contact_control_driver',
+        'contact_stream_gate',
         'fault_proxy',
         'metrics_collector',
         'parameter_bridge',
@@ -373,6 +720,8 @@ def _positive_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
     )
     passed = (
         cmd_owner_pass
+        and all(contact_publisher_ownership.values())
+        and all(contact_subscriber_ownership.values())
         and not forbidden_present
         and not required_nodes_missing
         and not services_missing
@@ -382,6 +731,8 @@ def _positive_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
     return passed, {
         'bounded_depth_live_proven_for_all_endpoints': bounded_depth_live_proven,
         'cmd_vel_owner_pass': cmd_owner_pass,
+        'contact_publisher_ownership': contact_publisher_ownership,
+        'contact_subscriber_ownership': contact_subscriber_ownership,
         'exact_static_qos_depth_contract': {
             topic: evidence['expected'] for topic, evidence in relevant.items()
         },
@@ -395,6 +746,44 @@ def _positive_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
         'scenario_services_missing': services_missing,
         'topics': relevant,
         'validation_autonomy_isolation_pass': not forbidden_present,
+    }
+
+
+def _contact_stream_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
+    nodes = _node_snapshot(node)
+    topics = {
+        name: _topic_evidence(node, name)
+        for name in ('/robotest/internal/raw_contacts', '/robotest/validation/contacts')
+    }
+    publisher_ownership = {
+        topic: _exact_endpoint_owners(
+            topics[topic]['publishers'],
+            CANDIDATE_EXPECTED_PUBLISHERS[topic],
+            expected_type=CONTACT_MESSAGE_TYPE,
+        )
+        for topic in topics
+    }
+    raw_subscriber_ownership = _exact_endpoint_owners(
+        topics['/robotest/internal/raw_contacts']['subscribers'],
+        {'/robotest/contact_stream_gate'},
+        expected_type=CONTACT_MESSAGE_TYPE,
+    )
+    qos_pass = all(
+        evidence['publisher_qos_pass'] and evidence['subscriber_qos_pass']
+        for evidence in topics.values()
+    )
+    gate_present = '/robotest/contact_stream_gate' in nodes
+    passed = (
+        gate_present and all(publisher_ownership.values()) and raw_subscriber_ownership and qos_pass
+    )
+    return passed, {
+        'contact_stream_gate_present': gate_present,
+        'mode': 'contact_stream',
+        'nodes': nodes,
+        'publisher_ownership': publisher_ownership,
+        'qos_contract_pass': qos_pass,
+        'raw_subscriber_ownership': raw_subscriber_ownership,
+        'topics': topics,
     }
 
 
@@ -418,6 +807,15 @@ def _run(arguments: argparse.Namespace) -> int:
         raise EvidenceError(f'runtime gate output already exists: {arguments.output}')
     if not 0.0 < arguments.wall_timeout_s <= 120.0:
         raise EvidenceError('wall timeout must be in (0, 120] seconds')
+    if arguments.mode != 'empty' and (
+        arguments.workspace is None
+        or not _pid_alive(arguments.launch_pid)
+        or arguments.expected_domain_id is None
+        or arguments.expected_gz_partition is None
+    ):
+        raise EvidenceError(
+            'live runtime gates require workspace, launch PID, domain, and partition'
+        )
     rclpy.init(args=list(arguments.ros_args))
     node = Node('phase3_runtime_gate', namespace='/robotest/evidence')
     executor = SingleThreadedExecutor()
@@ -438,8 +836,19 @@ def _run(arguments: argparse.Namespace) -> int:
                 passed, last = _candidate_evaluation(node)
             elif arguments.mode == 'positive-control':
                 passed, last = _positive_evaluation(node)
+            elif arguments.mode == 'contact-stream':
+                passed, last = _contact_stream_evaluation(node)
             else:
                 passed, last = _empty_evaluation(node)
+            if passed and arguments.mode != 'empty':
+                attestation = _contact_gate_binary_attestation(
+                    arguments.workspace.resolve(),
+                    arguments.launch_pid,
+                    arguments.expected_domain_id,
+                    arguments.expected_gz_partition,
+                )
+                last['contact_gate_binary_attestation'] = attestation
+                passed = attestation.get('verdict') == 'PASS'
             if passed:
                 result = {
                     **last,
@@ -480,6 +889,7 @@ def _self_test() -> int:
         depth = 10
 
     class Endpoint:
+        endpoint_gid = bytes.fromhex('01' * 16)
         node_namespace = '/robotest'
         node_name = 'metrics_collector'
         topic_type = 'std_msgs/msg/String'
@@ -501,8 +911,14 @@ def _self_test() -> int:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mode', choices=('candidate', 'positive-control', 'empty'))
+    parser.add_argument(
+        '--mode', choices=('candidate', 'positive-control', 'contact-stream', 'empty')
+    )
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--launch-pid', type=int)
+    parser.add_argument('--workspace', type=Path)
+    parser.add_argument('--expected-domain-id', type=int)
+    parser.add_argument('--expected-gz-partition')
     parser.add_argument('--watch-pid', type=int)
     parser.add_argument('--wall-timeout-s', type=float, default=90.0)
     parser.add_argument('--self-test', action='store_true')
