@@ -91,9 +91,19 @@
   subscriber_queue: 10
   qos_profile: SERVICES
 
-# Gazebo Harmonic 8.11 publishes an injected PosePublisher on the model's
-# scoped pose topic. All three mutually exclusive Phase 3 actors therefore
-# converge on one validation-only ROS stream with explicit bounded QoS.
+# Gazebo Harmonic 8.11 publishes an injected PosePublisher on each model's
+# scoped pose topic. A permanent ground-plane heartbeat and the three mutually
+# exclusive Phase 3 actors converge on one validation-only ROS stream with
+# explicit bounded QoS. The heartbeat makes post-delete absence source-spanned.
+- ros_topic_name: validation/scenario_entity_poses
+  gz_topic_name: /model/ground_plane/pose
+  ros_type_name: tf2_msgs/msg/TFMessage
+  gz_type_name: gz.msgs.Pose_V
+  direction: GZ_TO_ROS
+  publisher_queue: 10
+  subscriber_queue: 10
+  qos_profile: SERVICES
+
 - ros_topic_name: validation/scenario_entity_poses
   gz_topic_name: /model/phase3_static_block/pose
   ros_type_name: tf2_msgs/msg/TFMessage

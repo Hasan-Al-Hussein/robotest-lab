@@ -137,6 +137,12 @@ Pass criteria for every trial:
 Moving the obstacle before the initial path, changing the map to include it, or
 counting repeated publication of the same path is failure.
 
+Actor cleanup is source-spanned: after the exact successful delete response,
+the permanent 10 Hz `ground_plane` pose heartbeat must advance through a
+0.25 s simulation-time quiet interval with no further target-actor pose. A
+delete response plus `/clock` advancement without that pose-path heartbeat is
+incomplete evidence.
+
 ## Scenario 3 — Deterministic dynamic obstacle
 
 The entity `phase3_dynamic_block` is a pose-controlled static box of size

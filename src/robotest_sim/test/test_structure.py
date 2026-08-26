@@ -194,6 +194,21 @@ def test_world_is_local_enclosed_and_deterministic_friendly() -> None:
     model_names = {model.attrib['name'] for model in world.findall('model')}
     assert {'wall_north', 'wall_south', 'wall_east', 'wall_west'} <= model_names
     assert len({name for name in model_names if name.startswith('obstacle_')}) >= 3
+    heartbeat = world.find(
+        "./model[@name='ground_plane']/plugin[@name='gz::sim::systems::PosePublisher']"
+    )
+    assert heartbeat is not None
+    assert heartbeat.attrib['filename'] == 'gz-sim-pose-publisher-system'
+    assert heartbeat.findtext('publish_model_pose') == 'true'
+    assert heartbeat.findtext('publish_link_pose') == 'false'
+    assert heartbeat.findtext('publish_collision_pose') == 'false'
+    assert heartbeat.findtext('publish_visual_pose') == 'false'
+    assert heartbeat.findtext('publish_sensor_pose') == 'false'
+    assert heartbeat.findtext('publish_nested_model_pose') == 'false'
+    assert heartbeat.findtext('use_pose_vector_msg') == 'true'
+    assert float(heartbeat.findtext('update_frequency')) == 10.0
+    assert heartbeat.findtext('static_publisher') == 'false'
+    assert heartbeat.find('topic') is None
 
 
 def test_bridge_matches_the_frozen_data_plane() -> None:
@@ -259,6 +274,7 @@ def test_bridge_matches_the_frozen_data_plane() -> None:
         assert entry['qos_profile'] == qos_profile
 
     assert {entry['gz_topic_name'] for entry in scenario_pose_bridges} == {
+        '/model/ground_plane/pose',
         '/model/phase3_static_block/pose',
         '/model/phase3_dynamic_block/pose',
         '/model/phase3_contact_control_wall/pose',

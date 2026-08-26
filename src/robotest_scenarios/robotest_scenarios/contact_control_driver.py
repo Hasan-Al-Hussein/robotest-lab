@@ -79,6 +79,7 @@ from robotest_scenarios.constants import (
     DEFAULT_CONTROL_WALL_TIMEOUT_S,
     DEFAULT_SERVICE_TIMEOUT_S,
     DELETE_SERVICE,
+    ENTITY_POSE_HEARTBEAT_MODEL,
     ENTITY_POSE_TOPIC,
     FINAL_COMMAND_TOPIC,
     GROUND_TRUTH_ALIGNMENT_NS,
@@ -199,6 +200,7 @@ class ContactControlNode(Node):
         self.last_wall_stamp_ns: int | None = None
         self.last_ground_truth_stamp_ns: int | None = None
         self.entity_pose_message_count = 0
+        self.last_entity_pose_heartbeat_stamp_ns: int | None = None
         self.post_delete_entity_message_count = 0
         self.post_delete_entity_latest_sim_stamp_ns: int | None = None
         self.post_delete_wall_pose_count = 0
@@ -534,10 +536,20 @@ class ContactControlNode(Node):
 
     def _on_entity_poses(self, message: TFMessage) -> None:
         self.entity_pose_message_count += 1
-        if self.delete_response_stamp_ns is not None:
-            self.post_delete_entity_message_count += 1
-            self.post_delete_entity_latest_sim_stamp_ns = self.current_sim_stamp_ns
         for transform in message.transforms:
+            if transform.child_frame_id == ENTITY_POSE_HEARTBEAT_MODEL:
+                heartbeat_stamp_ns = stamp_to_ns(transform.header.stamp, positive=True)
+                if (
+                    self.last_entity_pose_heartbeat_stamp_ns is not None
+                    and heartbeat_stamp_ns < self.last_entity_pose_heartbeat_stamp_ns
+                ):
+                    raise ProtocolError('entity-pose heartbeat stamp regressed')
+                if transform.header.frame_id not in {'robotest_lab', 'world'}:
+                    raise ProtocolError('entity-pose heartbeat has an invalid frame')
+                self.last_entity_pose_heartbeat_stamp_ns = heartbeat_stamp_ns
+                if self.delete_response_stamp_ns is not None:
+                    self.post_delete_entity_message_count += 1
+                    self.post_delete_entity_latest_sim_stamp_ns = heartbeat_stamp_ns
             if transform.child_frame_id != WALL_NAME:
                 continue
             if self.spawn_request_sequence is None:
@@ -1409,6 +1421,13 @@ class ContactControlApp:
             raise ProtocolError('contact-control wall delete may be attempted exactly once')
         source_publishers_before = node.count_publishers(ENTITY_POSE_TOPIC)
         self.delete_attempt_count = 1
+        self.cleanup = {
+            'actor_absent': False,
+            'delete_attempt_count': 1,
+            'delete_success': None,
+            'proof': {'kind': 'delete_request_pending'},
+            'required': True,
+        }
         request = DeleteEntity.Request()
         request.entity.name = WALL_NAME
         request.entity.type = request.entity.MODEL
@@ -1439,6 +1458,24 @@ class ContactControlApp:
         node.post_delete_entity_latest_sim_stamp_ns = None
         node.post_delete_wall_pose_count = 0
         quiet_until_ns = response_stamp_ns + ACTOR_CLEANUP_QUIET_NS
+        self.cleanup = {
+            'actor_absent': False,
+            'delete_attempt_count': 1,
+            'delete_success': True,
+            'proof': {
+                'kind': 'successful_delete_response_cleanup_quiet_pending',
+                'pose_source_publishers_before': source_publishers_before,
+                'post_delete_pose_count': 0,
+                'post_delete_pose_source_heartbeat_count': 0,
+                'post_delete_pose_source_latest_sim_stamp_ns': None,
+                'quiet_until_sim_stamp_ns': quiet_until_ns,
+                'request_sequence': request_sequence,
+                'request_stamp_ns': request_stamp_ns,
+                'response_sequence': response_sequence,
+                'response_stamp_ns': response_stamp_ns,
+            },
+            'required': True,
+        }
         self._wait_for(
             lambda: (
                 node.current_sim_stamp_ns >= quiet_until_ns

@@ -16,6 +16,7 @@
 
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import rclpy
@@ -26,7 +27,7 @@ from robotest_scenarios.contact_control_driver import ContactControlApp, Contact
 from robotest_scenarios.contact_evidence import load_coverage_manifest
 from robotest_scenarios.errors import ProtocolError, ScenarioFailureError
 from robotest_scenarios.models import load_scenario
-from robotest_scenarios.scenario_controller import ScenarioControllerNode
+from robotest_scenarios.scenario_controller import ScenarioControllerApp, ScenarioControllerNode
 from ros_gz_interfaces.msg import Contact, Contacts
 from rosgraph_msgs.msg import Clock
 from tf2_msgs.msg import TFMessage
@@ -347,6 +348,153 @@ def test_contact_node_deduplicates_static_wall_pose_state() -> None:
         assert len(node.actor_state.items) == 1
         assert len(node.wall_poses) == 1
         assert node.actor_state.overflow_count == 0
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_contact_node_uses_permanent_pose_heartbeat_after_wall_delete() -> None:
+    _init_ros()
+    manifest = load_coverage_manifest(str(REPOSITORY / 'config' / 'collision-coverage.yaml'))
+    node = ContactControlNode(manifest)
+    try:
+        node.delete_response_stamp_ns = 1_000_000_000
+        transform = TransformStamped()
+        transform.header.frame_id = 'world'
+        transform.header.stamp.sec = 1
+        transform.header.stamp.nanosec = 200_000_000
+        transform.child_frame_id = 'unrelated_actor'
+        transform.transform.rotation.w = 1.0
+        node._on_entity_poses(TFMessage(transforms=[transform]))
+        assert node.post_delete_entity_message_count == 0
+        assert node.post_delete_entity_latest_sim_stamp_ns is None
+
+        transform.header.stamp.nanosec = 300_000_000
+        transform.child_frame_id = 'ground_plane'
+        node._on_entity_poses(TFMessage(transforms=[transform]))
+        assert node.post_delete_entity_message_count == 1
+        assert node.post_delete_entity_latest_sim_stamp_ns == 1_300_000_000
+        assert node.post_delete_wall_pose_count == 0
+
+        transform.header.stamp.nanosec = 200_000_000
+        with pytest.raises(ProtocolError, match='heartbeat stamp regressed'):
+            node._on_entity_poses(TFMessage(transforms=[transform]))
+
+        transform.header.frame_id = 'map'
+        transform.header.stamp.nanosec = 400_000_000
+        with pytest.raises(ProtocolError, match='heartbeat has an invalid frame'):
+            node._on_entity_poses(TFMessage(transforms=[transform]))
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_scenario_node_uses_permanent_pose_heartbeat_after_actor_delete() -> None:
+    _init_ros()
+    document = load_scenario(str(REPOSITORY / 'scenarios' / 'phase3_s2_static_obstacle.yaml'))
+    node = ScenarioControllerNode(document)
+    try:
+        node.delete_response_stamp_ns = 2_000_000_000
+        transform = TransformStamped()
+        transform.header.frame_id = 'robotest_lab'
+        transform.header.stamp.sec = 2
+        transform.header.stamp.nanosec = 200_000_000
+        transform.child_frame_id = 'unrelated_actor'
+        transform.transform.rotation.w = 1.0
+        node._on_entity_poses(TFMessage(transforms=[transform]))
+        assert node.post_delete_entity_message_count == 0
+        assert node.post_delete_entity_latest_sim_stamp_ns is None
+
+        transform.header.stamp.nanosec = 300_000_000
+        transform.child_frame_id = 'ground_plane'
+        node._on_entity_poses(TFMessage(transforms=[transform]))
+        assert node.post_delete_entity_message_count == 1
+        assert node.post_delete_entity_latest_sim_stamp_ns == 2_300_000_000
+        assert node.post_delete_pose_count == 0
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_contact_cleanup_retains_successful_response_when_quiet_wait_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_ros()
+    manifest = load_coverage_manifest(str(REPOSITORY / 'config' / 'collision-coverage.yaml'))
+    node = ContactControlNode(manifest)
+    app = ContactControlApp(
+        manifest=manifest,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        run_id='cleanup-proof-test',
+        wall_timeout_s=1.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    app.node = node
+    app.wall_spawn_request_sent = True
+
+    def fail_wait(*_args: object, **_kwargs: object) -> None:
+        raise ScenarioFailureError('quiet wait failed')
+
+    try:
+        node.current_sim_stamp_ns = 1_000_000_000
+        monkeypatch.setattr(node, 'count_publishers', lambda _topic: 4)
+        monkeypatch.setattr(
+            app,
+            '_call_service',
+            lambda *_args, **_kwargs: (SimpleNamespace(success=True), 7, 900_000_000),
+        )
+        monkeypatch.setattr(app, '_wait_for', fail_wait)
+        with pytest.raises(ScenarioFailureError, match='quiet wait failed'):
+            app._cleanup_wall()
+        assert app.cleanup['delete_attempt_count'] == 1
+        assert app.cleanup['delete_success'] is True
+        assert app.cleanup['actor_absent'] is False
+        assert app.cleanup['proof']['kind'] == 'successful_delete_response_cleanup_quiet_pending'
+        assert app.cleanup['proof']['response_stamp_ns'] == 1_000_000_000
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_scenario_cleanup_retains_successful_response_when_quiet_wait_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_ros()
+    document = load_scenario(str(REPOSITORY / 'scenarios' / 'phase3_s2_static_obstacle.yaml'))
+    node = ScenarioControllerNode(document)
+    app = ScenarioControllerApp(
+        document=document,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        identity={},
+        wall_timeout_s=1.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    app.node = node
+    app.actor_spawn_request_sent = True
+
+    def fail_wait(*_args: object, **_kwargs: object) -> None:
+        raise ScenarioFailureError('quiet wait failed')
+
+    try:
+        node.current_sim_stamp_ns = 2_000_000_000
+        monkeypatch.setattr(node, 'count_publishers', lambda _topic: 4)
+        monkeypatch.setattr(
+            app,
+            '_call_service',
+            lambda *_args, **_kwargs: (SimpleNamespace(success=True), 9, 1_900_000_000),
+        )
+        monkeypatch.setattr(app, '_wait_for', fail_wait)
+        with pytest.raises(ScenarioFailureError, match='quiet wait failed'):
+            app._cleanup_actor()
+        assert app.cleanup['delete_attempt_count'] == 1
+        assert app.cleanup['delete_success'] is True
+        assert app.cleanup['actor_absent'] is False
+        assert app.cleanup['proof']['kind'] == 'successful_delete_response_cleanup_quiet_pending'
+        assert app.cleanup['proof']['response_stamp_ns'] == 2_000_000_000
     finally:
         node.destroy_node()
         rclpy.try_shutdown()

@@ -19,10 +19,12 @@ Use `headless:=false` to launch the Gazebo GUI. All simulation participants use
 `/clock`; ground truth, contacts, and world statistics remain validation-only.
 Phase 3 also exposes bounded Gazebo user-command services below
 `/robotest/scenario/{spawn_entity,set_entity_pose,delete_entity}` and bridges
-the observed 10 Hz actor pose stream to
-`/robotest/validation/scenario_entity_poses`. The fixed actor SDF assets embed a
-Gazebo PosePublisher; the validation stream therefore reports simulator state,
-not controller request echoes.
+the observed 10 Hz actor pose streams plus a permanent ground-plane heartbeat
+to `/robotest/validation/scenario_entity_poses`. The world and fixed actor SDF
+assets embed Gazebo PosePublisher systems; the validation stream therefore
+reports simulator state, not controller request echoes. Cleanup requires the
+ground-plane source to span the post-delete quiet interval while the deleted
+actor remains absent.
 The configured Gaussian LiDAR and IMU noise is deterministic only relative to
 the recorded simulator seed and identical simulation inputs. Gazebo remains
 tolerance-repeatable rather than bitwise deterministic across platforms.

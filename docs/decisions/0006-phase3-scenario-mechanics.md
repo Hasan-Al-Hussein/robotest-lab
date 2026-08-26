@@ -367,7 +367,11 @@ not hard-code `/robotest` internally. The validation pose stream is RELIABLE,
 VOLATILE, KEEP_LAST(10), contains observed Gazebo state rather than echoed
 targets, and must have no subscriber in Nav2, AMCL, the mission runner, the
 fault proxy data path, or the command chain. It is never published on `/tf` or
-`/tf_static`.
+`/tf_static`. A permanent 10 Hz `ground_plane` PosePublisher is merged into the
+same stream. After an actor's successful delete response, that heartbeat must
+span the full 0.25 s simulation-time quiet interval while no target-actor pose
+is observed; `/clock` alone is not accepted as proof that the pose path stayed
+live.
 
 Spawn/set/delete availability and response waits are steady-wall bounded.
 Entity names are unique within a trial, exact, and never repaired by suffixing
