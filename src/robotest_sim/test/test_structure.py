@@ -15,6 +15,7 @@ from pathlib import Path
 
 import yaml
 from nav_msgs.msg import Odometry
+from ros_gz_interfaces.msg import Contact, Contacts
 from sensor_msgs.msg import Imu, LaserScan
 
 PACKAGE = Path(__file__).resolve().parents[1]
@@ -322,6 +323,123 @@ def test_runtime_probe_has_bounded_motion_and_final_zero_guard() -> None:
     assert 'qos_policy_failures' in text
     assert 'sensor_stamp_evidence' in text
     assert 'motion_trace' in text
+    assert 'CONTACT_EVIDENCE_CAPACITY' in text
+    assert 'unexpected_contact_pair_count' in text
+
+
+def test_runtime_probe_contact_policy_matches_frozen_coverage_manifest() -> None:
+    module = load_runtime_probe_module()
+    manifest = yaml.safe_load(
+        (PACKAGE.parents[1] / 'config' / 'collision-coverage.yaml').read_text(encoding='utf-8')
+    )
+    expected_robot_collisions = {entry['name'] for entry in manifest['robot_collisions']}
+    expected_by_role = {entry['role']: entry['name'] for entry in manifest['robot_collisions']}
+    expected_support_pairs = {
+        (entry['robot_collision'], entry['environment_collision'])
+        for entry in manifest['support_pairs']
+    }
+
+    assert expected_robot_collisions == module.PHASE1_ROBOT_COLLISIONS
+    assert expected_by_role == module.PHASE1_COLLISION_BY_ROLE
+    assert expected_support_pairs == module.PHASE1_SUPPORT_PAIRS
+    assert module.phase1_contact_policy_sha256() == (
+        'efdc004d1db75d4e7a1933db96124c1d02bf4a707f4d61ecf69b1b6183db8eac'
+    )
+
+
+def test_runtime_probe_contact_classifier_allows_only_support_and_internal_pairs() -> None:
+    module = load_runtime_probe_module()
+    support_robot, ground = next(iter(module.PHASE1_SUPPORT_PAIRS))
+    chassis = next(
+        collision
+        for collision in module.PHASE1_ROBOT_COLLISIONS
+        if 'base_link_collision' in collision
+    )
+    lidar = next(
+        collision for collision in module.PHASE1_ROBOT_COLLISIONS if 'lidar_link' in collision
+    )
+    obstacle = 'obstacle_1::link::collision'
+
+    assert (
+        module.classify_phase1_contact_pair(support_robot, ground) == 'allowlisted_support_contact'
+    )
+    assert (
+        module.classify_phase1_contact_pair(ground, support_robot) == 'allowlisted_support_contact'
+    )
+    assert module.classify_phase1_contact_pair(chassis, lidar) == 'robot_internal'
+    assert (
+        module.classify_phase1_contact_pair(chassis, ground)
+        == 'unexpected_robot_environment_contact'
+    )
+    assert (
+        module.classify_phase1_contact_pair(support_robot, obstacle)
+        == 'unexpected_robot_environment_contact'
+    )
+    assert module.classify_phase1_contact_pair(obstacle, ground) == 'unexpected_non_robot_pair'
+    assert module.classify_phase1_contact_pair('', ground) == 'invalid_collision_name'
+    assert module.classify_phase1_contact_pair(None, ground) == 'invalid_collision_name'
+
+
+def test_runtime_probe_contact_evidence_names_are_bounded() -> None:
+    module = load_runtime_probe_module()
+    oversized = 'x' * (module.CONTACT_NAME_EVIDENCE_LIMIT + 100)
+    retained = module.contact_name_evidence(oversized)
+
+    assert retained.endswith('...')
+    assert len(retained) == module.CONTACT_NAME_EVIDENCE_LIMIT + 3
+    assert module.contact_name_evidence(None) == '<non-string:NoneType>'
+
+
+def test_runtime_probe_contact_callback_counts_and_bounds_unexpected_prefix() -> None:
+    module = load_runtime_probe_module()
+    support_robot, ground = next(iter(module.PHASE1_SUPPORT_PAIRS))
+    chassis = module.PHASE1_COLLISION_BY_ROLE['chassis']
+    lidar = module.PHASE1_COLLISION_BY_ROLE['lidar_body']
+
+    def contact(collision1: str, collision2: str) -> Contact:
+        value = Contact()
+        value.collision1.name = collision1
+        value.collision2.name = collision2
+        return value
+
+    message = Contacts()
+    message.contacts = [
+        contact(support_robot, ground),
+        contact(chassis, lidar),
+        *[
+            contact(support_robot, f'obstacle_{index}::link::collision')
+            for index in range(module.CONTACT_EVIDENCE_CAPACITY + 1)
+        ],
+    ]
+
+    class ProbeState:
+        def __init__(self) -> None:
+            self.counts: dict[str, int] = {}
+            self.nonempty_contact_messages = 0
+            self.contact_record_count = 0
+            self.contact_dispositions = {
+                disposition: 0 for disposition in module.PHASE1_CONTACT_DISPOSITIONS
+            }
+            self.unexpected_contact_pair_count = 0
+            self.unexpected_contact_pair_prefix: list[dict[str, object]] = []
+            self.unexpected_contact_pair_omitted_count = 0
+
+        def _record(self, key: str) -> None:
+            self.counts[key] = self.counts.get(key, 0) + 1
+
+    state = ProbeState()
+    module.Phase1Probe._on_contacts(state, message)
+
+    assert state.nonempty_contact_messages == 1
+    assert state.contact_record_count == module.CONTACT_EVIDENCE_CAPACITY + 3
+    assert {key: value for key, value in state.contact_dispositions.items() if value} == {
+        'allowlisted_support_contact': 1,
+        'robot_internal': 1,
+        'unexpected_robot_environment_contact': module.CONTACT_EVIDENCE_CAPACITY + 1,
+    }
+    assert state.unexpected_contact_pair_count == module.CONTACT_EVIDENCE_CAPACITY + 1
+    assert len(state.unexpected_contact_pair_prefix) == module.CONTACT_EVIDENCE_CAPACITY
+    assert state.unexpected_contact_pair_omitted_count == 1
 
 
 def test_semantic_fingerprint_ignores_nan_payload_but_detects_value_changes() -> None:

@@ -8,6 +8,17 @@ umask 022
 
 SCRIPT_PATH="$(readlink -f -- "$0")"
 WORKSPACE="$(cd -- "$(dirname -- "$SCRIPT_PATH")/.." && pwd -P)"
+PROCESS_GROUP_HELPER="$WORKSPACE/scripts/phase1_process_group.sh"
+PIDFD_GROUP_HELPER="$WORKSPACE/scripts/phase1_pidfd_group.py"
+if [[ ! -f "$PROCESS_GROUP_HELPER" \
+  || -L "$PROCESS_GROUP_HELPER" \
+  || ! -f "$PIDFD_GROUP_HELPER" \
+  || -L "$PIDFD_GROUP_HELPER" ]]; then
+  echo "missing regular Phase 1 process-group helper" >&2
+  exit 2
+fi
+# shellcheck source=phase1_process_group.sh
+source "$PROCESS_GROUP_HELPER"
 ROBOTEST_CPUSET="${ROBOTEST_CPUSET:-0-5}"
 if [[ ! "$ROBOTEST_CPUSET" =~ ^[0-9]+([,-][0-9]+)*$ ]]; then
   echo "invalid ROBOTEST_CPUSET: $ROBOTEST_CPUSET" >&2
@@ -94,29 +105,49 @@ if (( ${#RUN_DIRS[@]} > 5 )); then
 fi
 
 LOG_FIFO="$RUN_DIR/.verify-log.pipe"
-mkfifo -- "$LOG_FIFO"
-exec 3>&1 4>&2
-tee -a "$RUN_DIR/verify.log" < "$LOG_FIFO" >&3 &
-TEE_PID=$!
-exec > "$LOG_FIFO" 2>&1
-rm -f -- "$LOG_FIFO"
+LOG_READY_FIFO="$RUN_DIR/.verify-log-ready.pipe"
 
 LAUNCH_PID=""
 LAUNCH_PGID=""
+LAUNCH_SID=""
+LAUNCH_START_TICKS=""
+LAUNCH_PIDFD=""
+LAUNCH_PIDFD_VALIDATED=false
+LAUNCH_GROUP_TOKEN=""
+LAUNCH_GROUP_TOKEN_SHA256=""
+LAUNCH_GO_FIFO=""
+LAUNCH_GO_FD=""
+LAUNCH_READY_FIFO=""
+LAUNCH_READY_FD=""
 SAMPLER_PID=""
+SAMPLER_STATUS=""
+SAMPLER_DRAINED=""
 LAUNCH_STARTED_UTC=""
 LAUNCH_STOPPED_UTC=""
 LAUNCH_WAIT_STATUS=""
 LAUNCH_TERM_SENT=false
 LAUNCH_KILL_SENT=false
+LAUNCH_GROUP_DRAINED=""
+LAUNCH_CLEANUP_STATUS=""
+LAUNCH_CLEANUP_FIRST_FAILURE=""
+LAUNCH_CLEANUP_ATTEMPTED=0
 SAMPLING_STARTED_UTC=""
 SAMPLING_STOPPED_UTC=""
 TEE_STATUS=""
+TEE_PID=""
+TEE_STARTED=false
+TEE_DRAINED=""
+VERIFY_LOG_BACKUPS_OPEN=false
+VERIFY_LOG_WRITER_ACTIVE=false
+VERIFY_LOG_ANCHOR_FD=""
+VERIFY_LOG_READY_FD=""
 FINALIZED=0
+PENDING_SIGNAL_STATUS=""
+SIGNAL_DEFER_DEPTH=0
 
 sample_launch_group() {
   local sample_time=""
-  sample_time="$(date +%s.%N)"
+  sample_time="$(date +%s.%N)" || return 1
   ps -eo pid=,pgid=,pcpu=,rss=,psr=,comm= \
     | awk -v now="$sample_time" -v group="$LAUNCH_PGID" \
       '$2 == group {print now "," $1 "," $2 "," $3 "," $4 "," $5 "," $6}' \
@@ -124,51 +155,129 @@ sample_launch_group() {
 }
 
 stop_sampler() {
+  local sampler_cleanup_status=0
+
+  phase1_begin_signal_deferral
   if [[ -n "$SAMPLER_PID" ]]; then
-    if kill -0 "$SAMPLER_PID" 2>/dev/null; then
-      kill -TERM "$SAMPLER_PID" 2>/dev/null || true
+    if phase1_stop_exact_child_bounded "$SAMPLER_PID"; then
+      sampler_cleanup_status=0
+    else
+      sampler_cleanup_status=$?
     fi
-    wait "$SAMPLER_PID" 2>/dev/null || true
+    SAMPLER_STATUS="$PHASE1_CHILD_OUTCOME_STATUS"
+    SAMPLER_DRAINED="$PHASE1_CHILD_DRAINED"
+    if [[ "$SAMPLER_DRAINED" == true ]]; then
+      SAMPLER_PID=""
+    fi
   fi
-  SAMPLER_PID=""
-  if [[ -n "$SAMPLING_STARTED_UTC" && -z "$SAMPLING_STOPPED_UTC" ]]; then
-    SAMPLING_STOPPED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ "$SAMPLER_DRAINED" == true \
+    && -n "$SAMPLING_STARTED_UTC" \
+    && -z "$SAMPLING_STOPPED_UTC" ]]; then
+    if ! SAMPLING_STOPPED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
+      SAMPLER_STATUS=125
+    fi
   fi
+  phase1_end_signal_deferral
+  return "$sampler_cleanup_status"
 }
 
 stop_owned_launch() {
-  if [[ -n "$LAUNCH_PID" && -n "$LAUNCH_PGID" && "$LAUNCH_PGID" =~ ^[0-9]+$ ]]; then
-    local actual_pgid=""
-    local wait_status=0
-    actual_pgid="$(ps -o pgid= -p "$LAUNCH_PID" 2>/dev/null | tr -d ' ' || true)"
-    if [[ -n "$actual_pgid" && "$actual_pgid" == "$LAUNCH_PGID" ]]; then
-      if kill -TERM -- "-$LAUNCH_PGID" 2>/dev/null; then
-        LAUNCH_TERM_SENT=true
-      fi
-      if [[ -n "$SAMPLER_PID" ]]; then
-        sample_launch_group || true
-      fi
-      for _ in {1..50}; do
-        kill -0 "$LAUNCH_PID" 2>/dev/null || break
-        sleep 0.1
-      done
-      if kill -0 "$LAUNCH_PID" 2>/dev/null &&
-        kill -KILL -- "-$LAUNCH_PGID" 2>/dev/null; then
-        LAUNCH_KILL_SENT=true
-      fi
-    fi
-    if wait "$LAUNCH_PID" 2>/dev/null; then
-      wait_status=0
-    else
-      wait_status=$?
-    fi
-    LAUNCH_WAIT_STATUS="$wait_status"
+  local cleanup_status=0
+  local launch_pid="$LAUNCH_PID"
+  local launch_pgid="$LAUNCH_PGID"
+  local launch_sid="$LAUNCH_SID"
+  local launch_start_ticks="$LAUNCH_START_TICKS"
+  local launch_pidfd="$LAUNCH_PIDFD"
+
+  if (( LAUNCH_CLEANUP_ATTEMPTED == 1 )) \
+    && [[ "$LAUNCH_GROUP_DRAINED" == true \
+      && -n "$LAUNCH_CLEANUP_STATUS" ]]; then
+    return "${LAUNCH_CLEANUP_STATUS:-1}"
   fi
-  if [[ -n "$LAUNCH_STARTED_UTC" && -z "$LAUNCH_STOPPED_UTC" ]]; then
+  [[ -n "$launch_pid" ]] || return 0
+  phase1_begin_signal_deferral
+  LAUNCH_CLEANUP_ATTEMPTED=1
+
+  if [[ -n "$SAMPLER_PID" ]]; then
+    sample_launch_group || true
+  fi
+  if [[ "$LAUNCH_PIDFD_VALIDATED" == true ]]; then
+    if phase1_stop_owned_process_group \
+        launch \
+        "$launch_pid" \
+        "$launch_pgid" \
+        "$launch_sid" \
+        "$launch_start_ticks" \
+        "$RUN_DIR/process-group-cleanup.tsv" \
+        "$PIDFD_GROUP_HELPER" \
+        "$launch_pidfd" \
+        "$RUN_DIR" \
+        "$LAUNCH_WAIT_STATUS"; then
+      cleanup_status=0
+    else
+      cleanup_status=$?
+    fi
+  elif phase1_abort_unreleased_launch_gate \
+      launch "$launch_pid" "$LAUNCH_GO_FD" \
+      "$RUN_DIR/process-group-cleanup.tsv" 12; then
+    cleanup_status=0
+  else
+    cleanup_status=$?
+  fi
+  if [[ "$PHASE1_GROUP_TERM_SENT" == true ]]; then
+    LAUNCH_TERM_SENT=true
+  fi
+  if [[ "$PHASE1_GROUP_KILL_SENT" == true ]]; then
+    LAUNCH_KILL_SENT=true
+  fi
+  LAUNCH_GROUP_DRAINED="$PHASE1_GROUP_DRAINED"
+  LAUNCH_WAIT_STATUS="$PHASE1_GROUP_WAIT_STATUS"
+  if [[ "$LAUNCH_GROUP_DRAINED" != true && "$cleanup_status" -eq 0 ]]; then
+    cleanup_status=4
+  fi
+  if (( cleanup_status != 0 )) && [[ -z "$LAUNCH_CLEANUP_FIRST_FAILURE" ]]; then
+    LAUNCH_CLEANUP_FIRST_FAILURE="$cleanup_status"
+  fi
+  if [[ -n "$LAUNCH_CLEANUP_FIRST_FAILURE" ]]; then
+    LAUNCH_CLEANUP_STATUS="$LAUNCH_CLEANUP_FIRST_FAILURE"
+  else
+    LAUNCH_CLEANUP_STATUS="$cleanup_status"
+  fi
+  if [[ "$LAUNCH_GROUP_DRAINED" == true \
+    && -n "$LAUNCH_STARTED_UTC" \
+    && -z "$LAUNCH_STOPPED_UTC" ]]; then
     LAUNCH_STOPPED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   fi
-  LAUNCH_PID=""
-  LAUNCH_PGID=""
+  if [[ "$LAUNCH_GROUP_DRAINED" == true ]]; then
+    LAUNCH_PID=""
+    LAUNCH_PGID=""
+    if [[ "$LAUNCH_PIDFD" =~ ^[0-9]+$ ]]; then
+      exec {LAUNCH_PIDFD}<&-
+      LAUNCH_PIDFD=""
+    fi
+  fi
+  phase1_end_signal_deferral
+  return "$LAUNCH_CLEANUP_STATUS"
+}
+
+close_launch_gate() {
+  if [[ "$LAUNCH_GO_FD" =~ ^[0-9]+$ ]]; then
+    exec {LAUNCH_GO_FD}>&-
+    LAUNCH_GO_FD=""
+  fi
+  if [[ -n "$LAUNCH_GO_FIFO" && -p "$LAUNCH_GO_FIFO" ]]; then
+    rm -f -- "$LAUNCH_GO_FIFO"
+  fi
+  if [[ "$LAUNCH_READY_FD" =~ ^[0-9]+$ ]]; then
+    exec {LAUNCH_READY_FD}>&-
+    LAUNCH_READY_FD=""
+  fi
+  if [[ -n "$LAUNCH_READY_FIFO" && -p "$LAUNCH_READY_FIFO" ]]; then
+    rm -f -- "$LAUNCH_READY_FIFO"
+  fi
+  LAUNCH_GO_FIFO=""
+  LAUNCH_READY_FIFO=""
+  LAUNCH_GROUP_TOKEN=""
 }
 
 capture_phase1_ogre2_log() {
@@ -190,14 +299,129 @@ capture_phase1_ogre2_log() {
   fi
 }
 
-close_verify_log() {
-  exec 1>&3 2>&4
-  if wait "$TEE_PID"; then
-    TEE_STATUS=0
-  else
-    TEE_STATUS=$?
+close_verify_log_control_fds() {
+  local close_status=0
+
+  if [[ "$VERIFY_LOG_ANCHOR_FD" =~ ^[0-9]+$ ]]; then
+    exec {VERIFY_LOG_ANCHOR_FD}>&- || close_status=1
+    VERIFY_LOG_ANCHOR_FD=""
   fi
-  exec 3>&- 4>&-
+  if [[ "$VERIFY_LOG_READY_FD" =~ ^[0-9]+$ ]]; then
+    exec {VERIFY_LOG_READY_FD}>&- || close_status=1
+    VERIFY_LOG_READY_FD=""
+  fi
+  if [[ -p "$LOG_FIFO" ]]; then
+    rm -f -- "$LOG_FIFO" || close_status=1
+  elif [[ -e "$LOG_FIFO" || -L "$LOG_FIFO" ]]; then
+    close_status=1
+  fi
+  if [[ -p "$LOG_READY_FIFO" ]]; then
+    rm -f -- "$LOG_READY_FIFO" || close_status=1
+  elif [[ -e "$LOG_READY_FIFO" || -L "$LOG_READY_FIFO" ]]; then
+    close_status=1
+  fi
+  return "$close_status"
+}
+
+verify_log_writer_child() {
+  local tee_read_fd=""
+
+  # The parent holds both FIFOs open read/write before this child is forked.
+  # Thus a signal before this trap cannot strand the parent in a FIFO open;
+  # readiness is reported only after the trap and dedicated read end exist.
+  trap '' INT TERM
+  if [[ "$VERIFY_LOG_ANCHOR_FD" =~ ^[0-9]+$ ]]; then
+    exec {VERIFY_LOG_ANCHOR_FD}>&-
+  fi
+  exec {tee_read_fd}<"$LOG_FIFO"
+  printf 'READY\n' >&"$VERIFY_LOG_READY_FD"
+  exec {VERIFY_LOG_READY_FD}>&-
+  exec tee -a "$RUN_DIR/verify.log" <&"$tee_read_fd" >&3
+}
+
+start_verify_log() {
+  local ready=""
+  local start_status=0
+
+  [[ "$TEE_STARTED" == false \
+    && -z "$TEE_PID" \
+    && "$VERIFY_LOG_BACKUPS_OPEN" == false \
+    && "$VERIFY_LOG_WRITER_ACTIVE" == false \
+    && -z "$VERIFY_LOG_ANCHOR_FD" \
+    && -z "$VERIFY_LOG_READY_FD" ]] || return 2
+
+  phase1_begin_signal_deferral
+  mkfifo -- "$LOG_FIFO" "$LOG_READY_FIFO"
+  exec {VERIFY_LOG_ANCHOR_FD}<>"$LOG_FIFO"
+  exec {VERIFY_LOG_READY_FD}<>"$LOG_READY_FIFO"
+  exec 3>&1 4>&2
+  VERIFY_LOG_BACKUPS_OPEN=true
+  verify_log_writer_child &
+  TEE_PID=$!
+  TEE_STARTED=true
+
+  if ! IFS= read -r -t 2 -u "$VERIFY_LOG_READY_FD" ready \
+    || [[ "$ready" != READY ]]; then
+    start_status=1
+  elif exec > "$LOG_FIFO" 2>&1; then
+    VERIFY_LOG_WRITER_ACTIVE=true
+  else
+    start_status=1
+  fi
+  close_verify_log_control_fds || start_status=1
+
+  if (( start_status != 0 )); then
+    if [[ "$VERIFY_LOG_WRITER_ACTIVE" == true ]]; then
+      exec 1>&3 2>&4
+      VERIFY_LOG_WRITER_ACTIVE=false
+    fi
+    if [[ "$TEE_PID" =~ ^[1-9][0-9]*$ ]]; then
+      phase1_stop_exact_child_bounded "$TEE_PID" || start_status=1
+      TEE_STATUS="$PHASE1_CHILD_OUTCOME_STATUS"
+      TEE_DRAINED="$PHASE1_CHILD_DRAINED"
+      if [[ "$TEE_DRAINED" == true ]]; then
+        TEE_PID=""
+      fi
+    else
+      TEE_STATUS=125
+      TEE_DRAINED=false
+    fi
+  fi
+  phase1_end_signal_deferral
+  return "$start_status"
+}
+
+close_verify_log() {
+  local tee_cleanup_status=0
+
+  phase1_begin_signal_deferral
+  if [[ "$VERIFY_LOG_WRITER_ACTIVE" == true ]]; then
+    exec 1>&3 2>&4
+    VERIFY_LOG_WRITER_ACTIVE=false
+  fi
+  close_verify_log_control_fds || tee_cleanup_status=1
+  if [[ "$TEE_STARTED" == true && "$TEE_PID" =~ ^[1-9][0-9]*$ ]]; then
+    if phase1_stop_exact_child_bounded "$TEE_PID"; then
+      :
+    else
+      tee_cleanup_status=1
+    fi
+    TEE_STATUS="$PHASE1_CHILD_OUTCOME_STATUS"
+    TEE_DRAINED="$PHASE1_CHILD_DRAINED"
+    if [[ "$TEE_DRAINED" == true ]]; then
+      TEE_PID=""
+    fi
+  elif [[ "$TEE_STARTED" == true && "$TEE_DRAINED" != true ]]; then
+    TEE_STATUS=125
+    TEE_DRAINED=false
+    tee_cleanup_status=1
+  fi
+  if [[ "$VERIFY_LOG_BACKUPS_OPEN" == true ]]; then
+    exec 3>&- 4>&-
+    VERIFY_LOG_BACKUPS_OPEN=false
+  fi
+  phase1_end_signal_deferral
+  return "$tee_cleanup_status"
 }
 
 write_source_config_hashes() {
@@ -211,6 +435,8 @@ workspace = Path(sys.argv[1]).resolve()
 output = Path(sys.argv[2])
 explicit_files = [
     workspace / 'scripts/verify_phase1.sh',
+    workspace / 'scripts/phase1_process_group.sh',
+    workspace / 'scripts/phase1_pidfd_group.py',
     workspace / 'docs/testing/acceptance-criteria.md',
     workspace / 'docs/testing/verification-matrix.md',
     workspace / 'docs/architecture/metrics-contract.md',
@@ -401,7 +627,16 @@ write_lifecycle_summary() {
     "$LAUNCH_KILL_SENT" \
     "$SAMPLING_STARTED_UTC" \
     "$SAMPLING_STOPPED_UTC" \
-    "$TEE_STATUS" <<'PY'
+    "$TEE_STATUS" \
+    "$LAUNCH_CLEANUP_STATUS" \
+    "$LAUNCH_GROUP_DRAINED" \
+    "$LAUNCH_SID" \
+    "$LAUNCH_START_TICKS" \
+    "$LAUNCH_PIDFD_VALIDATED" \
+    "$LAUNCH_GROUP_TOKEN_SHA256" \
+    "$SAMPLER_STATUS" \
+    "$SAMPLER_DRAINED" \
+    "$TEE_DRAINED" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -411,6 +646,13 @@ def optional_int(value):
     return int(value) if value else None
 
 
+summary_path = Path(sys.argv[1])
+cleanup_evidence_path = summary_path.parent / 'process-group-cleanup.tsv'
+cleanup_evidence = (
+    cleanup_evidence_path.name
+    if cleanup_evidence_path.is_file() and not cleanup_evidence_path.is_symlink()
+    else None
+)
 summary = {
     'checksum_validation_exit_code': int(sys.argv[6]),
     'created_utc': sys.argv[3],
@@ -418,26 +660,56 @@ summary = {
     'exit_code': int(sys.argv[5]),
     'gz_partition': sys.argv[8] or None,
     'launch': {
+        'cleanup_evidence': cleanup_evidence,
+        'cleanup_exit_code': optional_int(sys.argv[17]),
+        'group_drained': (
+            sys.argv[18] == 'true' if sys.argv[18] else None
+        ),
         'kill_sent': sys.argv[13] == 'true',
+        'leader_start_ticks': optional_int(sys.argv[20]),
+        'pidfd_group_signal': {
+            'flag': 4,
+            'token_sha256': sys.argv[22] or None,
+            'validated': sys.argv[21] == 'true',
+            'validation_evidence': (
+                'pidfd-validation.json' if sys.argv[21] == 'true' else None
+            ),
+        },
+        'session_id': optional_int(sys.argv[19]),
         'started_utc': sys.argv[9] or None,
         'stopped_utc': sys.argv[10] or None,
         'term_sent': sys.argv[12] == 'true',
         'wait_status': optional_int(sys.argv[11]),
     },
     'resource_sampling': {
+        'complete_through_group_drain': (
+            sys.argv[23] == '0'
+            and sys.argv[24] == 'true'
+            and sys.argv[18] == 'true'
+            and bool(sys.argv[14])
+            and bool(sys.argv[15])
+        ),
+        'drained': (
+            sys.argv[24] == 'true' if sys.argv[24] else None
+        ),
+        'exit_code': optional_int(sys.argv[23]),
         'scope': (
-            'isolated launch PGID, from the first sample immediately after PGID '
-            'validation through owned launch-leader shutdown; the small process-creation '
-            'to first-sample interval is not observed'
+            'isolated launch PGID; exit_code=0 and complete_through_group_drain=true '
+            'prove sampling continued from the first post-validation sample through '
+            'owned process-group drain; the small process-creation to first-sample '
+            'interval is not observed'
         ),
         'started_utc': sys.argv[14] or None,
         'stopped_utc': sys.argv[15] or None,
     },
     'ros_domain_id': optional_int(sys.argv[7]),
     'run_id': sys.argv[2],
+    'tee_drained': (
+        sys.argv[25] == 'true' if sys.argv[25] else None
+    ),
     'tee_exit_code': optional_int(sys.argv[16]),
 }
-Path(sys.argv[1]).write_text(
+summary_path.write_text(
     json.dumps(summary, indent=2, sort_keys=True) + '\n', encoding='utf-8'
 )
 PY
@@ -666,6 +938,9 @@ validate_checksum_manifest() {
 
 cleanup() {
   local execution_status=$?
+  local launch_cleanup_status=0
+  local sampler_cleanup_status=0
+  local tee_cleanup_status=0
   local checksum_status=0
   local final_status=0
   local metadata_status=0
@@ -674,24 +949,59 @@ cleanup() {
     return
   fi
   FINALIZED=1
-  trap - EXIT INT TERM
+  trap - EXIT
+  # The sourced process-group helper reads this shared deferral depth.
+  # shellcheck disable=SC2034
+  SIGNAL_DEFER_DEPTH=0
+  phase1_begin_signal_deferral
   set +e
 
   # The sampler stays alive while the owned launch group is terminated so the
-  # recorded interval covers controlled shutdown through launch-leader exit.
+  # recorded interval covers controlled shutdown through exact group drain.
   stop_owned_launch
-  stop_sampler
-  capture_phase1_ogre2_log
-  if (( execution_status == 0 )); then
-    echo "Phase 1 automated checks PASS; finalizing evidence: $RUN_DIR"
-  else
-    echo "Phase 1 automated checks FAIL with status $execution_status; finalizing evidence: $RUN_DIR"
+  launch_cleanup_status=$?
+  if [[ -n "$LAUNCH_PID" && "$LAUNCH_GROUP_DRAINED" != true ]]; then
+    stop_owned_launch
+    launch_cleanup_status=$?
   fi
+  close_launch_gate
+  stop_sampler
+  sampler_cleanup_status=$?
+  capture_phase1_ogre2_log
+  echo "Phase 1 automated execution ended with status $execution_status; finalizing evidence: $RUN_DIR"
   close_verify_log
+  tee_cleanup_status=$?
+  phase1_end_signal_deferral
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if (( execution_status == 0 )) && [[ -n "$PENDING_SIGNAL_STATUS" ]]; then
+    execution_status="$PENDING_SIGNAL_STATUS"
+  fi
 
   final_status=$execution_status
+  if (( launch_cleanup_status != 0 )); then
+    final_status=1
+  fi
+  if [[ -n "$SAMPLER_STATUS" && "$SAMPLER_STATUS" != "0" ]]; then
+    final_status=1
+  fi
+  if (( sampler_cleanup_status != 0 )) \
+    || [[ -n "$SAMPLING_STARTED_UTC" && "$SAMPLER_DRAINED" != true ]]; then
+    final_status=1
+  fi
   if [[ "$TEE_STATUS" != "0" ]]; then
     final_status=1
+  fi
+  if (( tee_cleanup_status != 0 )) \
+    || [[ "$TEE_STARTED" == true && "$TEE_DRAINED" != true ]]; then
+    final_status=1
+  fi
+  if [[ -n "$LAUNCH_PID" \
+    || -n "$SAMPLER_PID" \
+    || ( "$TEE_STARTED" == true && "$TEE_DRAINED" != true ) ]]; then
+    printf 'Phase 1 evidence finalization aborted: owned process cleanup was not confirmed.\n' \
+      >&2
+    exit 1
   fi
   write_final_metadata "$final_status" 0
   metadata_status=$?
@@ -724,10 +1034,11 @@ cleanup() {
   exit "$final_status"
 }
 
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'phase1_record_signal 130' INT
+trap 'phase1_record_signal 143' TERM
 trap cleanup EXIT
 
+start_verify_log
 write_command_evidence
 write_source_config_hashes
 if [[ -n "$GIT_STATUS_START" ]]; then
@@ -793,31 +1104,96 @@ printf 'ROS_DOMAIN_ID=%s\nGZ_PARTITION=%s\nROBOTEST_SIM_SEED=%s\n' \
   "$ROS_DOMAIN_ID" "$GZ_PARTITION" "$ROBOTEST_SIM_SEED" \
   | tee "$RUN_DIR/isolation.txt"
 
-LAUNCH_STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-setsid timeout --signal=TERM --kill-after=10s 100s \
+LAUNCH_GROUP_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+LAUNCH_GO_FIFO="$RUN_DIR/.launch-go.pipe"
+LAUNCH_READY_FIFO="$RUN_DIR/.launch-ready.pipe"
+mkfifo -- "$LAUNCH_GO_FIFO" "$LAUNCH_READY_FIFO"
+exec {LAUNCH_GO_FD}<>"$LAUNCH_GO_FIFO"
+exec {LAUNCH_READY_FD}<>"$LAUNCH_READY_FIFO"
+launch_parent_pid="$BASHPID"
+phase1_begin_signal_deferral
+ROBOTEST_PHASE1_GROUP_TOKEN="$LAUNCH_GROUP_TOKEN" \
+  setsid bash -c '
+    set -Eeuo pipefail
+    go_fifo="$1"
+    ready_fifo="$2"
+    shift 2
+    exec 8<"$go_fifo"
+    printf "READY\n" > "$ready_fifo"
+    release_token=""
+    if ! IFS= read -r -t 10 release_token <&8; then
+      exec 8<&-
+      exit 125
+    fi
+    exec 8<&-
+    [[ "$release_token" == "$ROBOTEST_PHASE1_GROUP_TOKEN" ]] || exit 125
+    exec "$@"
+  ' _ "$LAUNCH_GO_FIFO" "$LAUNCH_READY_FIFO" \
+  timeout --signal=TERM --kill-after=10s 100s \
   ros2 launch robotest_sim sim.launch.py headless:=true render_sensors:=true rviz:=false \
   seed:="$ROBOTEST_SIM_SEED" \
-  > "$RUN_DIR/launch.log" 2>&1 &
+  {LAUNCH_GO_FD}>&- {LAUNCH_READY_FD}>&- > "$RUN_DIR/launch.log" 2>&1 &
 LAUNCH_PID=$!
-LAUNCH_PGID="$(ps -o pgid= -p "$LAUNCH_PID" | tr -d ' ')"
-if [[ -z "$LAUNCH_PGID" || "$LAUNCH_PGID" != "$LAUNCH_PID" ]]; then
-  echo "launch did not enter its own process group" >&2
+phase1_end_signal_deferral
+LAUNCH_PGID="$LAUNCH_PID"
+LAUNCH_SID="$LAUNCH_PID"
+if ! exec {LAUNCH_PIDFD}<"/proc/$LAUNCH_PID"; then
+  echo "failed to retain the gated launch procfd" >&2
   exit 1
 fi
-printf 'launch_pid=%s\nlaunch_pgid=%s\nlaunch_started_utc=%s\n' \
-  "$LAUNCH_PID" "$LAUNCH_PGID" "$LAUNCH_STARTED_UTC" > "$RUN_DIR/process-group.txt"
+if ! python3 "$PIDFD_GROUP_HELPER" validate \
+    --fd 9 \
+    --parent-pid "$launch_parent_pid" \
+    --pid "$LAUNCH_PID" \
+    --token "$LAUNCH_GROUP_TOKEN" \
+    > "$RUN_DIR/pidfd-validation.json" 9<&"$LAUNCH_PIDFD"; then
+  echo "gated launch procfd validation failed" >&2
+  exit 1
+fi
+mapfile -t pidfd_validation_fields < <(
+  python3 - "$RUN_DIR/pidfd-validation.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+if payload.get('status') != 'validated' or payload.get('group_signal_flag') != 4:
+    raise SystemExit(1)
+print(payload['identity']['start_ticks'])
+print(payload['token_sha256'])
+PY
+)
+if (( ${#pidfd_validation_fields[@]} != 2 )); then
+  echo "gated launch procfd evidence is incomplete" >&2
+  exit 1
+fi
+LAUNCH_START_TICKS="${pidfd_validation_fields[0]}"
+LAUNCH_GROUP_TOKEN_SHA256="${pidfd_validation_fields[1]}"
+LAUNCH_PIDFD_VALIDATED=true
+launch_ready=""
+if ! IFS= read -r -t 2 -u "$LAUNCH_READY_FD" launch_ready \
+  || [[ "$launch_ready" != READY ]]; then
+  echo "gated launch wrapper did not become ready" >&2
+  exit 1
+fi
+if ! phase1_release_launch_gate \
+    "$LAUNCH_GO_FD" LAUNCH_GROUP_TOKEN LAUNCH_STARTED_UTC; then
+  echo "failed to release gated launch" >&2
+  exit 1
+fi
+close_launch_gate
+printf 'launch_pid=%s\nlaunch_pgid=%s\nlaunch_sid=%s\nlaunch_start_ticks=%s\npidfd_group_flag=4\npidfd_validated=true\nlaunch_started_utc=%s\n' \
+  "$LAUNCH_PID" "$LAUNCH_PGID" "$LAUNCH_SID" "$LAUNCH_START_TICKS" \
+  "$LAUNCH_STARTED_UTC" > "$RUN_DIR/process-group.txt"
 
 printf 'wall_epoch_s,pid,pgid,cpu_percent,rss_kib,processor,command\n' > "$RUN_DIR/resources.csv"
 SAMPLING_STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 sample_launch_group
-(
-  while kill -0 "$LAUNCH_PID" 2>/dev/null; do
-    sleep 1
-    kill -0 "$LAUNCH_PID" 2>/dev/null || break
-    sample_launch_group
-  done
-) &
+phase1_begin_signal_deferral
+phase1_sample_numeric_group_until_drain \
+  "$LAUNCH_PGID" sample_launch_group 1 &
 SAMPLER_PID=$!
+phase1_end_signal_deferral
 
 deadline=$((SECONDS + 50))
 required_topics=(
@@ -905,10 +1281,23 @@ stop_sampler
 capture_phase1_ogre2_log
 
 max_rss_kib="$(awk -F, 'NR>1 {sum[$1]+=$5} END {max=0; for (t in sum) if (sum[t]>max) max=sum[t]; print max+0}' "$RUN_DIR/resources.csv")"
+sampling_complete=false
+sampling_scope='isolated launch PGID; sampling did not complete through verified process-group drain'
+if [[ "$SAMPLER_STATUS" == "0" \
+  && "$SAMPLER_DRAINED" == true \
+  && "$LAUNCH_GROUP_DRAINED" == true \
+  && -n "$SAMPLING_STARTED_UTC" \
+  && -n "$SAMPLING_STOPPED_UTC" ]]; then
+  sampling_complete=true
+  sampling_scope='isolated launch PGID from first post-validation sample through verified process-group drain'
+fi
 printf '%s\n' \
   "peak_process_group_rss_kib=$max_rss_kib" \
   "target_max_kib=$((6 * 1024 * 1024))" \
-  'sampling_scope=isolated launch PGID from first post-PGID-validation sample through launch-leader shutdown' \
+  "sampler_exit_code=${SAMPLER_STATUS:-unavailable}" \
+  "sampler_drained=${SAMPLER_DRAINED:-unknown}" \
+  "sampling_complete_through_group_drain=$sampling_complete" \
+  "sampling_scope=$sampling_scope" \
   'startup_capture_gap=process creation through first sample is not observed' \
   | tee "$RUN_DIR/resource-summary.txt"
 (( max_rss_kib <= 6 * 1024 * 1024 )) || { echo "Phase 1 RSS target exceeded" >&2; exit 1; }

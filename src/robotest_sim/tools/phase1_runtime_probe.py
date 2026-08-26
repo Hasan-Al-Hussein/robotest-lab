@@ -38,6 +38,96 @@ from tf2_msgs.msg import TFMessage
 
 from robotest_interfaces.msg import FaultEvent
 
+PHASE1_GROUND_COLLISION = 'ground_plane::ground_link::ground_collision'
+PHASE1_COLLISION_BY_ROLE = {
+    'chassis': (
+        'robotest::base_footprint::base_footprint_fixed_joint_lump__base_link_collision_collision'
+    ),
+    'left_wheel': (
+        'robotest::left_wheel_link::'
+        'left_wheel_link_fixed_joint_lump__left_wheel_collision_collision'
+    ),
+    'right_wheel': (
+        'robotest::right_wheel_link::'
+        'right_wheel_link_fixed_joint_lump__right_wheel_collision_collision'
+    ),
+    'front_caster': (
+        'robotest::front_caster_link::'
+        'front_caster_link_fixed_joint_lump__front_caster_collision_collision'
+    ),
+    'rear_caster': (
+        'robotest::rear_caster_link::'
+        'rear_caster_link_fixed_joint_lump__rear_caster_collision_collision'
+    ),
+    'lidar_body': 'robotest::lidar_link::lidar_link_collision_collision',
+    'imu_body': 'robotest::imu_link::imu_link_collision_collision',
+}
+PHASE1_SUPPORT_ROLES = frozenset({'front_caster', 'left_wheel', 'rear_caster', 'right_wheel'})
+PHASE1_ROBOT_COLLISIONS = frozenset(PHASE1_COLLISION_BY_ROLE.values())
+PHASE1_SUPPORT_PAIRS = frozenset(
+    (PHASE1_COLLISION_BY_ROLE[role], PHASE1_GROUND_COLLISION) for role in PHASE1_SUPPORT_ROLES
+)
+PHASE1_ALLOWED_CONTACT_DISPOSITIONS = frozenset({'allowlisted_support_contact', 'robot_internal'})
+PHASE1_CONTACT_DISPOSITIONS = (
+    'allowlisted_support_contact',
+    'robot_internal',
+    'invalid_collision_name',
+    'unexpected_non_robot_pair',
+    'unexpected_robot_environment_contact',
+)
+CONTACT_EVIDENCE_CAPACITY = 64
+CONTACT_NAME_EVIDENCE_LIMIT = 256
+
+
+def classify_phase1_contact_pair(collision1: Any, collision2: Any) -> str:
+    """Classify an exact pair against the frozen collision-coverage policy."""
+    if not isinstance(collision1, str) or not collision1:
+        return 'invalid_collision_name'
+    if not isinstance(collision2, str) or not collision2:
+        return 'invalid_collision_name'
+    first_robot = collision1 in PHASE1_ROBOT_COLLISIONS
+    second_robot = collision2 in PHASE1_ROBOT_COLLISIONS
+    if first_robot and second_robot:
+        # The frozen Phase 3 classifier excludes exact covered robot/robot
+        # pairs as internal contacts rather than external collision events.
+        return 'robot_internal'
+    if not first_robot and not second_robot:
+        return 'unexpected_non_robot_pair'
+    robot_collision = collision1 if first_robot else collision2
+    counterpart_collision = collision2 if first_robot else collision1
+    if (robot_collision, counterpart_collision) in PHASE1_SUPPORT_PAIRS:
+        return 'allowlisted_support_contact'
+    return 'unexpected_robot_environment_contact'
+
+
+def contact_name_evidence(value: Any) -> str:
+    """Bound one untrusted collision name before retaining it in evidence."""
+    if not isinstance(value, str):
+        return f'<non-string:{type(value).__qualname__}>'
+    if len(value) <= CONTACT_NAME_EVIDENCE_LIMIT:
+        return value
+    return value[:CONTACT_NAME_EVIDENCE_LIMIT] + '...'
+
+
+def phase1_contact_policy() -> dict[str, Any]:
+    """Return the canonical exact-name policy embedded in runtime evidence."""
+    return {
+        'allowed_dispositions': sorted(PHASE1_ALLOWED_CONTACT_DISPOSITIONS),
+        'ground_collision': PHASE1_GROUND_COLLISION,
+        'robot_collisions': sorted(PHASE1_ROBOT_COLLISIONS),
+        'support_pairs': [list(pair) for pair in sorted(PHASE1_SUPPORT_PAIRS)],
+    }
+
+
+def phase1_contact_policy_sha256() -> str:
+    payload = json.dumps(
+        phase1_contact_policy(),
+        ensure_ascii=False,
+        separators=(',', ':'),
+        sort_keys=True,
+    ).encode('utf-8')
+    return hashlib.sha256(payload).hexdigest()
+
 
 def qos(depth: int, reliable: bool) -> QoSProfile:
     return QoSProfile(
@@ -288,6 +378,11 @@ class Phase1Probe(Node):
         self.latest_ground_truth: Odometry | None = None
         self.last_cmd: Twist | None = None
         self.nonempty_contact_messages = 0
+        self.contact_record_count = 0
+        self.contact_dispositions: dict[str, int] = defaultdict(int)
+        self.unexpected_contact_pair_count = 0
+        self.unexpected_contact_pair_prefix: list[dict[str, Any]] = []
+        self.unexpected_contact_pair_omitted_count = 0
         self.world_samples: list[tuple[int, float, bool, float]] = []
         self.tf_edges: set[tuple[str, str]] = set()
         self.tf_static_edges: set[tuple[str, str]] = set()
@@ -426,6 +521,27 @@ class Phase1Probe(Node):
         self._record('contacts')
         if message.contacts:
             self.nonempty_contact_messages += 1
+        for contact_index, contact in enumerate(message.contacts):
+            collision1 = getattr(getattr(contact, 'collision1', None), 'name', None)
+            collision2 = getattr(getattr(contact, 'collision2', None), 'name', None)
+            disposition = classify_phase1_contact_pair(collision1, collision2)
+            self.contact_record_count += 1
+            self.contact_dispositions[disposition] += 1
+            if disposition in PHASE1_ALLOWED_CONTACT_DISPOSITIONS:
+                continue
+            self.unexpected_contact_pair_count += 1
+            if len(self.unexpected_contact_pair_prefix) < CONTACT_EVIDENCE_CAPACITY:
+                self.unexpected_contact_pair_prefix.append(
+                    {
+                        'collision1': contact_name_evidence(collision1),
+                        'collision2': contact_name_evidence(collision2),
+                        'contact_index': contact_index,
+                        'disposition': disposition,
+                        'message_sequence': self.counts['contacts'],
+                    }
+                )
+            else:
+                self.unexpected_contact_pair_omitted_count += 1
 
     def _on_fault_event(self, message: FaultEvent) -> None:
         self._record('fault_events', stamp_ns(message))
@@ -796,9 +912,9 @@ class Phase1Probe(Node):
                     f'{self.semantic_mismatches[stream]} semantic mismatches'
                 )
 
-        if self.nonempty_contact_messages != 0:
+        if self.unexpected_contact_pair_count != 0:
             self.failures.append(
-                f'observed {self.nonempty_contact_messages} non-empty collision messages'
+                f'observed {self.unexpected_contact_pair_count} unexpected contact records'
             )
 
         validation_topics = [
@@ -955,6 +1071,27 @@ class Phase1Probe(Node):
             'pass_through_semantic_matches': dict(self.semantic_matches),
             'pass_through_semantic_mismatches': dict(self.semantic_mismatches),
             'nonempty_contact_messages': self.nonempty_contact_messages,
+            'contact_classification': {
+                'total_pair_count': self.contact_record_count,
+                'excluded_support_pair_count': self.contact_dispositions.get(
+                    'allowlisted_support_contact', 0
+                ),
+                'excluded_internal_pair_count': self.contact_dispositions.get('robot_internal', 0),
+                'counted_collision_pair_count': self.contact_dispositions.get(
+                    'unexpected_robot_environment_contact', 0
+                ),
+                'dispositions': {
+                    disposition: self.contact_dispositions.get(disposition, 0)
+                    for disposition in PHASE1_CONTACT_DISPOSITIONS
+                },
+                'unexpected_pair_count': self.unexpected_contact_pair_count,
+                'unexpected_pair_evidence_capacity': CONTACT_EVIDENCE_CAPACITY,
+                'unexpected_pair_omitted_count': self.unexpected_contact_pair_omitted_count,
+                'unexpected_pair_prefix': self.unexpected_contact_pair_prefix,
+                'exact_support_allowlist': [list(pair) for pair in sorted(PHASE1_SUPPORT_PAIRS)],
+                'policy_projection': phase1_contact_policy(),
+                'policy_sha256': phase1_contact_policy_sha256(),
+            },
             'motion_command': {
                 'publications': self.motion_command_publications,
                 'wall_rate_hz': motion_command_rate,
