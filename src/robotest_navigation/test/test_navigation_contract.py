@@ -339,6 +339,14 @@ def test_launch_description_is_fixed_noncomposed_and_discoverable() -> None:
     for process_name in ('map_server', 'bt_navigator', 'lifecycle_manager_navigation'):
         assert f'critical Nav2 process exited: {process_name}' in launch_text
     assert 'lifecycle_startup_trigger' in launch_text
+    navigation_group = launch_text.split('navigation = GroupAction(', 1)[1].split(
+        'return LaunchDescription(', 1
+    )[0]
+    assert 'lifecycle_manager,' in navigation_group
+    assert 'lifecycle_startup_trigger,' not in navigation_group
+    assert 'navigation,' in launch_text.split('return LaunchDescription(', 1)[1]
+    assert 'TimerAction(period=nav_delay, actions=[lifecycle_startup_trigger])' in launch_text
+    assert 'TimerAction(period=nav_delay, actions=[navigation])' not in launch_text
     assert 'ComposableNode' not in launch_text
     result = subprocess.run(
         ['ros2', 'launch', 'robotest_navigation', 'phase2.launch.py', '--show-args'],

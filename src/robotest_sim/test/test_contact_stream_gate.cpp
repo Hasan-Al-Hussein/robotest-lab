@@ -573,6 +573,10 @@ TEST(ContactStreamPolicy, SparseRawProgressRespectsCausalPublicGapBoundary)
     EXPECT_TRUE(exceeded.fatal);
     EXPECT_FALSE(exceeded.output.has_value());
     EXPECT_NE(exceeded.detail.find("completed raw contact stream"), std::string::npos);
+    EXPECT_NE(exceeded.detail.find("last_public_stamp_ns=1000000000"), std::string::npos);
+    EXPECT_NE(exceeded.detail.find("completed_stamp_ns=1221000000"), std::string::npos);
+    EXPECT_NE(exceeded.detail.find("gap_ns=221000000"), std::string::npos);
+    EXPECT_NE(exceeded.detail.find("completed_batch_message_count=1"), std::string::npos);
   }
 }
 

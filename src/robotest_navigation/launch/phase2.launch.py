@@ -260,6 +260,12 @@ def generate_launch_description():
         ],
     )
 
+    # Construct every unconfigured Nav2 process before the robot is spawned.
+    # Starting these processes together is the largest one-time CPU burst in
+    # the stack; keeping that burst ahead of contact production prevents it
+    # from starving the fail-closed contact evidence path.  Only lifecycle
+    # STARTUP remains delayed, so no Nav2 component consumes sensor data until
+    # the robot and its bridges have had the original settling interval.
     navigation = GroupAction(
         actions=[
             map_server,
@@ -272,7 +278,6 @@ def generate_launch_description():
             velocity_smoother,
             collision_monitor,
             lifecycle_manager,
-            lifecycle_startup_trigger,
         ]
     )
 
@@ -294,7 +299,7 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 'navigation_start_delay_sec',
                 default_value=DEFAULT_NAVIGATION_START_DELAY_SEC,
-                description='Wall-clock delay before starting the Nav2 processes',
+                description='Wall-clock delay before triggering Nav2 lifecycle STARTUP',
             ),
             DeclareLaunchArgument(
                 'lifecycle_discovery_grace_sec',
@@ -318,6 +323,7 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument('log_level', default_value='info'),
             sim,
-            TimerAction(period=nav_delay, actions=[navigation]),
+            navigation,
+            TimerAction(period=nav_delay, actions=[lifecycle_startup_trigger]),
         ]
     )

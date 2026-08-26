@@ -63,7 +63,7 @@ Launch arguments are:
 - `autostart` (`true`)
 - `map` (the installed `maps/robotest_lab.yaml`)
 - `params_file` (the installed `config/nav2_params.yaml`)
-- `navigation_start_delay_sec` (`7.0`)
+- `navigation_start_delay_sec` (`7.0`; delays lifecycle STARTUP, not process construction)
 - `lifecycle_discovery_grace_sec` (`4.0`)
 - `lifecycle_service_timeout_sec` (`20.0`)
 - `lifecycle_response_timeout_sec` (`60.0`)
@@ -74,8 +74,12 @@ Simulation time is always enabled. Node composition and process respawn are
 intentionally disabled for Phase 2; process restart belongs to the later Go
 supervisor.
 
-The Nav2 lifecycle manager itself always starts with `autostart=false`. When
-the public `autostart` argument is `true`, the project-owned
+All unconfigured Nav2 processes and the lifecycle manager are constructed
+immediately, before the simulation's delayed robot spawn begins contact
+production. This keeps their one-time process-construction CPU burst outside
+the contact-evidence interval. The Nav2 lifecycle manager itself always starts
+with `autostart=false`. When the public `autostart` argument is `true`, only the
+project-owned
 `lifecycle_startup_trigger` waits for the manager service, holds a stable
 `4.0 s` monotonic wall-clock discovery grace, and then sends exactly one
 bounded `nav2_msgs/srv/ManageLifecycleNodes` `STARTUP` request. This avoids

@@ -32,10 +32,10 @@ contact_stream:
       - path: src/robotest_sim/include/robotest_sim/contact_stream_gate.hpp
         sha256: 98c6e0f480c0bbf3ad9ee5a49ac33108c2869d1581a723dc67f5edc13ccad334
       - path: src/robotest_sim/src/contact_stream_gate.cpp
-        sha256: e033ec01730f1df641fd1970ea0340bde2aec409453faaf75b08f47ac4eb1306
+        sha256: c2ece291d7ce785e18385adfc951978e3b574d718ee890ea5da959d1baa87a60
       - path: src/robotest_sim/src/contact_stream_gate_node.cpp
         sha256: 9eddecff326b0277f1bbe5cf06efe010cbf130cf1d32acfdd5a7d923f9f0227f
-    source_inventory_sha256: eb5d52722df8168a203edf7c459c94c905295e3b8d28a17dd44d93396c306d95
+    source_inventory_sha256: c43328390590c5e19dabe10866a2a7a26dff5a1eb2482a3bc199f2b37def2712
   policy:
     active_pair_expiry_ns: 250000000
     active_pair_scope: support_robot_internal_and_countable_robot_external
@@ -152,8 +152,8 @@ support_pairs:
 - robot_collision: robotest::rear_caster_link::rear_caster_link_fixed_joint_lump__rear_caster_collision_collision
   environment_collision: ground_plane::ground_link::ground_collision
 bridge_sha256: ef517ad0e89e9df71668835aaaf306e21aa52a0d75371a9d331a87aaa6a710e7
-contact_configuration_sha256: 2e797c061be53dabfaa2493097e8782e98e266e4ec03f386fda10d49bcb3db9d
+contact_configuration_sha256: 7e0ed219e49270a7de678900ca6a818193756007f40bd4a3c781ce7bf01b734f
 rendered_sdf_sha256: 35afbcb86f78fadd72743aa125eeb919b64e6bf52ad85a33dac981fe6dcc246a
 robot_description_sha256: 380c2bb23114cfbd8558b4e48fa9b906020cf9cc26e4db7d2ad59f241cbd6a47
 world_source_sha256: c3765faae0a4fc309a64d62d97b4586664847d8756564ddc25f22cddd76ef091
-manifest_sha256: 28637081e9070954419f4b231e6e92dfb4ada6b0e2f3fe12ec2f6efab7e6aca4
+manifest_sha256: 4fd1deac1f85456a377bad6756dd39462b76c5b0f5903f61567213b6115caff6

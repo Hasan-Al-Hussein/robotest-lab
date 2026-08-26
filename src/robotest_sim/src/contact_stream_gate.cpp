@@ -371,9 +371,13 @@ ContactGateDecision ContactStreamPolicy::finalize_pending()
   if (last_forward_stamp_ns_.has_value() &&
     *completed_stamp - *last_forward_stamp_ns_ > kMaxPublicSnapshotGapNs)
   {
+    const auto gap_ns = *completed_stamp - *last_forward_stamp_ns_;
     return structural_fatal(
       "completed raw contact stream advanced more than 220 ms beyond the last "
-      "public snapshot");
+      "public snapshot: last_public_stamp_ns=" + std::to_string(*last_forward_stamp_ns_) +
+      ", completed_stamp_ns=" + std::to_string(*completed_stamp) +
+      ", gap_ns=" + std::to_string(gap_ns) +
+      ", completed_batch_message_count=" + std::to_string(batch.message_count));
   }
 
   std::set<ContactPair> expired_pairs;
