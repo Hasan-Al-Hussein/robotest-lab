@@ -112,6 +112,8 @@ from robotest_scenarios.provenance import (
 
 WALL_NAME = 'phase3_contact_control_wall'
 FIXTURE_ID = 'collision_positive_control'
+# ROS 2 Jazzy's pinned rmw ABI stores 16 endpoint-GID bytes, rendered as hex here.
+ENDPOINT_GID_HEX_LENGTH = 32
 FORBIDDEN_NAVIGATION_NODES = frozenset(
     {
         'amcl',
@@ -864,6 +866,14 @@ class ContactControlApp:
             'topic_type': str(endpoint.topic_type),
         }
 
+    @staticmethod
+    def _endpoint_gid_is_valid(value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == ENDPOINT_GID_HEX_LENGTH
+            and all(character in '0123456789abcdef' for character in value)
+        )
+
     def _contact_graph_snapshot(self) -> dict[str, Any]:
         node = self._node
         public_topic = self.manifest.public_contact_snapshot_topic
@@ -923,8 +933,7 @@ class ContactControlApp:
                 return False
             endpoint_gid = endpoint.get('endpoint_gid', '')
             if (
-                len(endpoint_gid) != 48
-                or any(character not in '0123456789abcdef' for character in endpoint_gid)
+                not self._endpoint_gid_is_valid(endpoint_gid)
                 or endpoint.get('node_fqn') != expected_node
                 or endpoint.get('topic_type') != 'ros_gz_interfaces/msg/Contacts'
                 or not isinstance(endpoint.get('qos_status'), Mapping)

@@ -95,6 +95,16 @@ def test_positive_control_is_hash_bound_and_must_pass() -> None:
         validate_collision_qualification(manifest, failed, binding)
 
 
+def test_positive_control_graph_pins_jazzy_endpoint_gid_width() -> None:
+    _manifest, positive, _binding = collision_fixture()
+    snapshot = positive['quality']['contact_graph_topology']['first_snapshot']
+    collision_module._validate_contact_graph_snapshot(snapshot, 'positive-control')
+    invalid = copy.deepcopy(snapshot)
+    invalid['public_snapshot_publishers'][0]['endpoint_gid'] = 'ab' * 24
+    with pytest.raises(MetricUnavailable, match='owner/type/QoS changed'):
+        collision_module._validate_contact_graph_snapshot(invalid, 'positive-control')
+
+
 @pytest.mark.parametrize(
     'mutation',
     [

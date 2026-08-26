@@ -22,7 +22,7 @@ import rclpy
 from action_msgs.msg import GoalStatus, GoalStatusArray
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
-from robotest_scenarios.contact_control_driver import ContactControlNode
+from robotest_scenarios.contact_control_driver import ContactControlApp, ContactControlNode
 from robotest_scenarios.contact_evidence import load_coverage_manifest
 from robotest_scenarios.errors import ProtocolError
 from robotest_scenarios.models import load_scenario
@@ -52,6 +52,15 @@ def _status(raw_uuid: bytes, stamp_ns: int, status_code: int) -> GoalStatusArray
 
 def _init_ros() -> None:
     rclpy.init(args=['--ros-args', '-r', '__ns:=/robotest'])
+
+
+def test_contact_graph_accepts_pinned_jazzy_rmw_endpoint_gid_size() -> None:
+    assert ContactControlApp._endpoint_gid_is_valid('ab' * 16)
+
+
+@pytest.mark.parametrize('value', ['', 'ab' * 15, 'ab' * 17, 'ab' * 24, 'gg' * 16])
+def test_contact_graph_rejects_invalid_rmw_endpoint_gids(value: str) -> None:
+    assert not ContactControlApp._endpoint_gid_is_valid(value)
 
 
 def test_scenario_controller_binds_only_one_post_ready_uuid() -> None:

@@ -16,7 +16,9 @@
 
 from pathlib import Path
 
+import pytest
 from robotest_scenarios.artifacts import load_schema, validate_against_schema
+from robotest_scenarios.errors import ArtifactError
 
 SCHEMA_DIR = Path(__file__).resolve().parents[1] / 'schema'
 
@@ -33,6 +35,34 @@ def _buffer() -> dict:
         'overflow_count': 0,
         'retained_count': 0,
     }
+
+
+def _contact_graph_endpoint(endpoint_gid: str) -> dict:
+    return {
+        'endpoint_gid': endpoint_gid,
+        'node_fqn': '/robotest/contact_stream_gate',
+        'qos': {
+            'depth': 10,
+            'durability': 'VOLATILE',
+            'history': 'KEEP_LAST',
+            'reliability': 'RELIABLE',
+        },
+        'qos_status': {
+            'depth_matches_or_unknown': True,
+            'durability_volatile': True,
+            'history_keep_last_or_unknown': True,
+            'reliability_reliable': True,
+        },
+        'topic_type': 'ros_gz_interfaces/msg/Contacts',
+    }
+
+
+def test_contact_graph_endpoint_schema_pins_jazzy_gid_width() -> None:
+    schema = load_schema(SCHEMA_DIR / 'contact-control-result.schema.json')
+    endpoint_schema = schema['$defs']['contactGraphEndpoint']
+    validate_against_schema(_contact_graph_endpoint('ab' * 16), endpoint_schema)
+    with pytest.raises(ArtifactError, match='schema violation'):
+        validate_against_schema(_contact_graph_endpoint('ab' * 24), endpoint_schema)
 
 
 def test_contact_failure_artifact_shape_is_valid() -> None:

@@ -457,7 +457,7 @@ def collision_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
 
     def graph_endpoint(node_fqn: str, depth: int, gid_byte: str) -> dict[str, Any]:
         return {
-            'endpoint_gid': gid_byte * 24,
+            'endpoint_gid': gid_byte * 16,
             'node_fqn': node_fqn,
             'qos': {
                 'depth': depth,

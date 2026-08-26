@@ -220,7 +220,7 @@ def _validate_contact_graph_snapshot(value: Any, label: str) -> None:
         }
         if (
             not isinstance(endpoint.get('endpoint_gid'), str)
-            or re.fullmatch(r'[0-9a-f]{48}', endpoint['endpoint_gid']) is None
+            or re.fullmatch(r'[0-9a-f]{32}', endpoint['endpoint_gid']) is None
             or endpoint.get('node_fqn') != node_fqn
             or endpoint.get('topic_type') != 'ros_gz_interfaces/msg/Contacts'
             or endpoint.get('qos_status') != expected_status

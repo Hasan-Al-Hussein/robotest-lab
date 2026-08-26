@@ -573,7 +573,7 @@
       "additionalProperties": false,
       "required": ["endpoint_gid", "node_fqn", "qos", "qos_status", "topic_type"],
       "properties": {
-        "endpoint_gid": {"type": "string", "pattern": "^[0-9a-f]{48}$"},
+        "endpoint_gid": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
         "node_fqn": {"enum": ["/robotest/contact_stream_gate", "/robotest/parameter_bridge"]},
         "qos": {
           "type": "object",
