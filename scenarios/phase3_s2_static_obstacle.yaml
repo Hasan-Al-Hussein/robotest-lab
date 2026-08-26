@@ -1,0 +1,32 @@
+schema_version: 1
+scenario_id: 2
+scenario_name: deterministic_static_obstacle_replan
+mission_seed: 42
+simulator_seed: 42
+scenario_controller_seed: 42
+frame_id: map
+start_pose: {x: 0.0, y: -3.5, yaw: 0.0}
+waypoints:
+  - {x: -2.0, y: -3.5, yaw: 0.0}
+  - {x: 0.0, y: 0.0, yaw: 0.0}
+  - {x: 0.0, y: 3.5, yaw: 0.0}
+mission_timeout_sim_s: 180.0
+wall_escape_timeout_s: 300.0
+allowed_collision_count: 0
+expected_outcome: succeeded
+retries: 0
+entity:
+  name: phase3_static_block
+  static: true
+  geometry: {type: box, size_x_m: 0.40, size_y_m: 0.40, size_z_m: 0.80}
+  world_pose: {x_m: -1.0, y_m: -3.5, z_m: 0.4, yaw_rad: 0.0}
+trigger:
+  anchor: accepted_goal_t0
+  target_offset_sim_s: 2.0
+  latest_first_observed_offset_sim_s: 2.25
+  required_leg_index: 0
+fault_schedule:
+  schema_version: 1
+  faults: []
+fault_schedule_sha256: 26080d7dc8f4108a369962ecad1d2e29941a991af68beb415067eae1dc1de6f8
+fault_seed: null

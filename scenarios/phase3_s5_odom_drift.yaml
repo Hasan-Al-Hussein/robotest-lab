@@ -1,0 +1,31 @@
+schema_version: 1
+scenario_id: 5
+scenario_name: deterministic_odometry_drift
+mission_seed: 42
+simulator_seed: 42
+scenario_controller_seed: 42
+frame_id: map
+start_pose: {x: 0.0, y: -3.5, yaw: 0.0}
+waypoints:
+  - {x: -2.0, y: -3.5, yaw: 0.0}
+  - {x: 0.0, y: 0.0, yaw: 0.0}
+  - {x: 0.0, y: 3.5, yaw: 0.0}
+mission_timeout_sim_s: 180.0
+wall_escape_timeout_s: 300.0
+allowed_collision_count: 0
+expected_outcome: succeeded
+retries: 0
+actor: null
+fault_seed: 42
+fault_schedule_sha256: 3c72bc48e05221a52058112e58c94b578550deb2ee1ff4ad0d719675917335eb
+fault:
+  schema_version: 1
+  fault_id: odom_drift
+  target: 2
+  mode: 4
+  start_offset_ns: 10000000000
+  duration_ns: 20000000000
+  seed: 42
+  parameters:
+    x_rate_nm_per_s: 10000000
+    yaw_rate_nrad_per_s: 5000000

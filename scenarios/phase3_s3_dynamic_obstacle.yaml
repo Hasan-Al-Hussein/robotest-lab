@@ -1,0 +1,34 @@
+schema_version: 1
+scenario_id: 3
+scenario_name: deterministic_dynamic_obstacle
+mission_seed: 42
+simulator_seed: 42
+scenario_controller_seed: 42
+frame_id: map
+start_pose: {x: 0.0, y: -3.5, yaw: 0.0}
+waypoints:
+  - {x: -2.0, y: -3.5, yaw: 0.0}
+  - {x: 0.0, y: 0.0, yaw: 0.0}
+  - {x: 0.0, y: 3.5, yaw: 0.0}
+mission_timeout_sim_s: 180.0
+wall_escape_timeout_s: 300.0
+allowed_collision_count: 0
+expected_outcome: succeeded
+retries: 0
+entity:
+  name: phase3_dynamic_block
+  static: true
+  pose_controlled: true
+  geometry: {type: box, size_x_m: 0.35, size_y_m: 0.35, size_z_m: 0.80}
+  initial_world_pose: {x_m: -0.8, y_m: 1.5, z_m: 0.4, yaw_rad: 0.0}
+trigger:
+  anchor: first_feedback_transition_to_waypoint_index_2
+control_rate_hz: 10.0
+move_1_duration_sim_s: 4.0
+dwell_duration_sim_s: 4.0
+move_2_duration_sim_s: 4.0
+fault_schedule:
+  schema_version: 1
+  faults: []
+fault_schedule_sha256: 26080d7dc8f4108a369962ecad1d2e29941a991af68beb415067eae1dc1de6f8
+fault_seed: null

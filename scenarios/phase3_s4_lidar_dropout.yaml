@@ -1,0 +1,29 @@
+schema_version: 1
+scenario_id: 4
+scenario_name: temporary_lidar_dropout
+mission_seed: 42
+simulator_seed: 42
+scenario_controller_seed: 42
+frame_id: map
+start_pose: {x: 0.0, y: -3.5, yaw: 0.0}
+waypoints:
+  - {x: -2.0, y: -3.5, yaw: 0.0}
+  - {x: 0.0, y: 0.0, yaw: 0.0}
+  - {x: 0.0, y: 3.5, yaw: 0.0}
+mission_timeout_sim_s: 180.0
+wall_escape_timeout_s: 300.0
+allowed_collision_count: 0
+expected_outcome: succeeded
+retries: 0
+actor: null
+fault_seed: 42
+fault_schedule_sha256: 5f93838ca7c0be214858ffe8f62fa351b82d260f6223f139dfaf6bd3dcd224c8
+fault:
+  schema_version: 1
+  fault_id: scan_drop
+  target: 1
+  mode: 1
+  start_offset_ns: 10000000000
+  duration_ns: 2000000000
+  seed: 42
+  parameters: {}

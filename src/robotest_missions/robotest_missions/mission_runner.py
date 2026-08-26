@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 from collections.abc import Sequence
@@ -36,6 +37,8 @@ from robotest_missions.artifacts import (
     write_result_artifacts,
 )
 from robotest_missions.execution import ExecutionRecord, ExitCode, MissionExecutor
+from robotest_missions.fault_control import RclpyFaultControlDriver
+from robotest_missions.models import MissionDocument
 from robotest_missions.ros_action import RclpyFollowWaypointsDriver
 from robotest_missions.schema import MissionValidationError, load_mission
 
@@ -50,7 +53,7 @@ class _ArgumentParser(argparse.ArgumentParser):
 
 
 class MissionRunnerNode(Node):
-    """Node hosting only the direct FollowWaypoints action client."""
+    """Node hosting direct action and deterministic fault-control clients."""
 
     def __init__(self) -> None:
         super().__init__(
@@ -86,6 +89,10 @@ def _parser() -> argparse.ArgumentParser:
         dest='csv_path',
         help='matching one-row CSV output',
     )
+    parser.add_argument('--run-id', help='required bounded run identity for Phase 3')
+    parser.add_argument('--candidate-id', help='required candidate-suite identity for Phase 3')
+    parser.add_argument('--repetition-index', type=int, choices=(0, 1, 2))
+    parser.add_argument('--suite-index', type=int, choices=range(15))
     return parser
 
 
@@ -95,6 +102,42 @@ def _run_id(created: datetime) -> str:
 
 def _created_utc(created: datetime) -> str:
     return created.isoformat(timespec='microseconds').replace('+00:00', 'Z')
+
+
+_RUN_ID_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
+_CANDIDATE_ID_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
+
+
+def _trial_identity(
+    document: MissionDocument,
+    cli: argparse.Namespace,
+) -> dict[str, object] | None:
+    config = document.config
+    values = (cli.run_id, cli.candidate_id, cli.repetition_index, cli.suite_index)
+    if not config.is_phase3:
+        if any(value is not None for value in values):
+            raise CliError('Phase 3 trial identity arguments require a Phase 3 scenario')
+        return None
+    if any(value is None for value in values):
+        raise CliError(
+            'Phase 3 requires --run-id, --candidate-id, --repetition-index, and --suite-index'
+        )
+    if _RUN_ID_PATTERN.fullmatch(cli.run_id) is None:
+        raise CliError('--run-id must match bounded ASCII [A-Za-z0-9][A-Za-z0-9._-]{0,127}')
+    if _CANDIDATE_ID_PATTERN.fullmatch(cli.candidate_id) is None:
+        raise CliError('--candidate-id must match bounded ASCII [A-Za-z0-9][A-Za-z0-9._-]{0,63}')
+    expected_suite_index = (config.scenario_id - 1) * 3 + cli.repetition_index
+    if cli.suite_index != expected_suite_index:
+        raise CliError(
+            f'--suite-index must equal (scenario_id-1)*3+repetition_index ({expected_suite_index})'
+        )
+    return {
+        'candidate_id': cli.candidate_id,
+        'repetition_index': cli.repetition_index,
+        'run_id': cli.run_id,
+        'scenario_id': config.scenario_id,
+        'suite_index': cli.suite_index,
+    }
 
 
 def _infrastructure_record(reason: str, clock: RosMissionClock) -> ExecutionRecord:
@@ -116,12 +159,13 @@ def main(args: Sequence[str] | None = None) -> int:
         cli = _parser().parse_args(remove_ros_args(args=raw_args)[1:])
         json_target, csv_target = validate_artifact_paths(cli.json_path, cli.csv_path)
         document = load_mission(cli.mission)
+        trial_identity = _trial_identity(document, cli)
     except (ArtifactError, CliError, MissionValidationError, OSError, RuntimeError) as exc:
         print(f'mission_runner: validation error: {exc}', file=sys.stderr)
         return int(ExitCode.VALIDATION_ERROR)
 
     created = datetime.now(UTC)
-    run_id = _run_id(created)
+    run_id = cli.run_id if trial_identity is not None else _run_id(created)
     node: MissionRunnerNode | None = None
     executor: SingleThreadedExecutor | None = None
     record: ExecutionRecord | None = None
@@ -134,12 +178,14 @@ def main(args: Sequence[str] | None = None) -> int:
         executor.add_node(node)
         clock = RosMissionClock(node)
         driver = RclpyFollowWaypointsDriver(node)
+        fault_driver = RclpyFaultControlDriver(node) if document.config.is_phase3 else None
         runner = MissionExecutor(
             document.config,
             driver,
             clock,
             lambda timeout: executor.spin_once(timeout_sec=timeout),
             runtime_ok=rclpy.ok,
+            fault_driver=fault_driver,
         )
         record = runner.run()
     except Exception as exc:
@@ -166,6 +212,7 @@ def main(args: Sequence[str] | None = None) -> int:
             record,
             run_id=run_id,
             created_utc=_created_utc(created),
+            trial_identity=trial_identity,
         )
         write_result_artifacts(result, json_target, csv_target)
     except ArtifactError as exc:

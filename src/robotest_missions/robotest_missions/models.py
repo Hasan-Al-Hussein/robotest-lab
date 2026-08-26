@@ -35,6 +35,55 @@ class PlanarPose:
 
 
 @dataclass(frozen=True, slots=True)
+class FaultSpec:
+    """One normalized deterministic fault specification."""
+
+    schema_version: int
+    fault_id: str
+    target: int
+    mode: int
+    start_offset_ns: int
+    duration_ns: int
+    seed: int
+    parameters: tuple[tuple[str, int], ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return the canonical property order frozen by ADR 0005."""
+        return {
+            'schema_version': self.schema_version,
+            'fault_id': self.fault_id,
+            'target': self.target,
+            'mode': self.mode,
+            'start_offset_ns': self.start_offset_ns,
+            'duration_ns': self.duration_ns,
+            'seed': self.seed,
+            'parameters': dict(self.parameters),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FaultSchedule:
+    """Canonical fault schedule plus its independently computed identity."""
+
+    schema_version: int
+    faults: tuple[FaultSpec, ...]
+    canonical_json: str
+    sha256: str
+
+    @property
+    def earliest_start_offset_ns(self) -> int | None:
+        """Return the first configured activation offset, if any."""
+        return None if not self.faults else self.faults[0].start_offset_ns
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return normalized schedule content without derived identity."""
+        return {
+            'schema_version': self.schema_version,
+            'faults': [fault.as_dict() for fault in self.faults],
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class MissionConfig:
     """Validated mission input used by both pure logic and ROS transport."""
 
@@ -48,10 +97,18 @@ class MissionConfig:
     mission_timeout_sim_s: float
     wall_escape_timeout_s: float
     allowed_collision_count: int
-    fault_schedule: None
-    fault_seed: None
+    fault_schedule: FaultSchedule | None
+    fault_seed: int | None
     expected_outcome: str
     retries: int
+    scenario_id: int | None = None
+    scenario_controller_seed: int | None = None
+    scenario_contract: dict[str, Any] | None = None
+
+    @property
+    def is_phase3(self) -> bool:
+        """Return whether this is one of the frozen Phase 3 scenarios."""
+        return self.scenario_id is not None
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-safe representation without runtime metadata."""
@@ -66,10 +123,15 @@ class MissionConfig:
             'mission_timeout_sim_s': self.mission_timeout_sim_s,
             'wall_escape_timeout_s': self.wall_escape_timeout_s,
             'allowed_collision_count': self.allowed_collision_count,
-            'fault_schedule': self.fault_schedule,
+            'fault_schedule': (
+                None if self.fault_schedule is None else self.fault_schedule.as_dict()
+            ),
             'fault_seed': self.fault_seed,
             'expected_outcome': self.expected_outcome,
             'retries': self.retries,
+            'scenario_id': self.scenario_id,
+            'scenario_controller_seed': self.scenario_controller_seed,
+            'scenario_contract': self.scenario_contract,
         }
 
 

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Protocol
 
-from robotest_missions.models import MissionConfig
+from robotest_missions.models import FaultSchedule, MissionConfig
 
 ACTION_SERVER_WAIT_WALL_S = 30.0
 SIM_TIME_READY_WAIT_WALL_S = 30.0
@@ -30,6 +30,12 @@ ACCEPTED_STATUS_TIMEOUT_WALL_S = 10.0
 CANCEL_ACK_TIMEOUT_WALL_S = 5.0
 CANCEL_RESULT_TIMEOUT_WALL_S = 10.0
 FEEDBACK_TRACE_CAPACITY = 4096
+MISSION_EVENT_TRACE_CAPACITY = 1024
+FAULT_EVENT_TRACE_CAPACITY = 512
+FAULT_SERVICE_WAIT_WALL_S = 20.0
+FAULT_RESPONSE_TIMEOUT_WALL_S = 10.0
+FAULT_EVENT_TIMEOUT_WALL_S = 5.0
+MIN_ARM_MARGIN_NS = 500_000_000
 SPIN_POLL_WALL_S = 0.05
 NAV2_ERROR_NONE = 0
 ACCEPTED_GOAL_STAMP_SOURCE = 'uuid_matched_action_status_goal_info'
@@ -69,6 +75,10 @@ class ActionProtocolError(RuntimeError):
 
 class FeedbackTraceOverflowError(ActionProtocolError):
     """Raised after an accepted goal exceeds the fixed feedback evidence bound."""
+
+
+class FaultProtocolError(ActionProtocolError):
+    """Raised when deterministic fault control cannot be proven atomically."""
 
 
 class MissionClock(Protocol):
@@ -154,6 +164,81 @@ class FollowWaypointsDriver(Protocol):
         """Return cancellation acknowledgement, or None while pending."""
 
 
+@dataclass(frozen=True, slots=True)
+class ResetResponse:
+    """Stable projection of std_srvs/Trigger reset."""
+
+    success: bool
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class PreloadResponse:
+    """Stable projection of PreloadFaultSchedule response."""
+
+    accepted: bool
+    replayed: bool
+    state: int
+    schedule_hash: str
+    loaded_count: int
+    generation: int
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class ArmResponse:
+    """Stable projection of ArmFaultSchedule response."""
+
+    accepted: bool
+    replayed: bool
+    state: int
+    schedule_hash: str
+    generation: int
+    goal_uuid: str
+    accepted_goal_stamp_ns: int
+    arm_commit_stamp_ns: int
+    arm_margin_ns: int
+    message: str
+
+
+class FaultControlDriver(Protocol):
+    """Non-blocking relative-name transport for the ADR 0005 control plane."""
+
+    def services_are_ready(self) -> bool:
+        """Return whether reset, preload, and arm services are all ready."""
+
+    def start_reset(self) -> None:
+        """Begin an asynchronous idempotent reset."""
+
+    def poll_reset_response(self) -> ResetResponse | None:
+        """Return the reset response when complete."""
+
+    def start_preload(self, schedule: FaultSchedule) -> None:
+        """Begin a preload using the canonical schedule and claimed digest."""
+
+    def poll_preload_response(self) -> PreloadResponse | None:
+        """Return the preload response when complete."""
+
+    def start_arm(
+        self,
+        schedule_hash: str,
+        generation: int,
+        goal_uuid: str,
+        accepted_goal_stamp_ns: int,
+    ) -> None:
+        """Begin the exact UUID/T0-bound arm operation."""
+
+    def poll_arm_response(self) -> ArmResponse | None:
+        """Return the arm response when complete."""
+
+    def drain_events(self) -> tuple[dict[str, Any], ...]:
+        """Return and remove all retained FaultEvent projections."""
+
+    @property
+    def event_overflow_count(self) -> int:
+        """Return the prefix-retaining subscriber overflow count."""
+
+
 @dataclass(slots=True)
 class ExecutionRecord:
     """Complete bounded mission observation used to build canonical artifacts."""
@@ -163,6 +248,8 @@ class ExecutionRecord:
     started_sim_stamp_ns: int
     started_steady_s: float
     events: list[dict[str, Any]] = field(default_factory=list)
+    event_trace_overflow: bool = False
+    event_trace_overflow_count: int = 0
     feedback_trace: list[dict[str, Any]] = field(default_factory=list)
     feedback_trace_overflow: bool = False
     feedback_trace_overflow_count: int = 0
@@ -178,6 +265,18 @@ class ExecutionRecord:
     cancellation_requested: bool = False
     cancel_acknowledged: bool | None = None
     deadline_kind: str | None = None
+    fault_events: list[dict[str, Any]] = field(default_factory=list)
+    fault_event_overflow: bool = False
+    fault_event_overflow_count: int = 0
+    fault_schedule_hash: str | None = None
+    fault_generation: int | None = None
+    fault_preload_replayed: bool | None = None
+    fault_arm_replayed: bool | None = None
+    fault_arm_commit_stamp_ns: int | None = None
+    fault_arm_margin_ns: int | None = None
+    fault_reset_before_goal: bool = False
+    fault_reset_after_goal: bool = False
+    fault_protocol_status: str = 'NOT_APPLICABLE'
     exit_code: ExitCode = ExitCode.INFRASTRUCTURE_ERROR
     reason: str = 'mission_not_started'
 
@@ -190,6 +289,10 @@ class ExecutionRecord:
         **details: Any,
     ) -> None:
         """Append a bounded event with both time domains."""
+        if len(self.events) >= MISSION_EVENT_TRACE_CAPACITY:
+            self.event_trace_overflow = True
+            self.event_trace_overflow_count += 1
+            return
         self.events.append(
             {
                 'kind': kind,
@@ -210,12 +313,15 @@ class MissionExecutor:
         clock: MissionClock,
         spin_once: Callable[[float], None],
         runtime_ok: Callable[[], bool] | None = None,
+        fault_driver: FaultControlDriver | None = None,
     ) -> None:
         self._config = config
         self._driver = driver
         self._clock = clock
         self._spin_once = spin_once
         self._runtime_ok = runtime_ok or _always_true
+        self._fault_driver = fault_driver
+        self._fault_event_sequence: int | None = None
         self._record = ExecutionRecord(
             action_name=driver.action_name,
             resolved_action_name=driver.resolved_action_name,
@@ -225,6 +331,25 @@ class MissionExecutor:
 
     def run(self) -> ExecutionRecord:
         """Run one goal through terminal result, cancellation, or bounded failure."""
+        result = self._run_once()
+        if self._config.is_phase3:
+            try:
+                reset_ok = self._reset_faults(before_goal=False)
+            except Exception as exc:
+                reset_ok = False
+                self._record.event('fault_teardown_error', self._clock, message=str(exc))
+            if not reset_ok:
+                self._record.exit_code = ExitCode.INFRASTRUCTURE_ERROR
+                self._record.reason = f'{self._record.reason}: fault_teardown_reset_failed'
+            try:
+                self._collect_fault_events()
+            except FaultProtocolError as exc:
+                self._record.exit_code = ExitCode.INFRASTRUCTURE_ERROR
+                self._record.reason = f'{self._record.reason}: {exc}'
+        return result
+
+    def _run_once(self) -> ExecutionRecord:
+        """Execute the bounded action body; :meth:`run` owns final fault reset."""
         accepted_goal_active = False
         try:
             if not self._wait_for_advancing_positive_sim_time():
@@ -232,6 +357,8 @@ class MissionExecutor:
                     ExitCode.INFRASTRUCTURE_ERROR,
                     'simulation_clock_unavailable',
                 )
+            if self._config.is_phase3:
+                self._prepare_fault_schedule()
             if not self._wait_for_server():
                 return self._finish(
                     ExitCode.INFRASTRUCTURE_ERROR,
@@ -319,6 +446,11 @@ class MissionExecutor:
                 return self._fail_closed_after_acceptance(
                     'client_clock_did_not_reach_accepted_goal_stamp'
                 )
+            if self._config.is_phase3:
+                self._arm_fault_schedule(
+                    goal_response.goal_uuid,
+                    accepted_status_stamp_ns,
+                )
             return self._wait_for_terminal_or_deadline(
                 local_acceptance_observed_ns,
                 local_acceptance_observed_wall_s,
@@ -346,6 +478,220 @@ class MissionExecutor:
             if accepted_goal_active or self._driver.accepted_goal_is_active():
                 return self._fail_closed_after_acceptance(reason)
             return self._finish(ExitCode.INFRASTRUCTURE_ERROR, reason)
+
+    def _prepare_fault_schedule(self) -> None:
+        schedule = self._require_fault_contract()
+        deadline = self._clock.steady_time_s() + min(
+            FAULT_SERVICE_WAIT_WALL_S,
+            self._config.wall_escape_timeout_s,
+        )
+        assert self._fault_driver is not None
+        while self._runtime_ok() and self._clock.steady_time_s() < deadline:
+            self._collect_fault_events()
+            if self._fault_driver.services_are_ready():
+                break
+            self._spin_bounded(deadline)
+        else:
+            raise FaultProtocolError('fault_control_services_unavailable')
+
+        if not self._reset_faults(before_goal=True):
+            raise FaultProtocolError('fault_pre_goal_reset_failed')
+        self._fault_driver.start_preload(schedule)
+        response = self._wait_for_value(
+            self._fault_driver.poll_preload_response,
+            min(FAULT_RESPONSE_TIMEOUT_WALL_S, self._config.wall_escape_timeout_s),
+        )
+        if not isinstance(response, PreloadResponse):
+            raise FaultProtocolError('fault_preload_response_timeout')
+        if (
+            not response.accepted
+            or response.state != 1
+            or response.schedule_hash != schedule.sha256
+            or response.loaded_count != len(schedule.faults)
+            or not _is_positive_uint64(response.generation)
+        ):
+            raise FaultProtocolError('fault_preload_response_mismatch')
+        event = self._wait_for_fault_event(1)
+        if (
+            not event.get('accepted')
+            or bool(event.get('replayed')) != response.replayed
+            or event.get('state_after') != 1
+            or event.get('requested_schedule_hash') != schedule.sha256
+            or event.get('committed_schedule_hash') != schedule.sha256
+            or event.get('requested_fault_count') != len(schedule.faults)
+            or event.get('committed_generation') != response.generation
+            or event.get('committed_fault_count') != len(schedule.faults)
+        ):
+            raise FaultProtocolError('fault_preload_event_mismatch')
+        self._record.fault_schedule_hash = schedule.sha256
+        self._record.fault_generation = response.generation
+        self._record.fault_preload_replayed = response.replayed
+        self._record.fault_protocol_status = 'PREPARED'
+        self._record.event(
+            'fault_schedule_prepared',
+            self._clock,
+            schedule_hash=schedule.sha256,
+            generation=response.generation,
+            loaded_count=response.loaded_count,
+            replayed=response.replayed,
+        )
+
+    def _arm_fault_schedule(self, goal_uuid: str, accepted_stamp_ns: int) -> None:
+        schedule = self._require_fault_contract()
+        generation = self._record.fault_generation
+        if not _is_positive_uint64(generation):
+            raise FaultProtocolError('fault_generation_unavailable')
+        assert self._fault_driver is not None
+        self._fault_driver.start_arm(
+            schedule.sha256,
+            generation,
+            goal_uuid,
+            accepted_stamp_ns,
+        )
+        response = self._wait_for_value(
+            self._fault_driver.poll_arm_response,
+            min(FAULT_RESPONSE_TIMEOUT_WALL_S, self._config.wall_escape_timeout_s),
+        )
+        if not isinstance(response, ArmResponse):
+            raise FaultProtocolError('fault_arm_response_timeout')
+        if (
+            not response.accepted
+            or response.state != 2
+            or response.schedule_hash != schedule.sha256
+            or response.generation != generation
+            or response.goal_uuid != goal_uuid
+            or response.accepted_goal_stamp_ns != accepted_stamp_ns
+            or not _is_positive_time_ns(response.arm_commit_stamp_ns)
+            or response.arm_commit_stamp_ns < accepted_stamp_ns
+        ):
+            raise FaultProtocolError('fault_arm_response_mismatch')
+        if not schedule.faults and response.arm_margin_ns != 0:
+            raise FaultProtocolError('empty_fault_schedule_arm_margin_must_be_zero')
+        if schedule.faults and response.arm_margin_ns < MIN_ARM_MARGIN_NS:
+            raise FaultProtocolError('fault_arm_margin_below_500ms')
+        if schedule.faults:
+            assert schedule.earliest_start_offset_ns is not None
+            activation_stamp_ns = accepted_stamp_ns + schedule.earliest_start_offset_ns
+            expected_margin_ns = activation_stamp_ns - response.arm_commit_stamp_ns
+            if response.arm_margin_ns != expected_margin_ns:
+                raise FaultProtocolError('fault_arm_margin_calculation_mismatch')
+        event = self._wait_for_fault_event(7)
+        if (
+            not event.get('accepted')
+            or bool(event.get('replayed')) != response.replayed
+            or event.get('state_after') != 2
+            or event.get('requested_schedule_hash') != schedule.sha256
+            or event.get('committed_schedule_hash') != schedule.sha256
+            or event.get('requested_generation') != generation
+            or event.get('committed_generation') != generation
+            or event.get('requested_goal_uuid') != goal_uuid
+            or event.get('bound_goal_uuid') != goal_uuid
+            or event.get('requested_t0_ns') != accepted_stamp_ns
+            or event.get('bound_t0_ns') != accepted_stamp_ns
+            or event.get('arm_commit_stamp_ns') != response.arm_commit_stamp_ns
+            or event.get('arm_margin_ns') != response.arm_margin_ns
+            or event.get('actual_stamp_ns') != response.arm_commit_stamp_ns
+            or event.get('header_stamp_ns') != response.arm_commit_stamp_ns
+        ):
+            raise FaultProtocolError('fault_arm_event_mismatch')
+        self._record.fault_arm_replayed = response.replayed
+        self._record.fault_arm_commit_stamp_ns = response.arm_commit_stamp_ns
+        self._record.fault_arm_margin_ns = response.arm_margin_ns
+        self._record.fault_protocol_status = 'ARMED'
+        self._record.event(
+            'fault_schedule_armed',
+            self._clock,
+            schedule_hash=schedule.sha256,
+            generation=generation,
+            goal_uuid=goal_uuid,
+            accepted_goal_stamp_ns=accepted_stamp_ns,
+            arm_commit_stamp_ns=response.arm_commit_stamp_ns,
+            arm_margin_ns=response.arm_margin_ns,
+            replayed=response.replayed,
+        )
+
+    def _reset_faults(self, *, before_goal: bool) -> bool:
+        if self._fault_driver is None:
+            return False
+        self._fault_driver.start_reset()
+        response = self._wait_for_value(
+            self._fault_driver.poll_reset_response,
+            min(FAULT_RESPONSE_TIMEOUT_WALL_S, self._config.wall_escape_timeout_s),
+        )
+        if not isinstance(response, ResetResponse) or not response.success:
+            return False
+        event = self._wait_for_fault_event(3)
+        if not event.get('accepted') or event.get('state_after') != 0:
+            return False
+        if before_goal:
+            self._record.fault_reset_before_goal = True
+            self._record.fault_protocol_status = 'RESET_CONFIRMED'
+        else:
+            self._record.fault_reset_after_goal = True
+            self._record.fault_protocol_status = 'RESET_CONFIRMED_AFTER_GOAL'
+        self._record.event(
+            'fault_reset_confirmed',
+            self._clock,
+            phase='before_goal' if before_goal else 'after_goal',
+        )
+        return True
+
+    def _wait_for_fault_event(self, event_type: int) -> dict[str, Any]:
+        deadline = self._clock.steady_time_s() + min(
+            FAULT_EVENT_TIMEOUT_WALL_S,
+            self._config.wall_escape_timeout_s,
+        )
+        start_index = len(self._record.fault_events)
+        while self._runtime_ok() and self._clock.steady_time_s() < deadline:
+            self._collect_fault_events()
+            for event in self._record.fault_events[start_index:]:
+                if event.get('event_type') == event_type:
+                    return event
+            self._spin_bounded(deadline)
+        self._collect_fault_events()
+        for event in self._record.fault_events[start_index:]:
+            if event.get('event_type') == event_type:
+                return event
+        raise FaultProtocolError(f'fault_event_{event_type}_timeout')
+
+    def _collect_fault_events(self) -> None:
+        if self._fault_driver is None:
+            return
+        for event in self._fault_driver.drain_events():
+            if event.get('schema_version') != 2:
+                raise FaultProtocolError('fault_event_schema_version_invalid')
+            event_type = event.get('event_type')
+            if (
+                not isinstance(event_type, int)
+                or isinstance(event_type, bool)
+                or not 1 <= event_type <= 9
+            ):
+                raise FaultProtocolError('fault_event_type_invalid')
+            sequence = event.get('event_sequence')
+            if not _is_positive_uint64(sequence):
+                raise FaultProtocolError('fault_event_sequence_invalid')
+            if (
+                self._fault_event_sequence is not None
+                and sequence != self._fault_event_sequence + 1
+            ):
+                raise FaultProtocolError('fault_event_sequence_gap')
+            self._fault_event_sequence = sequence
+            if len(self._record.fault_events) >= FAULT_EVENT_TRACE_CAPACITY:
+                self._record.fault_event_overflow = True
+                self._record.fault_event_overflow_count += 1
+                raise FaultProtocolError('fault_event_trace_overflow')
+            self._record.fault_events.append(event)
+        overflow = self._fault_driver.event_overflow_count
+        if overflow:
+            self._record.fault_event_overflow = True
+            self._record.fault_event_overflow_count = overflow
+            raise FaultProtocolError('fault_event_subscriber_overflow')
+
+    def _require_fault_contract(self) -> FaultSchedule:
+        schedule = self._config.fault_schedule
+        if schedule is None or self._fault_driver is None:
+            raise FaultProtocolError('phase3_fault_control_driver_unavailable')
+        return schedule
 
     def _wait_for_server(self) -> bool:
         deadline = self._clock.steady_time_s() + min(
@@ -438,6 +784,7 @@ class MissionExecutor:
 
         while self._runtime_ok():
             self._raise_if_feedback_trace_overflow()
+            self._collect_fault_events()
             observed_status_stamp_ns = self._driver.poll_accepted_status_stamp_ns()
             if observed_status_stamp_ns != accepted_status_stamp_ns:
                 raise ActionProtocolError(
@@ -588,6 +935,9 @@ class MissionExecutor:
             raise FeedbackTraceOverflowError('feedback_trace_overflow')
 
     def _finish(self, exit_code: ExitCode, reason: str) -> ExecutionRecord:
+        if self._record.event_trace_overflow:
+            exit_code = ExitCode.INFRASTRUCTURE_ERROR
+            reason = 'mission_event_trace_overflow'
         self._record.exit_code = exit_code
         self._record.reason = reason
         return self._record
@@ -613,3 +963,12 @@ def _is_positive_time_ns(value: object) -> bool:
 def _is_nonnegative_time_ns(value: object) -> bool:
     """Return whether *value* is a non-negative integer ROS timestamp."""
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_positive_uint64(value: object) -> bool:
+    """Return whether *value* is a positive uint64 wire value."""
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 < value <= 18_446_744_073_709_551_615
+    )

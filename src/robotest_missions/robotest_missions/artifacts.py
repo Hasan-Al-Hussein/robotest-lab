@@ -30,9 +30,11 @@ from robotest_missions.execution import (
     ACTION_SERVER_WAIT_WALL_S,
     CANCEL_ACK_TIMEOUT_WALL_S,
     CANCEL_RESULT_TIMEOUT_WALL_S,
+    FAULT_EVENT_TRACE_CAPACITY,
     FEEDBACK_TRACE_CAPACITY,
     GOAL_RESPONSE_TIMEOUT_WALL_S,
     GOAL_STATUS_NAMES,
+    MISSION_EVENT_TRACE_CAPACITY,
     SIM_TIME_READY_WAIT_WALL_S,
     ExecutionRecord,
     ExitCode,
@@ -42,6 +44,9 @@ from robotest_missions.models import MissionDocument
 
 ACTION_TYPE = 'nav2_msgs/action/FollowWaypoints'
 SCENARIO1_NOT_EVALUATED = 'NOT_EVALUATED_PHASE2_MISSION_ACTION_ONLY'
+PHASE3_BENCHMARK_NOT_EVALUATED = 'NOT_EVALUATED_COMPONENT_ARTIFACT_ONLY'
+MAX_JSON_BYTES = 32 * 1024 * 1024
+MAX_CSV_BYTES = 1024 * 1024
 CSV_FIELDS = (
     'run_id',
     'created_utc',
@@ -52,6 +57,11 @@ CSV_FIELDS = (
     'simulator_seed',
     'fault_schedule_hash',
     'fault_seed',
+    'scenario_id',
+    'scenario_controller_seed',
+    'candidate_id',
+    'repetition_index',
+    'suite_index',
     'action_name',
     'resolved_action_name',
     'waypoint_count',
@@ -67,6 +77,21 @@ CSV_FIELDS = (
     'feedback_trace_capacity',
     'feedback_trace_overflow',
     'feedback_trace_overflow_count',
+    'mission_event_count',
+    'mission_event_trace_capacity',
+    'mission_event_trace_overflow',
+    'fault_generation',
+    'fault_preload_replayed',
+    'fault_arm_replayed',
+    'fault_arm_commit_stamp_ns',
+    'fault_arm_margin_ns',
+    'fault_reset_before_goal',
+    'fault_reset_after_goal',
+    'fault_event_count',
+    'fault_event_trace_capacity',
+    'fault_event_overflow',
+    'fault_event_overflow_count',
+    'fault_protocol_status',
     'completed_waypoint_count',
     'missed_waypoint_count',
     'goal_status_code',
@@ -122,8 +147,9 @@ def build_result(
     *,
     run_id: str,
     created_utc: str,
+    trial_identity: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
-    """Build the canonical Phase 2 mission-action result."""
+    """Build the canonical bounded mission/action/fault component result."""
     config = document.config
     terminal = record.terminal_result
     status_code, status_name = _goal_status(record)
@@ -146,6 +172,29 @@ def build_result(
         raise ArtifactError(
             'successful execution requires ordered timestamps and a bounded feedback trace'
         )
+    if config.is_phase3:
+        if trial_identity is None:
+            raise ArtifactError('Phase 3 result requires exact trial identity')
+        assert config.fault_schedule is not None
+        if record.exit_code == ExitCode.SUCCESS and (
+            not record.fault_reset_before_goal
+            or not record.fault_reset_after_goal
+            or record.fault_protocol_status != 'RESET_CONFIRMED_AFTER_GOAL'
+            or record.fault_schedule_hash != config.fault_schedule.sha256
+            or record.fault_generation is None
+            or record.fault_generation <= 0
+            or not isinstance(record.fault_preload_replayed, bool)
+            or not isinstance(record.fault_arm_replayed, bool)
+            or record.fault_arm_commit_stamp_ns is None
+            or record.fault_arm_margin_ns is None
+            or record.fault_event_overflow
+            or record.event_trace_overflow
+        ):
+            raise ArtifactError(
+                'successful Phase 3 execution requires complete bounded fault proof'
+            )
+    elif trial_identity is not None:
+        raise ArtifactError('Phase 2 result cannot contain Phase 3 trial identity')
     completion_time_sim_s = None
     if record.accepted_goal_stamp_ns is not None and record.terminal_action_stamp_ns is not None:
         elapsed_ns = record.terminal_action_stamp_ns - record.accepted_goal_stamp_ns
@@ -162,12 +211,17 @@ def build_result(
 
     missed = [] if terminal is None else [item.as_dict() for item in terminal.missed_waypoints]
     succeeded = record.exit_code == ExitCode.SUCCESS
+    scenario_status = (
+        PHASE3_BENCHMARK_NOT_EVALUATED if config.is_phase3 else SCENARIO1_NOT_EVALUATED
+    )
     result = {
         'identity': {
             'action_name': record.action_name,
             'action_type': ACTION_TYPE,
             'created_utc': created_utc,
-            'fault_schedule_hash': None,
+            'fault_schedule_hash': (
+                None if config.fault_schedule is None else config.fault_schedule.sha256
+            ),
             'fault_seed': config.fault_seed,
             'mission_file': str(document.source_path),
             'mission_name': config.mission_name,
@@ -175,6 +229,13 @@ def build_result(
             'mission_sha256': document.source_sha256,
             'resolved_action_name': record.resolved_action_name,
             'run_id': run_id,
+            'candidate_id': None if trial_identity is None else trial_identity['candidate_id'],
+            'repetition_index': (
+                None if trial_identity is None else trial_identity['repetition_index']
+            ),
+            'scenario_controller_seed': config.scenario_controller_seed,
+            'scenario_id': config.scenario_id,
+            'suite_index': None if trial_identity is None else trial_identity['suite_index'],
             'schema_sha256': document.schema_sha256,
             'simulator_seed': config.simulator_seed,
             'verification_level': 'L3 bounded local simulation action observation',
@@ -187,10 +248,12 @@ def build_result(
             'cancel_result_timeout_wall_s': CANCEL_RESULT_TIMEOUT_WALL_S,
             'expected_outcome': config.expected_outcome,
             'feedback_trace_capacity': FEEDBACK_TRACE_CAPACITY,
+            'fault_event_trace_capacity': FAULT_EVENT_TRACE_CAPACITY,
             'frame_id': config.frame_id,
             'goal_index': 0,
             'goal_response_timeout_wall_s': GOAL_RESPONSE_TIMEOUT_WALL_S,
             'mission_timeout_sim_s': config.mission_timeout_sim_s,
+            'mission_event_trace_capacity': MISSION_EVENT_TRACE_CAPACITY,
             'number_of_loops': 0,
             'retries': config.retries,
             'sim_time_ready_wait_wall_s': SIM_TIME_READY_WAIT_WALL_S,
@@ -198,6 +261,7 @@ def build_result(
             'wall_escape_timeout_s': config.wall_escape_timeout_s,
             'waypoint_count': len(config.waypoints),
             'waypoints': [waypoint.as_dict() for waypoint in config.waypoints],
+            'scenario_contract': config.scenario_contract,
         },
         'measurements': {
             'accepted_goal_stamp': _stamp(record.accepted_goal_stamp_ns),
@@ -234,13 +298,18 @@ def build_result(
             'cancel_acknowledged': record.cancel_acknowledged,
             'cancellation_requested': record.cancellation_requested,
             'deadline_kind': record.deadline_kind,
-            'fault_schedule_active': False,
+            'event_trace_overflow': record.event_trace_overflow,
+            'event_trace_overflow_count': record.event_trace_overflow_count,
+            'fault_event_overflow': record.fault_event_overflow,
+            'fault_event_overflow_count': record.fault_event_overflow_count,
+            'fault_protocol_status': record.fault_protocol_status,
+            'fault_schedule_active': bool(config.fault_schedule and config.fault_schedule.faults),
             'goal_accepted': record.accepted_goal_uuid is not None,
             'feedback_trace_overflow': record.feedback_trace_overflow,
             'feedback_trace_overflow_count': record.feedback_trace_overflow_count,
             'invalid_feedback_count': record.invalid_feedback_count,
             'metrics_scope': 'mission_action_only',
-            'scenario1_metrics_status': SCENARIO1_NOT_EVALUATED,
+            'scenario1_metrics_status': scenario_status,
             'terminal_result_observed': terminal is not None,
         },
         'verdict': {
@@ -249,9 +318,35 @@ def build_result(
             'mission_status': status_name or record.reason.upper(),
             'phase2_action_integration_status': 'PASS' if succeeded else 'FAIL',
             'reason': record.reason,
-            'scenario1_acceptance_status': SCENARIO1_NOT_EVALUATED,
+            'scenario1_acceptance_status': scenario_status,
         },
     }
+    if config.is_phase3:
+        assert config.fault_schedule is not None
+        result['fault'] = {
+            'schedule': {
+                'canonical_json': config.fault_schedule.canonical_json,
+                'fault_count': len(config.fault_schedule.faults),
+                'faults': [fault.as_dict() for fault in config.fault_schedule.faults],
+                'schema_version': config.fault_schedule.schema_version,
+                'sha256': config.fault_schedule.sha256,
+            },
+            'control': {
+                'arm_commit_stamp_ns': record.fault_arm_commit_stamp_ns,
+                'arm_margin_ns': record.fault_arm_margin_ns,
+                'arm_replayed': record.fault_arm_replayed,
+                'event_count': len(record.fault_events),
+                'event_trace_capacity': FAULT_EVENT_TRACE_CAPACITY,
+                'event_trace_overflow': record.fault_event_overflow,
+                'event_trace_overflow_count': record.fault_event_overflow_count,
+                'generation': record.fault_generation,
+                'preload_replayed': record.fault_preload_replayed,
+                'protocol_status': record.fault_protocol_status,
+                'reset_after_goal': record.fault_reset_after_goal,
+                'reset_before_goal': record.fault_reset_before_goal,
+            },
+            'events': record.fault_events,
+        }
     json.dumps(result, allow_nan=False, sort_keys=True)
     return result
 
@@ -281,6 +376,11 @@ def flatten_result(result: Mapping[str, Any]) -> dict[str, str]:
         'simulator_seed': identity['simulator_seed'],
         'fault_schedule_hash': identity['fault_schedule_hash'],
         'fault_seed': identity['fault_seed'],
+        'scenario_id': identity['scenario_id'],
+        'scenario_controller_seed': identity['scenario_controller_seed'],
+        'candidate_id': identity['candidate_id'],
+        'repetition_index': identity['repetition_index'],
+        'suite_index': identity['suite_index'],
         'action_name': identity['action_name'],
         'resolved_action_name': identity['resolved_action_name'],
         'waypoint_count': targets['waypoint_count'],
@@ -296,6 +396,29 @@ def flatten_result(result: Mapping[str, Any]) -> dict[str, str]:
         'feedback_trace_capacity': targets['feedback_trace_capacity'],
         'feedback_trace_overflow': quality['feedback_trace_overflow'],
         'feedback_trace_overflow_count': quality['feedback_trace_overflow_count'],
+        'mission_event_count': len(result['events']),
+        'mission_event_trace_capacity': targets['mission_event_trace_capacity'],
+        'mission_event_trace_overflow': quality['event_trace_overflow'],
+        'fault_generation': result.get('fault', {}).get('control', {}).get('generation'),
+        'fault_preload_replayed': result.get('fault', {})
+        .get('control', {})
+        .get('preload_replayed'),
+        'fault_arm_replayed': result.get('fault', {}).get('control', {}).get('arm_replayed'),
+        'fault_arm_commit_stamp_ns': result.get('fault', {})
+        .get('control', {})
+        .get('arm_commit_stamp_ns'),
+        'fault_arm_margin_ns': result.get('fault', {}).get('control', {}).get('arm_margin_ns'),
+        'fault_reset_before_goal': result.get('fault', {})
+        .get('control', {})
+        .get('reset_before_goal'),
+        'fault_reset_after_goal': result.get('fault', {})
+        .get('control', {})
+        .get('reset_after_goal'),
+        'fault_event_count': result.get('fault', {}).get('control', {}).get('event_count'),
+        'fault_event_trace_capacity': targets['fault_event_trace_capacity'],
+        'fault_event_overflow': quality['fault_event_overflow'],
+        'fault_event_overflow_count': quality['fault_event_overflow_count'],
+        'fault_protocol_status': quality['fault_protocol_status'],
         'completed_waypoint_count': measurements['completed_waypoint_count'],
         'missed_waypoint_count': measurements['missed_waypoint_count'],
         'goal_status_code': measurements['goal_status_code'],
@@ -406,7 +529,12 @@ def write_result_artifacts(
         )
         + '\n'
     )
+    csv_text = _csv_text(row)
+    if len(json_text.encode('utf-8')) > MAX_JSON_BYTES:
+        raise ArtifactError(f'canonical JSON exceeds {MAX_JSON_BYTES} bytes')
+    if len(csv_text.encode('utf-8')) > MAX_CSV_BYTES:
+        raise ArtifactError(f'canonical CSV exceeds {MAX_CSV_BYTES} bytes')
     _atomic_text_write(json_target, json_text)
-    _atomic_text_write(csv_target, _csv_text(row))
+    _atomic_text_write(csv_target, csv_text)
     reconcile_artifacts(json_target, csv_target)
     return json_target, csv_target

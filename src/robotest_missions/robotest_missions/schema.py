@@ -26,6 +26,7 @@ import yaml
 from jsonschema import Draft202012Validator
 from yaml.constructor import ConstructorError
 
+from robotest_missions.fault_schedule import FaultScheduleError, build_fault_schedule
 from robotest_missions.models import MissionConfig, MissionDocument, PlanarPose
 
 MAX_MISSION_BYTES = 1024 * 1024
@@ -125,6 +126,21 @@ def _pose(value: dict[str, Any]) -> PlanarPose:
     return PlanarPose(x=float(value['x']), y=float(value['y']), yaw=float(value['yaw']))
 
 
+def _most_specific_error(error: Any) -> Any:
+    """Choose a useful leaf from a oneOf error without weakening validation."""
+    if not error.context:
+        return error
+    leaves = [_most_specific_error(child) for child in error.context]
+    return max(
+        leaves,
+        key=lambda child: (
+            len(child.absolute_path),
+            len(child.absolute_schema_path),
+            -len(child.message),
+        ),
+    )
+
+
 def load_mission(path: str | Path) -> MissionDocument:
     """Load one regular UTF-8 YAML file and validate it without coercion."""
     try:
@@ -151,12 +167,26 @@ def load_mission(path: str | Path) -> MissionDocument:
 
     _reject_non_finite(payload)
     schema, schema_sha256 = _load_schema()
+    validator = Draft202012Validator(schema)
+    if isinstance(payload, dict) and 'scenario_id' in payload:
+        scenario_id = payload.get('scenario_id')
+        valid_scenario_id = (
+            isinstance(scenario_id, int)
+            and not isinstance(scenario_id, bool)
+            and scenario_id in (1, 2, 3, 4, 5)
+        )
+        branch_name = f'phase3_s{scenario_id}' if valid_scenario_id else None
+        validation_schema = (
+            {'$ref': f'#/$defs/{branch_name}'} if branch_name is not None else schema
+        )
+    else:
+        validation_schema = {'$ref': '#/$defs/phase2'}
     errors = sorted(
-        Draft202012Validator(schema).iter_errors(payload),
+        validator.evolve(schema=validation_schema).iter_errors(payload),
         key=lambda error: tuple(str(part) for part in error.absolute_path),
     )
     if errors:
-        first = errors[0]
+        first = _most_specific_error(errors[0])
         raise MissionValidationError(f'{_format_path(first.absolute_path)}: {first.message}')
 
     try:
@@ -164,9 +194,27 @@ def load_mission(path: str | Path) -> MissionDocument:
     except (TypeError, ValueError) as exc:
         raise MissionValidationError(f'mission is not canonical JSON-compatible: {exc}') from exc
 
+    scenario_id = payload.get('scenario_id')
+    schedule = None
+    scenario_contract = None
+    if scenario_id is not None:
+        raw_faults = (
+            [payload['fault']] if 'fault' in payload else payload['fault_schedule']['faults']
+        )
+        try:
+            schedule = build_fault_schedule(
+                raw_faults,
+                claimed_sha256=payload['fault_schedule_sha256'],
+            )
+        except FaultScheduleError as exc:
+            raise MissionValidationError(f'$.fault_schedule: {exc}') from exc
+        scenario_contract = json.loads(
+            json.dumps(payload, allow_nan=False, separators=(',', ':'), sort_keys=True)
+        )
+
     config = MissionConfig(
         schema_version=payload['schema_version'],
-        mission_name=payload['mission_name'],
+        mission_name=payload.get('mission_name', payload.get('scenario_name')),
         mission_seed=payload['mission_seed'],
         simulator_seed=payload['simulator_seed'],
         frame_id=payload['frame_id'],
@@ -175,10 +223,13 @@ def load_mission(path: str | Path) -> MissionDocument:
         mission_timeout_sim_s=float(payload['mission_timeout_sim_s']),
         wall_escape_timeout_s=float(payload['wall_escape_timeout_s']),
         allowed_collision_count=payload['allowed_collision_count'],
-        fault_schedule=None,
-        fault_seed=None,
+        fault_schedule=schedule,
+        fault_seed=payload['fault_seed'],
         expected_outcome=payload['expected_outcome'],
         retries=payload['retries'],
+        scenario_id=scenario_id,
+        scenario_controller_seed=payload.get('scenario_controller_seed'),
+        scenario_contract=scenario_contract,
     )
     return MissionDocument(
         config=config,
