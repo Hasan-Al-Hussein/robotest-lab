@@ -62,7 +62,8 @@ def test_goal_observer_arm_ack_is_validated_before_mission_launch() -> None:
         )
 
     source = (TEST_DIR / 'phase3_benchmark_runner.py').read_text(encoding='utf-8')
-    trial_source = source[source.index('    def _run_trial(') :]
+    trial_start = source.index('    def _run_trial(')
+    trial_source = source[trial_start:]
     arm_request = trial_source.index('atomic_write_bytes(observer_arm,')
     arm_ack = trial_source.index("stage='goal_observer_armed'")
     mission_launch = trial_source.index("'mission_runner',")
