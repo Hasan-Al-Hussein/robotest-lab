@@ -509,7 +509,53 @@ TEST(ContactStreamPolicy, SlowJoinWarmupIsSuppressedAndOneMessageBatchIsAccepted
   EXPECT_FALSE(completed.fatal);
 }
 
-TEST(ContactStreamPolicy, PostSeedClockWatchdogAllowsPauseAndFailsOnSilence)
+TEST(ContactStreamPolicy, ClockCanDispatchAheadOfTimelyCausalHeartbeat)
+{
+  ContactStreamPolicy policy;
+  EXPECT_FALSE(observe(policy, 998000000LL, {{kLeftWheel, kGround}}).fatal);
+  EXPECT_FALSE(observe(policy, 1000000000LL, {{kChassis, kWall}}).fatal);
+  ASSERT_TRUE(observe(policy, 1002000000LL, {{kChassis, kWall}}).output.has_value());
+
+  // /clock is independently scheduled and may overtake raw callbacks that are
+  // already queued. Pending/raw source lag is only 218000001 ns here, so the
+  // public callback comparison must not preempt the causal heartbeat.
+  EXPECT_FALSE(policy.observe_clock(1220000001LL).fatal);
+
+  ContactGateDecision heartbeat;
+  for (std::int64_t stamp = 1004000000LL; stamp <= 1202000000LL; stamp += 2000000LL) {
+    auto decision = observe(policy, stamp, {{kChassis, kWall}});
+    if (decision.output.has_value()) {
+      heartbeat = std::move(decision);
+    }
+  }
+  ASSERT_TRUE(heartbeat.output.has_value());
+  EXPECT_EQ(heartbeat.reason, ContactForwardReason::kSteadyStateHeartbeat);
+  EXPECT_EQ(heartbeat.output->header.stamp.sec, 1);
+  EXPECT_EQ(heartbeat.output->header.stamp.nanosec, 200000000U);
+}
+
+TEST(ContactStreamPolicy, IrregularRawProgressKeepsCausalHeartbeatWithinGap)
+{
+  ContactStreamPolicy policy;
+  EXPECT_FALSE(observe(policy, 998000000LL, {{kLeftWheel, kGround}}).fatal);
+  EXPECT_FALSE(observe(policy, 1000000000LL, {{kChassis, kWall}}).fatal);
+  ASSERT_TRUE(observe(policy, 1002000000LL, {{kChassis, kWall}}).output.has_value());
+
+  for (std::int64_t stamp = 1020000000LL; stamp <= 1180000000LL; stamp += 20000000LL) {
+    const auto decision = observe(policy, stamp, {{kChassis, kWall}});
+    EXPECT_FALSE(decision.fatal);
+    EXPECT_FALSE(decision.output.has_value());
+  }
+  EXPECT_FALSE(observe(policy, 1199999999LL, {{kChassis, kWall}}).output.has_value());
+  EXPECT_FALSE(observe(policy, 1219999999LL, {{kChassis, kWall}}).output.has_value());
+  const auto heartbeat = observe(policy, 1239999999LL, {{kChassis, kWall}});
+  ASSERT_TRUE(heartbeat.output.has_value());
+  EXPECT_EQ(heartbeat.reason, ContactForwardReason::kSteadyStateHeartbeat);
+  EXPECT_EQ(heartbeat.output->header.stamp.sec, 1);
+  EXPECT_EQ(heartbeat.output->header.stamp.nanosec, 219999999U);
+}
+
+TEST(ContactStreamPolicy, RawClockWatchdogAllowsPauseAndFailsOnSilence)
 {
   ContactStreamPolicy policy;
   EXPECT_FALSE(observe(policy, 998000000LL, {{kLeftWheel, kGround}}).fatal);
@@ -517,10 +563,11 @@ TEST(ContactStreamPolicy, PostSeedClockWatchdogAllowsPauseAndFailsOnSilence)
   ASSERT_TRUE(observe(policy, 1002000000LL, {{kChassis, kWall}}).output.has_value());
   EXPECT_FALSE(policy.observe_clock(1005000000LL).fatal);
   EXPECT_FALSE(policy.observe_clock(1005000000LL).fatal);
-  EXPECT_FALSE(policy.observe_clock(1220000000LL).fatal);
-  const auto silence = policy.observe_clock(1220000001LL);
+  EXPECT_FALSE(policy.observe_clock(1222000000LL).fatal);
+  const auto silence = policy.observe_clock(1222000001LL);
   EXPECT_TRUE(silence.fatal);
   EXPECT_EQ(silence.reason, ContactForwardReason::kFatalStructuralInput);
+  EXPECT_NE(silence.detail.find("pending"), std::string::npos);
 }
 
 TEST(ContactStreamPolicy, PendingSemanticFailureCannotHideBehindRawSilence)

@@ -54,8 +54,11 @@ Unless a scenario below overrides a value:
 - the contact gate's active-pair expiry is **0.25 simulation seconds**, with
   release proven only by a completed authoritative snapshot whose stamp is
   strictly greater than the pair's last-seen stamp plus that gap;
-- public contact snapshot source gaps and callback `/clock` skew are at most
-  **0.22 simulation seconds** throughout the accepted interval;
+- public contact snapshot source gaps and consumer callback-time `/clock` skew
+  are each at most **0.22 simulation seconds** throughout the accepted
+  interval; the gate measures source cadence from causally ordered finalized
+  raw stamps and separately detects pending/raw silence, while evidence
+  consumers measure callback skew without treating it as DDS transport age;
 - terminal drain is an actually retained, collector-acknowledged public
   snapshot `q`, with `q > T_terminal + 0.25 s`; the target boundary alone is
   not completion evidence;

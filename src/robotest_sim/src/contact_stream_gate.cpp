@@ -362,6 +362,20 @@ ContactGateDecision ContactStreamPolicy::finalize_pending()
     return decision;
   }
 
+  const auto structural_fatal = [&decision](const std::string & detail) {
+      decision.fatal = true;
+      decision.reason = ContactForwardReason::kFatalStructuralInput;
+      decision.detail = detail;
+      return decision;
+    };
+  if (last_forward_stamp_ns_.has_value() &&
+    *completed_stamp - *last_forward_stamp_ns_ > kMaxPublicSnapshotGapNs)
+  {
+    return structural_fatal(
+      "completed raw contact stream advanced more than 220 ms beyond the last "
+      "public snapshot");
+  }
+
   std::set<ContactPair> expired_pairs;
   std::size_t projected_pair_count = active_pairs_.size();
   std::size_t projected_record_count = 0U;
@@ -396,12 +410,6 @@ ContactGateDecision ContactStreamPolicy::finalize_pending()
     projected_string_bytes += entry.second.string_bytes + pair_key_string_bytes(entry.first);
   }
 
-  const auto structural_fatal = [&decision](const std::string & detail) {
-      decision.fatal = true;
-      decision.reason = ContactForwardReason::kFatalStructuralInput;
-      decision.detail = detail;
-      return decision;
-    };
   if (projected_pair_count > kMaxActiveContactPairs) {
     return structural_fatal("active contact state exceeds the 16-pair bound");
   }
@@ -450,15 +458,6 @@ ContactGateDecision ContactStreamPolicy::finalize_pending()
       decision.detail = "public contact snapshot must contain between one and 16 records";
       return decision;
     }
-    if (last_forward_stamp_ns_.has_value() &&
-      *completed_stamp - *last_forward_stamp_ns_ > kMaxPublicSnapshotGapNs)
-    {
-      decision.output.reset();
-      decision.fatal = true;
-      decision.reason = ContactForwardReason::kFatalStructuralInput;
-      decision.detail = "public contact snapshot gap exceeded 220 ms";
-      return decision;
-    }
     last_forward_stamp_ns_ = *completed_stamp;
   }
   return decision;
@@ -483,7 +482,7 @@ ContactGateDecision ContactStreamPolicy::observe_clock(const std::int64_t clock_
   if (pending_batch_.has_value()) {
     const auto pending_stamp = stamp_ns(pending_batch_->header);
     if (!pending_stamp.has_value() ||
-      clock_stamp_ns - *pending_stamp > kMaxPublicSnapshotClockLagNs)
+      clock_stamp_ns - *pending_stamp > kMaxPendingBatchClockLagNs)
     {
       if (pending_batch_->semantic_fatal) {
         return fatal("pending semantic contact failure did not reach a closing raw stamp");
@@ -492,18 +491,18 @@ ContactGateDecision ContactStreamPolicy::observe_clock(const std::int64_t clock_
     }
   }
   if (last_raw_stamp_ns_.has_value() &&
-    clock_stamp_ns - *last_raw_stamp_ns_ > kMaxPublicSnapshotClockLagNs)
+    clock_stamp_ns - *last_raw_stamp_ns_ > kMaxRawClockLagNs)
   {
     return fatal("raw contact stream is more than 220 ms behind simulation clock");
   }
   if (!synchronized_) {
     return decision;
   }
-  if (last_forward_stamp_ns_.has_value() &&
-    clock_stamp_ns - *last_forward_stamp_ns_ > kMaxPublicSnapshotClockLagNs)
-  {
-    return fatal("public contact snapshot stream is more than 220 ms behind simulation clock");
-  }
+  // Do not compare /clock with the last public snapshot here. The clock and
+  // private raw subscriptions have no causal callback order, so /clock can run
+  // just before a queued raw callback closes a timely heartbeat. The finalized
+  // raw-stamp invariant in finalize_pending() owns public source cadence, while
+  // the pending/raw checks above own source silence.
   return decision;
 }
 

@@ -23,7 +23,9 @@ inline constexpr std::int64_t kContactHeartbeatPeriodNs = 200000000;
 inline constexpr std::int64_t kContactReleaseGapNs = 250000000;
 inline constexpr std::int64_t kMaxRawStampAdvanceNs = 20000000;
 inline constexpr std::int64_t kMaxPublicSnapshotGapNs = 220000000;
+inline constexpr std::int64_t kMaxPendingBatchClockLagNs = 220000000;
 inline constexpr std::int64_t kMaxPublicSnapshotClockLagNs = 220000000;
+inline constexpr std::int64_t kMaxRawClockLagNs = 220000000;
 inline constexpr std::size_t kRawContactQosDepth = 64U;
 inline constexpr std::size_t kPublicContactQosDepth = 10U;
 inline constexpr std::size_t kMaxActiveContactPairs = 16U;
@@ -38,6 +40,10 @@ inline constexpr std::size_t kMaxFrameIdBytes = 256U;
 inline constexpr std::size_t kMaxContactStringBytes = 8192U;
 inline constexpr std::size_t kMaxMessageStringBytes = 65536U;
 inline constexpr std::size_t kMaxActiveStringBytes = 65536U;
+
+static_assert(
+  kContactHeartbeatPeriodNs + kMaxRawStampAdvanceNs <= kMaxPublicSnapshotGapNs,
+  "heartbeat period plus one raw-stamp advance must fit the public snapshot gap");
 
 enum class ContactForwardReason
 {
