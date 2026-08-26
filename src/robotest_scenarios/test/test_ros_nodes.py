@@ -23,6 +23,7 @@ import rclpy
 from action_msgs.msg import GoalStatus, GoalStatusArray
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
+from robotest_scenarios.constants import ACTION_STATUS_TOPIC
 from robotest_scenarios.contact_control_driver import ContactControlApp, ContactControlNode
 from robotest_scenarios.contact_evidence import load_coverage_manifest
 from robotest_scenarios.errors import InfrastructureError, ProtocolError, ScenarioFailureError
@@ -70,11 +71,12 @@ def test_scenario_controller_binds_only_one_post_ready_uuid() -> None:
     node = ScenarioControllerNode(document)
     try:
         node._on_clock(_clock(1_000_000_000))
-        node._on_status(GoalStatusArray())
+        assert not node.status_message_seen
         node.mark_ready()
         first = uuid.UUID('00000000-0000-0000-0000-000000000001').bytes
         second = uuid.UUID('00000000-0000-0000-0000-000000000002').bytes
         node._on_status(_status(first, 1_100_000_000, GoalStatus.STATUS_ACCEPTED))
+        assert node.status_message_seen
         assert node.bound_uuid == first
         assert node.accepted_goal_stamp_ns == 1_100_000_000
         with pytest.raises(ProtocolError, match='more than one'):
@@ -90,7 +92,6 @@ def test_scenario_controller_rejects_post_terminal_status_regression() -> None:
     node = ScenarioControllerNode(document)
     try:
         node._on_clock(_clock(1_000_000_000))
-        node._on_status(GoalStatusArray())
         node.mark_ready()
         goal_uuid = uuid.UUID('00000000-0000-0000-0000-000000000001').bytes
         node._on_status(_status(goal_uuid, 1_100_000_000, GoalStatus.STATUS_ACCEPTED))
@@ -101,6 +102,43 @@ def test_scenario_controller_rejects_post_terminal_status_regression() -> None:
     finally:
         node.destroy_node()
         rclpy.try_shutdown()
+
+
+def test_scenario_controller_rejects_observed_active_goal_before_ready() -> None:
+    _init_ros()
+    document = load_scenario(str(REPOSITORY / 'scenarios' / 'phase3_s1_baseline.yaml'))
+    node = ScenarioControllerNode(document)
+    try:
+        node._on_clock(_clock(1_000_000_000))
+        goal_uuid = uuid.UUID('00000000-0000-0000-0000-000000000001').bytes
+        node._on_status(_status(goal_uuid, 900_000_000, GoalStatus.STATUS_EXECUTING))
+        with pytest.raises(InfrastructureError, match='active before readiness'):
+            node.mark_ready()
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_scenario_ready_prerequisites_require_endpoint_not_idle_status_message() -> None:
+    ready_client = SimpleNamespace(service_is_ready=lambda: True)
+    publisher_counts = {ACTION_STATUS_TOPIC: 1}
+    node = SimpleNamespace(
+        cancel_client=ready_client,
+        clock_seen=True,
+        count_publishers=lambda topic: publisher_counts.get(topic, 1),
+        current_sim_stamp_ns=1_000_000_000,
+        delete_client=ready_client,
+        set_pose_client=ready_client,
+        spawn_client=ready_client,
+        status_message_seen=False,
+    )
+    app = object.__new__(ScenarioControllerApp)
+    app.document = SimpleNamespace(has_actor=False)
+    app.node = node
+
+    assert app._ready_prerequisites()
+    publisher_counts[ACTION_STATUS_TOPIC] = 0
+    assert not app._ready_prerequisites()
 
 
 def test_contact_node_stops_on_exact_manifest_pair() -> None:

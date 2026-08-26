@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 import shutil
 import sys
+from types import SimpleNamespace
 
 from jsonschema import Draft202012Validator
 import pytest
@@ -116,6 +117,60 @@ def _workspace(tmp_path: Path) -> Path:
     for scenario_id, scenario_name, relative in orchestration.SCENARIOS:
         _scenario(tmp_path / relative, scenario_id, scenario_name)
     return tmp_path
+
+
+def test_goal_observer_readiness_requires_endpoint_not_idle_status_message() -> None:
+    publisher_count = 1
+    node = SimpleNamespace(
+        clock_ns=1,
+        count_publishers=lambda _topic: publisher_count,
+        status_message_count=0,
+    )
+
+    assert runtime_observer._goal_observer_ready(node)
+    node.clock_ns = 0
+    assert not runtime_observer._goal_observer_ready(node)
+    node.clock_ns = 1
+    publisher_count = 0
+    assert not runtime_observer._goal_observer_ready(node)
+
+
+def test_goal_observer_binds_first_executing_status_after_empty_prearm_window() -> None:
+    observer = runtime_observer.GoalObserver()
+
+    observer.arm()
+    observer.observe(uuid='new', status=2, stamp_ns=2, clock_ns=3)
+
+    assert observer.prearm_uuids == set()
+    assert observer.bound_uuid == 'new'
+    assert observer.bound_t0_ns == 2
+    observer.observe(uuid='new', status=4, stamp_ns=2, clock_ns=4)
+    with pytest.raises(orchestration.EvidenceError, match='UUID/T0 changed'):
+        observer.observe(uuid='new', status=4, stamp_ns=3, clock_ns=5)
+
+
+def test_goal_observer_rejects_terminal_first_status() -> None:
+    observer = runtime_observer.GoalObserver()
+
+    observer.arm()
+    with pytest.raises(orchestration.EvidenceError, match='first observed only after'):
+        observer.observe(uuid='new', status=4, stamp_ns=2, clock_ns=3)
+
+    invalid = runtime_observer.GoalObserver()
+    invalid.arm()
+    with pytest.raises(orchestration.EvidenceError, match='invalid action status'):
+        invalid.observe(uuid='new', status=0, stamp_ns=2, clock_ns=3)
+
+
+def test_goal_observer_accepts_only_exact_bounded_arm_request(tmp_path: Path) -> None:
+    arm_path = tmp_path / 'goal-observer.arm'
+
+    assert not runtime_observer._arm_requested(arm_path)
+    arm_path.write_bytes(runtime_observer.ARM_REQUEST)
+    assert runtime_observer._arm_requested(arm_path)
+    arm_path.write_bytes(b'wrong\n')
+    with pytest.raises(orchestration.EvidenceError, match='payload is invalid'):
+        runtime_observer._arm_requested(arm_path)
 
 
 @pytest.mark.parametrize(

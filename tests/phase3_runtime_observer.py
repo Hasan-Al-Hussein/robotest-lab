@@ -6,7 +6,7 @@
 """Bounded ROS observers needed by the Phase 3 orchestration lane.
 
 The goal observer is armed only after the scenario controller is ready.  It
-binds the first newly ACCEPTED FollowWaypoints UUID, preserves the immutable
+binds the first newly active FollowWaypoints UUID, preserves the immutable
 action-status goal stamp as T0, and optionally emits the absolute Scenario-4
 lifecycle schedule.  The contact-drain observer binds the first authoritative
 public snapshot strictly beyond terminal + 0.25 s to a caught-up /clock sample.
@@ -32,6 +32,12 @@ from phase3_orchestration import (
 
 MAX_STATUS_SAMPLES = 4096
 STATUS_ACCEPTED = 1
+STATUS_EXECUTING = 2
+STATUS_CANCELING = 3
+ACTIVE_STATUSES = frozenset({STATUS_ACCEPTED, STATUS_EXECUTING, STATUS_CANCELING})
+TERMINAL_STATUSES = frozenset({4, 5, 6})
+VALID_STATUSES = ACTIVE_STATUSES | TERMINAL_STATUSES
+ARM_REQUEST = b'arm-next-new-goal\n'
 CONTACT_TOPIC = '/robotest/validation/contacts'
 CONTACT_GATE_NODE = '/robotest/contact_stream_gate'
 CONTACT_RELEASE_GAP_NS = 250_000_000
@@ -88,6 +94,22 @@ def _valid_scoped_collision_name(value: Any) -> bool:
     return len(segments) >= 3 and all(segments)
 
 
+def _goal_observer_ready(node: Any) -> bool:
+    """Require a live action-status endpoint without inventing an idle sample."""
+    return node.clock_ns > 0 and node.count_publishers('follow_waypoints/_action/status') >= 1
+
+
+def _arm_requested(path: Path) -> bool:
+    """Recognize only the runner-owned bounded arm request."""
+    if not path.exists() and not path.is_symlink():
+        return False
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 256:
+        raise EvidenceError('goal observer arm request is not a bounded regular file')
+    if path.read_bytes() != ARM_REQUEST:
+        raise EvidenceError('goal observer arm request payload is invalid')
+    return True
+
+
 class GoalObserver:
     """Small state machine separated from the rclpy node for pure tests."""
 
@@ -109,6 +131,8 @@ class GoalObserver:
             raise EvidenceError('goal observer exceeded 4,096 status samples')
         if stamp_ns <= 0:
             raise EvidenceError('goal observer saw a non-positive goal stamp')
+        if status not in VALID_STATUSES:
+            raise EvidenceError('goal observer saw an invalid action status')
         if not self.armed:
             self.prearm_uuids.add(uuid)
             return
@@ -121,8 +145,8 @@ class GoalObserver:
             if uuid != self.bound_uuid or stamp_ns != self.bound_t0_ns:
                 raise EvidenceError('bound goal UUID/T0 changed after acceptance')
             return
-        if status != STATUS_ACCEPTED:
-            return
+        if status in TERMINAL_STATUSES:
+            raise EvidenceError('new goal was first observed only after it became terminal')
         if clock_ns <= 0:
             return
         self.bound_uuid = uuid
@@ -338,9 +362,14 @@ def _run_goal_observer(arguments: argparse.Namespace) -> int:
                     clock_ns=self.clock_ns,
                 )
 
-    for path in (arguments.ready_file, arguments.output):
+    for path in (
+        arguments.arm_file,
+        arguments.armed_file,
+        arguments.ready_file,
+        arguments.output,
+    ):
         if path.exists() or path.is_symlink():
-            raise EvidenceError(f'goal observer output already exists: {path}')
+            raise EvidenceError(f'goal observer path already exists: {path}')
     if arguments.schedule_output is not None and (
         arguments.schedule_output.exists() or arguments.schedule_output.is_symlink()
     ):
@@ -359,12 +388,7 @@ def _run_goal_observer(arguments: argparse.Namespace) -> int:
             if not _pid_alive(arguments.watch_pid):
                 raise EvidenceError('watched process exited before goal observation completed')
             executor.spin_once(timeout_sec=0.05)
-            if (
-                not ready_written
-                and node.clock_ns > 0
-                and node.status_message_count > 0
-                and node.count_publishers('follow_waypoints/_action/status') >= 1
-            ):
+            if not ready_written and _goal_observer_ready(node):
                 atomic_write_json(
                     arguments.ready_file,
                     {
@@ -377,8 +401,19 @@ def _run_goal_observer(arguments: argparse.Namespace) -> int:
                     },
                 )
                 ready_written = True
-            if ready_written and arguments.arm_file.is_file() and not node.machine.armed:
+            if ready_written and not node.machine.armed and _arm_requested(arguments.arm_file):
                 node.machine.arm()
+                atomic_write_json(
+                    arguments.armed_file,
+                    {
+                        'armed_steady_ns': time.monotonic_ns(),
+                        'prearm_uuid_set_sha256': canonical_sha256(
+                            sorted(node.machine.prearm_uuids)
+                        ),
+                        'producer': 'robotest_phase3/goal_observer',
+                        'schema_version': 1,
+                    },
+                )
             if node.machine.bound_uuid is not None:
                 assert node.machine.bound_t0_ns is not None
                 result = {
@@ -554,6 +589,7 @@ def _parser() -> argparse.ArgumentParser:
     goal.add_argument('--run-id', required=True)
     goal.add_argument('--ready-file', required=True, type=Path)
     goal.add_argument('--arm-file', required=True, type=Path)
+    goal.add_argument('--armed-file', required=True, type=Path)
     goal.add_argument('--output', required=True, type=Path)
     goal.add_argument('--schedule-output', type=Path)
     goal.add_argument('--watch-pid', required=True, type=int)

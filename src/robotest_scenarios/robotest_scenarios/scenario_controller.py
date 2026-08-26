@@ -374,8 +374,6 @@ class ScenarioControllerNode(Node):
         """Freeze the readiness boundary after pre-goal checks."""
         if not self.clock_seen or self.current_sim_stamp_ns <= 0:
             raise InfrastructureError('cannot mark ready before a positive /clock sample')
-        if not self.status_message_seen:
-            raise InfrastructureError('cannot mark ready before observing action status')
         active = [
             raw_uuid
             for raw_uuid, (_, status_code) in self.last_status_by_uuid.items()
@@ -1133,7 +1131,7 @@ class ScenarioControllerApp:
 
     def _ready_prerequisites(self) -> bool:
         node = self._node
-        if not node.clock_seen or node.current_sim_stamp_ns <= 0 or not node.status_message_seen:
+        if not node.clock_seen or node.current_sim_stamp_ns <= 0:
             return False
         return (
             node.count_publishers(ACTION_STATUS_TOPIC) >= 1

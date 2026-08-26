@@ -700,6 +700,41 @@ def _wait_for_file(
     )
 
 
+def _validate_goal_observer_armed(
+    document: object,
+    ready_document: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the observer-owned arm acknowledgment before mission launch."""
+    if not isinstance(document, Mapping):
+        raise EvidenceError('goal observer arm acknowledgment must be an object')
+    expected_keys = {
+        'armed_steady_ns',
+        'prearm_uuid_set_sha256',
+        'producer',
+        'schema_version',
+    }
+    if set(document) != expected_keys:
+        raise EvidenceError('goal observer arm acknowledgment keys are invalid')
+    armed_steady_ns = document.get('armed_steady_ns')
+    if (
+        isinstance(armed_steady_ns, bool)
+        or not isinstance(armed_steady_ns, int)
+        or armed_steady_ns <= 0
+    ):
+        raise EvidenceError('goal observer armed_steady_ns must be positive')
+    if document.get('producer') != 'robotest_phase3/goal_observer':
+        raise EvidenceError('goal observer arm acknowledgment producer is invalid')
+    schema_version = document.get('schema_version')
+    if isinstance(schema_version, bool) or schema_version != 1:
+        raise EvidenceError('goal observer arm acknowledgment schema is invalid')
+    prearm_hash = document.get('prearm_uuid_set_sha256')
+    if not isinstance(prearm_hash, str) or re.fullmatch(r'[0-9a-f]{64}', prearm_hash) is None:
+        raise EvidenceError('goal observer arm acknowledgment prearm hash is invalid')
+    if prearm_hash != ready_document.get('prearm_uuid_set_sha256'):
+        raise EvidenceError('goal observer prearm UUID set changed after readiness')
+    return dict(document)
+
+
 def _wait_for_contact_progress(
     path: Path,
     *,
@@ -1542,6 +1577,7 @@ class BenchmarkRunner:
             )
             observer_ready = run_dir / 'goal-observer.ready.json'
             observer_arm = run_dir / 'goal-observer.arm'
+            observer_armed = run_dir / 'goal-observer.armed.json'
             observer_result = run_dir / 'goal-observer.json'
             schedule_path = run_dir / 'lifecycle-schedule.json'
             observer_command = [
@@ -1554,6 +1590,8 @@ class BenchmarkRunner:
                 str(observer_ready),
                 '--arm-file',
                 str(observer_arm),
+                '--armed-file',
+                str(observer_armed),
                 '--output',
                 str(observer_result),
                 '--watch-pid',
@@ -1597,6 +1635,24 @@ class BenchmarkRunner:
                 stage='graph_gate',
             )
             atomic_write_bytes(observer_arm, b'arm-next-new-goal\n', 256)
+            _wait_for_file(
+                observer_armed,
+                timeout_s=20.0,
+                watched=(launch, collector, scenario, observer),
+                stage='goal_observer_armed',
+            )
+            try:
+                _validate_goal_observer_armed(
+                    load_json(observer_armed),
+                    load_json(observer_ready),
+                )
+            except EvidenceError as exc:
+                raise StageFailure(
+                    'goal_observer_armed',
+                    'invalid_evidence',
+                    str(exc),
+                    evidence=load_json(observer_armed),
+                ) from exc
             mission_result = run_dir / 'mission-result.json'
             mission_csv = run_dir / 'mission-result.csv'
             mission = registry.start(

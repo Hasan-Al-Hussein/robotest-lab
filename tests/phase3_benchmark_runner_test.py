@@ -33,6 +33,42 @@ runner = _load('phase3_benchmark_runner', 'phase3_benchmark_runner.py')
 runtime_gate = _load('phase3_runtime_gate', 'phase3_runtime_gate.py')
 
 
+def test_goal_observer_arm_ack_is_validated_before_mission_launch() -> None:
+    prearm_hash = orchestration.canonical_sha256([])
+    acknowledgment = {
+        'armed_steady_ns': 1,
+        'prearm_uuid_set_sha256': prearm_hash,
+        'producer': 'robotest_phase3/goal_observer',
+        'schema_version': 1,
+    }
+
+    assert (
+        runner._validate_goal_observer_armed(
+            acknowledgment,
+            {'prearm_uuid_set_sha256': prearm_hash},
+        )
+        == acknowledgment
+    )
+    tampered = dict(acknowledgment, prearm_uuid_set_sha256='0' * 64)
+    with pytest.raises(runner.EvidenceError, match='changed after readiness'):
+        runner._validate_goal_observer_armed(
+            tampered,
+            {'prearm_uuid_set_sha256': prearm_hash},
+        )
+    with pytest.raises(runner.EvidenceError, match='schema is invalid'):
+        runner._validate_goal_observer_armed(
+            dict(acknowledgment, schema_version=True),
+            {'prearm_uuid_set_sha256': prearm_hash},
+        )
+
+    source = (TEST_DIR / 'phase3_benchmark_runner.py').read_text(encoding='utf-8')
+    trial_source = source[source.index('    def _run_trial(') :]
+    arm_request = trial_source.index('atomic_write_bytes(observer_arm,')
+    arm_ack = trial_source.index("stage='goal_observer_armed'")
+    mission_launch = trial_source.index("'mission_runner',")
+    assert arm_request < arm_ack < mission_launch
+
+
 def test_bounded_process_is_group_leader_and_records_exact_command(tmp_path: Path) -> None:
     process = runner.BoundedProcess(
         role='probe',
