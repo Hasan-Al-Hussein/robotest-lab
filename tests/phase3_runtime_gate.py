@@ -211,9 +211,16 @@ def _elf_embedded_source_inventory_sha256(path: Path) -> str:
     return next(iter(matches))
 
 
-def _proc_parent_pid(stat_text: str) -> int:
+def _proc_stat_fields(stat_text: str) -> list[str]:
     closing = stat_text.rfind(')')
-    fields = stat_text[closing + 2 :].split() if closing >= 0 else []
+    if closing < 0:
+        return []
+    fields_start = closing + 2
+    return stat_text[fields_start:].split()
+
+
+def _proc_parent_pid(stat_text: str) -> int:
+    fields = _proc_stat_fields(stat_text)
     if len(fields) < 2:
         raise ValueError('malformed /proc stat')
     return int(fields[1])
@@ -271,8 +278,7 @@ def _contact_gate_binary_attestation(
             )
         live_pid, live_path = candidates[0]
         stat_text = Path(f'/proc/{live_pid}/stat').read_text(encoding='ascii')
-        closing = stat_text.rfind(')')
-        stat_fields = stat_text[closing + 2 :].split() if closing >= 0 else []
+        stat_fields = _proc_stat_fields(stat_text)
         if len(stat_fields) < 20:
             raise EvidenceError('live contact gate /proc stat is malformed')
         live_ppid = int(stat_fields[1])
@@ -301,8 +307,7 @@ def _contact_gate_binary_attestation(
         installed_stat = installed_path.stat()
         live_stat = Path(f'/proc/{live_pid}/exe').stat()
         final_stat_text = Path(f'/proc/{live_pid}/stat').read_text(encoding='ascii')
-        final_closing = final_stat_text.rfind(')')
-        final_fields = final_stat_text[final_closing + 2 :].split() if final_closing >= 0 else []
+        final_fields = _proc_stat_fields(final_stat_text)
         identity_revalidated_after_hashing = (
             len(final_fields) >= 20
             and int(final_fields[19]) == live_start_ticks
@@ -773,9 +778,13 @@ def _contact_stream_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
         for evidence in topics.values()
     )
     gate_present = '/robotest/contact_stream_gate' in nodes
-    passed = (
-        gate_present and all(publisher_ownership.values()) and raw_subscriber_ownership and qos_pass
+    checks = (
+        gate_present,
+        all(publisher_ownership.values()),
+        raw_subscriber_ownership,
+        qos_pass,
     )
+    passed = all(checks)
     return passed, {
         'contact_stream_gate_present': gate_present,
         'mode': 'contact_stream',

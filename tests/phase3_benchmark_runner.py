@@ -47,17 +47,17 @@ from phase3_orchestration import (
     LOG_MAX_BYTES,
     make_orchestrator_evidence,
     make_trial_context,
-    PRODUCER,
     positive_control_qualified_snapshot_stamp,
-    reconcile_goal_binding,
+    PRODUCER,
     reconcile_contact_gate_reobservation,
+    reconcile_goal_binding,
     reconcile_positive_control,
     safe_candidate_id,
     suite_document,
     summarize_resources,
+    validate_build_binding,
     validate_contact_drain_evidence,
     validate_contact_progress,
-    validate_build_binding,
     verify_component_manifest,
     verify_json_sidecar,
 )
@@ -1738,7 +1738,8 @@ class BenchmarkRunner:
                     )
                     verify_json_sidecar(contact_drain_path)
                     drain_document = load_json(contact_drain_path)
-                    qualifying_stamp_ns = drain_document.get('qualifying_contact_snapshot_stamp_ns')
+                    qualifying_key = 'qualifying_contact_snapshot_stamp_ns'
+                    qualifying_stamp_ns = drain_document.get(qualifying_key)
                     if (
                         isinstance(qualifying_stamp_ns, bool)
                         or not isinstance(qualifying_stamp_ns, int)

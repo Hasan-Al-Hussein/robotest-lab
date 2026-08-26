@@ -56,6 +56,11 @@ CONTACT_MAX_CLOCK_LAG_NS = 220_000_000
 CONTACT_PUBLIC_TOPIC = '/robotest/validation/contacts'
 CONTACT_GATE_NODE = '/robotest/contact_stream_gate'
 CONTACT_PRIVATE_RAW_TOPIC = '/robotest/internal/raw_contacts'
+CONTACT_INGRESS_MEMORY_BOUND_SCOPE_PARTS = (
+    'post_dds_deserialization_of',
+    'trusted_sole_private_bridge_input',
+)
+CONTACT_INGRESS_MEMORY_BOUND_SCOPE = '_'.join(CONTACT_INGRESS_MEMORY_BOUND_SCOPE_PARTS)
 EXPECTED_CONTACT_STREAM_POLICY = {
     'active_pair_expiry_ns': 250_000_000,
     'active_pair_scope': 'support_robot_internal_and_countable_robot_external',
@@ -65,7 +70,7 @@ EXPECTED_CONTACT_STREAM_POLICY = {
     'delivery_semantics': 'authoritative_delivered_active_pair_snapshot',
     'emission_policy': ('immediate_active_pair_set_transition_else_heartbeat_at_or_after_200ms'),
     'heartbeat_period_ns': 200_000_000,
-    'ingress_memory_bound_scope': ('post_dds_deserialization_of_trusted_sole_private_bridge_input'),
+    'ingress_memory_bound_scope': CONTACT_INGRESS_MEMORY_BOUND_SCOPE,
     'initial_finalized_stamp_suppressed': True,
     'max_pending_batch_clock_lag_ns': 220_000_000,
     'max_public_snapshot_gap_ns': 220_000_000,
@@ -1238,9 +1243,11 @@ def _component_contact_projection(
             'positive-control qualifying release snapshot is not present exactly once'
         )
     qualifying_index = qualifying_indexes[0]
-    suffix = projection[qualifying_index + 1 :]
+    suffix_start = qualifying_index + 1
+    suffix = projection[suffix_start:]
     if _captured_contact_episodes(suffix, manifest=manifest):
-        raise EvidenceError('positive-control component observed countable recontact after release')
+        message = 'positive-control component observed countable recontact after release'
+        raise EvidenceError(message)
     return projection[: qualifying_index + 1]
 
 
@@ -1567,11 +1574,13 @@ def reconcile_positive_control(
     release_expected_pair_count = 0
     for record_value in release_records:
         record = _require_mapping(record_value, 'captured release contact record')
+        collision1 = record.get('collision1')
+        collision2 = record.get('collision2')
         pair = tuple(
             sorted(
                 (
-                    require_bounded_string(record.get('collision1'), 'captured release collision1'),
-                    require_bounded_string(record.get('collision2'), 'captured release collision2'),
+                    require_bounded_string(collision1, 'captured release collision1'),
+                    require_bounded_string(collision2, 'captured release collision2'),
                 )
             )
         )
@@ -1670,11 +1679,19 @@ def reconcile_positive_control(
         )
         expected_linear = _require_number(command.get('linear_x'), 'component command linear_x')
         expected_angular = _require_number(command.get('angular_z'), 'component command angular_z')
-        while cursor < len(captured_command_projection) and not (
-            expected_stamp <= captured_command_projection[cursor][0] <= expected_stamp + 100_000_000
-            and captured_command_projection[cursor][1] == expected_linear
-            and captured_command_projection[cursor][2] == expected_angular
-        ):
+        latest_expected_stamp = expected_stamp + 100_000_000
+        while cursor < len(captured_command_projection):
+            captured_command = captured_command_projection[cursor]
+            captured_stamp = captured_command[0]
+            captured_linear = captured_command[1]
+            captured_angular = captured_command[2]
+            stamp_matches = expected_stamp <= captured_stamp <= latest_expected_stamp
+            if (
+                stamp_matches
+                and captured_linear == expected_linear
+                and captured_angular == expected_angular
+            ):
+                break
             cursor += 1
         if cursor >= len(captured_command_projection):
             raise EvidenceError('collector command stream is not a complete component subsequence')
@@ -2532,9 +2549,14 @@ def _capture_contains_qualified_contact_snapshot(
             item.get('delivery_clock_offset_ns'),
             f'capture.contacts.items[{index}].delivery_clock_offset_ns',
         )
+        minimum_clock_offset = -CONTACT_MAX_CLOCK_LAG_NS
+        maximum_clock_offset = CONTACT_MAX_CLOCK_LAG_NS
+        delivery_within_clock_lag = (
+            minimum_clock_offset <= delivery_clock_offset_ns <= maximum_clock_offset
+        )
         if (
             delivery_clock_offset_ns != delivery_clock_stamp_ns - stamp
-            or not -CONTACT_MAX_CLOCK_LAG_NS <= delivery_clock_offset_ns <= CONTACT_MAX_CLOCK_LAG_NS
+            or not delivery_within_clock_lag
         ):
             raise EvidenceError('capture contact snapshot delivery /clock bracket is invalid')
         if item.get('frame_id') != '':
@@ -2710,10 +2732,11 @@ def validate_contact_drain_evidence(
     _require_int(evidence.get('clock_first_stamp_ns'), 'contact_drain.clock_first_stamp_ns')
     if _require_int(evidence.get('clock_message_count'), 'contact_drain.clock_message_count') < 1:
         raise EvidenceError('contact drain observed no clock samples')
-    if (
-        _require_int(evidence.get('clock_regression_count'), 'contact_drain.clock_regression_count')
-        != 0
-    ):
+    clock_regression_count = _require_int(
+        evidence.get('clock_regression_count'),
+        'contact_drain.clock_regression_count',
+    )
+    if clock_regression_count != 0:
         raise EvidenceError('contact drain clock regressed')
     lag = _require_int(
         evidence.get('clock_minus_qualifying_contact_ns'),

@@ -33,7 +33,11 @@ sys.modules[OBSERVER_SPEC.name] = runtime_observer
 OBSERVER_SPEC.loader.exec_module(runtime_observer)
 
 RUNTIME_GATE_PATH = Path(__file__).with_name('phase3_runtime_gate.py')
-RUNTIME_GATE_SPEC = importlib.util.spec_from_file_location('phase3_runtime_gate', RUNTIME_GATE_PATH)
+RUNTIME_GATE_MODULE = 'phase3_runtime_gate'
+RUNTIME_GATE_SPEC = importlib.util.spec_from_file_location(
+    RUNTIME_GATE_MODULE,
+    RUNTIME_GATE_PATH,
+)
 assert RUNTIME_GATE_SPEC is not None and RUNTIME_GATE_SPEC.loader is not None
 runtime_gate = importlib.util.module_from_spec(RUNTIME_GATE_SPEC)
 sys.modules[RUNTIME_GATE_SPEC.name] = runtime_gate
@@ -158,7 +162,8 @@ def test_suite_plan_rejects_unsafe_identity_or_domain(
 
 
 def test_canonical_json_is_strict_and_newline_terminated() -> None:
-    assert orchestration.canonical_json_bytes({'b': 2, 'a': 1}) == b'{"a":1,"b":2}\n'
+    expected = b'{"a":1,"b":2}\n'
+    assert orchestration.canonical_json_bytes({'b': 2, 'a': 1}) == expected
     with pytest.raises(orchestration.EvidenceError):
         orchestration.canonical_json_bytes({'bad': float('nan')})
 
@@ -166,9 +171,9 @@ def test_canonical_json_is_strict_and_newline_terminated() -> None:
 def test_contact_stream_manifest_requires_exact_v3_contract() -> None:
     workspace = Path(__file__).parents[1]
     manifest = {'schema_version': 3, 'contact_stream': _contact_stream_contract()}
-    assert (
-        orchestration._contact_stream_manifest_v3(manifest, workspace) == manifest['contact_stream']
-    )
+    expected_contact_stream = manifest['contact_stream']
+    actual_contact_stream = orchestration._contact_stream_manifest_v3(manifest, workspace)
+    assert actual_contact_stream == expected_contact_stream
 
     with pytest.raises(orchestration.EvidenceError, match='schema_version 3'):
         orchestration._contact_stream_manifest_v3(
@@ -201,9 +206,10 @@ def test_contact_stream_manifest_requires_exact_v3_contract() -> None:
     changed_owner['contact_stream']['gate']['executable'] = 'legacy_contact_gate'
     mutations.append(changed_owner)
     changed_source = copy.deepcopy(manifest)
-    changed_source['contact_stream']['gate']['source_inventory']['sources'][0]['sha256'] = '0' * 64
+    changed_inventory = changed_source['contact_stream']['gate']['source_inventory']
+    changed_inventory['sources'][0]['sha256'] = '0' * 64
     changed_source['contact_stream']['gate']['source_inventory_sha256'] = (
-        orchestration.canonical_sha256(changed_source['contact_stream']['gate']['source_inventory'])
+        orchestration.canonical_sha256(changed_inventory)
     )
     mutations.append(changed_source)
 
@@ -214,8 +220,12 @@ def test_contact_stream_manifest_requires_exact_v3_contract() -> None:
 
 def test_generated_contact_stream_configuration_round_trips_v3_contract() -> None:
     workspace = Path(__file__).parents[1]
-    generator_path = workspace / 'src/robotest_description/tools/generate_collision_coverage.py'
-    spec = importlib.util.spec_from_file_location('collision_coverage_generator_v3', generator_path)
+    generator_relative_path = 'src/robotest_description/tools/generate_collision_coverage.py'
+    generator_path = workspace / generator_relative_path
+    spec = importlib.util.spec_from_file_location(
+        'collision_coverage_generator_v3',
+        generator_path,
+    )
     assert spec is not None and spec.loader is not None
     generator = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(generator)
@@ -514,16 +524,31 @@ def test_contact_drain_rejects_duplicate_regression_frame_and_early_heartbeat() 
     duplicate = runtime_observer.ContactDrainObserver(1)
     duplicate.observe_contact(stamp_ns=300_000_000, frame_id='', pair_set=pair, record_count=1)
     with pytest.raises(orchestration.EvidenceError, match='duplicated'):
-        duplicate.observe_contact(stamp_ns=300_000_000, frame_id='', pair_set=pair, record_count=1)
+        duplicate.observe_contact(
+            stamp_ns=300_000_000,
+            frame_id='',
+            pair_set=pair,
+            record_count=1,
+        )
 
     regression = runtime_observer.ContactDrainObserver(1)
     regression.observe_contact(stamp_ns=300_000_000, frame_id='', pair_set=pair, record_count=1)
     with pytest.raises(orchestration.EvidenceError, match='regressed'):
-        regression.observe_contact(stamp_ns=299_999_999, frame_id='', pair_set=pair, record_count=1)
+        regression.observe_contact(
+            stamp_ns=299_999_999,
+            frame_id='',
+            pair_set=pair,
+            record_count=1,
+        )
 
     frame = runtime_observer.ContactDrainObserver(1)
     with pytest.raises(orchestration.EvidenceError, match='frame_id'):
-        frame.observe_contact(stamp_ns=300_000_000, frame_id='world', pair_set=pair, record_count=1)
+        frame.observe_contact(
+            stamp_ns=300_000_000,
+            frame_id='world',
+            pair_set=pair,
+            record_count=1,
+        )
 
     heartbeat = runtime_observer.ContactDrainObserver(1)
     heartbeat.observe_contact(stamp_ns=300_000_000, frame_id='', pair_set=pair, record_count=1)
@@ -700,11 +725,9 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         'world_source_sha256': '5' * 64,
     }
     manifest = {**unsigned, 'manifest_sha256': orchestration.canonical_sha256(unsigned)}
-    positive_build_binding = {
-        'contact_gate_binary': {
-            'source_inventory_sha256': manifest['contact_stream']['gate']['source_inventory_sha256']
-        }
-    }
+    source_inventory_sha256 = manifest['contact_stream']['gate']['source_inventory_sha256']
+    gate_binary = {'source_inventory_sha256': source_inventory_sha256}
+    positive_build_binding = {'contact_gate_binary': gate_binary}
     manifest_path = tmp_path / 'coverage.yaml'
     manifest_path.write_text(yaml.safe_dump(manifest, sort_keys=True), encoding='utf-8')
     result = {
@@ -1022,9 +1045,11 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     )
 
     missing_qualified = copy.deepcopy(result)
-    missing_qualified['control']['contact']['snapshots'][1]['sim_stamp_ns'] = 301_000_000
-    missing_qualified['control']['contact']['snapshots'][1]['delivery_clock_stamp_ns'] = 501_000_000
-    missing_qualified['control']['contact']['snapshot_records'][1]['sim_stamp_ns'] = 301_000_000
+    missing_snapshots = missing_qualified['control']['contact']['snapshots']
+    missing_records = missing_qualified['control']['contact']['snapshot_records']
+    missing_snapshots[1]['sim_stamp_ns'] = 301_000_000
+    missing_snapshots[1]['delivery_clock_stamp_ns'] = 501_000_000
+    missing_records[1]['sim_stamp_ns'] = 301_000_000
     orchestration.atomic_write_json(result_path, missing_qualified, sidecar=True)
     orchestration.atomic_write_json(capture_path, capture)
     orchestration.atomic_write_json(contact_progress_path, contact_progress)

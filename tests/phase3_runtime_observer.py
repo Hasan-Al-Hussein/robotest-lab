@@ -247,6 +247,7 @@ class ContactDrainObserver:
         qualifying = self.qualifying_contact_snapshot_stamp_ns
         latest_clock = self.clock_latest_stamp_ns
         assert qualifying is not None and latest_clock is not None
+        interval_violations = self.same_pair_set_interval_violation_count
         return {
             'clock_first_stamp_ns': self.clock_first_stamp_ns,
             'clock_latest_stamp_ns': latest_clock,
@@ -272,7 +273,7 @@ class ContactDrainObserver:
             'producer': 'robotest_phase3/contact_drain_observer',
             'public_topic': CONTACT_TOPIC,
             'qualifying_contact_snapshot_stamp_ns': qualifying,
-            'same_pair_set_interval_violation_count': (self.same_pair_set_interval_violation_count),
+            'same_pair_set_interval_violation_count': interval_violations,
             'schema_version': 3,
             'target_stamp_ns': self.target_stamp_ns,
             'terminal_action_stamp_ns': self.terminal_action_stamp_ns,
@@ -475,10 +476,12 @@ def _run_contact_drain_observer(arguments: argparse.Namespace) -> int:
             executor.spin_once(timeout_sec=0.05)
             if node.machine.complete():
                 publisher_endpoints = node.get_publishers_info_by_topic(CONTACT_TOPIC)
-                publisher_nodes = sorted(
-                    f'{endpoint.node_namespace.rstrip("/")}/{endpoint.node_name}'.replace('//', '/')
-                    for endpoint in publisher_endpoints
-                )
+                publisher_nodes = []
+                for endpoint in publisher_endpoints:
+                    namespace = endpoint.node_namespace.rstrip('/')
+                    node_name = f'{namespace}/{endpoint.node_name}'.replace('//', '/')
+                    publisher_nodes.append(node_name)
+                publisher_nodes.sort()
                 graph_nodes = {
                     f'{namespace.rstrip("/")}/{name}'.replace('//', '/')
                     for name, namespace in node.get_node_names_and_namespaces()
