@@ -74,7 +74,7 @@
   qos_profile: SERVICES
 
 - ros_topic_name: internal/raw_contacts
-  gz_topic_name: /robotest/validation/contacts
+  gz_topic_name: /robotest/internal/contact_aggregate
   ros_type_name: ros_gz_interfaces/msg/Contacts
   gz_type_name: gz.msgs.Contacts
   direction: GZ_TO_ROS

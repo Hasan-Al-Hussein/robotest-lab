@@ -5,7 +5,7 @@
 
 import os
 
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
     AppendEnvironmentVariable,
@@ -234,11 +234,12 @@ def _launch_runtime(context):
 
 def generate_launch_description():
     """Return the canonical Gazebo, spawn, proxy, bridge, and RViz chain."""
-    plugin_dir = '/opt/ros/jazzy/opt/gz_sim_vendor/lib/gz-sim-8/plugins'
+    robotest_plugin_dir = os.path.join(get_package_prefix('robotest_sim'), 'lib', 'robotest_sim')
+    vendor_plugin_dir = '/opt/ros/jazzy/opt/gz_sim_vendor/lib/gz-sim-8/plugins'
     current_plugins = os.environ.get('GZ_SIM_SYSTEM_PLUGIN_PATH', '')
-    plugin_path = plugin_dir
+    plugin_path = os.pathsep.join((robotest_plugin_dir, vendor_plugin_dir))
     if current_plugins:
-        plugin_path = plugin_dir + os.pathsep + current_plugins
+        plugin_path += os.pathsep + current_plugins
 
     return LaunchDescription(
         [

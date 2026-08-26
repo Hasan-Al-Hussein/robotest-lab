@@ -99,25 +99,40 @@ EXPECTED_GEOMETRIES = {
     },
 }
 GROUND_COLLISION = 'ground_plane::ground_link::ground_collision'
+FROZEN_GAZEBO_CONTACT_TOPIC = '/robotest/internal/contact_aggregate'
 FROZEN_CONTACT_TOPIC = '/robotest/validation/contacts'
 FROZEN_PRIVATE_CONTACT_TOPIC = '/robotest/internal/raw_contacts'
 EXPECTED_CONTACT_GATE_SOURCE_PATHS = (
+    'src/robotest_description/urdf/robotest_gazebo.xacro',
     'src/robotest_sim/CMakeLists.txt',
+    'src/robotest_sim/config/bridge.yaml',
+    'src/robotest_sim/include/robotest_sim/contact_aggregator.hpp',
     'src/robotest_sim/include/robotest_sim/contact_stream_gate.hpp',
+    'src/robotest_sim/launch/sim.launch.py',
+    'src/robotest_sim/src/contact_aggregator.cpp',
+    'src/robotest_sim/src/contact_aggregator_system.cpp',
     'src/robotest_sim/src/contact_stream_gate.cpp',
     'src/robotest_sim/src/contact_stream_gate_node.cpp',
+    'src/robotest_sim/worlds/robotest_lab.sdf',
 )
 EXPECTED_CONTACT_STREAM_POLICY = {
     'active_pair_expiry_ns': 250_000_000,
     'active_pair_scope': 'support_robot_internal_and_countable_robot_external',
-    'accepted_run_scope': 'bounded_pending_raw_and_public_source_liveness_required',
+    'accepted_run_scope': 'bounded_complete_aggregate_and_public_source_liveness_required',
+    'aggregate_interval_ns': 20_000_000,
+    'aggregate_interval_pair_membership': 'union_of_every_physics_step_in_open_closed_interval',
+    'aggregate_record_reduction': (
+        'latest_complete_physics_step_group_per_normalized_pair_preserving_record_order'
+    ),
     'capacity_claim_scope': 'unchanged_pair_set_heartbeat_only',
-    'completed_stamp_batching': 'finalize_on_strictly_greater_raw_stamp',
+    'completed_stamp_batching': 'one_complete_interval_aggregate_per_stamp',
     'delivery_semantics': 'authoritative_delivered_active_pair_snapshot',
     'emission_policy': 'immediate_active_pair_set_transition_else_heartbeat_at_or_after_200ms',
     'heartbeat_period_ns': 200_000_000,
     'initial_finalized_stamp_suppressed': True,
-    'ingress_memory_bound_scope': ('post_dds_deserialization_of_trusted_sole_private_bridge_input'),
+    'ingress_memory_bound_scope': (
+        'post_dds_deserialization_of_trusted_sole_private_aggregate_bridge_input'
+    ),
     'max_pending_batch_clock_lag_ns': 220_000_000,
     'max_public_snapshot_gap_ns': 220_000_000,
     'max_public_snapshot_clock_lag_ns': 220_000_000,
@@ -140,20 +155,26 @@ EXPECTED_CONTACT_STREAM_POLICY = {
         'max_contact_string_bytes': 8_192,
         'max_frame_id_bytes': 256,
         'max_raw_contact_records': 16,
-        'max_raw_messages_per_completed_stamp': 7,
+        'max_raw_messages_per_completed_stamp': 1,
         'max_raw_string_bytes_per_completed_stamp': 65_536,
     },
     'release_comparison': 'completed_absent_stamp_strictly_greater_than_last_seen_plus_gap',
     'raw_contact_positions': 'required_nonempty_1_to_64',
     'raw_stamp_gap_semantics': (
-        'consecutive_nonempty_raw_gaps_are_not_absence_evidence_and_have_no_independent_bound'
+        'sole_source_grid_is_exact_20ms_and_gate_rejects_delivered_gaps_greater_than_20ms'
     ),
     'raw_messages_require_nonempty_contacts': True,
     'required_raw_frame_id': '',
-    'retained_contact_payload': 'exact_nested_contact_record_copy',
+    'retained_contact_payload': (
+        'exact_ros_projected_nested_copy_of_latest_pair_group_selected_by_interval_reduction'
+    ),
     'semantic_fatal_delivery': 'best_effort_diagnostic_snapshot_before_process_failure',
     'string_budget_accounting': ('payload_strings_plus_normalized_pair_key_once_per_stored_pair'),
-    'synthesized_envelope': ['container', 'current_completed_header', 'normalized_pair_order'],
+    'synthesized_envelope': [
+        'container',
+        'interval_boundary_container_and_contact_headers',
+        'normalized_pair_order',
+    ],
     'synchronization': 'second_finalized_stamp_seeds_public_stream',
 }
 _SHA256_PATTERN = re.compile(r'^[0-9a-f]{64}$')
@@ -311,7 +332,7 @@ def load_coverage_manifest(path_value: str) -> CoverageManifest:
         raise ValidationError('coverage contact stream schema is not revision 1')
     topics = contact_stream['topics']
     if topics != {
-        'gazebo_raw': FROZEN_CONTACT_TOPIC,
+        'gazebo_raw': FROZEN_GAZEBO_CONTACT_TOPIC,
         'private_raw_ros': FROZEN_PRIVATE_CONTACT_TOPIC,
         'public_ros': FROZEN_CONTACT_TOPIC,
     }:

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import hashlib
 import importlib.util
 import struct
@@ -21,6 +22,31 @@ from sensor_msgs.msg import Imu, LaserScan
 
 PACKAGE = Path(__file__).resolve().parents[1]
 WORKSPACE = PACKAGE.parents[1]
+CONTACT_AGGREGATOR_BUILD_INSTALL_FIELDS = frozenset(
+    {
+        'build_elf_build_id',
+        'build_embedded_source_inventory_match',
+        'build_embedded_source_inventory_sha256',
+        'build_install_build_id_match',
+        'build_install_embedded_source_inventory_match',
+        'build_install_samefile',
+        'build_install_sha256_match',
+        'build_path',
+        'build_regular_file',
+        'build_sha256',
+        'installed_declared_is_symlink',
+        'installed_declared_path',
+        'installed_elf_build_id',
+        'installed_embedded_source_inventory_match',
+        'installed_embedded_source_inventory_sha256',
+        'installed_path',
+        'installed_regular_file',
+        'installed_sha256',
+        'package',
+        'schema_version',
+        'source_inventory_sha256',
+    }
+)
 
 
 def _source_hash_declarations(script_path: Path) -> tuple[list[Path], list[Path]]:
@@ -78,6 +104,44 @@ def _source_hash_evidence(
         entries[relative] = digest
         aggregate.update(relative.encode('utf-8') + b'\0' + digest.encode('ascii') + b'\n')
     return aggregate.hexdigest(), entries
+
+
+def _runtime_attestor_python_source(script_path: Path) -> str:
+    function = script_path.read_text(encoding='utf-8').split(
+        'write_contact_gate_runtime_attestation() {', 1
+    )[1]
+    return function.split("<<'PY'\n", 1)[1].split('\nPY\n}', 1)[0]
+
+
+def _aggregator_build_install_projection(script_path: Path):
+    tree = ast.parse(_runtime_attestor_python_source(script_path), filename=str(script_path))
+    fields_assignment = next(
+        statement
+        for statement in tree.body
+        if (
+            isinstance(statement, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == 'aggregator_build_install_fields'
+                for target in statement.targets
+            )
+        )
+    )
+    projection = next(
+        statement
+        for statement in tree.body
+        if (
+            isinstance(statement, ast.FunctionDef)
+            and statement.name == 'contact_aggregator_build_install_binding'
+        )
+    )
+    selected = ast.Module(body=[fields_assignment, projection], type_ignores=[])
+    ast.fix_missing_locations(selected)
+    namespace: dict[str, object] = {}
+    exec(compile(selected, str(script_path), 'exec'), namespace)
+    return (
+        namespace['aggregator_build_install_fields'],
+        namespace['contact_aggregator_build_install_binding'],
+    )
 
 
 def load_runtime_probe_module():
@@ -140,6 +204,76 @@ def test_phase1_and_phase2_hash_runtime_attestation_helper_bytes() -> None:
             assert baseline_aggregate != mutated_aggregate
 
 
+def test_phase1_and_phase2_attest_the_loaded_contact_aggregator_dso() -> None:
+    for phase in (1, 2):
+        script = (WORKSPACE / 'scripts' / f'verify_phase{phase}.sh').read_text(encoding='utf-8')
+        assert 'module._contact_aggregator_binary_attestation(' in script
+        assert "'contact_aggregator_binary_attestation': aggregator_attestation" in script
+        assert "initial['contact_aggregator_binary_attestation']" in script
+        assert "get('stable_identity_sha256')" in script
+        assert 'contact aggregator runtime identity changed before final evaluation' in script
+        registration = 'sys.modules[spec.name] = module'
+        execution = 'spec.loader.exec_module(module)'
+        assert registration in script
+        assert script.index(registration) < script.index(execution)
+    phase2 = (WORKSPACE / 'scripts' / f'verify_phase{2}.sh').read_text(encoding='utf-8')
+    assert "'library': 'librobotest_contact_aggregator_system.so'" in phase2
+    assert "aggregator_record.get('build_install_samefile') is True" in phase2
+    assert 'contact aggregator runtime differs from installed source binding' in phase2
+
+
+def test_runtime_attestor_dynamic_import_supports_dataclass_annotations() -> None:
+    tests_path = str(WORKSPACE / 'tests')
+    module_name = 'robotest_contact_gate_attestor_structure_test'
+    previous_module = sys.modules.get(module_name)
+    orchestration_was_loaded = 'phase3_orchestration' in sys.modules
+    sys.path.insert(0, tests_path)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            WORKSPACE / 'tests/phase3_runtime_gate.py',
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        assert dataclasses.is_dataclass(module.ProcMapEntry)
+    finally:
+        sys.path.remove(tests_path)
+        if previous_module is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous_module
+        if not orchestration_was_loaded:
+            sys.modules.pop('phase3_orchestration', None)
+
+
+def test_phase1_and_phase2_fail_closed_on_aggregator_binding_drift() -> None:
+    for phase in (1, 2):
+        script_path = WORKSPACE / 'scripts' / f'verify_phase{phase}.sh'
+        source = _runtime_attestor_python_source(script_path)
+        fields, projection = _aggregator_build_install_projection(script_path)
+        assert len(fields) == len(CONTACT_AGGREGATOR_BUILD_INSTALL_FIELDS) == 21
+        assert set(fields) == CONTACT_AGGREGATOR_BUILD_INSTALL_FIELDS
+        assert "get('installed_declared_is_symlink') is True" in source
+        assert "get('build_install_samefile') is True" in source
+        assert 'initial_aggregator_build_install != aggregator_build_install' in source
+        assert "initial.get('contact_aggregator_build_install_sha256')" in source
+
+        baseline_attestation = {field: f'baseline:{field}' for field in fields}
+        baseline_binding = projection(baseline_attestation)
+        for field in fields:
+            tampered = dict(baseline_attestation)
+            tampered[field] = f'tampered:{field}'
+            assert projection(tampered) != baseline_binding
+
+    phase2 = (WORKSPACE / 'scripts' / f'verify_phase{2}.sh').read_text(encoding='utf-8')
+    assert 'and aggregator_installed_declared.is_symlink()' in phase2
+    assert "initial.get('installed_source_binding_sha256')" in phase2
+    assert "!= result['installed_source_binding_sha256']" in phase2
+    assert 'installed source binding changed before final evaluation' in phase2
+
+
 def load_sim_launch_module():
     path = PACKAGE / 'launch' / 'sim.launch.py'
     spec = importlib.util.spec_from_file_location('robotest_sim_launch', path)
@@ -165,6 +299,17 @@ def test_package_is_apache_ament_cmake_and_installs_runtime_assets() -> None:
     assert 'phase1_runtime_probe.py' in cmake
 
 
+def test_contact_aggregator_avoids_unbounded_raw_message_staging() -> None:
+    source = (PACKAGE / 'src' / 'contact_aggregator_system.cpp').read_text(encoding='utf-8')
+    post_update = source.split('  void PostUpdate(', 1)[1].split('  void Reset(', 1)[0]
+
+    assert 'ContactAggregateSources current_sources{};' in post_update
+    assert 'current_sources[index] = &contacts->Data();' in post_update
+    assert 'policy_.observe(stamp_ns, current_sources)' in post_update
+    assert 'CopyFrom' not in post_update
+    assert 'gz::msgs::Contacts aggregate' not in post_update
+
+
 def test_world_is_local_enclosed_and_deterministic_friendly() -> None:
     world_path = PACKAGE / 'worlds' / 'robotest_lab.sdf'
     text = world_path.read_text(encoding='utf-8')
@@ -183,11 +328,18 @@ def test_world_is_local_enclosed_and_deterministic_friendly() -> None:
         'gz-sim-physics-system',
         'gz-sim-user-commands-system',
         'gz-sim-scene-broadcaster-system',
-        'gz-sim-contact-system',
+        'robotest_contact_aggregator_system',
         'gz-sim-sensors-system',
         'gz-sim-imu-system',
     }
     assert required <= plugins
+    assert 'gz-sim-contact-system' not in plugins
+    aggregator = world.find("./plugin[@name='robotest_sim::ContactAggregatorSystem']")
+    assert aggregator is not None
+    assert aggregator.attrib['filename'] == 'robotest_contact_aggregator_system'
+    assert aggregator.findtext('output_topic') == '/robotest/internal/contact_aggregate'
+    assert int(aggregator.findtext('publish_period_ns', default='0')) == 20_000_000
+    assert aggregator.findtext('robot_model_name') == 'robotest'
     assert world.findall('include') == []
     assert 'fuel.gazebosim' not in text.lower()
     assert 'http://' not in text.lower() and 'https://' not in text.lower()
@@ -273,6 +425,10 @@ def test_bridge_matches_the_frozen_data_plane() -> None:
         assert 1 <= int(entry['subscriber_queue']) <= 100
         assert entry['qos_profile'] == qos_profile
 
+    assert by_ros_name['internal/raw_contacts']['gz_topic_name'] == (
+        '/robotest/internal/contact_aggregate'
+    )
+
     assert {entry['gz_topic_name'] for entry in scenario_pose_bridges} == {
         '/model/ground_plane/pose',
         '/model/phase3_static_block/pose',
@@ -311,6 +467,8 @@ def test_launch_uses_context_safe_headless_logic_and_all_core_stages() -> None:
         'use_sim_time',
         'GZ_SIM_RESOURCE_PATH',
         'GZ_SIM_SYSTEM_PLUGIN_PATH',
+        'get_package_prefix',
+        "'lib', 'robotest_sim'",
         'rviz2',
     ):
         assert token in text

@@ -32,6 +32,9 @@ target as Ubuntu 24.04.1 LTS in the `Ubuntu` WSL distribution and records:
   `0.11.0-1noble.20260616.084325`;
 - `ros-jazzy-ros-gz` `1.0.22-1noble.20260616.074726` and Gazebo `gz sim`
   `8.11.0`;
+- direct Gazebo vendor interfaces used by the installed contact-aggregation
+  system: `gz_msgs_vendor` `0.0.6`, `gz_plugin_vendor` `0.0.5`,
+  `gz_sim_vendor` `0.0.10`, and `gz_transport_vendor` `0.0.7`;
 - `ros-jazzy-navigation2` `1.3.12-1noble.20260615.181551` and
   `ros-jazzy-nav2-bringup` `1.3.12-1noble.20260616.082701`;
 - `rmw_fastrtps_cpp` from `ros-jazzy-rmw-fastrtps-cpp`
@@ -131,6 +134,9 @@ The version was verified against PyPI on the evidence date. Do not install Ruff 
 - `ros-dev-tools`: colcon/rosdep/vcs and ROS development workflow.
 - `ros-jazzy-ros-base`: lean ROS 2 runtime and command-line foundation.
 - `ros-jazzy-ros-gz`: Jazzy-aligned ROS/Gazebo integration; for Jazzy the intended simulator family is Gazebo Harmonic.
+- `gz_msgs_vendor`, `gz_plugin_vendor`, `gz_sim_vendor`, and
+  `gz_transport_vendor`: direct CMake/API ownership for the repository-built
+  contact-aggregation system loaded by Gazebo Harmonic.
 - `ros-jazzy-navigation2` and `ros-jazzy-nav2-bringup`: Nav2 runtime and bringup.
 - `ros-jazzy-rviz2`: manual visualization and evidence, never an automatic headless dependency.
 - `ros-jazzy-xacro`, `ros-jazzy-robot-state-publisher`, and `ros-jazzy-joint-state-publisher`: robot description and TF support.

@@ -556,12 +556,20 @@ spec = importlib.util.spec_from_file_location('robotest_contact_gate_attestor', 
 if spec is None or spec.loader is None:
     raise SystemExit('cannot load contact gate attestor')
 module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 attestation = module._contact_gate_binary_attestation(
     workspace, launch_pid, domain_id, partition
 )
 if attestation.get('verdict') != 'PASS':
     raise SystemExit(f'contact gate runtime attestation failed: {attestation}')
+aggregator_attestation = module._contact_aggregator_binary_attestation(
+    workspace, launch_pid, domain_id, partition
+)
+if aggregator_attestation.get('verdict') != 'PASS':
+    raise SystemExit(
+        f'contact aggregator runtime attestation failed: {aggregator_attestation}'
+    )
 manifest_path = workspace / 'config/collision-coverage.yaml'
 manifest_bytes = manifest_path.read_bytes()
 manifest = yaml.safe_load(manifest_bytes)
@@ -571,7 +579,57 @@ declared_source_inventory_sha256 = contact_stream['gate'][
 ]
 if attestation.get('source_inventory_sha256') != declared_source_inventory_sha256:
     raise SystemExit('contact gate runtime source inventory differs from manifest v3')
+if (
+    aggregator_attestation.get('source_inventory_sha256')
+    != declared_source_inventory_sha256
+):
+    raise SystemExit('contact aggregator runtime source inventory differs from manifest v3')
+if not (
+    aggregator_attestation.get('installed_declared_is_symlink') is True
+    and aggregator_attestation.get('build_install_samefile') is True
+):
+    raise SystemExit('contact aggregator runtime lacks exact symlink-install identity')
+aggregator_build_install_fields = (
+    'build_elf_build_id',
+    'build_embedded_source_inventory_match',
+    'build_embedded_source_inventory_sha256',
+    'build_install_build_id_match',
+    'build_install_embedded_source_inventory_match',
+    'build_install_samefile',
+    'build_install_sha256_match',
+    'build_path',
+    'build_regular_file',
+    'build_sha256',
+    'installed_declared_is_symlink',
+    'installed_declared_path',
+    'installed_elf_build_id',
+    'installed_embedded_source_inventory_match',
+    'installed_embedded_source_inventory_sha256',
+    'installed_path',
+    'installed_regular_file',
+    'installed_sha256',
+    'package',
+    'schema_version',
+    'source_inventory_sha256',
+)
+
+
+def contact_aggregator_build_install_binding(attestation):
+    return {
+        field: attestation[field]
+        for field in aggregator_build_install_fields
+    }
+
+
+aggregator_build_install = contact_aggregator_build_install_binding(
+    aggregator_attestation
+)
+aggregator_build_install_sha256 = orchestration.canonical_sha256(
+    aggregator_build_install
+)
 result = {
+    'contact_aggregator_build_install_sha256': aggregator_build_install_sha256,
+    'contact_aggregator_binary_attestation': aggregator_attestation,
     'contact_gate_binary_attestation': attestation,
     'manifest_declared_sha256': manifest['manifest_sha256'],
     'manifest_file_sha256': hashlib.sha256(manifest_bytes).hexdigest(),
@@ -586,6 +644,10 @@ if initial_path is not None:
     initial_bytes = initial_path.read_bytes()
     initial = json.loads(initial_bytes)
     initial_attestation = initial['contact_gate_binary_attestation']
+    initial_aggregator_attestation = initial['contact_aggregator_binary_attestation']
+    initial_aggregator_build_install = contact_aggregator_build_install_binding(
+        initial_aggregator_attestation
+    )
     if (
         initial.get('manifest_path') != result['manifest_path']
         or initial.get('manifest_file_sha256') != result['manifest_file_sha256']
@@ -609,6 +671,21 @@ if initial_path is not None:
     )
     if any(initial_attestation.get(key) != attestation.get(key) for key in stable_fields):
         raise SystemExit('contact gate runtime identity changed before final evaluation')
+    if (
+        initial_aggregator_attestation.get('stable_identity_sha256')
+        != aggregator_attestation.get('stable_identity_sha256')
+        or initial_aggregator_attestation.get('stable_identity')
+        != aggregator_attestation.get('stable_identity')
+    ):
+        raise SystemExit('contact aggregator runtime identity changed before final evaluation')
+    if (
+        initial_aggregator_build_install != aggregator_build_install
+        or initial.get('contact_aggregator_build_install_sha256')
+        != aggregator_build_install_sha256
+    ):
+        raise SystemExit(
+            'contact aggregator build/install identity changed before final evaluation'
+        )
     result['initial_artifact_sha256'] = hashlib.sha256(initial_bytes).hexdigest()
     result['stable_identity'] = True
 output.write_text(json.dumps(result, indent=2, sort_keys=True) + '\n', encoding='utf-8')

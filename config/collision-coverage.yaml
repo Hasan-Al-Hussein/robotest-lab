@@ -6,7 +6,7 @@ contact_topic: /robotest/validation/contacts
 contact_stream:
   schema_version: 1
   topics:
-    gazebo_raw: /robotest/validation/contacts
+    gazebo_raw: /robotest/internal/contact_aggregate
     private_raw_ros: /robotest/internal/raw_contacts
     public_ros: /robotest/validation/contacts
   qos:
@@ -22,31 +22,48 @@ contact_stream:
       reliability: RELIABLE
   gate:
     executable: contact_stream_gate
-    launch_sha256: 359f5c485a283b697615dcc2d2c0e807e8d147da5444b37dc183b422b3843541
+    launch_sha256: 42f976808a87d10e349ec9532dd16c147741da668a8eed66549b2952ca3cdcb4
     package: robotest_sim
     source_inventory:
       schema_version: 1
       sources:
+      - path: src/robotest_description/urdf/robotest_gazebo.xacro
+        sha256: 4fb2130c57d97251db28290861c90a4de77861f1305ce31d04b72b71627ed45f
       - path: src/robotest_sim/CMakeLists.txt
-        sha256: 70f514bc234429c034bd6be16859b1950027e0fade3ad0a81cd938a6bdf68db5
+        sha256: 39758b385429bc9ea4a4f635d6828a4362b5cb977778653ef569f26ed6a1b7a7
+      - path: src/robotest_sim/config/bridge.yaml
+        sha256: 092bb7f3e02d2725b41023b9d579476895aa770c3f329c92cf38d196481fba6c
+      - path: src/robotest_sim/include/robotest_sim/contact_aggregator.hpp
+        sha256: 4a18c804d21dad7b2b9016fb074c99872d8010db6add5fd91caefc0f5f35c847
       - path: src/robotest_sim/include/robotest_sim/contact_stream_gate.hpp
-        sha256: 98c6e0f480c0bbf3ad9ee5a49ac33108c2869d1581a723dc67f5edc13ccad334
+        sha256: 145da14d8fcb5a6495785d6c341ad37f46ace7e514e48e4b8b846673bd550ee7
+      - path: src/robotest_sim/launch/sim.launch.py
+        sha256: 42f976808a87d10e349ec9532dd16c147741da668a8eed66549b2952ca3cdcb4
+      - path: src/robotest_sim/src/contact_aggregator.cpp
+        sha256: 7c398dfcc6046d6c2322dd78fd13329345bbe64b2c760b883ffb55f34b8d78bb
+      - path: src/robotest_sim/src/contact_aggregator_system.cpp
+        sha256: 5c5c1d46b4692e16c6479bd665a926151cc6c17b41add6b7cf41d41df757925d
       - path: src/robotest_sim/src/contact_stream_gate.cpp
-        sha256: c2ece291d7ce785e18385adfc951978e3b574d718ee890ea5da959d1baa87a60
+        sha256: d94c901b0d96710435cca5c48e4b162f3a2e7c3aa4e0fc7f6f7ce91eefda4fb0
       - path: src/robotest_sim/src/contact_stream_gate_node.cpp
         sha256: 9eddecff326b0277f1bbe5cf06efe010cbf130cf1d32acfdd5a7d923f9f0227f
-    source_inventory_sha256: c43328390590c5e19dabe10866a2a7a26dff5a1eb2482a3bc199f2b37def2712
+      - path: src/robotest_sim/worlds/robotest_lab.sdf
+        sha256: 06ae57acb82e58ebb64cacf0082e0de3a92fb8907a839c22011b8acc7acba539
+    source_inventory_sha256: 61626e1c253917fd982ae2ba35dc1aa71ad847ab3a4c75370b4fdc8acf7d737b
   policy:
     active_pair_expiry_ns: 250000000
     active_pair_scope: support_robot_internal_and_countable_robot_external
-    accepted_run_scope: bounded_pending_raw_and_public_source_liveness_required
+    accepted_run_scope: bounded_complete_aggregate_and_public_source_liveness_required
+    aggregate_interval_ns: 20000000
+    aggregate_interval_pair_membership: union_of_every_physics_step_in_open_closed_interval
+    aggregate_record_reduction: latest_complete_physics_step_group_per_normalized_pair_preserving_record_order
     capacity_claim_scope: unchanged_pair_set_heartbeat_only
-    completed_stamp_batching: finalize_on_strictly_greater_raw_stamp
+    completed_stamp_batching: one_complete_interval_aggregate_per_stamp
     delivery_semantics: authoritative_delivered_active_pair_snapshot
     emission_policy: immediate_active_pair_set_transition_else_heartbeat_at_or_after_200ms
     heartbeat_period_ns: 200000000
     initial_finalized_stamp_suppressed: true
-    ingress_memory_bound_scope: post_dds_deserialization_of_trusted_sole_private_bridge_input
+    ingress_memory_bound_scope: post_dds_deserialization_of_trusted_sole_private_aggregate_bridge_input
     max_pending_batch_clock_lag_ns: 220000000
     max_public_snapshot_gap_ns: 220000000
     max_public_snapshot_clock_lag_ns: 220000000
@@ -67,22 +84,22 @@ contact_stream:
       max_contact_string_bytes: 8192
       max_frame_id_bytes: 256
       max_raw_contact_records: 16
-      max_raw_messages_per_completed_stamp: 7
+      max_raw_messages_per_completed_stamp: 1
       max_raw_string_bytes_per_completed_stamp: 65536
     release_comparison: completed_absent_stamp_strictly_greater_than_last_seen_plus_gap
     raw_contact_positions: required_nonempty_1_to_64
-    raw_stamp_gap_semantics: consecutive_nonempty_raw_gaps_are_not_absence_evidence_and_have_no_independent_bound
+    raw_stamp_gap_semantics: sole_source_grid_is_exact_20ms_and_gate_rejects_delivered_gaps_greater_than_20ms
     raw_messages_require_nonempty_contacts: true
     required_raw_frame_id: ''
-    retained_contact_payload: exact_nested_contact_record_copy
+    retained_contact_payload: exact_ros_projected_nested_copy_of_latest_pair_group_selected_by_interval_reduction
     semantic_fatal_delivery: best_effort_diagnostic_snapshot_before_process_failure
     string_budget_accounting: payload_strings_plus_normalized_pair_key_once_per_stored_pair
     synthesized_envelope:
     - container
-    - current_completed_header
+    - interval_boundary_container_and_contact_headers
     - normalized_pair_order
     synchronization: second_finalized_stamp_seeds_public_stream
-  policy_sha256: 745c3a45d51082f5dcb13763fd690560bc9823780d0e7649de253a3606cf493f
+  policy_sha256: a448484464f71157d096d55a29c3d05e0207e693d1b4b16d1faa9aece2d20ebe
 robot_collisions:
 - name: robotest::base_footprint::base_footprint_fixed_joint_lump__base_link_collision_collision
   role: chassis
@@ -151,9 +168,9 @@ support_pairs:
   environment_collision: ground_plane::ground_link::ground_collision
 - robot_collision: robotest::rear_caster_link::rear_caster_link_fixed_joint_lump__rear_caster_collision_collision
   environment_collision: ground_plane::ground_link::ground_collision
-bridge_sha256: ef517ad0e89e9df71668835aaaf306e21aa52a0d75371a9d331a87aaa6a710e7
-contact_configuration_sha256: 7e0ed219e49270a7de678900ca6a818193756007f40bd4a3c781ce7bf01b734f
-rendered_sdf_sha256: 35afbcb86f78fadd72743aa125eeb919b64e6bf52ad85a33dac981fe6dcc246a
-robot_description_sha256: 380c2bb23114cfbd8558b4e48fa9b906020cf9cc26e4db7d2ad59f241cbd6a47
-world_source_sha256: c3765faae0a4fc309a64d62d97b4586664847d8756564ddc25f22cddd76ef091
-manifest_sha256: 4fd1deac1f85456a377bad6756dd39462b76c5b0f5903f61567213b6115caff6
+bridge_sha256: 092bb7f3e02d2725b41023b9d579476895aa770c3f329c92cf38d196481fba6c
+contact_configuration_sha256: ef0025aba2983543432ba362b79c6f08e0fd3304b4840a421a8f179733645097
+rendered_sdf_sha256: 0b3261652693ec2cc8d88924a88d6fa3fcbcdf89c556bd6684b3fbcfb1b1ed16
+robot_description_sha256: 9504b43c5d6af62d6a634bd98b615026bdf95ed9ef1120f3efd2308fad161263
+world_source_sha256: 06ae57acb82e58ebb64cacf0082e0de3a92fb8907a839c22011b8acc7acba539
+manifest_sha256: a45ef9aa28671f800b0b122c3e9fa40690581b1bf219ac88b89d18f028b1182a

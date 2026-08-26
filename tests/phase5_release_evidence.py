@@ -210,6 +210,12 @@ ALLOWED_GENERATED_DELTA = [
     'artifacts/evidence/phase0/ros2-doctor.txt',
     'artifacts/evidence/phase0/tool-versions.tsv',
 ]
+CONTACT_GATE_BUILD_PATH = 'build/robotest_sim/contact_stream_gate'
+CONTACT_GATE_INSTALL_PATH = 'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
+CONTACT_AGGREGATOR_BUILD_PATH = 'build/robotest_sim/librobotest_contact_aggregator_system.so'
+CONTACT_AGGREGATOR_INSTALL_PATH = (
+    'install/robotest_sim/lib/robotest_sim/librobotest_contact_aggregator_system.so'
+)
 
 
 def _require(condition: bool, message: str) -> None:
@@ -603,10 +609,12 @@ def _validate_contact_gate_binary_binding(value: object) -> None:
             'build_embedded_source_inventory_sha256',
             'build_elf_build_id',
             'build_install_build_id_match',
+            'build_install_samefile',
             'build_install_sha256_match',
             'build_path',
             'build_regular_executable',
             'build_sha256',
+            'installed_declared_is_symlink',
             'installed_declared_path',
             'installed_declared_samefile',
             'installed_embedded_source_inventory_match',
@@ -620,12 +628,12 @@ def _validate_contact_gate_binary_binding(value: object) -> None:
             'source_inventory_sha256',
         }
         and binding.get('package') == 'robotest_sim'
+        and _exact_integer(binding.get('schema_version'))
         and binding.get('schema_version') == 1
-        and binding.get('build_path') == 'build/robotest_sim/contact_stream_gate'
-        and binding.get('installed_declared_path')
-        == 'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
-        and binding.get('installed_path')
-        == 'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
+        and binding.get('build_path') == CONTACT_GATE_BUILD_PATH
+        and binding.get('installed_declared_path') == CONTACT_GATE_INSTALL_PATH
+        and isinstance(binding.get('installed_declared_is_symlink'), bool)
+        and isinstance(binding.get('build_install_samefile'), bool)
         and binding.get('build_install_build_id_match') is True
         and binding.get('build_install_sha256_match') is True
         and binding.get('build_embedded_source_inventory_match') is True
@@ -634,6 +642,15 @@ def _validate_contact_gate_binary_binding(value: object) -> None:
         and binding.get('installed_regular_executable') is True
         and binding.get('installed_embedded_source_inventory_match') is True,
         'Phase 3 contact gate build/install binding changed',
+    )
+    installed_declared_is_symlink = binding['installed_declared_is_symlink']
+    expected_installed_path = (
+        CONTACT_GATE_BUILD_PATH if installed_declared_is_symlink else CONTACT_GATE_INSTALL_PATH
+    )
+    _require(
+        binding.get('installed_path') == expected_installed_path
+        and (not installed_declared_is_symlink or binding.get('build_install_samefile') is True),
+        'Phase 3 contact gate declared/resolved install path is invalid',
     )
     for field in (
         'build_embedded_source_inventory_sha256',
@@ -660,6 +677,88 @@ def _validate_contact_gate_binary_binding(value: object) -> None:
         and re.fullmatch(r'[0-9a-f]+', binding['build_elf_build_id']) is not None
         and binding.get('installed_elf_build_id') == binding.get('build_elf_build_id'),
         'Phase 3 contact gate ELF build ID binding is invalid',
+    )
+
+
+def _validate_contact_aggregator_binary_binding(value: object) -> None:
+    binding = _mapping(value, 'Phase 3 contact aggregator binary binding')
+    _require(
+        set(binding)
+        == {
+            'build_embedded_source_inventory_match',
+            'build_embedded_source_inventory_sha256',
+            'build_elf_build_id',
+            'build_install_build_id_match',
+            'build_install_embedded_source_inventory_match',
+            'build_install_samefile',
+            'build_install_sha256_match',
+            'build_path',
+            'build_regular_file',
+            'build_sha256',
+            'installed_declared_is_symlink',
+            'installed_declared_path',
+            'installed_embedded_source_inventory_match',
+            'installed_embedded_source_inventory_sha256',
+            'installed_elf_build_id',
+            'installed_path',
+            'installed_regular_file',
+            'installed_sha256',
+            'package',
+            'schema_version',
+            'source_inventory_sha256',
+        }
+        and binding.get('package') == 'robotest_sim'
+        and _exact_integer(binding.get('schema_version'))
+        and binding.get('schema_version') == 1
+        and binding.get('build_path') == CONTACT_AGGREGATOR_BUILD_PATH
+        and binding.get('installed_declared_path') == CONTACT_AGGREGATOR_INSTALL_PATH
+        and isinstance(binding.get('installed_declared_is_symlink'), bool)
+        and isinstance(binding.get('build_install_samefile'), bool)
+        and binding.get('build_regular_file') is True
+        and binding.get('installed_regular_file') is True
+        and binding.get('build_install_build_id_match') is True
+        and binding.get('build_install_embedded_source_inventory_match') is True
+        and binding.get('build_install_sha256_match') is True
+        and binding.get('build_embedded_source_inventory_match') is True
+        and binding.get('installed_embedded_source_inventory_match') is True,
+        'Phase 3 contact aggregator build/install binding changed',
+    )
+    installed_declared_is_symlink = binding['installed_declared_is_symlink']
+    expected_installed_path = (
+        CONTACT_AGGREGATOR_BUILD_PATH
+        if installed_declared_is_symlink
+        else CONTACT_AGGREGATOR_INSTALL_PATH
+    )
+    _require(
+        binding.get('installed_path') == expected_installed_path
+        and (not installed_declared_is_symlink or binding.get('build_install_samefile') is True),
+        'Phase 3 contact aggregator declared/resolved install path is invalid',
+    )
+    for field in (
+        'build_embedded_source_inventory_sha256',
+        'build_sha256',
+        'installed_embedded_source_inventory_sha256',
+        'installed_sha256',
+        'source_inventory_sha256',
+    ):
+        _require(
+            isinstance(binding.get(field), str)
+            and re.fullmatch(r'[0-9a-f]{64}', binding[field]) is not None,
+            f'Phase 3 contact aggregator {field} is invalid',
+        )
+    _require(
+        binding.get('build_embedded_source_inventory_sha256')
+        == binding.get('source_inventory_sha256')
+        and binding.get('installed_embedded_source_inventory_sha256')
+        == binding.get('source_inventory_sha256')
+        and binding.get('build_sha256') == binding.get('installed_sha256'),
+        'Phase 3 contact aggregator embedded source or build/install hash differs',
+    )
+    _require(
+        isinstance(binding.get('build_elf_build_id'), str)
+        and re.fullmatch(r'[0-9a-f]+', binding['build_elf_build_id']) is not None
+        and binding.get('installed_elf_build_id') == binding.get('build_elf_build_id'),
+        'Phase 3 contact aggregator ELF build ID binding is invalid',
     )
 
 
@@ -1047,6 +1146,7 @@ def _phase3_evidence(
         set(binding)
         == {
             'collector_configuration_sha256',
+            'contact_aggregator_binary',
             'contact_gate_binary',
             'created_by',
             'git',
@@ -1067,7 +1167,20 @@ def _phase3_evidence(
     _validate_tree_manifest(binding.get('source'), 'Phase 3 source tree manifest')
     _validate_tree_manifest(binding.get('install'), 'Phase 3 install tree manifest')
     _validate_source_install(binding.get('source_install'))
-    _validate_contact_gate_binary_binding(binding.get('contact_gate_binary'))
+    contact_aggregator_binary = _mapping(
+        binding.get('contact_aggregator_binary'),
+        'Phase 3 contact aggregator binary binding',
+    )
+    contact_gate_binary = _mapping(
+        binding.get('contact_gate_binary'), 'Phase 3 contact gate binary binding'
+    )
+    _validate_contact_aggregator_binary_binding(contact_aggregator_binary)
+    _validate_contact_gate_binary_binding(contact_gate_binary)
+    _require(
+        contact_aggregator_binary.get('source_inventory_sha256')
+        == contact_gate_binary.get('source_inventory_sha256'),
+        'Phase 3 contact binaries do not share one source inventory',
+    )
     orchestration = _load_repository_module(
         repository,
         'tests/phase3_orchestration.py',

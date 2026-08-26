@@ -21,7 +21,20 @@
     <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
     <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
     <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
-    <plugin filename="gz-sim-contact-system" name="gz::sim::systems::Contact"/>
+    <!--
+      The stock Contact system publishes once per nonempty sensor and physics
+      step. With seven sensors that unbounded fan-in can overrun the bridge
+      while other processes start. This source-bound system provisions the
+      same ContactSensorData components, observes every completed physics
+      step, and publishes one complete 20 ms interval aggregate instead.
+    -->
+    <plugin
+      filename="robotest_contact_aggregator_system"
+      name="robotest_sim::ContactAggregatorSystem">
+      <output_topic>/robotest/internal/contact_aggregate</output_topic>
+      <publish_period_ns>20000000</publish_period_ns>
+      <robot_model_name>robotest</robot_model_name>
+    </plugin>
     <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
       <render_engine>ogre2</render_engine>
     </plugin>

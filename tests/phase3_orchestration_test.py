@@ -47,12 +47,7 @@ RUNTIME_GATE_SPEC.loader.exec_module(runtime_gate)
 def _contact_stream_contract() -> dict:
     workspace = Path(__file__).parents[1]
     policy = copy.deepcopy(orchestration.EXPECTED_CONTACT_STREAM_POLICY)
-    source_paths = [
-        'src/robotest_sim/CMakeLists.txt',
-        'src/robotest_sim/include/robotest_sim/contact_stream_gate.hpp',
-        'src/robotest_sim/src/contact_stream_gate.cpp',
-        'src/robotest_sim/src/contact_stream_gate_node.cpp',
-    ]
+    source_paths = orchestration.CONTACT_GATE_SOURCE_PATHS
     source_inventory = {
         'schema_version': 1,
         'sources': [
@@ -91,7 +86,7 @@ def _contact_stream_contract() -> dict:
         },
         'schema_version': 1,
         'topics': {
-            'gazebo_raw': '/robotest/validation/contacts',
+            'gazebo_raw': '/robotest/internal/contact_aggregate',
             'private_raw_ros': '/robotest/internal/raw_contacts',
             'public_ros': '/robotest/validation/contacts',
         },
@@ -234,6 +229,100 @@ def test_generated_contact_stream_configuration_round_trips_v3_contract() -> Non
     assert orchestration._contact_stream_manifest_v3(manifest, workspace) == contact_stream
 
 
+def _contact_aggregator_reobservation_fixture(
+    *, source_inventory_sha256: str = '4' * 64
+) -> tuple[dict, dict]:
+    digest = source_inventory_sha256
+    binary = {
+        field: True
+        for field in orchestration.CONTACT_AGGREGATOR_BINARY_FIELDS
+        if field.endswith('_match') or field.endswith('_file')
+    } | {
+        'build_elf_build_id': 'b2',
+        'build_embedded_source_inventory_sha256': digest,
+        'build_install_samefile': True,
+        'build_path': orchestration.CONTACT_AGGREGATOR_BUILD_PATH,
+        'build_sha256': '6' * 64,
+        'installed_declared_is_symlink': True,
+        'installed_declared_path': orchestration.CONTACT_AGGREGATOR_INSTALLED_PATH,
+        'installed_elf_build_id': 'b2',
+        'installed_embedded_source_inventory_sha256': digest,
+        'installed_path': orchestration.CONTACT_AGGREGATOR_BUILD_PATH,
+        'installed_sha256': '6' * 64,
+        'package': 'robotest_sim',
+        'schema_version': 1,
+        'source_inventory_sha256': digest,
+    }
+    stable_identity = {
+        'build_elf_build_id': binary['build_elf_build_id'],
+        'build_path': binary['build_path'],
+        'build_sha256': binary['build_sha256'],
+        'installed_declared_path': binary['installed_declared_path'],
+        'installed_device': 9,
+        'installed_elf_build_id': binary['installed_elf_build_id'],
+        'installed_embedded_source_inventory_sha256': digest,
+        'installed_inode': 10,
+        'installed_path': binary['installed_path'],
+        'installed_sha256': binary['installed_sha256'],
+        'launch_root_pid': 100,
+        'live_cmdline_sha256': '7' * 64,
+        'live_executable_link': '/usr/bin/gz',
+        'live_executable_path': '/usr/bin/gz',
+        'live_mapping_device': 9,
+        'live_mapping_fingerprint_sha256': '8' * 64,
+        'live_mapping_inode': 10,
+        'live_mapping_paths': ['/workspace/librobotest_contact_aggregator_system.so'],
+        'live_pgid': 100,
+        'live_pid': 103,
+        'live_ppid': 100,
+        'live_sid': 100,
+        'live_start_ticks': 3456,
+        'observed_gz_partition': 'robotest_p3_candidate_trial',
+        'observed_ros_domain_id': '100',
+        'source_inventory_sha256': digest,
+    }
+    attestation = {
+        **binary,
+        'attestation_method': 'proc_maps_exact_device_inode',
+        'exact_live_process_count': 1,
+        'identity_revalidated_after_hashing': True,
+        'installed_device': 9,
+        'installed_identity_revalidated_after_hashing': True,
+        'installed_inode': 10,
+        'installed_size_bytes': 2_000,
+        'launch_root_pid': 100,
+        'live_cmdline_sha256': '7' * 64,
+        'live_elf_build_id': binary['installed_elf_build_id'],
+        'live_embedded_source_inventory_match': True,
+        'live_embedded_source_inventory_sha256': digest,
+        'live_executable_link': '/usr/bin/gz',
+        'live_executable_path': '/usr/bin/gz',
+        'live_installed_build_id_match': True,
+        'live_installed_inode_match': True,
+        'live_installed_sha256_match': True,
+        'live_mapping_count': 5,
+        'live_mapping_device': 9,
+        'live_mapping_fingerprint_sha256': '8' * 64,
+        'live_mapping_has_executable': True,
+        'live_mapping_has_offset_zero': True,
+        'live_mapping_inode': 10,
+        'live_mapping_paths': stable_identity['live_mapping_paths'],
+        'live_pgid': 100,
+        'live_pid': 103,
+        'live_ppid': 100,
+        'live_sid': 100,
+        'live_start_ticks': 3456,
+        'maps_revalidated_after_hashing': True,
+        'observed_gz_partition': 'robotest_p3_candidate_trial',
+        'observed_ros_domain_id': '100',
+        'process_identity_match': True,
+        'stable_identity': stable_identity,
+        'stable_identity_sha256': orchestration.canonical_sha256(stable_identity),
+        'verdict': 'PASS',
+    }
+    return binary, attestation
+
+
 def test_contact_gate_reobservation_binds_build_and_rejects_rebound(
     tmp_path: Path,
 ) -> None:
@@ -244,11 +333,14 @@ def test_contact_gate_reobservation_binds_build_and_rejects_rebound(
             'build_embedded_source_inventory_sha256': '4' * 64,
             'build_elf_build_id': 'a1',
             'build_install_build_id_match': True,
+            'build_install_samefile': False,
             'build_install_sha256_match': True,
             'build_path': 'build/robotest_sim/contact_stream_gate',
+            'build_regular_executable': True,
             'build_sha256': '2' * 64,
             'exact_live_process_count': 1,
             'identity_revalidated_after_hashing': True,
+            'installed_declared_is_symlink': False,
             'installed_declared_path': 'install/robotest_sim/lib/robotest_sim/contact_stream_gate',
             'installed_declared_samefile': True,
             'installed_device': 7,
@@ -291,21 +383,29 @@ def test_contact_gate_reobservation_binds_build_and_rejects_rebound(
             'verdict': 'PASS',
         }
     )
+    aggregator_binary, aggregator_attestation = _contact_aggregator_reobservation_fixture()
     initial_path = tmp_path / 'runtime-gate.json'
     final_path = tmp_path / 'contact-stream-final-gate.json'
-    document = {'contact_gate_binary_attestation': attestation, 'verdict': 'PASS'}
+    document = {
+        'contact_aggregator_binary_attestation': aggregator_attestation,
+        'contact_gate_binary_attestation': attestation,
+        'verdict': 'PASS',
+    }
     orchestration.atomic_write_json(initial_path, document, sidecar=True)
     orchestration.atomic_write_json(final_path, document, sidecar=True)
     build_binding = {
+        'contact_aggregator_binary': aggregator_binary,
         'contact_gate_binary': {
             'build_embedded_source_inventory_match': True,
             'build_embedded_source_inventory_sha256': '4' * 64,
             'build_elf_build_id': 'a1',
             'build_install_build_id_match': True,
+            'build_install_samefile': False,
             'build_install_sha256_match': True,
             'build_path': 'build/robotest_sim/contact_stream_gate',
             'build_regular_executable': True,
             'build_sha256': '2' * 64,
+            'installed_declared_is_symlink': False,
             'installed_declared_path': (
                 'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
             ),
@@ -316,8 +416,10 @@ def test_contact_gate_reobservation_binds_build_and_rejects_rebound(
             'installed_path': 'install/robotest_sim/lib/robotest_sim/contact_stream_gate',
             'installed_regular_executable': True,
             'installed_sha256': '2' * 64,
+            'package': 'robotest_sim',
+            'schema_version': 1,
             'source_inventory_sha256': '4' * 64,
-        }
+        },
     }
     evidence = orchestration.reconcile_contact_gate_reobservation(
         initial_path,
@@ -403,6 +505,9 @@ def test_contact_gate_build_install_rejects_same_build_id_with_appended_byte(
     shutil.copy2(build, installed)
     binding = orchestration.contact_gate_build_install_binding(tmp_path)
     assert binding['build_install_sha256_match'] is True
+    assert binding['installed_declared_is_symlink'] is False
+    assert binding['build_install_samefile'] is False
+    assert binding['installed_path'] == orchestration.CONTACT_GATE_INSTALLED_PATH
 
     with installed.open('ab') as stream:
         stream.write(b'x')
@@ -412,6 +517,47 @@ def test_contact_gate_build_install_rejects_same_build_id_with_appended_byte(
     ) == orchestration._elf_embedded_source_inventory_sha256(installed)
     with pytest.raises(orchestration.EvidenceError, match='hashes differ'):
         orchestration.contact_gate_build_install_binding(tmp_path)
+
+
+def _contact_gate_binary_analysis_schema() -> dict[str, object]:
+    schema = json.loads(
+        (
+            Path(__file__).parents[1] / 'src/robotest_metrics/schema/analysis-request.schema.json'
+        ).read_text(encoding='utf-8')
+    )
+    gate_schema = schema['$defs']['orchestrator']['properties']['source_binding']['properties'][
+        'contact_gate_binary'
+    ]
+    return {**gate_schema, '$defs': schema['$defs']}
+
+
+def test_current_contact_gate_build_binding_matches_analysis_schema() -> None:
+    workspace = Path(__file__).parents[1]
+    binding = orchestration.contact_gate_build_install_binding(workspace)
+    assert binding['installed_declared_is_symlink'] is True
+    assert binding['build_install_samefile'] is True
+    assert binding['installed_path'] == orchestration.CONTACT_GATE_BUILD_PATH
+    assert (
+        list(Draft202012Validator(_contact_gate_binary_analysis_schema()).iter_errors(binding))
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        ('installed_declared_is_symlink', 1),
+        ('installed_path', orchestration.CONTACT_GATE_INSTALLED_PATH),
+        ('build_install_samefile', False),
+    ],
+)
+def test_contact_gate_analysis_schema_rejects_symlink_binding_tampering(
+    field: str,
+    value: object,
+) -> None:
+    binding = orchestration.contact_gate_build_install_binding(Path(__file__).parents[1])
+    binding[field] = value
+    assert list(Draft202012Validator(_contact_gate_binary_analysis_schema()).iter_errors(binding))
 
 
 def test_utf8_string_bound_is_bytes_not_codepoints() -> None:
@@ -727,7 +873,12 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     manifest = {**unsigned, 'manifest_sha256': orchestration.canonical_sha256(unsigned)}
     source_inventory_sha256 = manifest['contact_stream']['gate']['source_inventory_sha256']
     gate_binary = {'source_inventory_sha256': source_inventory_sha256}
-    positive_build_binding = {'contact_gate_binary': gate_binary}
+    positive_build_binding = {
+        'contact_aggregator_binary': {
+            'source_inventory_sha256': source_inventory_sha256,
+        },
+        'contact_gate_binary': gate_binary,
+    }
     manifest_path = tmp_path / 'coverage.yaml'
     manifest_path.write_text(yaml.safe_dump(manifest, sort_keys=True), encoding='utf-8')
     result = {
@@ -1139,9 +1290,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     )
 
     inconsistent_offset = copy.deepcopy(diagnostic_offset)
-    inconsistent_offset['streams']['contacts']['items'][1][
-        'delivery_clock_offset_ns'
-    ] = 278_000_001
+    inconsistent_offset['streams']['contacts']['items'][1]['delivery_clock_offset_ns'] = 278_000_001
     orchestration.atomic_write_json(capture_path, inconsistent_offset)
     with pytest.raises(orchestration.EvidenceError, match='offset is inconsistent'):
         orchestration.reconcile_positive_control(
@@ -1324,15 +1473,20 @@ def test_orchestrator_evidence_matches_metrics_schema(tmp_path: Path) -> None:
     }
     build = {
         'collector_configuration_sha256': '2' * 64,
+        'contact_aggregator_binary': _contact_aggregator_reobservation_fixture(
+            source_inventory_sha256='8' * 64
+        )[0],
         'contact_gate_binary': {
             'build_embedded_source_inventory_match': True,
             'build_embedded_source_inventory_sha256': '8' * 64,
             'build_elf_build_id': 'a1',
             'build_install_build_id_match': True,
+            'build_install_samefile': True,
             'build_install_sha256_match': True,
             'build_path': 'build/robotest_sim/contact_stream_gate',
             'build_regular_executable': True,
             'build_sha256': '9' * 64,
+            'installed_declared_is_symlink': True,
             'installed_declared_path': (
                 'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
             ),
@@ -1340,7 +1494,7 @@ def test_orchestrator_evidence_matches_metrics_schema(tmp_path: Path) -> None:
             'installed_embedded_source_inventory_match': True,
             'installed_embedded_source_inventory_sha256': '8' * 64,
             'installed_elf_build_id': 'a1',
-            'installed_path': 'install/robotest_sim/lib/robotest_sim/contact_stream_gate',
+            'installed_path': 'build/robotest_sim/contact_stream_gate',
             'installed_regular_executable': True,
             'installed_sha256': '9' * 64,
             'package': 'robotest_sim',

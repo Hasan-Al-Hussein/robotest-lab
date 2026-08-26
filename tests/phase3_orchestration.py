@@ -56,17 +56,23 @@ CONTACT_MAX_CLOCK_LAG_NS = 220_000_000
 CONTACT_PUBLIC_TOPIC = '/robotest/validation/contacts'
 CONTACT_GATE_NODE = '/robotest/contact_stream_gate'
 CONTACT_PRIVATE_RAW_TOPIC = '/robotest/internal/raw_contacts'
+CONTACT_GAZEBO_AGGREGATE_TOPIC = '/robotest/internal/contact_aggregate'
 CONTACT_INGRESS_MEMORY_BOUND_SCOPE_PARTS = (
     'post_dds_deserialization_of',
-    'trusted_sole_private_bridge_input',
+    'trusted_sole_private_aggregate_bridge_input',
 )
 CONTACT_INGRESS_MEMORY_BOUND_SCOPE = '_'.join(CONTACT_INGRESS_MEMORY_BOUND_SCOPE_PARTS)
 EXPECTED_CONTACT_STREAM_POLICY = {
     'active_pair_expiry_ns': 250_000_000,
     'active_pair_scope': 'support_robot_internal_and_countable_robot_external',
-    'accepted_run_scope': 'bounded_pending_raw_and_public_source_liveness_required',
+    'accepted_run_scope': 'bounded_complete_aggregate_and_public_source_liveness_required',
+    'aggregate_interval_ns': 20_000_000,
+    'aggregate_interval_pair_membership': 'union_of_every_physics_step_in_open_closed_interval',
+    'aggregate_record_reduction': (
+        'latest_complete_physics_step_group_per_normalized_pair_preserving_record_order'
+    ),
     'capacity_claim_scope': 'unchanged_pair_set_heartbeat_only',
-    'completed_stamp_batching': 'finalize_on_strictly_greater_raw_stamp',
+    'completed_stamp_batching': 'one_complete_interval_aggregate_per_stamp',
     'delivery_semantics': 'authoritative_delivered_active_pair_snapshot',
     'emission_policy': ('immediate_active_pair_set_transition_else_heartbeat_at_or_after_200ms'),
     'heartbeat_period_ns': 200_000_000,
@@ -88,13 +94,13 @@ EXPECTED_CONTACT_STREAM_POLICY = {
         'max_contact_string_bytes': 8_192,
         'max_frame_id_bytes': 256,
         'max_raw_contact_records': 16,
-        'max_raw_messages_per_completed_stamp': 7,
+        'max_raw_messages_per_completed_stamp': 1,
         'max_raw_string_bytes_per_completed_stamp': 65_536,
     },
     'release_comparison': ('completed_absent_stamp_strictly_greater_than_last_seen_plus_gap'),
     'raw_contact_positions': 'required_nonempty_1_to_64',
     'raw_stamp_gap_semantics': (
-        'consecutive_nonempty_raw_gaps_are_not_absence_evidence_and_have_no_independent_bound'
+        'sole_source_grid_is_exact_20ms_and_gate_rejects_delivered_gaps_greater_than_20ms'
     ),
     'raw_messages_require_nonempty_contacts': True,
     'public_snapshot_cardinality': 'required_nonempty_1_to_16',
@@ -104,10 +110,12 @@ EXPECTED_CONTACT_STREAM_POLICY = {
     'public_snapshots_per_finalized_stamp': 'at_most_one',
     'public_snapshots_require_nonempty_contacts': True,
     'required_raw_frame_id': '',
-    'retained_contact_payload': 'exact_nested_contact_record_copy',
+    'retained_contact_payload': (
+        'exact_ros_projected_nested_copy_of_latest_pair_group_selected_by_interval_reduction'
+    ),
     'synthesized_envelope': [
         'container',
-        'current_completed_header',
+        'interval_boundary_container_and_contact_headers',
         'normalized_pair_order',
     ],
     'synchronization': 'second_finalized_stamp_seeds_public_stream',
@@ -591,11 +599,70 @@ def _elf_build_id(path: Path) -> str:
 
 
 CONTACT_GATE_SOURCE_TAG = b'ROBOTEST_CONTACT_GATE_SOURCE_INVENTORY_SHA256='
+CONTACT_GATE_BUILD_PATH = 'build/robotest_sim/contact_stream_gate'
+CONTACT_GATE_INSTALLED_PATH = 'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
+CONTACT_GATE_BINARY_FIELDS = {
+    'build_embedded_source_inventory_match',
+    'build_embedded_source_inventory_sha256',
+    'build_elf_build_id',
+    'build_install_build_id_match',
+    'build_install_samefile',
+    'build_install_sha256_match',
+    'build_path',
+    'build_regular_executable',
+    'build_sha256',
+    'installed_declared_is_symlink',
+    'installed_declared_path',
+    'installed_declared_samefile',
+    'installed_embedded_source_inventory_match',
+    'installed_embedded_source_inventory_sha256',
+    'installed_elf_build_id',
+    'installed_path',
+    'installed_regular_executable',
+    'installed_sha256',
+    'package',
+    'schema_version',
+    'source_inventory_sha256',
+}
+CONTACT_AGGREGATOR_BUILD_PATH = 'build/robotest_sim/librobotest_contact_aggregator_system.so'
+CONTACT_AGGREGATOR_INSTALLED_PATH = (
+    'install/robotest_sim/lib/robotest_sim/librobotest_contact_aggregator_system.so'
+)
+CONTACT_AGGREGATOR_BINARY_FIELDS = {
+    'build_elf_build_id',
+    'build_embedded_source_inventory_match',
+    'build_embedded_source_inventory_sha256',
+    'build_install_build_id_match',
+    'build_install_embedded_source_inventory_match',
+    'build_install_samefile',
+    'build_install_sha256_match',
+    'build_path',
+    'build_regular_file',
+    'build_sha256',
+    'installed_declared_is_symlink',
+    'installed_declared_path',
+    'installed_elf_build_id',
+    'installed_embedded_source_inventory_match',
+    'installed_embedded_source_inventory_sha256',
+    'installed_path',
+    'installed_regular_file',
+    'installed_sha256',
+    'package',
+    'schema_version',
+    'source_inventory_sha256',
+}
 CONTACT_GATE_SOURCE_PATHS = (
+    'src/robotest_description/urdf/robotest_gazebo.xacro',
     'src/robotest_sim/CMakeLists.txt',
+    'src/robotest_sim/config/bridge.yaml',
+    'src/robotest_sim/include/robotest_sim/contact_aggregator.hpp',
     'src/robotest_sim/include/robotest_sim/contact_stream_gate.hpp',
+    'src/robotest_sim/launch/sim.launch.py',
+    'src/robotest_sim/src/contact_aggregator.cpp',
+    'src/robotest_sim/src/contact_aggregator_system.cpp',
     'src/robotest_sim/src/contact_stream_gate.cpp',
     'src/robotest_sim/src/contact_stream_gate_node.cpp',
+    'src/robotest_sim/worlds/robotest_lab.sdf',
 )
 
 
@@ -631,15 +698,33 @@ def contact_gate_source_inventory(workspace: Path) -> dict[str, Any]:
 
 def contact_gate_build_install_binding(workspace: Path) -> dict[str, Any]:
     """Bind the compiled contact gate build artifact to its installed ELF."""
-    build_path = (workspace / 'build/robotest_sim/contact_stream_gate').resolve(strict=True)
-    installed_declared_path = workspace / (
-        'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
-    )
-    installed_path = installed_declared_path.resolve(strict=True)
+    try:
+        workspace_root = workspace.resolve(strict=True)
+        build_path = (workspace_root / CONTACT_GATE_BUILD_PATH).resolve(strict=True)
+        installed_declared_path = workspace_root / CONTACT_GATE_INSTALLED_PATH
+        installed_path = installed_declared_path.resolve(strict=True)
+    except OSError as exc:
+        raise EvidenceError('contact stream gate build/install artifact is missing') from exc
     if not build_path.is_file() or not installed_path.is_file():
         raise EvidenceError('contact stream gate build/install artifact is not regular')
     if not os.access(build_path, os.X_OK) or not os.access(installed_path, os.X_OK):
         raise EvidenceError('contact stream gate build/install artifact is not executable')
+    try:
+        build_relative = build_path.relative_to(workspace_root).as_posix()
+        installed_relative = installed_path.relative_to(workspace_root).as_posix()
+    except ValueError as exc:
+        raise EvidenceError(
+            'contact stream gate build/install artifact escapes the workspace'
+        ) from exc
+    installed_declared_is_symlink = installed_declared_path.is_symlink()
+    build_install_samefile = build_path.samefile(installed_path)
+    if installed_declared_is_symlink:
+        if installed_path != build_path or not build_install_samefile:
+            raise EvidenceError(
+                'contact stream gate symlink install does not resolve to the build artifact'
+            )
+    elif installed_path != installed_declared_path:
+        raise EvidenceError('contact stream gate copied install resolved path is invalid')
     build_sha256 = file_sha256(build_path)
     installed_sha256 = file_sha256(installed_path)
     build_install_sha256_match = build_sha256 == installed_sha256
@@ -663,17 +748,91 @@ def contact_gate_build_install_binding(workspace: Path) -> dict[str, Any]:
         'build_embedded_source_inventory_sha256': build_embedded_source,
         'build_elf_build_id': build_id,
         'build_regular_executable': True,
-        'build_path': build_path.relative_to(workspace).as_posix(),
+        'build_install_samefile': build_install_samefile,
+        'build_path': build_relative,
         'build_sha256': build_sha256,
         'build_install_build_id_match': True,
         'build_install_sha256_match': build_install_sha256_match,
-        'installed_declared_path': installed_declared_path.relative_to(workspace).as_posix(),
+        'installed_declared_is_symlink': installed_declared_is_symlink,
+        'installed_declared_path': CONTACT_GATE_INSTALLED_PATH,
         'installed_declared_samefile': installed_declared_path.samefile(installed_path),
         'installed_embedded_source_inventory_match': installed_embedded_source_match,
         'installed_embedded_source_inventory_sha256': installed_embedded_source,
         'installed_elf_build_id': installed_build_id,
-        'installed_path': installed_path.relative_to(workspace).as_posix(),
+        'installed_path': installed_relative,
         'installed_regular_executable': True,
+        'installed_sha256': installed_sha256,
+        'package': 'robotest_sim',
+        'schema_version': 1,
+        'source_inventory_sha256': source_inventory_sha256,
+    }
+
+
+def contact_aggregator_build_install_binding(workspace: Path) -> dict[str, Any]:
+    """Bind the Gazebo contact-aggregator DSO to its declared install path."""
+    try:
+        workspace_root = workspace.resolve(strict=True)
+        build_path = (workspace_root / CONTACT_AGGREGATOR_BUILD_PATH).resolve(strict=True)
+        installed_declared_path = workspace_root / CONTACT_AGGREGATOR_INSTALLED_PATH
+        installed_path = installed_declared_path.resolve(strict=True)
+    except OSError as exc:
+        raise EvidenceError('contact aggregator build/install DSO is missing') from exc
+    if not build_path.is_file() or not installed_path.is_file():
+        raise EvidenceError('contact aggregator build/install DSO is not a regular file')
+    try:
+        build_relative = build_path.relative_to(workspace_root).as_posix()
+        installed_relative = installed_path.relative_to(workspace_root).as_posix()
+    except ValueError as exc:
+        raise EvidenceError('contact aggregator build/install DSO escapes the workspace') from exc
+
+    build_sha256 = file_sha256(build_path)
+    installed_sha256 = file_sha256(installed_path)
+    build_install_sha256_match = build_sha256 == installed_sha256
+    if not build_install_sha256_match:
+        raise EvidenceError('contact aggregator build/install DSO hashes differ')
+    build_id = _elf_build_id(build_path)
+    installed_build_id = _elf_build_id(installed_path)
+    build_install_build_id_match = build_id == installed_build_id
+    if not build_install_build_id_match:
+        raise EvidenceError('contact aggregator build/install DSO build IDs differ')
+
+    source_inventory_sha256 = canonical_sha256(contact_gate_source_inventory(workspace_root))
+    build_embedded_source = _elf_embedded_source_inventory_sha256(build_path)
+    installed_embedded_source = _elf_embedded_source_inventory_sha256(installed_path)
+    build_embedded_source_match = build_embedded_source == source_inventory_sha256
+    installed_embedded_source_match = installed_embedded_source == source_inventory_sha256
+    build_install_embedded_source_match = build_embedded_source == installed_embedded_source
+    installed_declared_is_symlink = installed_declared_path.is_symlink()
+    build_install_samefile = build_path.samefile(installed_path)
+    if not (
+        build_embedded_source_match
+        and installed_embedded_source_match
+        and build_install_embedded_source_match
+    ):
+        raise EvidenceError(
+            'contact aggregator DSO does not embed the exact shared source inventory hash'
+        )
+    if installed_declared_is_symlink and not build_install_samefile:
+        raise EvidenceError('contact aggregator install symlink does not resolve to the build DSO')
+
+    return {
+        'build_elf_build_id': build_id,
+        'build_embedded_source_inventory_match': build_embedded_source_match,
+        'build_embedded_source_inventory_sha256': build_embedded_source,
+        'build_install_build_id_match': build_install_build_id_match,
+        'build_install_embedded_source_inventory_match': (build_install_embedded_source_match),
+        'build_install_samefile': build_install_samefile,
+        'build_install_sha256_match': build_install_sha256_match,
+        'build_path': build_relative,
+        'build_regular_file': True,
+        'build_sha256': build_sha256,
+        'installed_declared_is_symlink': installed_declared_is_symlink,
+        'installed_declared_path': CONTACT_AGGREGATOR_INSTALLED_PATH,
+        'installed_elf_build_id': installed_build_id,
+        'installed_embedded_source_inventory_match': installed_embedded_source_match,
+        'installed_embedded_source_inventory_sha256': installed_embedded_source,
+        'installed_path': installed_relative,
+        'installed_regular_file': True,
         'installed_sha256': installed_sha256,
         'package': 'robotest_sim',
         'schema_version': 1,
@@ -796,12 +955,14 @@ def build_binding(
     installed = install_manifest(workspace)
     source_install = source_install_correspondence(workspace)
     contact_gate_binary = contact_gate_build_install_binding(workspace)
+    contact_aggregator_binary = contact_aggregator_build_install_binding(workspace)
     metrics_contract_sha = file_sha256(workspace / 'docs/architecture/metrics-contract.md')
     target_set_sha = file_sha256(workspace / 'docs/testing/acceptance-criteria.md')
     return {
         'collector_configuration_sha256': configuration_hash(
             workspace, COLLECTOR_CONFIGURATION_FILES
         ),
+        'contact_aggregator_binary': contact_aggregator_binary,
         'created_by': PRODUCER,
         'contact_gate_binary': contact_gate_binary,
         'git': {
@@ -849,6 +1010,9 @@ def validate_build_binding(
     contact_gate_binary = _require_mapping(
         binding.get('contact_gate_binary'), 'build_binding.contact_gate_binary'
     )
+    contact_aggregator_binary = _require_mapping(
+        binding.get('contact_aggregator_binary'), 'build_binding.contact_aggregator_binary'
+    )
     if source.get('aggregate_sha256') != expected['source']['aggregate_sha256']:
         raise EvidenceError('source tree differs from verified build binding')
     if installed.get('aggregate_sha256') != expected['install']['aggregate_sha256']:
@@ -862,6 +1026,8 @@ def validate_build_binding(
         raise EvidenceError('Git state differs from verified build binding')
     if dict(contact_gate_binary) != expected['contact_gate_binary']:
         raise EvidenceError('contact gate binary differs from verified build binding')
+    if dict(contact_aggregator_binary) != expected['contact_aggregator_binary']:
+        raise EvidenceError('contact aggregator binary differs from verified build binding')
     return expected
 
 
@@ -983,7 +1149,7 @@ def _contact_stream_manifest_v3(manifest: Mapping[str, Any], workspace: Path) ->
         raise EvidenceError('contact stream manifest must be schema_version 1')
     topics = _require_mapping(contact_stream.get('topics'), 'contact_stream.topics')
     if dict(topics) != {
-        'gazebo_raw': CONTACT_PUBLIC_TOPIC,
+        'gazebo_raw': CONTACT_GAZEBO_AGGREGATE_TOPIC,
         'private_raw_ros': CONTACT_PRIVATE_RAW_TOPIC,
         'public_ros': CONTACT_PUBLIC_TOPIC,
     }:
@@ -1408,7 +1574,15 @@ def reconcile_positive_control(
     frozen_gate_binary = _require_mapping(
         build_binding.get('contact_gate_binary'), 'build_binding.contact_gate_binary'
     )
-    if gate.get('source_inventory_sha256') != frozen_gate_binary.get('source_inventory_sha256'):
+    frozen_aggregator_binary = _require_mapping(
+        build_binding.get('contact_aggregator_binary'),
+        'build_binding.contact_aggregator_binary',
+    )
+    shared_inventory_sha256 = gate.get('source_inventory_sha256')
+    if not (
+        shared_inventory_sha256 == frozen_gate_binary.get('source_inventory_sha256')
+        and shared_inventory_sha256 == frozen_aggregator_binary.get('source_inventory_sha256')
+    ):
         raise EvidenceError('contact stream source inventory differs from build binding')
     semantic_without_hash = dict(manifest)
     declared_manifest_hash = require_sha256(
@@ -2116,8 +2290,16 @@ def make_orchestrator_evidence(
     contact_gate_binary_end = _require_mapping(
         build_end.get('contact_gate_binary'), 'build_end.contact_gate_binary'
     )
+    contact_aggregator_binary_start = _require_mapping(
+        build_start.get('contact_aggregator_binary'), 'build_start.contact_aggregator_binary'
+    )
+    contact_aggregator_binary_end = _require_mapping(
+        build_end.get('contact_aggregator_binary'), 'build_end.contact_aggregator_binary'
+    )
     if dict(contact_gate_binary_start) != dict(contact_gate_binary_end):
         raise EvidenceError('contact gate build/install binding changed during the run')
+    if dict(contact_aggregator_binary_start) != dict(contact_aggregator_binary_end):
+        raise EvidenceError('contact aggregator build/install binding changed during the run')
     identity = {
         key: plan[key]
         for key in (
@@ -2198,6 +2380,7 @@ def make_orchestrator_evidence(
         'schema_version': SCHEMA_VERSION,
         'source_binding': {
             'collector_configuration_sha256': build_start['collector_configuration_sha256'],
+            'contact_aggregator_binary': dict(contact_aggregator_binary_start),
             'contact_gate_binary': dict(contact_gate_binary_start),
             'install_end_sha256': install_end['aggregate_sha256'],
             'install_start_sha256': install_start['aggregate_sha256'],
@@ -2254,25 +2437,10 @@ CONTACT_PROGRESS_FIELDS = {
     'schema_version',
 }
 
-CONTACT_GATE_ATTESTATION_FIELDS = {
-    'build_embedded_source_inventory_match',
-    'build_embedded_source_inventory_sha256',
-    'build_elf_build_id',
-    'build_install_build_id_match',
-    'build_install_sha256_match',
-    'build_path',
-    'build_sha256',
+CONTACT_GATE_ATTESTATION_FIELDS = CONTACT_GATE_BINARY_FIELDS | {
     'exact_live_process_count',
-    'installed_declared_path',
-    'installed_declared_samefile',
     'installed_device',
-    'installed_embedded_source_inventory_match',
-    'installed_embedded_source_inventory_sha256',
-    'installed_elf_build_id',
     'installed_inode',
-    'installed_path',
-    'installed_regular_executable',
-    'installed_sha256',
     'identity_revalidated_after_hashing',
     'launch_root_pid',
     'live_cmdline_sha256',
@@ -2295,12 +2463,227 @@ CONTACT_GATE_ATTESTATION_FIELDS = {
     'live_start_ticks',
     'observed_gz_partition',
     'observed_ros_domain_id',
-    'package',
     'process_identity_match',
-    'schema_version',
-    'source_inventory_sha256',
     'verdict',
 }
+
+CONTACT_AGGREGATOR_ATTESTATION_FIELDS = CONTACT_AGGREGATOR_BINARY_FIELDS | {
+    'attestation_method',
+    'exact_live_process_count',
+    'identity_revalidated_after_hashing',
+    'installed_device',
+    'installed_identity_revalidated_after_hashing',
+    'installed_inode',
+    'installed_size_bytes',
+    'launch_root_pid',
+    'live_cmdline_sha256',
+    'live_elf_build_id',
+    'live_embedded_source_inventory_match',
+    'live_embedded_source_inventory_sha256',
+    'live_executable_link',
+    'live_executable_path',
+    'live_installed_build_id_match',
+    'live_installed_inode_match',
+    'live_installed_sha256_match',
+    'live_mapping_count',
+    'live_mapping_device',
+    'live_mapping_fingerprint_sha256',
+    'live_mapping_has_executable',
+    'live_mapping_has_offset_zero',
+    'live_mapping_inode',
+    'live_mapping_paths',
+    'live_pgid',
+    'live_pid',
+    'live_ppid',
+    'live_sid',
+    'live_start_ticks',
+    'maps_revalidated_after_hashing',
+    'observed_gz_partition',
+    'observed_ros_domain_id',
+    'process_identity_match',
+    'stable_identity',
+    'stable_identity_sha256',
+    'verdict',
+}
+CONTACT_AGGREGATOR_STABLE_IDENTITY_FIELDS = {
+    'build_elf_build_id',
+    'build_path',
+    'build_sha256',
+    'installed_declared_path',
+    'installed_device',
+    'installed_elf_build_id',
+    'installed_embedded_source_inventory_sha256',
+    'installed_inode',
+    'installed_path',
+    'installed_sha256',
+    'launch_root_pid',
+    'live_cmdline_sha256',
+    'live_executable_link',
+    'live_executable_path',
+    'live_mapping_device',
+    'live_mapping_fingerprint_sha256',
+    'live_mapping_inode',
+    'live_mapping_paths',
+    'live_pgid',
+    'live_pid',
+    'live_ppid',
+    'live_sid',
+    'live_start_ticks',
+    'observed_gz_partition',
+    'observed_ros_domain_id',
+    'source_inventory_sha256',
+}
+
+
+def _validated_contact_aggregator_attestation(
+    value: Any,
+    *,
+    frozen_binary: Mapping[str, Any],
+    expected_domain_id: int,
+    expected_gz_partition: str,
+    label: str,
+) -> dict[str, Any]:
+    attestation = _require_mapping(value, f'{label}.contact_aggregator_binary_attestation')
+    if set(attestation) != CONTACT_AGGREGATOR_ATTESTATION_FIELDS:
+        raise EvidenceError(f'{label} contact aggregator attestation fields are invalid')
+    if set(frozen_binary) != CONTACT_AGGREGATOR_BINARY_FIELDS:
+        raise EvidenceError('frozen contact aggregator binary fields are invalid')
+    if (
+        attestation.get('schema_version') != 1
+        or attestation.get('package') != 'robotest_sim'
+        or attestation.get('verdict') != 'PASS'
+        or attestation.get('attestation_method') != 'proc_maps_exact_device_inode'
+        or attestation.get('exact_live_process_count') != 1
+        or attestation.get('observed_ros_domain_id') != str(expected_domain_id)
+        or attestation.get('observed_gz_partition') != expected_gz_partition
+    ):
+        raise EvidenceError(f'{label} contact aggregator binary attestation did not PASS')
+    for field in (
+        'build_embedded_source_inventory_match',
+        'build_install_build_id_match',
+        'build_install_embedded_source_inventory_match',
+        'build_install_sha256_match',
+        'build_regular_file',
+        'identity_revalidated_after_hashing',
+        'installed_embedded_source_inventory_match',
+        'installed_identity_revalidated_after_hashing',
+        'installed_regular_file',
+        'live_embedded_source_inventory_match',
+        'live_installed_build_id_match',
+        'live_installed_inode_match',
+        'live_installed_sha256_match',
+        'live_mapping_has_executable',
+        'live_mapping_has_offset_zero',
+        'maps_revalidated_after_hashing',
+        'process_identity_match',
+    ):
+        if attestation.get(field) is not True:
+            raise EvidenceError(f'{label} contact aggregator invariant is false: {field}')
+    installed_declared_is_symlink = _require_bool(
+        attestation.get('installed_declared_is_symlink'),
+        f'{label}.installed_declared_is_symlink',
+    )
+    build_install_samefile = _require_bool(
+        attestation.get('build_install_samefile'),
+        f'{label}.build_install_samefile',
+    )
+    if installed_declared_is_symlink:
+        if not build_install_samefile or attestation.get('installed_path') != attestation.get(
+            'build_path'
+        ):
+            raise EvidenceError(f'{label} symlink-install contact aggregator identity is invalid')
+    elif attestation.get('installed_path') != attestation.get('installed_declared_path'):
+        raise EvidenceError(f'{label} copied contact aggregator resolved path is invalid')
+
+    for field in (
+        'installed_inode',
+        'installed_size_bytes',
+        'launch_root_pid',
+        'live_mapping_count',
+        'live_mapping_inode',
+        'live_pgid',
+        'live_pid',
+        'live_ppid',
+        'live_sid',
+        'live_start_ticks',
+    ):
+        _require_int(attestation.get(field), f'{label}.{field}', minimum=1)
+    for field in ('installed_device', 'live_mapping_device'):
+        _require_int(attestation.get(field), f'{label}.{field}', minimum=0)
+    if (
+        attestation.get('live_pgid') != attestation.get('launch_root_pid')
+        or attestation.get('live_sid') != attestation.get('launch_root_pid')
+        or attestation.get('live_mapping_device') != attestation.get('installed_device')
+        or attestation.get('live_mapping_inode') != attestation.get('installed_inode')
+        or attestation.get('live_elf_build_id') != attestation.get('installed_elf_build_id')
+    ):
+        raise EvidenceError(f'{label} contact aggregator process/mapping identity conflicts')
+    mapping_count = _require_int(
+        attestation.get('live_mapping_count'), f'{label}.live_mapping_count', minimum=1
+    )
+    if mapping_count > 64:
+        raise EvidenceError(f'{label} contact aggregator mapping count exceeds 64')
+    mapping_paths = attestation.get('live_mapping_paths')
+    if (
+        not isinstance(mapping_paths, list)
+        or not (1 <= len(mapping_paths) <= 64)
+        or any(not isinstance(path, str) for path in mapping_paths)
+        or mapping_paths != sorted(set(mapping_paths))
+    ):
+        raise EvidenceError(f'{label} contact aggregator mapping paths are invalid')
+    for index, path in enumerate(mapping_paths):
+        require_bounded_string(path, f'{label}.live_mapping_paths[{index}]')
+
+    for field in (
+        'build_embedded_source_inventory_sha256',
+        'build_sha256',
+        'installed_embedded_source_inventory_sha256',
+        'installed_sha256',
+        'live_cmdline_sha256',
+        'live_embedded_source_inventory_sha256',
+        'live_mapping_fingerprint_sha256',
+        'source_inventory_sha256',
+        'stable_identity_sha256',
+    ):
+        require_sha256(attestation.get(field), f'{label}.{field}')
+    for field in (
+        'build_elf_build_id',
+        'build_path',
+        'installed_declared_path',
+        'installed_elf_build_id',
+        'installed_path',
+        'live_elf_build_id',
+        'live_executable_link',
+        'live_executable_path',
+    ):
+        require_bounded_string(attestation.get(field), f'{label}.{field}')
+    if not (
+        attestation.get('build_sha256') == attestation.get('installed_sha256')
+        and attestation.get('build_elf_build_id') == attestation.get('installed_elf_build_id')
+        and attestation.get('build_embedded_source_inventory_sha256')
+        == attestation.get('source_inventory_sha256')
+        == attestation.get('installed_embedded_source_inventory_sha256')
+        == attestation.get('live_embedded_source_inventory_sha256')
+    ):
+        raise EvidenceError(f'{label} contact aggregator digest/build-ID binding conflicts')
+    if any(attestation.get(field) != expected for field, expected in frozen_binary.items()):
+        raise EvidenceError(
+            f'{label} contact aggregator binary differs from the prelaunch build binding'
+        )
+
+    stable_identity = _require_mapping(
+        attestation.get('stable_identity'), f'{label}.stable_identity'
+    )
+    if set(stable_identity) != CONTACT_AGGREGATOR_STABLE_IDENTITY_FIELDS:
+        raise EvidenceError(f'{label} contact aggregator stable identity fields are invalid')
+    if any(
+        stable_identity.get(field) != attestation.get(field)
+        for field in CONTACT_AGGREGATOR_STABLE_IDENTITY_FIELDS
+    ):
+        raise EvidenceError(f'{label} contact aggregator stable identity conflicts')
+    if canonical_sha256(stable_identity) != attestation.get('stable_identity_sha256'):
+        raise EvidenceError(f'{label} contact aggregator stable identity hash conflicts')
+    return dict(attestation)
 
 
 def reconcile_contact_gate_reobservation(
@@ -2317,7 +2700,12 @@ def reconcile_contact_gate_reobservation(
     frozen_binary = _require_mapping(
         build_binding.get('contact_gate_binary'), 'build_binding.contact_gate_binary'
     )
+    frozen_aggregator_binary = _require_mapping(
+        build_binding.get('contact_aggregator_binary'),
+        'build_binding.contact_aggregator_binary',
+    )
     observations: list[Mapping[str, Any]] = []
+    aggregator_observations: list[dict[str, Any]] = []
     for label, path in (('initial', initial_gate_path), ('final', final_gate_path)):
         document = _require_mapping(load_json(path), f'{label}_runtime_gate')
         if document.get('verdict') != 'PASS':
@@ -2328,6 +2716,8 @@ def reconcile_contact_gate_reobservation(
         )
         if set(attestation) != CONTACT_GATE_ATTESTATION_FIELDS:
             raise EvidenceError(f'{label} contact gate attestation fields are invalid')
+        if set(frozen_binary) != CONTACT_GATE_BINARY_FIELDS:
+            raise EvidenceError('frozen contact gate binary fields are invalid')
         if (
             attestation.get('schema_version') != 1
             or attestation.get('package') != 'robotest_sim'
@@ -2341,6 +2731,7 @@ def reconcile_contact_gate_reobservation(
                     'build_embedded_source_inventory_match',
                     'build_install_build_id_match',
                     'build_install_sha256_match',
+                    'build_regular_executable',
                     'installed_declared_samefile',
                     'installed_embedded_source_inventory_match',
                     'installed_regular_executable',
@@ -2354,6 +2745,21 @@ def reconcile_contact_gate_reobservation(
             )
         ):
             raise EvidenceError(f'{label} contact gate binary attestation did not PASS')
+        installed_declared_is_symlink = _require_bool(
+            attestation.get('installed_declared_is_symlink'),
+            f'{label}.installed_declared_is_symlink',
+        )
+        build_install_samefile = _require_bool(
+            attestation.get('build_install_samefile'),
+            f'{label}.build_install_samefile',
+        )
+        if installed_declared_is_symlink:
+            if not build_install_samefile or attestation.get('installed_path') != attestation.get(
+                'build_path'
+            ):
+                raise EvidenceError(f'{label} symlink-install contact gate identity is invalid')
+        elif attestation.get('installed_path') != attestation.get('installed_declared_path'):
+            raise EvidenceError(f'{label} copied contact gate resolved path is invalid')
         for field in (
             'launch_root_pid',
             'live_pid',
@@ -2388,36 +2794,22 @@ def reconcile_contact_gate_reobservation(
             'source_inventory_sha256',
         ):
             require_sha256(attestation.get(field), f'{label}.{field}')
-        if (
-            attestation.get('build_sha256') != frozen_binary.get('build_sha256')
-            or attestation.get('installed_sha256') != frozen_binary.get('installed_sha256')
-            or attestation.get('build_elf_build_id') != frozen_binary.get('build_elf_build_id')
-            or attestation.get('installed_elf_build_id')
-            != frozen_binary.get('installed_elf_build_id')
-            or attestation.get('source_inventory_sha256')
-            != frozen_binary.get('source_inventory_sha256')
-            or attestation.get('build_embedded_source_inventory_sha256')
-            != frozen_binary.get('build_embedded_source_inventory_sha256')
-            or attestation.get('installed_embedded_source_inventory_sha256')
-            != frozen_binary.get('installed_embedded_source_inventory_sha256')
-            or attestation.get('live_embedded_source_inventory_sha256')
-            != frozen_binary.get('installed_embedded_source_inventory_sha256')
-            or attestation.get('build_path') != frozen_binary.get('build_path')
-            or attestation.get('installed_declared_path')
-            != frozen_binary.get('installed_declared_path')
-            or attestation.get('installed_path') != frozen_binary.get('installed_path')
-            or frozen_binary.get('build_regular_executable') is not True
-            or frozen_binary.get('installed_regular_executable') is not True
-            or frozen_binary.get('build_install_build_id_match') is not True
-            or frozen_binary.get('build_install_sha256_match') is not True
-            or frozen_binary.get('build_embedded_source_inventory_match') is not True
-            or frozen_binary.get('installed_embedded_source_inventory_match') is not True
-            or frozen_binary.get('installed_declared_samefile') is not True
-        ):
+        if attestation.get('live_embedded_source_inventory_sha256') != frozen_binary.get(
+            'installed_embedded_source_inventory_sha256'
+        ) or any(attestation.get(field) != expected for field, expected in frozen_binary.items()):
             raise EvidenceError(
                 f'{label} contact gate binary differs from the prelaunch build binding'
             )
         observations.append(attestation)
+        aggregator_observations.append(
+            _validated_contact_aggregator_attestation(
+                document.get('contact_aggregator_binary_attestation'),
+                frozen_binary=frozen_aggregator_binary,
+                expected_domain_id=expected_domain_id,
+                expected_gz_partition=expected_gz_partition,
+                label=label,
+            )
+        )
     stable_fields = (
         'build_elf_build_id',
         'build_embedded_source_inventory_sha256',
@@ -2451,16 +2843,30 @@ def reconcile_contact_gate_reobservation(
     initial, final = observations
     if any(initial.get(field) != final.get(field) for field in stable_fields):
         raise EvidenceError('contact gate process/binary identity changed before final drain')
+    initial_aggregator, final_aggregator = aggregator_observations
+    if initial_aggregator.get('stable_identity') != final_aggregator.get(
+        'stable_identity'
+    ) or initial_aggregator.get('stable_identity_sha256') != final_aggregator.get(
+        'stable_identity_sha256'
+    ):
+        raise EvidenceError('contact aggregator process/DSO identity changed before final drain')
     return {
         'final_gate_artifact_sha256': final_sha256,
+        'frozen_contact_aggregator_binary_sha256': canonical_sha256(frozen_aggregator_binary),
         'frozen_contact_gate_binary_sha256': canonical_sha256(frozen_binary),
         'initial_gate_artifact_sha256': initial_sha256,
+        'live_aggregator_mapping_fingerprint_sha256': initial_aggregator[
+            'live_mapping_fingerprint_sha256'
+        ],
+        'live_aggregator_pid': initial_aggregator['live_pid'],
+        'live_aggregator_start_ticks': initial_aggregator['live_start_ticks'],
         'live_executable_sha256': initial['live_executable_sha256'],
         'live_inode': initial['live_inode'],
         'live_pid': initial['live_pid'],
         'live_start_ticks': initial['live_start_ticks'],
         'producer': PRODUCER,
         'schema_version': 1,
+        'stable_aggregator_identity': True,
         'stable_identity': True,
     }
 
@@ -2779,9 +3185,15 @@ def compose_analysis_request(
     contact_gate_binary = _require_mapping(
         build.get('contact_gate_binary'), 'orchestrator.source_binding.contact_gate_binary'
     )
+    contact_aggregator_binary = _require_mapping(
+        build.get('contact_aggregator_binary'),
+        'orchestrator.source_binding.contact_aggregator_binary',
+    )
     contact_gate = _require_mapping(contact_stream.get('gate'), 'contact_stream.gate')
-    if contact_gate.get('source_inventory_sha256') != contact_gate_binary.get(
-        'source_inventory_sha256'
+    shared_inventory_sha256 = contact_gate.get('source_inventory_sha256')
+    if not (
+        shared_inventory_sha256 == contact_gate_binary.get('source_inventory_sha256')
+        and shared_inventory_sha256 == contact_aggregator_binary.get('source_inventory_sha256')
     ):
         raise EvidenceError('contact stream source inventory differs from trial build binding')
     verify_json_sidecar(contact_drain_path)

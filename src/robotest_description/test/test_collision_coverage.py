@@ -122,10 +122,10 @@ def test_manifest_hashes_real_rendered_and_source_evidence(
     assert generated_manifest['contact_stream'] == contact_stream
     policy = contact_stream['policy']
     assert policy['accepted_run_scope'] == (
-        'bounded_pending_raw_and_public_source_liveness_required'
+        'bounded_complete_aggregate_and_public_source_liveness_required'
     )
     assert policy['raw_stamp_gap_semantics'] == (
-        'consecutive_nonempty_raw_gaps_are_not_absence_evidence_and_have_no_independent_bound'
+        'sole_source_grid_is_exact_20ms_and_gate_rejects_delivered_gaps_greater_than_20ms'
     )
     assert policy['passive_callback_clock_offset_semantics'] == 'diagnostic_noncausal'
     assert policy['public_snapshot_clock_lag_scope'] == (
@@ -197,21 +197,21 @@ def test_bridge_validation_rejects_contact_mapping_drift(
         generator.bridge_sha256(tmp_path)
 
 
-def test_world_validation_rejects_missing_contact_system(
+def test_world_validation_rejects_missing_contact_aggregate_system(
     generator: ModuleType,
     tmp_path: Path,
 ) -> None:
     source = REPOSITORY_ROOT / 'src' / 'robotest_sim' / 'worlds' / 'robotest_lab.sdf'
     text = source.read_text(encoding='utf-8').replace(
-        'gz-sim-contact-system',
-        'gz-sim-wrong-contact-system',
+        'robotest_contact_aggregator_system',
+        'robotest_wrong_contact_aggregator_system',
         1,
     )
     destination = tmp_path / 'src' / 'robotest_sim' / 'worlds' / 'robotest_lab.sdf'
     destination.parent.mkdir(parents=True)
     destination.write_text(text, encoding='utf-8')
 
-    with pytest.raises(generator.CoverageGenerationError, match='Contact system'):
+    with pytest.raises(generator.CoverageGenerationError, match='aggregate system'):
         generator.world_source_sha256(tmp_path)
 
 

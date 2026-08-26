@@ -449,6 +449,7 @@
           "additionalProperties": false,
           "required": [
             "collector_configuration_sha256",
+            "contact_aggregator_binary",
             "contact_gate_binary",
             "install_end_sha256",
             "install_start_sha256",
@@ -463,6 +464,90 @@
           ],
           "properties": {
             "collector_configuration_sha256": {"$ref": "#/$defs/sha256"},
+            "contact_aggregator_binary": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "build_embedded_source_inventory_match",
+                "build_embedded_source_inventory_sha256",
+                "build_elf_build_id",
+                "build_install_build_id_match",
+                "build_install_embedded_source_inventory_match",
+                "build_install_samefile",
+                "build_install_sha256_match",
+                "build_path",
+                "build_regular_file",
+                "build_sha256",
+                "installed_declared_is_symlink",
+                "installed_declared_path",
+                "installed_embedded_source_inventory_match",
+                "installed_embedded_source_inventory_sha256",
+                "installed_elf_build_id",
+                "installed_path",
+                "installed_regular_file",
+                "installed_sha256",
+                "package",
+                "schema_version",
+                "source_inventory_sha256"
+              ],
+              "properties": {
+                "build_embedded_source_inventory_match": {"const": true},
+                "build_embedded_source_inventory_sha256": {"$ref": "#/$defs/sha256"},
+                "build_elf_build_id": {"type": "string", "pattern": "^[0-9a-f]+$"},
+                "build_install_build_id_match": {"const": true},
+                "build_install_embedded_source_inventory_match": {"const": true},
+                "build_install_samefile": {"type": "boolean"},
+                "build_install_sha256_match": {"const": true},
+                "build_path": {
+                  "const": "build/robotest_sim/librobotest_contact_aggregator_system.so"
+                },
+                "build_regular_file": {"const": true},
+                "build_sha256": {"$ref": "#/$defs/sha256"},
+                "installed_declared_is_symlink": {"type": "boolean"},
+                "installed_declared_path": {
+                  "const": "install/robotest_sim/lib/robotest_sim/librobotest_contact_aggregator_system.so"
+                },
+                "installed_embedded_source_inventory_match": {"const": true},
+                "installed_embedded_source_inventory_sha256": {
+                  "$ref": "#/$defs/sha256"
+                },
+                "installed_elf_build_id": {"type": "string", "pattern": "^[0-9a-f]+$"},
+                "installed_path": {
+                  "enum": [
+                    "build/robotest_sim/librobotest_contact_aggregator_system.so",
+                    "install/robotest_sim/lib/robotest_sim/librobotest_contact_aggregator_system.so"
+                  ]
+                },
+                "installed_regular_file": {"const": true},
+                "installed_sha256": {"$ref": "#/$defs/sha256"},
+                "package": {"const": "robotest_sim"},
+                "schema_version": {"const": 1},
+                "source_inventory_sha256": {"$ref": "#/$defs/sha256"}
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {"installed_declared_is_symlink": {"const": true}},
+                    "required": ["installed_declared_is_symlink"]
+                  },
+                  "then": {
+                    "properties": {
+                      "build_install_samefile": {"const": true},
+                      "installed_path": {
+                        "const": "build/robotest_sim/librobotest_contact_aggregator_system.so"
+                      }
+                    }
+                  },
+                  "else": {
+                    "properties": {
+                      "installed_path": {
+                        "const": "install/robotest_sim/lib/robotest_sim/librobotest_contact_aggregator_system.so"
+                      }
+                    }
+                  }
+                }
+              ]
+            },
             "contact_gate_binary": {
               "type": "object",
               "additionalProperties": false,
@@ -471,10 +556,12 @@
                 "build_embedded_source_inventory_sha256",
                 "build_elf_build_id",
                 "build_install_build_id_match",
+                "build_install_samefile",
                 "build_install_sha256_match",
                 "build_path",
                 "build_regular_executable",
                 "build_sha256",
+                "installed_declared_is_symlink",
                 "installed_declared_path",
                 "installed_declared_samefile",
                 "installed_embedded_source_inventory_match",
@@ -492,10 +579,12 @@
                 "build_embedded_source_inventory_sha256": {"$ref": "#/$defs/sha256"},
                 "build_elf_build_id": {"type": "string", "pattern": "^[0-9a-f]+$"},
                 "build_install_build_id_match": {"const": true},
+                "build_install_samefile": {"type": "boolean"},
                 "build_install_sha256_match": {"const": true},
                 "build_path": {"const": "build/robotest_sim/contact_stream_gate"},
                 "build_regular_executable": {"const": true},
                 "build_sha256": {"$ref": "#/$defs/sha256"},
+                "installed_declared_is_symlink": {"type": "boolean"},
                 "installed_declared_path": {
                   "const": "install/robotest_sim/lib/robotest_sim/contact_stream_gate"
                 },
@@ -506,14 +595,38 @@
                 },
                 "installed_elf_build_id": {"type": "string", "pattern": "^[0-9a-f]+$"},
                 "installed_path": {
-                  "const": "install/robotest_sim/lib/robotest_sim/contact_stream_gate"
+                  "enum": [
+                    "build/robotest_sim/contact_stream_gate",
+                    "install/robotest_sim/lib/robotest_sim/contact_stream_gate"
+                  ]
                 },
                 "installed_regular_executable": {"const": true},
                 "installed_sha256": {"$ref": "#/$defs/sha256"},
                 "package": {"const": "robotest_sim"},
                 "schema_version": {"const": 1},
                 "source_inventory_sha256": {"$ref": "#/$defs/sha256"}
-              }
+              },
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {"installed_declared_is_symlink": {"const": true}},
+                    "required": ["installed_declared_is_symlink"]
+                  },
+                  "then": {
+                    "properties": {
+                      "build_install_samefile": {"const": true},
+                      "installed_path": {"const": "build/robotest_sim/contact_stream_gate"}
+                    }
+                  },
+                  "else": {
+                    "properties": {
+                      "installed_path": {
+                        "const": "install/robotest_sim/lib/robotest_sim/contact_stream_gate"
+                      }
+                    }
+                  }
+                }
+              ]
             },
             "install_end_sha256": {"$ref": "#/$defs/sha256"},
             "install_start_sha256": {"$ref": "#/$defs/sha256"},

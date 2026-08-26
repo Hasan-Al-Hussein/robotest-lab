@@ -10,15 +10,16 @@
       <sensor name="${sensor_name}" type="contact">
         <always_on>true</always_on>
         <!--
-          This remains a declared sensor rate for source provenance only.
-          Gazebo Sim 8's Contact system does not enforce it; the compiled ROS
-          gate supplies a 5 Hz steady-state heartbeat, publishes pair-set
-          transitions immediately, and fails closed on bounded-state overflow.
+          Gazebo Sim 8 does not enforce this declared rate. The repo-owned
+          world system reads every completed physics step and publishes one
+          bounded aggregate. Each sensor keeps a unique, unbridged defensive
+          topic so accidentally restoring the stock Contact publisher cannot
+          recreate the former seven-writer private transport.
         -->
         <update_rate>5</update_rate>
         <contact>
           <collision>${collision_name}</collision>
-          <topic>${topic_namespace}/validation/contacts</topic>
+          <topic>${topic_namespace}/internal/contact_sources/${sensor_name}</topic>
         </contact>
       </sensor>
     </gazebo>

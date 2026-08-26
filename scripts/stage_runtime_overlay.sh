@@ -295,6 +295,9 @@ verify_release_overlay() {
       -x "${release_target}/install/${required_executable}" ]] ||
       die "Release executable is missing or not executable: ${required_executable}"
   done
+  [[ -f "${release_target}/install/robotest_sim/lib/robotest_sim/librobotest_contact_aggregator_system.so" &&
+    ! -L "${release_target}/install/robotest_sim/lib/robotest_sim/librobotest_contact_aggregator_system.so" ]] ||
+    die 'Release contact aggregator DSO is missing or not a regular file.'
 
   if [[ -z "${TARGET_MANIFEST}" ]]; then
     TARGET_MANIFEST="$(mktemp /tmp/robotest-overlay-target-manifest.XXXXXX)"

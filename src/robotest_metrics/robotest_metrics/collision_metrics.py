@@ -533,7 +533,7 @@ def _collision_names(manifest: Mapping[str, Any]) -> tuple[str, set[str], set[tu
     if (
         topics
         != {
-            'gazebo_raw': '/robotest/validation/contacts',
+            'gazebo_raw': '/robotest/internal/contact_aggregate',
             'private_raw_ros': '/robotest/internal/raw_contacts',
             'public_ros': '/robotest/validation/contacts',
         }

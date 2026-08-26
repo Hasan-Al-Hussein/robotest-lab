@@ -340,8 +340,18 @@ compared for equality.
 
 ### Event de-duplication
 
-The gate batches private raw messages by exact simulation stamp and publishes a
-strictly increasing, complete snapshot of its delivered active-pair state. A
+The stock per-sensor Gazebo Contact publisher is not part of the accepted
+pipeline. A source-bound system observes all seven contact components after
+every physics step and emits one bounded aggregate at each 20 ms boundary. Pair
+membership is the union over that interval; each pair carries the complete
+latest physics-step record group observed for that pair, in source order. A
+one-step transient therefore survives to the boundary without retaining a pair
+into the next interval. Repeated physics samples are intentionally reduced and
+are not claimed as an exact pre-aggregate sample stream or as raw force/depth
+peaks.
+
+The gate consumes one private aggregate per stamp and publishes a strictly
+increasing, complete snapshot of its delivered active-pair state. A
 collision episode begins when a counterpart is present in an authoritative
 snapshot and ends at the first later authoritative snapshot where that
 counterpart is absent. The gate omits a pair only when a completed absent stamp
@@ -350,16 +360,22 @@ remains continuous. Offline analysis never infers release from elapsed clock
 time. Pair migration for one counterpart remains one episode; simultaneous
 distinct counterpart models remain distinct episodes.
 
-Consecutive delivered private callbacks have no independent maximum spacing:
-their stamps must remain monotonic, while causal finalized-public source gaps
-and pending/raw lag against `/clock` each remain bounded at 0.22 s. This avoids
-misclassifying a sparse but timely delivered raw sequence as a source failure.
+The sole producer emits on an exact 20 ms grid after its first nonempty
+interval. The gate rejects a delivered private aggregate gap greater than
+20 ms, in addition to regression, duplicate, malformed, overflow, causal
+public-gap, and pending/raw `/clock` liveness checks. This fixed-grid source
+sequence turns a missing aggregate into an explicit fail-closed transport
+violation.
 
 Snapshot records are grouped in canonical normalized-pair order. Duplicate
-records within one pair retain the sole private bridge's delivered callback
-order; deterministic here means deterministic for that delivered ordered
-batch, not permutation-invariant sorting of nested force/depth payloads. Each
-retained nested `Contact` record remains field-exact.
+records within one pair retain the selected latest physics-step group's record
+order. Each selected record is an exact copy of its bounded ROS `Contact`
+projection. Protobuf-only Contact/world metadata, Entity and Vector3 headers,
+inner Wrench headers and force offsets, and unknown fields are canonicalized
+away before interval storage. The admitted outer JointWrench stamp and
+`frame_id` plus every other ROS-visible field remain field-exact. The Gazebo
+aggregate container and per-Contact headers are rewritten to the interval
+boundary; the ROS Contact type does not expose the latter header.
 
 Contact collection remains active until it retains an actual authoritative
 snapshot with stamp strictly greater than `T_terminal + 0.25 s`. The exact

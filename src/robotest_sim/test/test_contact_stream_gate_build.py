@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Build-time provenance regressions for the compiled contact-stream gate."""
+"""Build-time provenance regressions for the compiled contact pipeline."""
 
 from __future__ import annotations
 
@@ -30,13 +30,29 @@ TAG = b'ROBOTEST_CONTACT_GATE_SOURCE_INVENTORY_SHA256='
 CONFIGURE_TIMEOUT_SECONDS = 180
 BUILD_TIMEOUT_SECONDS = 360
 SOURCE_PATHS = (
+    (
+        'src/robotest_description/urdf/robotest_gazebo.xacro',
+        '../robotest_description/urdf/robotest_gazebo.xacro',
+    ),
     ('src/robotest_sim/CMakeLists.txt', 'CMakeLists.txt'),
+    ('src/robotest_sim/config/bridge.yaml', 'config/bridge.yaml'),
+    (
+        'src/robotest_sim/include/robotest_sim/contact_aggregator.hpp',
+        'include/robotest_sim/contact_aggregator.hpp',
+    ),
     (
         'src/robotest_sim/include/robotest_sim/contact_stream_gate.hpp',
         'include/robotest_sim/contact_stream_gate.hpp',
     ),
+    ('src/robotest_sim/launch/sim.launch.py', 'launch/sim.launch.py'),
+    ('src/robotest_sim/src/contact_aggregator.cpp', 'src/contact_aggregator.cpp'),
+    (
+        'src/robotest_sim/src/contact_aggregator_system.cpp',
+        'src/contact_aggregator_system.cpp',
+    ),
     ('src/robotest_sim/src/contact_stream_gate.cpp', 'src/contact_stream_gate.cpp'),
     ('src/robotest_sim/src/contact_stream_gate_node.cpp', 'src/contact_stream_gate_node.cpp'),
+    ('src/robotest_sim/worlds/robotest_lab.sdf', 'worlds/robotest_lab.sdf'),
 )
 
 
@@ -72,17 +88,26 @@ def _embedded_sha256(executable: Path) -> str:
 
 def _build(source_root: Path, build_root: Path) -> None:
     subprocess.run(
-        ['cmake', '--build', str(build_root), '--target', 'contact_stream_gate', '-j2'],
+        [
+            'cmake',
+            '--build',
+            str(build_root),
+            '--target',
+            'contact_stream_gate',
+            'robotest_contact_aggregator_system',
+            '-j2',
+        ],
         check=True,
         cwd=source_root,
         timeout=BUILD_TIMEOUT_SECONDS,
     )
 
 
-def test_incremental_build_reconfigures_and_rebinds_source_inventory(tmp_path: Path) -> None:
+def test_incremental_build_reconfigures_and_rebinds_pipeline_inventory(tmp_path: Path) -> None:
     source_root = tmp_path / 'robotest_sim'
     build_root = tmp_path / 'build'
     shutil.copytree(PACKAGE_ROOT, source_root)
+    shutil.copytree(PACKAGE_ROOT.parent / 'robotest_description', tmp_path / 'robotest_description')
     subprocess.run(
         [
             'cmake',
@@ -98,8 +123,11 @@ def test_incremental_build_reconfigures_and_rebinds_source_inventory(tmp_path: P
     )
     _build(source_root, build_root)
     executable = build_root / 'contact_stream_gate'
+    plugin = build_root / 'librobotest_contact_aggregator_system.so'
     initial = _embedded_sha256(executable)
+    initial_plugin = _embedded_sha256(plugin)
     assert initial == _inventory_sha256(source_root)
+    assert initial_plugin == initial
 
     policy_source = source_root / 'src' / 'contact_stream_gate.cpp'
     policy_source.write_bytes(
@@ -107,5 +135,7 @@ def test_incremental_build_reconfigures_and_rebinds_source_inventory(tmp_path: P
     )
     _build(source_root, build_root)
     updated = _embedded_sha256(executable)
+    updated_plugin = _embedded_sha256(plugin)
     assert updated == _inventory_sha256(source_root)
+    assert updated_plugin == updated
     assert updated != initial

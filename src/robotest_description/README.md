@@ -39,9 +39,10 @@ Gazebo Transport TF. Their TF outputs are intentionally moved to
 not bridge either topic. This preserves the architectural rule that only the
 fault-proxy layer may publish the ROS 'odom -> base_footprint' transform.
 
-The world must load Gazebo's Sensors, IMU, and Contact systems before spawning
-this model. The simulation package owns those world-level systems and the
-explicit ROS-Gazebo bridge allowlist.
+The world must load Gazebo's Sensors and IMU systems plus RoboTest's compiled
+contact-aggregate system before spawning this model. The aggregate system
+replaces Gazebo's stock multi-publisher Contact system. The simulation package
+owns those world-level systems and the explicit ROS-Gazebo bridge allowlist.
 
 ## Collision-coverage provenance
 
@@ -57,16 +58,21 @@ The generator expands the exact launch arguments, converts the URDF with
 `gz sdf --precision 17 -p`, and proves that every one of the seven rendered
 collision geometries has exactly one 5 Hz contact sensor on the frozen topic.
 The 5 Hz value is declared source metadata only: Gazebo Sim 8 does not enforce
-it. The raw Gazebo topic is bridged privately to
+it. Each sensor has a unique unbridged defensive source topic. A source-bound
+Gazebo system observes every completed physics step and publishes one bounded
+20 ms interval aggregate on `/robotest/internal/contact_aggregate`; each
+interval contains the union of observed normalized pairs and the latest exact
+record group for each pair. That sole aggregate is bridged privately to
 `/robotest/internal/raw_contacts`; the compiled `contact_stream_gate` owns the
 public `/robotest/validation/contacts` stream. It publishes complete delivered
 active-pair snapshots at a 5 Hz unchanged-state heartbeat and immediately on
 pair-set transitions, with strict bounds and fail-closed overflow behavior.
 
-The manifest binds raw bridge and world bytes, the gate's CMake/header/source
-inventory and launch wiring, a canonical inventory of every
-Xacro source plus render arguments, the printed rendered SDF bytes, and a
-canonical semantic projection of the seven contact sensors. Its declared
+The manifest binds raw bridge and world bytes, the aggregate plugin and gate's
+shared CMake/header/source/configuration inventory and launch wiring, a
+canonical inventory of every Xacro source plus render arguments, the printed
+rendered SDF bytes, and a canonical semantic projection of the seven contact
+sensors. Its declared
 `manifest_sha256` is SHA-256 over sorted compact UTF-8 JSON plus LF with the
 self-hash field omitted. YAML formatting and comments are not authoritative.
 The four support exclusions are exact wheel/caster-to-ground pairs; no other

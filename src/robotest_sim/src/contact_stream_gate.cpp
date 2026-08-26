@@ -525,8 +525,20 @@ ContactGateDecision ContactStreamPolicy::observe(
   if (!incoming_stamp.has_value()) {
     return fatal_current("raw contact message has an invalid simulation stamp");
   }
-  if (last_raw_stamp_ns_.has_value() && *incoming_stamp < *last_raw_stamp_ns_) {
-    return fatal_current("raw contact simulation stamp regressed");
+  if (*incoming_stamp <= 0) {
+    return fatal_current("private contact aggregate stamp must be positive");
+  }
+  if (last_raw_stamp_ns_.has_value()) {
+    if (*incoming_stamp <= *last_raw_stamp_ns_) {
+      return fatal_current("private contact aggregate stamp did not advance strictly");
+    }
+    const auto gap_ns = *incoming_stamp - *last_raw_stamp_ns_;
+    if (gap_ns > kPrivateContactAggregatePeriodNs) {
+      return fatal_current(
+        "private contact aggregate sequence gap exceeds 20 ms: previous_stamp_ns=" +
+        std::to_string(*last_raw_stamp_ns_) + ", incoming_stamp_ns=" +
+        std::to_string(*incoming_stamp) + ", gap_ns=" + std::to_string(gap_ns));
+    }
   }
   if (!message.header.frame_id.empty()) {
     return fatal_current("raw Gazebo contact frame_id must be empty");
@@ -537,97 +549,26 @@ ContactGateDecision ContactStreamPolicy::observe(
     return fatal_current(*error);
   }
 
-  if (pending_batch_.has_value() && *incoming_stamp > *last_raw_stamp_ns_) {
+  if (pending_batch_.has_value()) {
     decision = finalize_pending();
     if (decision.fatal) {
       return decision;
     }
   }
-  if (!pending_batch_.has_value()) {
-    PendingBatch batch;
-    batch.header = message.header;
-    for (auto & entry : validated.pairs) {
-      ContactRecords records;
-      records.string_bytes = entry.second.string_bytes;
-      records.records = std::move(entry.second.records);
-      batch.pairs.emplace(entry.first, std::move(records));
-    }
-    batch.record_count = validated.record_count;
-    batch.message_count = 1U;
-    batch.string_bytes = validated.string_bytes;
-    batch.semantic_fatal = validated.semantic_fatal;
-    batch.fatal_detail = std::move(validated.fatal_detail);
-    pending_batch_ = std::move(batch);
-  } else {
-    auto & batch = *pending_batch_;
-    if (batch.message_count >= kMaxRawMessagesPerBatch) {
-      decision.fatal = true;
-      decision.reason = ContactForwardReason::kFatalStructuralInput;
-      decision.detail = "equal-stamp raw contact batch exceeds the seven-sensor bound";
-      return decision;
-    }
-    ++batch.message_count;
-    if (batch.record_count + validated.record_count > kMaxRawContactRecords) {
-      decision.fatal = true;
-      decision.reason = ContactForwardReason::kFatalStructuralInput;
-      decision.detail = "equal-stamp raw contact batch exceeds the 16-record bound";
-      return decision;
-    }
-    std::size_t incremental_string_bytes = 0U;
-    for (const auto & entry : validated.pairs) {
-      if (!checked_add(
-          entry.second.string_bytes, incremental_string_bytes, kMaxMessageStringBytes) ||
-        (batch.pairs.find(entry.first) == batch.pairs.end() &&
-        !checked_add(
-          pair_key_string_bytes(entry.first),
-          incremental_string_bytes,
-          kMaxMessageStringBytes)))
-      {
-        decision.fatal = true;
-        decision.reason = ContactForwardReason::kFatalStructuralInput;
-        decision.detail =
-          "equal-stamp raw contact batch strings plus normalized pair keys exceed the budget";
-        return decision;
-      }
-    }
-    if (!checked_add(
-        incremental_string_bytes, batch.string_bytes, kMaxMessageStringBytes))
-    {
-      decision.fatal = true;
-      decision.reason = ContactForwardReason::kFatalStructuralInput;
-      decision.detail =
-        "equal-stamp raw contact batch strings plus normalized pair keys exceed the budget";
-      return decision;
-    }
-    batch.record_count += validated.record_count;
-    for (auto & entry : validated.pairs) {
-      auto & group = batch.pairs[entry.first];
-      if (group.records.size() + entry.second.records.size() >
-        kMaxContactRecordsPerPair)
-      {
-        decision.fatal = true;
-        decision.reason = ContactForwardReason::kFatalStructuralInput;
-        decision.detail = "equal-stamp pair exceeds the four-record duplicate bound";
-        return decision;
-      }
-      if (!checked_add(
-          entry.second.string_bytes, group.string_bytes, kMaxContactStringBytes))
-      {
-        decision.fatal = true;
-        decision.reason = ContactForwardReason::kFatalStructuralInput;
-        decision.detail = "equal-stamp pair exceeds the contact string budget";
-        return decision;
-      }
-      group.records.insert(
-        group.records.end(),
-        std::make_move_iterator(entry.second.records.begin()),
-        std::make_move_iterator(entry.second.records.end()));
-    }
-    batch.semantic_fatal = batch.semantic_fatal || validated.semantic_fatal;
-    if (batch.fatal_detail.empty()) {
-      batch.fatal_detail = std::move(validated.fatal_detail);
-    }
+  PendingBatch batch;
+  batch.header = message.header;
+  for (auto & entry : validated.pairs) {
+    ContactRecords records;
+    records.string_bytes = entry.second.string_bytes;
+    records.records = std::move(entry.second.records);
+    batch.pairs.emplace(entry.first, std::move(records));
   }
+  batch.record_count = validated.record_count;
+  batch.message_count = 1U;
+  batch.string_bytes = validated.string_bytes;
+  batch.semantic_fatal = validated.semantic_fatal;
+  batch.fatal_detail = std::move(validated.fatal_detail);
+  pending_batch_ = std::move(batch);
 
   last_raw_stamp_ns_ = *incoming_stamp;
   return decision;

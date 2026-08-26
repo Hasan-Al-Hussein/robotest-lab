@@ -120,7 +120,7 @@ std::vector<Pair> normalized_output_pairs(const ContactGateDecision & decision)
   return result;
 }
 
-TEST(ContactStreamPolicy, EqualStampSupportBatchWallAndReleaseAreCompleteAndBounded)
+TEST(ContactStreamPolicy, CompleteAggregateWallAndReleaseAreBounded)
 {
   ContactStreamPolicy policy;
   const std::vector<Pair> supports = {
@@ -132,9 +132,7 @@ TEST(ContactStreamPolicy, EqualStampSupportBatchWallAndReleaseAreCompleteAndBoun
 
   EXPECT_FALSE(observe(policy, 998000000LL, {{kLeftWheel, kGround}}).output.has_value());
 
-  for (const auto & support : supports) {
-    EXPECT_FALSE(policy.observe(message_at(1000000000LL, {support})).output.has_value());
-  }
+  EXPECT_FALSE(policy.observe(message_at(1000000000LL, supports)).output.has_value());
   auto decision = observe(policy, 1002000000LL, {supports[0]});
   ASSERT_TRUE(decision.output.has_value());
   EXPECT_EQ(decision.output->header.stamp.sec, 1);
@@ -290,20 +288,24 @@ TEST(ContactStreamPolicy, DuplicateRecordsAndNestedPayloadsRemainExact)
   ContactStreamPolicy policy;
   EXPECT_FALSE(observe(policy, 998000000LL, {{kLeftWheel, kGround}}).output.has_value());
   auto message = message_at(1000000000LL, {});
-  message.contacts.push_back(contact_for({kChassis, kWall}, 2.0, 0.01));
-  message.contacts.push_back(contact_for({kChassis, kWall}, 17.0, 0.02));
+  auto first_record = contact_for({kChassis, kWall}, 2.0, 0.01);
+  auto second_record = contact_for({kChassis, kWall}, 17.0, 0.02);
+  message.contacts.push_back(first_record);
+  message.contacts.push_back(second_record);
   EXPECT_FALSE(policy.observe(message).output.has_value());
 
-  // This later callback contributes a lexicographically earlier normalized
-  // pair. Pair blocks must be canonical even though duplicate records within
-  // the wall pair retain their delivered callback order.
-  auto earlier_pair = message_at(1000000000LL, {{kLidar, kBox}});
+  // One complete aggregate contributes a lexicographically earlier normalized
+  // pair. Pair blocks are canonical while duplicate records within a pair keep
+  // their aggregate record order.
+  auto earlier_pair = message_at(1002000000LL, {{kLidar, kBox}});
+  earlier_pair.contacts.push_back(first_record);
+  earlier_pair.contacts.push_back(second_record);
   const std::vector<ros_gz_interfaces::msg::Contact> expected = {
-    earlier_pair.contacts[0], message.contacts[0], message.contacts[1]};
-  EXPECT_FALSE(policy.observe(earlier_pair).output.has_value());
-
-  const auto decision = observe(policy, 1002000000LL, {{kLeftWheel, kGround}});
+    earlier_pair.contacts[0], earlier_pair.contacts[1], earlier_pair.contacts[2]};
+  EXPECT_FALSE(policy.observe(earlier_pair).fatal);
+  const auto decision = observe(policy, 1004000000LL, {{kLeftWheel, kGround}});
   ASSERT_TRUE(decision.output.has_value());
+
   ASSERT_EQ(decision.output->contacts.size(), 3U);
   EXPECT_EQ(decision.output->contacts, expected);
   const auto maximum_force = std::max_element(
@@ -340,7 +342,8 @@ TEST(ContactStreamPolicy, RawBatchDuplicateAndNestedBoundsFailClosed)
     ContactStreamPolicy policy;
     auto message = message_at(1000000000LL, {});
     for (std::size_t index = 0U; index <= kMaxContactRecordsPerPair; ++index) {
-      message.contacts.push_back(contact_for({kChassis, kWall}));
+      auto contact = contact_for({kChassis, kWall});
+      message.contacts.push_back(std::move(contact));
     }
     const auto overflow = policy.observe(message);
     EXPECT_TRUE(overflow.fatal);
@@ -350,8 +353,9 @@ TEST(ContactStreamPolicy, RawBatchDuplicateAndNestedBoundsFailClosed)
     ContactStreamPolicy policy;
     auto message = message_at(1000000000LL, {});
     for (std::size_t index = 0U; index <= kMaxRawContactRecords; ++index) {
-      message.contacts.push_back(contact_for(
-          {kChassis, "wall_" + std::to_string(index) + "::link::collision"}));
+      auto contact = contact_for(
+        {kChassis, "wall_" + std::to_string(index) + "::link::collision"});
+      message.contacts.push_back(std::move(contact));
     }
     const auto overflow = policy.observe(message);
     EXPECT_TRUE(overflow.fatal);
@@ -359,23 +363,12 @@ TEST(ContactStreamPolicy, RawBatchDuplicateAndNestedBoundsFailClosed)
   }
   {
     ContactStreamPolicy policy;
-    const std::vector<Pair> pairs = {
-      {kLeftWheel, kGround},
-      {kRightWheel, kGround},
-      {kFrontCaster, kGround},
-      {kRearCaster, kGround},
-      {kChassis, kWall},
-      {kLidar, kWall},
-      {kChassis, kBox},
-      {kLidar, kBox},
-    };
-    for (std::size_t index = 0U; index < kMaxRawMessagesPerBatch; ++index) {
-      EXPECT_FALSE(policy.observe(message_at(1000000000LL, {pairs[index]})).fatal);
-    }
-    const auto overflow = policy.observe(
-      message_at(1000000000LL, {pairs[kMaxRawMessagesPerBatch]}));
-    EXPECT_TRUE(overflow.fatal);
-    EXPECT_FALSE(overflow.output.has_value());
+    EXPECT_FALSE(policy.observe(
+      message_at(1000000000LL, {{kLeftWheel, kGround}})).fatal);
+    const auto duplicate = policy.observe(
+      message_at(1000000000LL, {{kRightWheel, kGround}}));
+    EXPECT_TRUE(duplicate.fatal);
+    EXPECT_FALSE(duplicate.output.has_value());
   }
   {
     ContactStreamPolicy policy;
@@ -486,7 +479,6 @@ TEST(ContactStreamPolicy, SlowJoinWarmupIsSuppressedAndOneMessageBatchIsAccepted
 {
   ContactStreamPolicy policy;
   EXPECT_FALSE(policy.observe(message_at(1000000000LL, {{kLeftWheel, kGround}})).fatal);
-  EXPECT_FALSE(policy.observe(message_at(1000000000LL, {{kRightWheel, kGround}})).fatal);
   EXPECT_FALSE(observe(policy, 1002000000LL, {{kChassis, kWall}}).output.has_value());
   ASSERT_TRUE(observe(policy, 1004000000LL, {{kChassis, kWall}}).output.has_value());
 
@@ -541,25 +533,15 @@ TEST(ContactStreamPolicy, IrregularRawProgressKeepsCausalHeartbeatWithinGap)
   EXPECT_EQ(heartbeat.output->header.stamp.nanosec, 219999999U);
 }
 
-TEST(ContactStreamPolicy, SparseRawProgressRespectsCausalPublicGapBoundary)
+TEST(ContactStreamPolicy, PrivateAggregateGapBoundaryFailsClosed)
 {
   {
     ContactStreamPolicy policy;
     EXPECT_FALSE(observe(policy, 998000000LL, {{kLeftWheel, kGround}}).fatal);
     EXPECT_FALSE(observe(policy, 1000000000LL, {{kChassis, kWall}}).fatal);
     ASSERT_TRUE(observe(policy, 1002000000LL, {{kChassis, kWall}}).output.has_value());
-
-    // A sparse private callback sequence is valid when the causally completed
-    // public heartbeat still lands on the accepted 220 ms source-gap boundary,
-    // even when the independently scheduled clock callback overtakes it.
-    EXPECT_FALSE(policy.observe_clock(1220000001LL).fatal);
-    EXPECT_FALSE(observe(policy, 1220000000LL, {{kChassis, kWall}}).fatal);
-    const auto boundary = observe(policy, 1222000000LL, {{kChassis, kWall}});
-    ASSERT_TRUE(boundary.output.has_value());
+    const auto boundary = observe(policy, 1022000000LL, {{kChassis, kWall}});
     EXPECT_FALSE(boundary.fatal);
-    EXPECT_EQ(boundary.reason, ContactForwardReason::kSteadyStateHeartbeat);
-    EXPECT_EQ(boundary.output->header.stamp.sec, 1);
-    EXPECT_EQ(boundary.output->header.stamp.nanosec, 220000000U);
   }
 
   {
@@ -568,15 +550,11 @@ TEST(ContactStreamPolicy, SparseRawProgressRespectsCausalPublicGapBoundary)
     EXPECT_FALSE(observe(policy, 1000000000LL, {{kChassis, kWall}}).fatal);
     ASSERT_TRUE(observe(policy, 1002000000LL, {{kChassis, kWall}}).output.has_value());
 
-    EXPECT_FALSE(observe(policy, 1221000000LL, {{kChassis, kWall}}).fatal);
-    const auto exceeded = observe(policy, 1223000000LL, {{kChassis, kWall}});
+    const auto exceeded = observe(policy, 1022000001LL, {{kChassis, kWall}});
     EXPECT_TRUE(exceeded.fatal);
     EXPECT_FALSE(exceeded.output.has_value());
-    EXPECT_NE(exceeded.detail.find("completed raw contact stream"), std::string::npos);
-    EXPECT_NE(exceeded.detail.find("last_public_stamp_ns=1000000000"), std::string::npos);
-    EXPECT_NE(exceeded.detail.find("completed_stamp_ns=1221000000"), std::string::npos);
-    EXPECT_NE(exceeded.detail.find("gap_ns=221000000"), std::string::npos);
-    EXPECT_NE(exceeded.detail.find("completed_batch_message_count=1"), std::string::npos);
+    EXPECT_NE(exceeded.detail.find("sequence gap exceeds 20 ms"), std::string::npos);
+    EXPECT_NE(exceeded.detail.find("gap_ns=20000001"), std::string::npos);
   }
 }
 
@@ -609,7 +587,7 @@ TEST(ContactStreamPolicy, PendingSemanticFailureCannotHideBehindRawSilence)
   EXPECT_NE(failure.detail.find("semantic"), std::string::npos);
 }
 
-TEST(ContactStreamPolicy, SevenSensorEmptyFrameBatchIsAccepted)
+TEST(ContactStreamPolicy, CompleteSevenSensorAggregateIsAccepted)
 {
   ContactStreamPolicy policy;
   EXPECT_FALSE(observe(policy, 998000000LL, {{kLeftWheel, kGround}}).output.has_value());
@@ -622,9 +600,7 @@ TEST(ContactStreamPolicy, SevenSensorEmptyFrameBatchIsAccepted)
     {kLidar, kWall},
     {kChassis, kBox},
   };
-  for (const auto & pair : pairs) {
-    EXPECT_FALSE(policy.observe(message_at(1000000000LL, {pair})).fatal);
-  }
+  EXPECT_FALSE(policy.observe(message_at(1000000000LL, pairs)).fatal);
   const auto decision = observe(policy, 1002000000LL, {{kLeftWheel, kGround}});
   ASSERT_TRUE(decision.output.has_value());
   EXPECT_TRUE(decision.output->header.frame_id.empty());

@@ -978,6 +978,68 @@ entries.append(
 )
 if not gate_matches:
     failures.append('robotest_sim/contact_stream_gate executable')
+
+aggregator_build = (
+    workspace / 'build/robotest_sim/librobotest_contact_aggregator_system.so'
+).resolve()
+aggregator_installed_declared = (
+    sim_prefix / 'lib/robotest_sim/librobotest_contact_aggregator_system.so'
+)
+try:
+    aggregator_installed = aggregator_installed_declared.resolve(strict=True)
+except OSError:
+    aggregator_installed = aggregator_installed_declared
+aggregator_build_hash = digest(aggregator_build)
+aggregator_installed_hash = digest(aggregator_installed)
+aggregator_build_id = elf_build_id(aggregator_build)
+aggregator_installed_build_id = elf_build_id(aggregator_installed)
+aggregator_declared_samefile = (
+    aggregator_installed_declared.exists()
+    and aggregator_installed_declared.samefile(aggregator_installed)
+)
+aggregator_build_install_samefile = (
+    aggregator_build.is_file()
+    and aggregator_installed.is_file()
+    and aggregator_build.samefile(aggregator_installed)
+)
+aggregator_matches = (
+    aggregator_build.is_file()
+    and aggregator_installed.is_file()
+    and aggregator_installed_declared.is_symlink()
+    and aggregator_declared_samefile
+    and aggregator_build_install_samefile
+    and aggregator_build_hash == aggregator_installed_hash
+    and aggregator_build_id is not None
+    and aggregator_build_id == aggregator_installed_build_id
+)
+entries.append(
+    {
+        'binding_type': 'built_runtime_artifact',
+        'package': 'robotest_sim',
+        'library': 'librobotest_contact_aggregator_system.so',
+        'build_path': str(aggregator_build),
+        'installed_declared_path': str(aggregator_installed_declared),
+        'installed_path': str(aggregator_installed),
+        'build_sha256': aggregator_build_hash,
+        'installed_sha256': aggregator_installed_hash,
+        'build_elf_build_id': aggregator_build_id,
+        'build_install_sha256_match': (
+            aggregator_build_hash == aggregator_installed_hash
+        ),
+        'build_install_samefile': aggregator_build_install_samefile,
+        'installed_elf_build_id': aggregator_installed_build_id,
+        'installed_declared_is_symlink': aggregator_installed_declared.is_symlink(),
+        'installed_declared_samefile': aggregator_declared_samefile,
+        'regular_file': aggregator_installed.is_file(),
+        'comparison_method': (
+            'matching whole-file SHA-256 and GNU ELF build-id plus exact symlink-install '
+            'build/installed file identity'
+        ),
+        'matches': aggregator_matches,
+    }
+)
+if not aggregator_matches:
+    failures.append('robotest_sim/librobotest_contact_aggregator_system.so')
 evidence = {'verdict': 'PASS' if not failures else 'FAIL', 'failures': failures, 'files': entries}
 output.write_text(json.dumps(evidence, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 if failures:
@@ -1121,12 +1183,20 @@ spec = importlib.util.spec_from_file_location('robotest_contact_gate_attestor', 
 if spec is None or spec.loader is None:
     raise SystemExit('cannot load contact gate attestor')
 module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 attestation = module._contact_gate_binary_attestation(
     workspace, launch_pid, domain_id, partition
 )
 if attestation.get('verdict') != 'PASS':
     raise SystemExit(f'contact gate runtime attestation failed: {attestation}')
+aggregator_attestation = module._contact_aggregator_binary_attestation(
+    workspace, launch_pid, domain_id, partition
+)
+if aggregator_attestation.get('verdict') != 'PASS':
+    raise SystemExit(
+        f'contact aggregator runtime attestation failed: {aggregator_attestation}'
+    )
 manifest_path = workspace / 'config/collision-coverage.yaml'
 manifest_bytes = manifest_path.read_bytes()
 manifest = yaml.safe_load(manifest_bytes)
@@ -1136,6 +1206,54 @@ declared_source_inventory_sha256 = contact_stream['gate'][
 ]
 if attestation.get('source_inventory_sha256') != declared_source_inventory_sha256:
     raise SystemExit('contact gate runtime source inventory differs from manifest v3')
+if (
+    aggregator_attestation.get('source_inventory_sha256')
+    != declared_source_inventory_sha256
+):
+    raise SystemExit('contact aggregator runtime source inventory differs from manifest v3')
+if not (
+    aggregator_attestation.get('installed_declared_is_symlink') is True
+    and aggregator_attestation.get('build_install_samefile') is True
+):
+    raise SystemExit('contact aggregator runtime lacks exact symlink-install identity')
+aggregator_build_install_fields = (
+    'build_elf_build_id',
+    'build_embedded_source_inventory_match',
+    'build_embedded_source_inventory_sha256',
+    'build_install_build_id_match',
+    'build_install_embedded_source_inventory_match',
+    'build_install_samefile',
+    'build_install_sha256_match',
+    'build_path',
+    'build_regular_file',
+    'build_sha256',
+    'installed_declared_is_symlink',
+    'installed_declared_path',
+    'installed_elf_build_id',
+    'installed_embedded_source_inventory_match',
+    'installed_embedded_source_inventory_sha256',
+    'installed_path',
+    'installed_regular_file',
+    'installed_sha256',
+    'package',
+    'schema_version',
+    'source_inventory_sha256',
+)
+
+
+def contact_aggregator_build_install_binding(attestation):
+    return {
+        field: attestation[field]
+        for field in aggregator_build_install_fields
+    }
+
+
+aggregator_build_install = contact_aggregator_build_install_binding(
+    aggregator_attestation
+)
+aggregator_build_install_sha256 = orchestration.canonical_sha256(
+    aggregator_build_install
+)
 binding_path = output.parent / 'installed-source-binding.json'
 binding_bytes = binding_path.read_bytes()
 binding = json.loads(binding_bytes)
@@ -1167,7 +1285,43 @@ if not (
     == attestation.get('installed_elf_build_id')
 ):
     raise SystemExit('contact gate runtime differs from installed source binding')
+aggregator_records = [
+    record
+    for record in binding.get('files', [])
+    if record.get('package') == 'robotest_sim'
+    and record.get('library') == 'librobotest_contact_aggregator_system.so'
+]
+if len(aggregator_records) != 1:
+    raise SystemExit('installed source binding lacks exactly one contact aggregator record')
+aggregator_record = aggregator_records[0]
+if not (
+    aggregator_record.get('matches') is True
+    and aggregator_record.get('build_install_sha256_match') is True
+    and aggregator_record.get('build_install_samefile') is True
+    and aggregator_record.get('regular_file') is True
+    and aggregator_record.get('installed_declared_samefile') is True
+    and aggregator_record.get('installed_declared_is_symlink') is True
+    and aggregator_record.get('installed_declared_is_symlink')
+    == aggregator_attestation.get('installed_declared_is_symlink')
+    and Path(aggregator_record['build_path']).resolve()
+    == (workspace / aggregator_attestation['build_path']).resolve()
+    and Path(aggregator_record['installed_declared_path']).resolve()
+    == (workspace / aggregator_attestation['installed_declared_path']).resolve()
+    and Path(aggregator_record['installed_path']).resolve()
+    == (workspace / aggregator_attestation['installed_path']).resolve()
+    and aggregator_record.get('build_sha256')
+    == aggregator_attestation.get('build_sha256')
+    and aggregator_record.get('installed_sha256')
+    == aggregator_attestation.get('installed_sha256')
+    and aggregator_record.get('build_elf_build_id')
+    == aggregator_attestation.get('build_elf_build_id')
+    and aggregator_record.get('installed_elf_build_id')
+    == aggregator_attestation.get('installed_elf_build_id')
+):
+    raise SystemExit('contact aggregator runtime differs from installed source binding')
 result = {
+    'contact_aggregator_build_install_sha256': aggregator_build_install_sha256,
+    'contact_aggregator_binary_attestation': aggregator_attestation,
     'contact_gate_binary_attestation': attestation,
     'manifest_declared_sha256': manifest['manifest_sha256'],
     'manifest_file_sha256': hashlib.sha256(manifest_bytes).hexdigest(),
@@ -1183,12 +1337,21 @@ if initial_path is not None:
     initial_bytes = initial_path.read_bytes()
     initial = json.loads(initial_bytes)
     initial_attestation = initial['contact_gate_binary_attestation']
+    initial_aggregator_attestation = initial['contact_aggregator_binary_attestation']
+    initial_aggregator_build_install = contact_aggregator_build_install_binding(
+        initial_aggregator_attestation
+    )
     if (
         initial.get('manifest_path') != result['manifest_path']
         or initial.get('manifest_file_sha256') != result['manifest_file_sha256']
         or initial.get('manifest_declared_sha256') != result['manifest_declared_sha256']
     ):
         raise SystemExit('contact stream manifest changed before final evaluation')
+    if (
+        initial.get('installed_source_binding_sha256')
+        != result['installed_source_binding_sha256']
+    ):
+        raise SystemExit('installed source binding changed before final evaluation')
     stable_fields = (
         'build_elf_build_id', 'build_embedded_source_inventory_sha256',
         'build_install_sha256_match',
@@ -1205,6 +1368,21 @@ if initial_path is not None:
     )
     if any(initial_attestation.get(key) != attestation.get(key) for key in stable_fields):
         raise SystemExit('contact gate runtime identity changed before final evaluation')
+    if (
+        initial_aggregator_attestation.get('stable_identity_sha256')
+        != aggregator_attestation.get('stable_identity_sha256')
+        or initial_aggregator_attestation.get('stable_identity')
+        != aggregator_attestation.get('stable_identity')
+    ):
+        raise SystemExit('contact aggregator runtime identity changed before final evaluation')
+    if (
+        initial_aggregator_build_install != aggregator_build_install
+        or initial.get('contact_aggregator_build_install_sha256')
+        != aggregator_build_install_sha256
+    ):
+        raise SystemExit(
+            'contact aggregator build/install identity changed before final evaluation'
+        )
     result['initial_artifact_sha256'] = hashlib.sha256(initial_bytes).hexdigest()
     result['stable_identity'] = True
 output.write_text(json.dumps(result, indent=2, sort_keys=True) + '\n', encoding='utf-8')

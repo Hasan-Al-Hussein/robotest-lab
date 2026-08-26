@@ -17,6 +17,13 @@ ros2 launch robotest_sim sim.launch.py headless:=true rviz:=false seed:=42
 
 Use `headless:=false` to launch the Gazebo GUI. All simulation participants use
 `/clock`; ground truth, contacts, and world statistics remain validation-only.
+The world replaces Gazebo's stock per-sensor Contact publisher with the
+source-bound `robotest_contact_aggregator_system`. It reads all seven rendered
+contact sensors after every physics step and emits one bounded 20 ms interval
+aggregate on the private Gazebo topic
+`/robotest/internal/contact_aggregate`. Only that topic is bridged to the
+compiled ROS contact gate; the seven sensor-local topics are deliberately
+unbridged.
 Phase 3 also exposes bounded Gazebo user-command services below
 `/robotest/scenario/{spawn_entity,set_entity_pose,delete_entity}` and bridges
 the observed 10 Hz actor pose streams plus a permanent ground-plane heartbeat

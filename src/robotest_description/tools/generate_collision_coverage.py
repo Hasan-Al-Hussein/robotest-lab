@@ -36,7 +36,8 @@ import yaml
 
 SCHEMA_VERSION = 3
 ROBOT_MODEL = 'robotest'
-GAZEBO_CONTACT_TOPIC = '/robotest/validation/contacts'
+GAZEBO_CONTACT_TOPIC = '/robotest/internal/contact_aggregate'
+CONTACT_SENSOR_TOPIC_PREFIX = '/robotest/internal/contact_sources'
 PRIVATE_RAW_CONTACT_TOPIC = '/robotest/internal/raw_contacts'
 PUBLIC_CONTACT_TOPIC = '/robotest/validation/contacts'
 CONTACT_TOPIC = PUBLIC_CONTACT_TOPIC
@@ -68,23 +69,35 @@ BRIDGE_CONTACT_ENTRY = {
     'qos_profile': 'SERVICES',
 }
 CONTACT_GATE_SOURCE_PATHS = (
+    'src/robotest_description/urdf/robotest_gazebo.xacro',
     'src/robotest_sim/CMakeLists.txt',
+    'src/robotest_sim/config/bridge.yaml',
+    'src/robotest_sim/include/robotest_sim/contact_aggregator.hpp',
     'src/robotest_sim/include/robotest_sim/contact_stream_gate.hpp',
+    'src/robotest_sim/launch/sim.launch.py',
+    'src/robotest_sim/src/contact_aggregator.cpp',
+    'src/robotest_sim/src/contact_aggregator_system.cpp',
     'src/robotest_sim/src/contact_stream_gate.cpp',
     'src/robotest_sim/src/contact_stream_gate_node.cpp',
+    'src/robotest_sim/worlds/robotest_lab.sdf',
 )
 CONTACT_STREAM_POLICY = {
     'active_pair_expiry_ns': 250_000_000,
     'active_pair_scope': 'support_robot_internal_and_countable_robot_external',
-    'accepted_run_scope': 'bounded_pending_raw_and_public_source_liveness_required',
+    'accepted_run_scope': 'bounded_complete_aggregate_and_public_source_liveness_required',
+    'aggregate_interval_ns': 20_000_000,
+    'aggregate_interval_pair_membership': 'union_of_every_physics_step_in_open_closed_interval',
+    'aggregate_record_reduction': (
+        'latest_complete_physics_step_group_per_normalized_pair_preserving_record_order'
+    ),
     'capacity_claim_scope': 'unchanged_pair_set_heartbeat_only',
-    'completed_stamp_batching': 'finalize_on_strictly_greater_raw_stamp',
+    'completed_stamp_batching': 'one_complete_interval_aggregate_per_stamp',
     'delivery_semantics': 'authoritative_delivered_active_pair_snapshot',
     'emission_policy': 'immediate_active_pair_set_transition_else_heartbeat_at_or_after_200ms',
     'heartbeat_period_ns': 200_000_000,
     'initial_finalized_stamp_suppressed': True,
     'ingress_memory_bound_scope': '_'.join(
-        ('post_dds_deserialization_of_trusted_sole', 'private_bridge_input')
+        ('post_dds_deserialization_of_trusted_sole', 'private_aggregate_bridge_input')
     ),
     'max_pending_batch_clock_lag_ns': 220_000_000,
     'max_public_snapshot_gap_ns': 220_000_000,
@@ -108,20 +121,26 @@ CONTACT_STREAM_POLICY = {
         'max_contact_string_bytes': 8_192,
         'max_frame_id_bytes': 256,
         'max_raw_contact_records': 16,
-        'max_raw_messages_per_completed_stamp': 7,
+        'max_raw_messages_per_completed_stamp': 1,
         'max_raw_string_bytes_per_completed_stamp': 65_536,
     },
     'release_comparison': 'completed_absent_stamp_strictly_greater_than_last_seen_plus_gap',
     'raw_contact_positions': 'required_nonempty_1_to_64',
     'raw_stamp_gap_semantics': (
-        'consecutive_nonempty_raw_gaps_are_not_absence_evidence_and_have_no_independent_bound'
+        'sole_source_grid_is_exact_20ms_and_gate_rejects_delivered_gaps_greater_than_20ms'
     ),
     'raw_messages_require_nonempty_contacts': True,
     'required_raw_frame_id': '',
-    'retained_contact_payload': 'exact_nested_contact_record_copy',
+    'retained_contact_payload': (
+        'exact_ros_projected_nested_copy_of_latest_pair_group_selected_by_interval_reduction'
+    ),
     'semantic_fatal_delivery': 'best_effort_diagnostic_snapshot_before_process_failure',
     'string_budget_accounting': ('payload_strings_plus_normalized_pair_key_once_per_stored_pair'),
-    'synthesized_envelope': ['container', 'current_completed_header', 'normalized_pair_order'],
+    'synthesized_envelope': [
+        'container',
+        'interval_boundary_container_and_contact_headers',
+        'normalized_pair_order',
+    ],
     'synchronization': 'second_finalized_stamp_seeds_public_stream',
 }
 
@@ -286,6 +305,7 @@ def extract_rendered_coverage(
         sensor = contact_sensors[0]
         target_collision = sensor.findtext('contact/collision')
         topic = sensor.findtext('contact/topic')
+        expected_sensor_topic = f'{CONTACT_SENSOR_TOPIC_PREFIX}/{sensor_name}'
         update_rate_text = sensor.findtext('update_rate')
         try:
             update_rate = float(update_rate_text) if update_rate_text is not None else math.nan
@@ -293,7 +313,7 @@ def extract_rendered_coverage(
             raise CoverageGenerationError(f'{sensor_name} update rate is invalid') from exc
         if (
             target_collision != collision_name
-            or topic != GAZEBO_CONTACT_TOPIC
+            or topic != expected_sensor_topic
             or sensor.findtext('always_on') != 'true'
             or not math.isfinite(update_rate)
             or update_rate != DECLARED_CONTACT_UPDATE_RATE_HZ
@@ -306,7 +326,7 @@ def extract_rendered_coverage(
             {
                 'name': scoped_name,
                 'role': role,
-                'source': GAZEBO_CONTACT_TOPIC,
+                'source': PUBLIC_CONTACT_TOPIC,
                 'link': link_name,
                 'collision': collision_name,
                 'contact_sensor': sensor_name,
@@ -319,6 +339,7 @@ def extract_rendered_coverage(
                 'link': link_name,
                 'declared_update_rate_hz': update_rate,
                 'source': GAZEBO_CONTACT_TOPIC,
+                'sensor_topic': expected_sensor_topic,
             }
         )
     if len({item['name'] for item in geometries}) != len(ROLE_BINDINGS):
@@ -424,7 +445,7 @@ def bridge_sha256(repository_root: Path) -> str:
 
 
 def world_source_sha256(repository_root: Path) -> str:
-    """Validate the Contact system and exact ground collision, then hash the world."""
+    """Validate the aggregate system and exact ground collision, then hash the world."""
     path = repository_root / 'src' / 'robotest_sim' / 'worlds' / 'robotest_lab.sdf'
     try:
         root = ET.parse(path).getroot()
@@ -436,16 +457,28 @@ def world_source_sha256(repository_root: Path) -> str:
     contact_plugins = [
         plugin
         for plugin in world.findall('plugin')
+        if plugin.get('filename') == 'robotest_contact_aggregator_system'
+        and plugin.get('name') == 'robotest_sim::ContactAggregatorSystem'
+    ]
+    stock_contact_plugins = [
+        plugin
+        for plugin in world.findall('plugin')
         if plugin.get('filename') == 'gz-sim-contact-system'
-        and plugin.get('name') == 'gz::sim::systems::Contact'
+        or plugin.get('name') == 'gz::sim::systems::Contact'
     ]
     ground = world.find(
         "./model[@name='ground_plane']/link[@name='ground_link']/"
         "collision[@name='ground_collision']"
     )
-    if len(contact_plugins) != 1 or ground is None:
+    plugin = contact_plugins[0] if len(contact_plugins) == 1 else None
+    plugin_contract_matches = plugin is not None and (
+        plugin.findtext('output_topic') == GAZEBO_CONTACT_TOPIC
+        and plugin.findtext('publish_period_ns') == '20000000'
+        and plugin.findtext('robot_model_name') == ROBOT_MODEL
+    )
+    if stock_contact_plugins or not plugin_contract_matches or ground is None:
         raise CoverageGenerationError(
-            'world lacks the exact Contact system or ground support collision'
+            'world lacks the exact contact aggregate system or ground support collision'
         )
     return file_sha256(path)
 

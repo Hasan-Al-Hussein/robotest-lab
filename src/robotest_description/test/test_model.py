@@ -183,7 +183,9 @@ def test_sensor_contract(robot_xml: ET.Element) -> None:
         contact = _sensor(robot_xml, sensor_name)
         assert contact.attrib['type'] == 'contact'
         assert contact.findtext('update_rate') == '5'
-        assert contact.findtext('contact/topic') == '/robotest/validation/contacts'
+        assert contact.findtext('contact/topic') == (
+            f'/robotest/internal/contact_sources/{sensor_name}'
+        )
         assert contact.findtext('contact/collision') == collision_name
 
 
@@ -197,7 +199,7 @@ def test_collision_coverage_manifest_matches_contact_sensors() -> None:
     contact_stream = coverage['contact_stream']
     assert contact_stream['schema_version'] == 1
     assert contact_stream['topics'] == {
-        'gazebo_raw': '/robotest/validation/contacts',
+        'gazebo_raw': '/robotest/internal/contact_aggregate',
         'private_raw_ros': '/robotest/internal/raw_contacts',
         'public_ros': '/robotest/validation/contacts',
     }
@@ -211,10 +213,17 @@ def test_collision_coverage_manifest_matches_contact_sensors() -> None:
     assert contact_stream['qos']['public_ros']['depth'] == 10
     source_inventory = contact_stream['gate']['source_inventory']
     expected_source_paths = [
+        'src/robotest_description/urdf/robotest_gazebo.xacro',
         'src/robotest_sim/CMakeLists.txt',
+        'src/robotest_sim/config/bridge.yaml',
+        'src/robotest_sim/include/robotest_sim/contact_aggregator.hpp',
         'src/robotest_sim/include/robotest_sim/contact_stream_gate.hpp',
+        'src/robotest_sim/launch/sim.launch.py',
+        'src/robotest_sim/src/contact_aggregator.cpp',
+        'src/robotest_sim/src/contact_aggregator_system.cpp',
         'src/robotest_sim/src/contact_stream_gate.cpp',
         'src/robotest_sim/src/contact_stream_gate_node.cpp',
+        'src/robotest_sim/worlds/robotest_lab.sdf',
     ]
     assert [source['path'] for source in source_inventory['sources']] == expected_source_paths
     for source in source_inventory['sources']:
@@ -288,9 +297,12 @@ def test_namespace_and_feature_switches() -> None:
         '/robot_2/raw/scan',
         '/robot_2/raw/odom',
         '/robot_2/raw/imu',
-        '/robot_2/validation/contacts',
         '/robot_2/validation/ground_truth',
     }.issubset(topics)
+    assert {
+        f'/robot_2/internal/contact_sources/{sensor_name}' for sensor_name in CONTACT_SENSORS
+    }.issubset(topics)
+    assert '/robot_2/validation/contacts' not in topics
     assert all(topic.startswith('/robot_2/') for topic in topics)
 
     without_truth = ET.fromstring(_render(enable_ground_truth=False))
@@ -332,7 +344,9 @@ def test_sdformat_conversion_preserves_complete_contact_coverage() -> None:
         target = contact.findtext('contact/collision')
         assert target == expected_collision
         assert target in link_collisions
-        assert contact.findtext('contact/topic') == '/robotest/validation/contacts'
+        assert contact.findtext('contact/topic') == (
+            f'/robotest/internal/contact_sources/{sensor_name}'
+        )
         covered_collisions.add(target)
 
     assert covered_collisions == rendered_collisions

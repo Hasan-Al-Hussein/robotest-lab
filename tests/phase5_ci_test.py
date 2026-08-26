@@ -165,9 +165,19 @@ def test_dependency_license_inventory_and_first_party_licenses_are_complete() ->
     assert dependency_inventory['apt_package_count'] == 42
     assert dependency_inventory['github_action_count'] == 3
     assert dependency_inventory['python_distribution_count'] == 1
-    assert dependency_inventory['ros_dependency_count'] == 57
+    assert dependency_inventory['ros_dependency_count'] == 61
     assert dependency_inventory['rosdep_system_dependency_count'] == 6
     assert 'Direct repository declarations only' in report['verification_scope']
+
+
+def test_stage_runtime_overlay_requires_regular_contact_aggregator_dso() -> None:
+    script = (REPOSITORY / 'scripts/stage_runtime_overlay.sh').read_text(encoding='utf-8')
+    dso = (
+        '${release_target}/install/robotest_sim/lib/robotest_sim/'
+        'librobotest_contact_aggregator_system.so'
+    )
+    assert f'[[ -f "{dso}" &&\n    ! -L "{dso}" ]] ||' in script
+    assert "die 'Release contact aggregator DSO is missing or not a regular file.'" in script
 
 
 def _copy_license_fixture(destination: Path) -> None:
@@ -432,6 +442,36 @@ def test_checksum_manifest_is_exact_and_detects_tampering(tmp_path: Path) -> Non
         validate_checksum_manifest(run)
 
 
+def _contact_gate_binary_fixture(*, symlink_install: bool) -> dict[str, object]:
+    return {
+        'build_embedded_source_inventory_match': True,
+        'build_embedded_source_inventory_sha256': '3' * 64,
+        'build_elf_build_id': 'a1',
+        'build_install_build_id_match': True,
+        'build_install_samefile': symlink_install,
+        'build_install_sha256_match': True,
+        'build_path': release_module.CONTACT_GATE_BUILD_PATH,
+        'build_regular_executable': True,
+        'build_sha256': '4' * 64,
+        'installed_declared_is_symlink': symlink_install,
+        'installed_declared_path': release_module.CONTACT_GATE_INSTALL_PATH,
+        'installed_declared_samefile': True,
+        'installed_elf_build_id': 'a1',
+        'installed_embedded_source_inventory_match': True,
+        'installed_embedded_source_inventory_sha256': '3' * 64,
+        'installed_path': (
+            release_module.CONTACT_GATE_BUILD_PATH
+            if symlink_install
+            else release_module.CONTACT_GATE_INSTALL_PATH
+        ),
+        'installed_regular_executable': True,
+        'installed_sha256': '4' * 64,
+        'package': 'robotest_sim',
+        'schema_version': 1,
+        'source_inventory_sha256': '3' * 64,
+    }
+
+
 def test_phase5_source_install_and_contact_gate_binding_validators_fail_closed() -> None:
     source_record = {
         'binding_type': 'python_module',
@@ -454,32 +494,42 @@ def test_phase5_source_install_and_contact_gate_binding_validators_fail_closed()
     with pytest.raises(EvidenceError, match='source/install record'):
         release_module._validate_source_install(forged_source_install)
 
-    gate_binding = {
-        'build_embedded_source_inventory_match': True,
-        'build_embedded_source_inventory_sha256': '3' * 64,
-        'build_elf_build_id': 'a1',
-        'build_install_build_id_match': True,
-        'build_install_sha256_match': True,
-        'build_path': 'build/robotest_sim/contact_stream_gate',
-        'build_regular_executable': True,
-        'build_sha256': '4' * 64,
-        'installed_declared_path': 'install/robotest_sim/lib/robotest_sim/contact_stream_gate',
-        'installed_declared_samefile': True,
-        'installed_elf_build_id': 'a1',
-        'installed_embedded_source_inventory_match': True,
-        'installed_embedded_source_inventory_sha256': '3' * 64,
-        'installed_path': 'install/robotest_sim/lib/robotest_sim/contact_stream_gate',
-        'installed_regular_executable': True,
-        'installed_sha256': '4' * 64,
-        'package': 'robotest_sim',
-        'schema_version': 1,
-        'source_inventory_sha256': '3' * 64,
-    }
+    gate_binding = _contact_gate_binary_fixture(symlink_install=True)
     release_module._validate_contact_gate_binary_binding(gate_binding)
     forged_gate_binding = copy.deepcopy(gate_binding)
     forged_gate_binding['installed_embedded_source_inventory_sha256'] = '6' * 64
     with pytest.raises(EvidenceError, match='embedded source or build/install hash'):
         release_module._validate_contact_gate_binary_binding(forged_gate_binding)
+
+
+@pytest.mark.parametrize('symlink_install', [False, True])
+def test_phase5_contact_gate_binding_accepts_copy_and_symlink_installs(
+    symlink_install: bool,
+) -> None:
+    release_module._validate_contact_gate_binary_binding(
+        _contact_gate_binary_fixture(symlink_install=symlink_install)
+    )
+
+
+@pytest.mark.parametrize(
+    ('field', 'value', 'message'),
+    [
+        ('installed_declared_is_symlink', 1, 'binding changed'),
+        (
+            'installed_path',
+            release_module.CONTACT_GATE_INSTALL_PATH,
+            'declared/resolved install path',
+        ),
+        ('build_install_samefile', False, 'declared/resolved install path'),
+    ],
+)
+def test_phase5_contact_gate_binding_rejects_path_tampering(
+    field: str, value: object, message: str
+) -> None:
+    binding = _contact_gate_binary_fixture(symlink_install=True)
+    binding[field] = value
+    with pytest.raises(EvidenceError, match=message):
+        release_module._validate_contact_gate_binary_binding(binding)
 
 
 def test_remote_checksum_sidecar_detects_tampering(tmp_path: Path) -> None:
@@ -1043,20 +1093,28 @@ def _write_phase3_contact_gate_reobservation(
     gz_partition: str,
 ) -> None:
     frozen = build_binding['contact_gate_binary']
+    frozen_aggregator = build_binding['contact_aggregator_binary']
     installed_path = (repository / frozen['installed_path']).resolve(strict=True)
     installed_stat = installed_path.stat()
+    aggregator_installed_path = (repository / frozen_aggregator['installed_path']).resolve(
+        strict=True
+    )
+    aggregator_installed_stat = aggregator_installed_path.stat()
     launch_pid = 40_000 + ros_domain_id
     attestation = {
         'build_embedded_source_inventory_match': True,
         'build_embedded_source_inventory_sha256': frozen['build_embedded_source_inventory_sha256'],
         'build_elf_build_id': frozen['build_elf_build_id'],
         'build_install_build_id_match': True,
+        'build_install_samefile': frozen['build_install_samefile'],
         'build_install_sha256_match': True,
         'build_path': frozen['build_path'],
+        'build_regular_executable': True,
         'build_sha256': frozen['build_sha256'],
         'exact_live_process_count': 1,
         'identity_revalidated_after_hashing': True,
         'installed_declared_path': frozen['installed_declared_path'],
+        'installed_declared_is_symlink': frozen['installed_declared_is_symlink'],
         'installed_declared_samefile': True,
         'installed_device': installed_stat.st_dev,
         'installed_embedded_source_inventory_match': True,
@@ -1099,7 +1157,66 @@ def _write_phase3_contact_gate_reobservation(
         'source_inventory_sha256': frozen['source_inventory_sha256'],
         'verdict': 'PASS',
     }
+    live_executable_path = str(Path(sys.executable).resolve(strict=True))
+    live_mapping_paths = [str(aggregator_installed_path)]
+    aggregator_attestation = {
+        **frozen_aggregator,
+        'attestation_method': 'proc_maps_exact_device_inode',
+        'exact_live_process_count': 1,
+        'identity_revalidated_after_hashing': True,
+        'installed_device': aggregator_installed_stat.st_dev,
+        'installed_identity_revalidated_after_hashing': True,
+        'installed_inode': aggregator_installed_stat.st_ino,
+        'installed_size_bytes': aggregator_installed_stat.st_size,
+        'launch_root_pid': launch_pid,
+        'live_cmdline_sha256': hashlib.sha256(
+            f'{live_executable_path}\0-r\0robotest_lab.sdf\0'.encode()
+        ).hexdigest(),
+        'live_elf_build_id': frozen_aggregator['installed_elf_build_id'],
+        'live_embedded_source_inventory_match': True,
+        'live_embedded_source_inventory_sha256': frozen_aggregator[
+            'installed_embedded_source_inventory_sha256'
+        ],
+        'live_executable_link': live_executable_path,
+        'live_executable_path': live_executable_path,
+        'live_installed_build_id_match': True,
+        'live_installed_inode_match': True,
+        'live_installed_sha256_match': True,
+        'live_mapping_count': len(live_mapping_paths),
+        'live_mapping_device': aggregator_installed_stat.st_dev,
+        'live_mapping_fingerprint_sha256': hashlib.sha256(
+            (
+                f'{aggregator_installed_stat.st_dev}:'
+                f'{aggregator_installed_stat.st_ino}:'
+                f'{aggregator_installed_stat.st_size}:'
+                f'{aggregator_installed_path}'
+            ).encode()
+        ).hexdigest(),
+        'live_mapping_has_executable': True,
+        'live_mapping_has_offset_zero': True,
+        'live_mapping_inode': aggregator_installed_stat.st_ino,
+        'live_mapping_paths': live_mapping_paths,
+        'live_pgid': launch_pid,
+        'live_pid': launch_pid + 2,
+        'live_ppid': launch_pid,
+        'live_sid': launch_pid,
+        'live_start_ticks': 2_000_000 + ros_domain_id,
+        'maps_revalidated_after_hashing': True,
+        'observed_gz_partition': gz_partition,
+        'observed_ros_domain_id': str(ros_domain_id),
+        'process_identity_match': True,
+        'verdict': 'PASS',
+    }
+    stable_identity = {
+        field: aggregator_attestation[field]
+        for field in orchestration.CONTACT_AGGREGATOR_STABLE_IDENTITY_FIELDS
+    }
+    aggregator_attestation['stable_identity'] = stable_identity
+    aggregator_attestation['stable_identity_sha256'] = orchestration.canonical_sha256(
+        stable_identity
+    )
     gate_document = {
+        'contact_aggregator_binary_attestation': aggregator_attestation,
         'contact_gate_binary_attestation': attestation,
         'verdict': 'PASS',
     }
@@ -1577,6 +1694,7 @@ def _phase3_bundle(
     orchestrator['source_binding'].update(
         {
             'collector_configuration_sha256': build_binding['collector_configuration_sha256'],
+            'contact_aggregator_binary': build_binding['contact_aggregator_binary'],
             'contact_gate_binary': build_binding['contact_gate_binary'],
             'install_end_sha256': build_binding['install']['aggregate_sha256'],
             'install_start_sha256': build_binding['install']['aggregate_sha256'],
@@ -2145,10 +2263,14 @@ def _build_release_fixture(tmp_path: Path) -> dict[str, Path | str]:
     gate_fixture_source = Path(sys.executable).resolve(strict=True)
     gate_build = repository / 'build/robotest_sim/contact_stream_gate'
     gate_install = repository / 'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
+    aggregator_build = repository / 'build/robotest_sim/librobotest_contact_aggregator_system.so'
+    aggregator_install = repository / (
+        'install/robotest_sim/lib/robotest_sim/librobotest_contact_aggregator_system.so'
+    )
     gate_build.parent.mkdir(parents=True, exist_ok=True)
     gate_install.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(gate_fixture_source, gate_build)
-    shutil.copy2(gate_fixture_source, gate_install)
+    for binary_path in (gate_build, gate_install, aggregator_build, aggregator_install):
+        shutil.copy2(gate_fixture_source, binary_path)
     gate_build.chmod(0o755)
     gate_install.chmod(0o755)
     phase0_version = repository / 'artifacts/evidence/phase0/phase0-versions.json'
@@ -2200,8 +2322,8 @@ PY
         + gate_source_inventory_sha256.encode('ascii')
         + b'\0'
     )
-    for gate_path in (gate_build, gate_install):
-        with gate_path.open('ab') as stream:
+    for binary_path in (gate_build, gate_install, aggregator_build, aggregator_install):
+        with binary_path.open('ab') as stream:
             stream.write(embedded_gate_source)
     build_binding = orchestration.build_binding(
         repository,
@@ -3751,6 +3873,94 @@ def test_release_evidence_rejects_phase3_target_binding_forgery(tmp_path: Path) 
     )
 
     with pytest.raises(EvidenceError, match='production analysis replay'):
+        _validate_release_fixture(fixture)
+
+
+def _contact_aggregator_binary_fixture(*, symlink_install: bool) -> dict[str, object]:
+    source_inventory_sha256 = '5' * 64
+    binary_sha256 = '7' * 64
+    build_id = 'b' * 40
+    return {
+        'build_embedded_source_inventory_match': True,
+        'build_embedded_source_inventory_sha256': source_inventory_sha256,
+        'build_elf_build_id': build_id,
+        'build_install_build_id_match': True,
+        'build_install_embedded_source_inventory_match': True,
+        'build_install_samefile': symlink_install,
+        'build_install_sha256_match': True,
+        'build_path': release_module.CONTACT_AGGREGATOR_BUILD_PATH,
+        'build_regular_file': True,
+        'build_sha256': binary_sha256,
+        'installed_declared_is_symlink': symlink_install,
+        'installed_declared_path': release_module.CONTACT_AGGREGATOR_INSTALL_PATH,
+        'installed_embedded_source_inventory_match': True,
+        'installed_embedded_source_inventory_sha256': source_inventory_sha256,
+        'installed_elf_build_id': build_id,
+        'installed_path': (
+            release_module.CONTACT_AGGREGATOR_BUILD_PATH
+            if symlink_install
+            else release_module.CONTACT_AGGREGATOR_INSTALL_PATH
+        ),
+        'installed_regular_file': True,
+        'installed_sha256': binary_sha256,
+        'package': 'robotest_sim',
+        'schema_version': 1,
+        'source_inventory_sha256': source_inventory_sha256,
+    }
+
+
+@pytest.mark.parametrize('symlink_install', [False, True])
+def test_release_contact_aggregator_binding_accepts_copy_and_symlink_installs(
+    symlink_install: bool,
+) -> None:
+    release_module._validate_contact_aggregator_binary_binding(
+        _contact_aggregator_binary_fixture(symlink_install=symlink_install)
+    )
+
+
+@pytest.mark.parametrize(
+    ('field', 'value', 'message'),
+    [
+        ('unexpected', True, 'binding changed'),
+        ('build_regular_file', False, 'binding changed'),
+        ('schema_version', True, 'binding changed'),
+        ('installed_declared_is_symlink', 1, 'binding changed'),
+        ('build_install_samefile', False, 'declared/resolved install path'),
+        (
+            'installed_path',
+            release_module.CONTACT_AGGREGATOR_INSTALL_PATH,
+            'declared/resolved install path',
+        ),
+        ('installed_sha256', '8' * 64, 'build/install hash differs'),
+        ('installed_elf_build_id', 'c' * 40, 'ELF build ID binding is invalid'),
+        (
+            'installed_embedded_source_inventory_sha256',
+            '8' * 64,
+            'embedded source or build/install hash differs',
+        ),
+    ],
+)
+def test_release_contact_aggregator_binding_rejects_tampering(
+    field: str, value: object, message: str
+) -> None:
+    binding = _contact_aggregator_binary_fixture(symlink_install=True)
+    binding[field] = value
+    with pytest.raises(EvidenceError, match=message):
+        release_module._validate_contact_aggregator_binary_binding(binding)
+
+
+def test_release_evidence_rejects_unshared_contact_binary_inventory(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    binding_path = Path(fixture['candidate_root']) / 'build-binding.json'
+    binding = json.loads(binding_path.read_text(encoding='utf-8'))
+    aggregator = binding['contact_aggregator_binary']
+    rebound_inventory_sha256 = 'f' * 64
+    aggregator['source_inventory_sha256'] = rebound_inventory_sha256
+    aggregator['build_embedded_source_inventory_sha256'] = rebound_inventory_sha256
+    aggregator['installed_embedded_source_inventory_sha256'] = rebound_inventory_sha256
+    _canonical_file(binding_path, binding, sidecar=True)
+
+    with pytest.raises(EvidenceError, match='do not share one source inventory'):
         _validate_release_fixture(fixture)
 
 

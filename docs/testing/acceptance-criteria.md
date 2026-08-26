@@ -68,9 +68,10 @@ Unless a scenario below overrides a value:
   liveness evidence, not simulation-time freshness;
 - the active positive-control driver separately fails closed when its own
   callback-time offset exceeds **0.22 simulation seconds** and proves the
-  qualifying stop command within **0.10 simulation seconds**; no stricter
-  consecutive-private-callback spacing is inferred from the simulator's
-  delivered raw sequence;
+  qualifying stop command within **0.10 simulation seconds**; the source-bound
+  Gazebo producer additionally emits one complete aggregate on an exact
+  **0.02 simulation second** grid after synchronization, and the gate rejects
+  any delivered private-aggregate gap greater than that bound;
 - terminal drain is an actually retained, collector-acknowledged public
   snapshot `q`, with `q > T_terminal + 0.25 s`; the target boundary alone is
   not completion evidence;

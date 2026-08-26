@@ -22,7 +22,10 @@ import pytest
 from robotest_metrics.artifacts import canonical_sha256
 from robotest_metrics.collector import CollectorCore
 from robotest_scenarios.constants import CONTROL_ROBOT_START, CONTROL_WALL_POSE
-from robotest_scenarios.contact_evidence import EXPECTED_CONTACT_STREAM_POLICY
+from robotest_scenarios.contact_evidence import (
+    EXPECTED_CONTACT_GATE_SOURCE_PATHS,
+    EXPECTED_CONTACT_STREAM_POLICY,
+)
 from robotest_scenarios.provenance import (
     contact_control_configuration,
     contact_control_configuration_sha256,
@@ -228,15 +231,42 @@ def _orchestrator(identity: dict[str, Any]) -> dict[str, Any]:
         'schema_version': 1,
         'source_binding': {
             'collector_configuration_sha256': '1' * 64,
+            'contact_aggregator_binary': {
+                'build_embedded_source_inventory_match': True,
+                'build_embedded_source_inventory_sha256': '5' * 64,
+                'build_elf_build_id': 'b' * 40,
+                'build_install_build_id_match': True,
+                'build_install_embedded_source_inventory_match': True,
+                'build_install_samefile': True,
+                'build_install_sha256_match': True,
+                'build_path': ('build/robotest_sim/librobotest_contact_aggregator_system.so'),
+                'build_regular_file': True,
+                'build_sha256': '7' * 64,
+                'installed_declared_is_symlink': True,
+                'installed_declared_path': (
+                    'install/robotest_sim/lib/robotest_sim/librobotest_contact_aggregator_system.so'
+                ),
+                'installed_embedded_source_inventory_match': True,
+                'installed_embedded_source_inventory_sha256': '5' * 64,
+                'installed_elf_build_id': 'b' * 40,
+                'installed_path': ('build/robotest_sim/librobotest_contact_aggregator_system.so'),
+                'installed_regular_file': True,
+                'installed_sha256': '7' * 64,
+                'package': 'robotest_sim',
+                'schema_version': 1,
+                'source_inventory_sha256': '5' * 64,
+            },
             'contact_gate_binary': {
                 'build_embedded_source_inventory_match': True,
                 'build_embedded_source_inventory_sha256': '5' * 64,
                 'build_elf_build_id': 'a' * 40,
                 'build_install_build_id_match': True,
+                'build_install_samefile': True,
                 'build_install_sha256_match': True,
                 'build_path': 'build/robotest_sim/contact_stream_gate',
                 'build_regular_executable': True,
                 'build_sha256': '6' * 64,
+                'installed_declared_is_symlink': True,
                 'installed_declared_path': (
                     'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
                 ),
@@ -244,7 +274,7 @@ def _orchestrator(identity: dict[str, Any]) -> dict[str, Any]:
                 'installed_embedded_source_inventory_match': True,
                 'installed_embedded_source_inventory_sha256': '5' * 64,
                 'installed_elf_build_id': 'a' * 40,
-                'installed_path': ('install/robotest_sim/lib/robotest_sim/contact_stream_gate'),
+                'installed_path': 'build/robotest_sim/contact_stream_gate',
                 'installed_regular_executable': True,
                 'installed_sha256': '6' * 64,
                 'package': 'robotest_sim',
@@ -277,16 +307,8 @@ def collision_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
     gate_source_inventory = {
         'schema_version': 1,
         'sources': [
-            {'path': path, 'sha256': str(index) * 64}
-            for index, path in enumerate(
-                (
-                    'src/robotest_sim/CMakeLists.txt',
-                    'src/robotest_sim/include/robotest_sim/contact_stream_gate.hpp',
-                    'src/robotest_sim/src/contact_stream_gate.cpp',
-                    'src/robotest_sim/src/contact_stream_gate_node.cpp',
-                ),
-                start=1,
-            )
+            {'path': path, 'sha256': file_sha256(repository / path)}
+            for path in EXPECTED_CONTACT_GATE_SOURCE_PATHS
         ],
     }
     contact_stream = {
@@ -315,7 +337,7 @@ def collision_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
         },
         'schema_version': 1,
         'topics': {
-            'gazebo_raw': '/robotest/validation/contacts',
+            'gazebo_raw': '/robotest/internal/contact_aggregate',
             'private_raw_ros': '/robotest/internal/raw_contacts',
             'public_ros': '/robotest/validation/contacts',
         },

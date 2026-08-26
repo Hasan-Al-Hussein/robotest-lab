@@ -20,6 +20,7 @@ namespace robotest_sim
 {
 
 inline constexpr std::int64_t kContactHeartbeatPeriodNs = 200000000;
+inline constexpr std::int64_t kPrivateContactAggregatePeriodNs = 20000000;
 inline constexpr std::int64_t kContactReleaseGapNs = 250000000;
 inline constexpr std::int64_t kMaxPublicSnapshotGapNs = 220000000;
 inline constexpr std::int64_t kMaxPendingBatchClockLagNs = 220000000;
@@ -29,7 +30,7 @@ inline constexpr std::size_t kRawContactQosDepth = 64U;
 inline constexpr std::size_t kPublicContactQosDepth = 10U;
 inline constexpr std::size_t kMaxActiveContactPairs = 16U;
 inline constexpr std::size_t kMaxRawContactRecords = 16U;
-inline constexpr std::size_t kMaxRawMessagesPerBatch = 7U;
+inline constexpr std::size_t kMaxRawMessagesPerBatch = 1U;
 inline constexpr std::size_t kMaxActiveContactRecords = 16U;
 inline constexpr std::size_t kMaxContactRecordsPerPair = 4U;
 inline constexpr std::size_t kMaxContactPointsPerRecord = 64U;

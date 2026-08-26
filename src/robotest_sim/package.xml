@@ -17,6 +17,10 @@
 
   <depend>builtin_interfaces</depend>
   <depend>geometry_msgs</depend>
+  <depend>gz_msgs_vendor</depend>
+  <depend>gz_plugin_vendor</depend>
+  <depend>gz_sim_vendor</depend>
+  <depend>gz_transport_vendor</depend>
   <depend>rclcpp</depend>
   <depend>ros_gz_interfaces</depend>
   <depend>rosgraph_msgs</depend>

@@ -385,11 +385,13 @@ the exact rendered collision manifest and contact configuration used by the
 candidate suite. The control is not one of the 15 mission trials and its
 intentional collision is not added to a mission collision count.
 
-The frozen control uses the same world, built robot, rendered-SDF hash, private
-raw contact bridge, compiled contact-stream gate, collector, and schema-v3
+The frozen control uses the same world, built robot, rendered-SDF hash,
+source-bound Gazebo contact aggregator, private raw contact bridge, compiled
+contact-stream gate, collector, and schema-v3
 collision-coverage manifest. The manifest binds the gate CMake/header/source/
-node inventory, and the uniquely tagged digest in the running ELF must match
-that inventory. The sole private bridge publisher feeds only the gate; the
+node inventory, plus the aggregator/configuration sources. Uniquely tagged
+digests in the loaded plugin DSO and running gate ELF must match that inventory.
+The sole private bridge publisher feeds only the gate; the
 gate is the sole public publisher. It suppresses its first finalized raw stamp,
 then provides a seeded, strictly increasing authoritative delivered active-pair
 snapshot stream before motion. The control starts the robot at
