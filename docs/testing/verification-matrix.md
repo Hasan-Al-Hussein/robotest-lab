@@ -1,6 +1,6 @@
 # RoboTest Lab Verification Matrix
 
-Status: **Phase 0 normative verification plan**
+Status: **Phase 3 normative verification plan, revision 2**
 
 All commands are launched from Windows unless the row says otherwise. The
 canonical Linux working directory is `/home/hasan/robotest-lab`.
@@ -81,6 +81,15 @@ their frozen targets into measured-result fields.
 
 ## Phase 3 — metrics and scenarios 1–5
 
+Phase 3 uses the exact 15-trial cold-stack order, bounded evidence streams,
+canonical result ownership, and artifact byte limits frozen in the
+[metrics contract](../architecture/metrics-contract.md). Fault control follows
+[ADR 0005](../decisions/0005-phase3-deterministic-fault-protocol.md), while
+obstacle and trial mechanics follow
+[ADR 0006](../decisions/0006-phase3-scenario-mechanics.md). Candidate benchmark
+commands refuse a dirty worktree; development smoke runs are labeled
+non-candidate and cannot be aggregated with the clean suite.
+
 Canonical commands:
 
 ```powershell
@@ -90,12 +99,14 @@ wsl -d Ubuntu -- bash -lc 'cd /home/hasan/robotest-lab && taskset -c 0-5 scripts
 
 | Criterion | Proof method | Expected result and evidence | Failure signal | Recovery trigger |
 | --- | --- | --- | --- | --- |
-| P3-01 Fault logic | GTest for schedules, boundaries, deterministic transforms, queues, reset, and events | Same seed/input produces same output; half-open intervals and counts correct; queues bounded | Wall-time dependence, off-by-one interval, odom/TF mismatch, nondeterminism | Isolate pure logic; no simulation run until unit proof passes |
-| P3-02 Metric formulas | Pytest fixtures for every formula and invalid edge case | Results match `metrics-contract.md`; nulls and quality failures preserved | Zero substituted for missing, bad angular wrap, contact overcount, hidden sample drop | Correct pure calculation and regenerate all affected reports |
-| P3-03 Baseline/static/dynamic | Repeated Scenario 1–3 benchmark runs | Three of three trials per scenario satisfy frozen criteria; individual and aggregate artifacts retained | Missing interaction, collision, timeout, unrecorded trial, threshold miss | Keep failed evidence; simplify/tune within frozen contract, then rerun full set |
-| P3-04 LiDAR dropout | Raw/validated/event/cmd/action bag and repeated runs | Raw scans continue, validated scans absent in interval, safe stop/recovery and mission outcome meet Scenario 4 targets | Substitute scan, count mismatch, unsafe motion, false recovery/success | Fix one fault path; repeat Scenario 4 from clean state |
-| P3-05 Odometry drift | Raw/validated odom, TF, truth, localization, action and event comparison | Injected offsets and odom/TF consistency meet Scenario 5; localization metrics have required coverage | Duplicate/bypassed TF, wrong drift, raw mutation, missing coverage | Fix TF/data ownership and invalidate affected drift results |
-| P3-06 Report integrity | Regenerate Markdown/HTML/PNG from canonical JSON and verify hashes | Every displayed number resolves to JSON field and run ID; target and measurement sections distinct | Hand-entered/untraceable number or hash mismatch | Delete/regenerate only derived artifacts from preserved canonical data |
+| P3-01 Fault protocol and transforms | GTest plus cross-language known-answer hash fixtures for canonical schedules, RESET/PREPARED/ARMED transitions, boundaries, idempotency, counts, dropout, drift, queues, and reset | Python/C++ canonical bytes and SHA-256 match; preload is inert; exact UUID/T0/hash/generation arm precedes the first fault by >=0.50 s; half-open intervals, event counts, left-composed SE(2), odom/TF identity, and bounded QoS pass | Wall-time dependence, hash mismatch, partial state, conflicting replay accepted, off-by-one interval, odom/TF mismatch, nondeterminism, or pre-arm effect | Isolate pure logic and interface contract; no simulation run until unit and service fixtures pass |
+| P3-02 Metric formulas and bounds | Pytest fixtures for every formula, invalid edge case, collector capacity, artifact cap, collision coverage, positive control, plan leg/hash, TF alignment, and recovery candidate | Results match `metrics-contract.md`; nulls and quality failures preserved; every first overflow fails closed; JSON/CSV reconcile | Zero substituted for missing, bad angular wrap, leg mix-up, contact overcount, silent topic called collision-free, hidden sample drop/truncation, or permissive recovery | Correct pure calculation/collector first and regenerate all derived artifacts |
+| P3-03 Contact-pipeline qualification | Rendered-SDF collision manifest plus a bounded positive-control run before the candidate suite | Manifest covers chassis, wheels, casters, LiDAR, and IMU collisions exactly; one expected non-excluded robot/environment contact is observed; final command zero, hashes and cleanup pass | Missing/unknown collision, chassis-only coverage, only ground/internal contact, stale control hash, orphan, or silent topic | Fix sensor/bridge/normalization coverage and repeat the positive control before any candidate trial |
+| P3-04 Baseline/static/dynamic | Repeated Scenario 1–3 cold-stack runs with bounded controllers and validation world-pose evidence | Three of three trials per scenario satisfy frozen mission/path/collision/resource criteria; Scenario 2 proves post-plan insertion plus a changed safe leg-0 path; Scenario 3 proves the exact trajectory and collision-monitor stop response; individual and aggregate artifacts retained | Missing interaction/pose, collision, timeout, unrecorded trial, action retry, threshold miss, or source/config mismatch | Keep failed evidence; fix the first product or harness layer without changing targets, commit, then start a new full candidate set |
+| P3-05 LiDAR dropout | Raw/validated/event/command/action traces and three cold-stack runs | Raw scans continue, validated scans are absent only in the half-open interval, counts reconcile, source timeout is exactly 0.60 s, final command becomes/remains safe, the complete 1.0 s recovery window passes, and the mission outcome meets Scenario 4 | Substitute/stale scan, count mismatch, unsafe motion, incomplete stability evidence, false recovery/success, or missing arm binding | Fix one fault/control/metric path; invalidate the affected candidate suite and restart from clean state |
+| P3-06 Odometry drift | Raw/validated odom, proxy TF, truth, localization, action, and event comparison across three cold-stack runs | `T_validated * inverse(T_raw)` matches the configured end offset at a sample <=0.25 s before interval end; raw odom, twist, covariance, stamps remain valid; odom/TF agree; localization coverage and mission criteria pass | Duplicate/bypassed TF, wrong composition/endpoint, raw mutation, covariance/twist change, missing coverage, or false action verdict | Fix TF/data ownership and invalidate affected drift results before a new candidate suite |
+| P3-07 Suite independence, resources, and cleanup | Orchestrator ledger, source/install binding, per-run process/resource probes, exact ordered run IDs, and post-run process/graph audit | Clean commit; exactly 15 immutable runs in order; unique domains/partitions/PGIDs; reset confirmed; retries zero; every run meets affinity/RSS/RTF/isolation/integrity gates; no survivor or reused state | Dirty source, replacement attempt, warm state, resource miss, validation leak, orphan, checksum or provenance mismatch | Preserve the failed suite; clean only owned processes; fix/commit and restart all 15 candidate runs |
+| P3-08 Report integrity | Regenerate JSON/CSV/Markdown/HTML/PNG and aggregate tables from canonical run JSON, then verify hashes and caps | Sole per-run verdict and every displayed number resolve to source JSON/run ID; nearest-rank aggregation, target/measurement separation, byte caps, and full 3/3 denominators pass | Hand-entered/untraceable number, dropped failure, default percentile, JSON/CSV mismatch, cap overrun, or hash mismatch | Delete and regenerate only derived artifacts from preserved canonical data; never edit benchmark values manually |
 
 ## Phase 4 — supervision, service, and package
 

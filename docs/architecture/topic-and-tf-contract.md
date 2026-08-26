@@ -1,6 +1,6 @@
 # RoboTest Lab Topic and TF Contract
 
-Status: **Normative contract, revised for Phase 2**
+Status: **Normative contract, revised for Phase 3**
 Default ROS namespace: `/robotest`
 Target platform: ROS 2 Jazzy, Gazebo Harmonic, Nav2
 
@@ -44,6 +44,7 @@ must compare them with the live endpoints using `ros2 topic info -v`.
 | `/robotest/cmd_vel_smoothed` | `geometry_msgs/msg/Twist` | Velocity smoother only | Collision monitor | RELIABLE, VOLATILE, KEEP_LAST(1) |
 | `/robotest/cmd_vel` | `geometry_msgs/msg/Twist` | Collision monitor only | Gazebo command bridge and evidence probes | RELIABLE, VOLATILE, KEEP_LAST(1) |
 | `/robotest/cmd_vel_behavior_unused` | `geometry_msgs/msg/Twist` | Isolated Nav2 behavior-server output | None; this topic is not bridged or connected to an actuator path | RELIABLE, VOLATILE, KEEP_LAST(1) |
+| `/robotest/collision_monitor_state` | `nav2_msgs/msg/CollisionMonitorState` | Collision monitor | Metrics and evidence probes | RELIABLE, VOLATILE, KEEP_LAST(10) |
 | `/robotest/validation/ground_truth` | `nav_msgs/msg/Odometry` | Gazebo model truth -> bridge | Metrics, validation tests, evidence recorder | RELIABLE, VOLATILE, KEEP_LAST(10) |
 | `/robotest/validation/contacts` | `ros_gz_interfaces/msg/Contacts` | Gazebo contact sensor -> bridge | Metrics and validation tests | RELIABLE, VOLATILE, KEEP_LAST(10) |
 | `/robotest/validation/world_stats` | `ros_gz_interfaces/msg/WorldStatistics` | Gazebo world statistics -> bridge | Metrics and resource recorder | RELIABLE, VOLATILE, KEEP_LAST(10) |
@@ -87,17 +88,19 @@ cancellation, and terminal-result waits retain steady wall-clock deadlines.
 
 ## Fault-control interfaces
 
-The interface package owns:
+The Phase 3 interface package owns:
 
 - `robotest_interfaces/msg/FaultSpec`
 - `robotest_interfaces/msg/FaultEvent`
-- `robotest_interfaces/srv/LoadFaultSchedule`
+- `robotest_interfaces/srv/PreloadFaultSchedule`
+- `robotest_interfaces/srv/ArmFaultSchedule`
 
-The Phase 1 proxy currently exposes:
+The Phase 3 proxy exposes:
 
 | Service | Type | Contract |
 | --- | --- | --- |
-| `/robotest/faults/load_schedule` | `robotest_interfaces/srv/LoadFaultSchedule` | Atomically validate and replace the current Phase 1 pass-through schedule representation |
+| `/robotest/faults/preload_schedule` | `robotest_interfaces/srv/PreloadFaultSchedule` | Recompute the canonical schedule hash, atomically validate and prepare at most 16 bounded specifications, or idempotently replay the exact committed content; PREPARED remains inert |
+| `/robotest/faults/arm_schedule` | `robotest_interfaces/srv/ArmFaultSchedule` | Atomically bind the exact prepared hash/generation to one UUID-matched accepted goal and authoritative `T0`, with at least 0.50 s margin before the first fault |
 | `/robotest/faults/reset` | `std_srvs/srv/Trigger` | Disable every fault, clear schedule state, reset deterministic generators, and confirm the pass-through state |
 
 Generated service/action QoS remains the Jazzy default reliable profile unless
@@ -105,24 +108,20 @@ live endpoint inspection proves an incompatibility. Service calls have bounded
 availability and response timeouts; no callback waits synchronously on a
 service future.
 
-Each `FaultSpec` conveys a stable fault ID, target stream, mode, simulation
-offset from mission start, duration, deterministic seed, and mode-specific
-parameters. The current load request includes the canonical schedule hash. A
-rejected schedule activates nothing.
+Each `FaultSpec` conveys a stable fault ID, target stream, supported mode,
+simulation offset from `T0`, duration, deterministic seed, and mode-specific
+parameters. The proxy independently canonicalizes the bounded sequence and
+recomputes its SHA-256; a rejected request cannot mutate committed state.
 
-[ADR 0003](../decisions/0003-two-phase-fault-schedule-arming.md) resolves the
-future ordering requirement with separate PRELOAD and ARM operations. A
-prepared schedule remains inert; after `FollowWaypoints` accepts the goal, ARM
-will bind that exact generation to the server-returned goal UUID and accepted
-stamp. The current `LoadFaultSchedule` interface and proxy do **not** implement
-those operations, states, goal binding, or fault arming. Phase 2 therefore runs
-an empty no-fault baseline and must not report ADR 0003 as implemented or
-verified.
+[ADR 0005](../decisions/0005-phase3-deterministic-fault-protocol.md) freezes
+the exact `RESET -> PREPARED -> ARMED` state machine, generation and replay
+policy, canonical bytes, supported modes, event schema, arming margin, drift
+math, and failure behavior. The legacy `faults/load_schedule` service is not
+allowed in a Phase 3 runtime graph.
 
 ## Simulation-time semantics
 
-The following semantics apply to the future fault implementation specified by
-ADR 0003, not to the Phase 2 no-fault baseline:
+The following Phase 3 semantics apply exactly as specified by ADR 0005:
 
 1. The complete schedule is preloaded, validated, and inert before the first
    navigation goal.
@@ -139,8 +138,10 @@ ADR 0003, not to the Phase 2 no-fault baseline:
 5. A paused simulation pauses the schedule. A steady wall-clock escape timeout
    remains outside the simulated-time state machine so a stopped `/clock`
    cannot hang a test.
-6. Resetting a run resets all PRNG state. Seeds, schedule hash, input sequence
-   counts, and affected message counts are evidence fields.
+6. Resetting a run resets all transformation state and counters while the
+   per-process generation allocator remains monotonic. Seeds, canonical bytes,
+   schedule hash, generation, event/input sequences, and raw/validated/affected
+   counts are evidence fields.
 
 Every control, action, cancellation, and reset wait has a steady wall-clock
 deadline. A stopped simulation clock must not hang either the Phase 2 mission
@@ -150,11 +151,11 @@ LiDAR dropout means omission: raw scans continue, while matching validated
 scans are not published. It must not publish an empty or stale scan. Frozen
 readings and noise are separate future modes.
 
-Odometry drift is a deterministic SE(2) offset evaluated from simulation time.
-The same offset is applied to the validated `Odometry` pose and the
-`odom -> base_footprint` transform. Their stamps and frame identifiers must
-match. Twist remains the raw measured twist unless a later, separately
-specified fault mode changes it.
+Odometry drift is the deterministic left-composed odom-frame offset
+`T_validated = D(elapsed) * T_raw`. The same validated pose supplies the
+`Odometry` message and `odom -> base_footprint` transform; stamps and frame IDs
+match, while raw odometry, z, twist, and both covariance arrays remain
+unchanged.
 
 ## TF contract
 
@@ -245,3 +246,26 @@ The topic/TF portion of `scripts/verify_phase2.sh` must:
 
 The Phase 2 baseline does not call fault preload or arm operations and does not
 claim that ADR 0003's future state machine exists.
+
+## Phase 3 proof
+
+The topic, service, and TF portion of `scripts/verify_phase3.sh` must:
+
+1. reject the legacy `faults/load_schedule` service and require the exact
+   PRELOAD, ARM, reset, event-topic, and message/service type contracts;
+2. prove every evidence subscriber is ready before preload, PREPARED streams
+   remain pass-through, the UUID/T0-bound arm event precedes the earliest fault
+   by at least 0.50 simulation seconds, and reset restores pass-through;
+3. retain exact endpoint/QoS/owner evidence for raw and validated scan,
+   odometry, fault events, collision-monitor state, command stages, validation
+   truth, and every required TF edge, rejecting `KEEP_ALL` and incompatible
+   reliability or durability;
+4. reconcile the monotonically ordered FaultEvent version-2 control/data
+   events and raw/validated/affected counters with observed streams;
+5. prove LiDAR omission and restoration without an empty/stale substitute;
+6. prove raw odometry is unchanged and the same left-composed drifted pose and
+   stamp appear in validated odometry and `odom -> base_footprint`;
+7. enforce the exact collision-monitor `source_timeout=0.60`, final-command
+   safety, validation/autonomy isolation, and bounded evidence queues; and
+8. preserve unique domains/partitions/process groups plus full cleanup and
+   source/install/provenance bindings for every cold-stack trial.

@@ -62,7 +62,13 @@ The manifest intentionally records direct project tooling even when a metapackag
 
 ### Bootstrap and native build
 
-`ca-certificates`, `curl`, and `gnupg` establish authenticated source retrieval. `git`, `build-essential`, `cmake`, `ninja-build`, and `pkg-config` support the mixed C++/Python workspace. Several are already installed, but remain in the desired-state manifest for reproducibility.
+`ca-certificates`, `curl`, and `gnupg` establish authenticated source retrieval.
+`git`, `build-essential`, `cmake`, `ninja-build`, and `pkg-config` support the
+mixed C++/Python workspace. `libssl-dev` supplies the OpenSSL EVP SHA-256 API
+used to recompute canonical fault-schedule digests, and
+`nlohmann-json3-dev` supplies the strict bounded C++ JSON parser used for
+mode-specific fault parameters. Several packages are already installed, but
+remain in the desired-state manifest for reproducibility.
 
 ### Static analysis and developer checks
 

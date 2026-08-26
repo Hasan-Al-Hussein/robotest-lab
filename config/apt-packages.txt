@@ -6,6 +6,8 @@ build-essential
 cmake
 ninja-build
 pkg-config
+libssl-dev
+nlohmann-json3-dev
 clang-format
 clang-tidy
 cppcheck

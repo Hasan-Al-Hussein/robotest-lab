@@ -1,11 +1,21 @@
 # RoboTest Lab Acceptance Criteria
 
-Status: **Frozen Phase 0 target set, revision 1**
+Status: **Frozen Phase 3 target set, revision 2**
 
 These values are targets, not results. No measurement in this document is
-claimed to have occurred. Future run manifests copy this target-set revision
-and hash before execution. Results are recorded elsewhere and are never written
-back into the target fields.
+claimed to have occurred. Revision 2 freezes the Phase 3 fault, metric,
+collision, scenario, and repeated-trial semantics before the first Phase 3
+candidate suite. Run manifests copy this target-set revision and hash before
+execution. Results are recorded elsewhere and are never written back into the
+target fields.
+
+The normative calculation details live in the
+[metrics contract](../architecture/metrics-contract.md), the deterministic
+fault-control protocol lives in
+[ADR 0005](../decisions/0005-phase3-deterministic-fault-protocol.md), and the
+scenario mechanics live in
+[ADR 0006](../decisions/0006-phase3-scenario-mechanics.md). Those files and
+their SHA-256 hashes are part of the target set.
 
 Changing a target requires a dated decision record before the affected run.
 Changing a threshold after seeing a result invalidates that result for
@@ -46,6 +56,14 @@ Unless a scenario below overrides a value:
   `abs(linear.x) <= 0.02 m/s` and
   `abs(angular.z) <= 0.05 rad/s`.
 
+The Phase 3 benchmark candidate is exactly 15 cold-stack trials: Scenarios 1
+through 5 in order, with repetition indices 0, 1, and 2. Every trial uses the
+same clean commit, the seeds frozen in its scenario file, `retries: 0`, a new
+ROS domain, Gazebo partition, process group, and artifact directory, and a
+confirmed reset fault state. A failed index remains failed and cannot be
+replaced by an unrecorded retry. The canonical Phase 3 run result, rather than
+the mission process exit alone, owns the benchmark verdict.
+
 All trials, including failures and timeouts, remain in the denominator.
 
 ## Scenario 1 — Baseline navigation
@@ -63,7 +81,8 @@ Pass criteria for every trial:
 1. Nav2 returns `SUCCEEDED` after all three waypoints.
 2. Collision count is 0.
 3. Completion time is at most 180 simulation seconds and 300 wall seconds.
-4. Initial and actual path lengths are finite and greater than 0.1 m.
+4. The cumulative first-valid-per-waypoint-leg planned reference and actual
+   ground-truth path are finite and greater than 0.1 m.
 5. Path efficiency is at least 0.75.
 6. JSON and CSV agree and the process exit code is 0.
 
@@ -72,17 +91,22 @@ result, missing evidence, or validation-topic leak is failure.
 
 ## Scenario 2 — Deterministic static obstacle replan
 
-The obstacle's geometry and insertion pose are known to the test, but it is
-inserted only after the initial global path has been recorded. It is therefore
-newly observed by autonomy and can prove replanning rather than merely initial
-planning around a mapped obstacle.
+The inserted entity is `phase3_static_block`, an axis-aligned static box of
+size `0.40 x 0.40 x 0.80 m` at world pose
+`(-1.00, -3.50, 0.40, yaw 0.0)`. It is absent from the map and world at stack
+startup. The controller requires a valid initial plan for waypoint leg 0, then
+inserts the obstacle at the first controller opportunity no earlier than
+`T0 + 2.0 s`. Missing the plan-before-insertion ordering or an insertion stamp
+later than `T0 + 2.25 s` is infrastructure failure, not a valid trial.
 
 Pass criteria for every trial:
 
-1. The obstacle appears after the initial-path timestamp at the frozen
-   simulation offset.
-2. At least one later global path has a different geometry hash and avoids the
-   obstacle footprint plus configured inflation.
+1. The obstacle appears after the initial-path timestamp inside the frozen
+   insertion window, and the spawn response plus validation world-pose stream
+   confirm its exact name, geometry hash, pose, and first-observed stamp.
+2. At least one later valid plan for leg 0 has a different canonical geometry
+   hash and every segment avoids the obstacle rectangle expanded by the frozen
+   `0.35 m` costmap inflation radius.
 3. The mission reaches its goal with Nav2 `SUCCEEDED`.
 4. Collision count is 0.
 5. Completion remains within the common timeouts.
@@ -93,18 +117,25 @@ counting repeated publication of the same path is failure.
 
 ## Scenario 3 — Deterministic dynamic obstacle
 
-One lightweight obstacle follows a versioned deterministic trajectory that
-intersects the initially preferred route.
+The entity `phase3_dynamic_block` is a pose-controlled static box of size
+`0.35 x 0.35 x 0.80 m`, centered at `z=0.40 m`. Its trajectory is anchored to
+the first valid feedback transition to waypoint index 2 at simulation stamp
+`T_leg2`: move at constant speed from `(-0.80, 1.50)` to `(0.00, 1.50)` over
+4.0 s, dwell there for 4.0 s, then move to `(0.80, 1.50)` over 4.0 s. Pose
+commands occur at 10 Hz simulation time, including exact segment endpoints.
+The validation world-pose stream, not request values alone, proves the actual
+trajectory and its hash.
 
 Pass criteria for every trial:
 
 1. The mission reaches its goal within the common timeouts.
 2. Collision count is 0.
-3. Evidence records at least one safe response:
-   - a geometrically changed global/local plan; or
-   - a final command within the zero-command tolerance for at least
-     0.20 simulation seconds while the obstacle blocks the route.
-4. The robot does not command motion through a collision-monitor stop state.
+3. While the obstacle occupies the frozen central blocking region, the
+   collision monitor reports `STOP` and the final command remains within the
+   zero-command tolerance for at least 0.20 continuous simulation seconds.
+4. No nonzero final command is published during a collision-monitor `STOP`
+   interval. A replan may be recorded as diagnostic evidence but cannot replace
+   the required stop proof.
 5. Obstacle trajectory hash and actual start/end stamps are present.
 
 A successful goal without recorded obstacle interaction does not exercise the
@@ -128,10 +159,14 @@ Pass criteria for every trial:
 4. The final command reaches zero-command tolerance within 1.0 simulation
    second of the configured sensor-stale threshold and remains safe until a
    restored scan is accepted.
-5. Sensor recovery is declared within 10.0 simulation seconds after actual
-   restoration.
+5. Sensor recovery satisfies the metrics contract's complete 1.0-second
+   stability window and is declared within 10.0 simulation seconds after
+   actual restoration.
 6. The mission subsequently succeeds within the common timeouts.
 7. Collision count is 0.
+
+The effective Nav2 collision-monitor `source_timeout` must be exactly
+`0.60 s`; a different installed or runtime value invalidates the trial.
 
 Publishing empty/stale substitute scans, continuing unsafe motion, or labeling
 the run successful before recovery is failure.
@@ -152,9 +187,11 @@ x and 0.100 rad in yaw.
 Pass criteria for every trial:
 
 1. Validated odometry and `odom -> base_footprint` carry the same
-   deterministic offset and timestamp.
-2. End-of-interval x offset is within 0.020 m of 0.200 m, and yaw offset is
-   within 0.010 rad of 0.100 rad.
+   deterministic left-composed SE(2) offset and timestamp, where
+   `T_validated = D(elapsed) * T_raw` in the odom frame.
+2. The last active validated/raw pair is no more than 0.25 s before the
+   configured interval end. For `T_validated * inverse(T_raw)`, its x offset is
+   within 0.020 m of 0.200 m and yaw offset is within 0.010 rad of 0.100 rad.
 3. Raw odometry remains unchanged by the proxy.
 4. Localization-error coverage is at least 95%, with RMSE, p95, and maximum
    reported rather than compared to a fabricated baseline.
@@ -203,7 +240,15 @@ second systemd-owned ROS process is failure.
 
 - Pass-through outputs preserve input stamp, frame, finite values, and payload.
 - QoS histories are bounded.
-- Schedule loading is atomic and invalid schedules activate nothing.
+- Preload, arm, and reset implement the frozen `RESET -> PREPARED -> ARMED`
+  protocol. Preload is atomic and inert; only an exact UUID/T0/hash/generation
+  arm can activate a prepared schedule.
+- The proxy independently recomputes the canonical schedule SHA-256, accepts at
+  most 16 non-overlapping same-target specifications, and rejects unsupported
+  modes or parameters without changing prior state.
+- Arm completes at least 0.50 simulation seconds before the earliest fault
+  activation. Exact duplicate requests follow the frozen idempotency policy;
+  conflicting replays fail closed.
 - Same input sequence, configuration, and seed produce identical transformed
   outputs and event metadata within floating-point test tolerance.
 - Reset returns to pass-through and resets deterministic state.
@@ -223,6 +268,12 @@ second systemd-owned ROS process is failure.
 - Formula tests cover empty, one-sample, duplicate/non-monotonic timestamp,
   zero-length, angular wrap, contact burst, missing feedback, and alignment-gap
   cases.
+- Rendered-SDF collision coverage includes every robot collision geometry, and
+  every candidate suite references a passing hash-compatible positive-control
+  contact run. A silent contact stream alone cannot establish collision zero.
+- Every collector buffer and artifact writer respects the capacities and byte
+  limits in the metrics contract; any overflow, truncation, or missing
+  terminal contact drain fails closed.
 - Reports derive all displayed numbers from canonical run JSON.
 - Null/unavailable values never become zero.
 

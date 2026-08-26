@@ -1,11 +1,18 @@
 # RoboTest Lab Metrics Contract
 
-Status: **Phase 0 normative contract**
+Status: **Phase 3 normative contract, revision 2**
 
 This document defines how evidence is calculated. It contains no benchmark
 results. Numerical pass targets live in
 `docs/testing/acceptance-criteria.md`; future measured values live only in
 run artifacts and generated result reports.
+
+Revision 2 freezes the Phase 3 measurement semantics before the first Phase 3
+benchmark. In particular, a `FollowWaypoints` mission uses the cumulative
+first valid plan for every feedback-derived leg, collision evidence covers the
+complete rendered robot collision set and is qualified by a positive-control
+run, every retained collector is bounded, and aggregate statistics have one
+deterministic definition. The numerical acceptance thresholds are unchanged.
 
 ## Evidence model
 
@@ -13,11 +20,16 @@ Every run has a unique `run_id` and a machine-readable manifest containing:
 
 - UTC creation time and simulation start/end stamps
 - Git commit SHA and dirty-worktree flag
-- scenario name, scenario file hash, expected outcome, and repetition index
+- scenario name, scenario file hash, expected outcome, repetition index, and
+  the ordered benchmark-suite index
 - mission seed, fault schedule hash, and all effective parameters
 - ROS, Gazebo, Nav2, ros_gz, compiler, Python, and Go versions
 - RMW implementation, WSL identity, CPU affinity, and build type
-- target-set version/hash
+- target-set version/hash and this metrics-contract SHA-256
+- collector configuration/hash, capacities, ingress/retained/invalid counts,
+  and overflow state for every evidence stream
+- rendered collision-coverage manifest/hash and the qualifying
+  positive-control run ID/JSON hash
 - paths and SHA-256 hashes for JSON, CSV, logs, charts, and retained bags
 - command, working directory, exit code, and verification level
 
@@ -41,6 +53,11 @@ The canonical per-run JSON contains separate top-level objects:
 `measurements` is populated only from observed messages, process samples, and
 terminal results. Target values must never be copied into measurements.
 
+`quality` holds coverage, alignment, overflow, provenance, and positive-control
+gates. A required measurement with a failed quality gate is null with an
+explicit reason; it is never computed from the remaining prefix and presented
+as complete.
+
 CSV is a flattened one-row-per-run comparison view. Column names include units,
 for example `completion_time_sim_s`, `actual_path_length_m`, and
 `peak_rss_sum_mib`. Null JSON values become blank CSV fields, never zero.
@@ -49,10 +66,10 @@ for example `completion_time_sim_s`, `actual_path_length_m`, and
 
 | Measurement | Source | Clock |
 | --- | --- | --- |
-| Mission result and waypoint progress | Nav2 action result/feedback recorded by mission runner | Simulation stamps plus steady wall escape timer |
+| Mission result and waypoint progress | UUID-bound `FollowWaypoints` action result and feedback recorded by the mission runner | Simulation stamps plus steady wall escape timer |
 | Actual path | `/robotest/validation/ground_truth` | Simulation |
 | Planned paths | `/robotest/navigation/plan` | Simulation |
-| Collisions | `/robotest/validation/contacts` | Simulation |
+| Collisions | Coverage-qualified `/robotest/validation/contacts` plus its bound positive-control evidence | Simulation |
 | Localization estimate | TF `map -> odom -> base_footprint` | Simulation |
 | Fault interval and affected messages | `/robotest/faults/events` | Simulation |
 | Final command response | `/robotest/cmd_vel` | Simulation |
@@ -63,6 +80,58 @@ for example `completion_time_sim_s`, `actual_path_length_m`, and
 
 Validation data is observational. It does not feed goal submission, planning,
 control, localization, or recovery decisions.
+
+## Time, ordering, and bounded collection
+
+Simulation timestamps are stored as signed integer nanoseconds. A callback also
+receives a monotonically increasing collector sequence number. The pair
+`(sim_stamp_ns, collector_sequence)` provides deterministic ordering when two
+callbacks observe the same simulation stamp. Messages with a header use that
+header stamp. Headerless action feedback is stamped from the node's ROS clock
+at callback entry, while steady-wall nanoseconds are retained separately for
+diagnosis. Steady-wall time is used only for wall deadlines and host/process
+measurements; it is never substituted for a missing simulation stamp.
+
+The Phase 3 collector uses prefix-retaining buffers with these hard capacities:
+
+| Evidence stream | Retained capacity |
+| --- | ---: |
+| Ground-truth pose | 8,192 samples |
+| Each configured dynamic TF edge | 8,192 samples |
+| Raw and validated odometry | 8,192 samples per stream |
+| Raw and validated scan | 2,048 samples per stream |
+| Final velocity command | 4,096 samples |
+| Global plans | 1,024 messages and 65,536 poses total |
+| Contact messages | 8,192 message summaries and 32,768 normalized contact records total |
+| World statistics | 4,096 samples |
+| Mission, lifecycle, obstacle, and process state transitions | 1,024 events |
+| Fault-control and fault-application events | 512 events |
+| `/clock` | Constant-space first/latest/count/gap/regression summary; no raw sample buffer |
+
+Only state **transitions** are stored in the 1,024-event state buffer; repeated
+unchanged action or lifecycle observations increment counters without consuming
+entries. Every buffer also keeps constant-space ingress, accepted, invalid, and
+overflow counters plus the first overflow sequence and stamp. On the first item
+beyond a capacity, the collector preserves the existing prefix, increments the
+overflow counter, and marks the run failed. It does not overwrite old samples,
+silently downsample, grow the buffer, or compute an acceptance metric from the
+truncated prefix. Exceeding either the global-plan message limit or the total
+plan-pose limit is overflow.
+
+A retained scan sample is bounded metadata (stamp, frame, range count, and
+payload hash), not a copy of an unbounded range array. Contact messages are
+normalized on receipt; the collector does not retain the transport message
+after extracting its bounded summary and records. Crossing either contact
+limit is overflow. Variable-length strings are UTF-8 validated and capped at
+4,096 bytes per field; an over-limit field is invalid evidence and is never
+truncated into a misleading value.
+
+Invalid, duplicate where uniqueness is required, or non-monotonic samples are
+counted separately from capacity overflow. DDS loss that occurs before the
+callback is not described as collector overflow; sequence/source counters when
+available, observed rate, maximum gap, and coverage gates expose that distinct
+quality failure. Every accepted benchmark requires zero overflow on every
+configured evidence stream.
 
 ## Mission status and time
 
@@ -89,92 +158,261 @@ failure.
 
 ### Actual path length
 
-For ordered valid ground-truth planar samples `p_i=(x_i,y_i)`:
+The integration interval is the closed simulation-time interval from the
+UUID-matched accepted-goal stamp `T0` through the terminal action-result stamp
+`T_terminal`. Ground truth must bracket both boundaries. When a boundary falls
+between two samples whose gap is within the frozen 0.25 s alignment limit, its
+planar position is linearly interpolated and inserted. Extrapolation is
+prohibited. A sample exactly on a boundary is used directly.
 
-`actual_path_length_m = sum(hypot(x_i-x_(i-1), y_i-y_(i-1)))`
+Let `q_0 ... q_n` be the resulting sequence: the inserted or exact `T0`
+position, every original ground-truth `(x, y)` sample strictly inside the
+interval, then the inserted or exact `T_terminal` position. The metric is the
+observed polyline length:
 
-The interval begins at accepted goal and ends at the terminal action result.
-Duplicate timestamps are rejected. Non-monotonic stamps, non-finite values, or
-a sample gap above the versioned alignment limit invalidate the metric rather
-than being silently filtered. The raw sample count and maximum gap are stored.
+`actual_path_length_m = sum(hypot(q_i.x-q_(i-1).x, q_i.y-q_(i-1).y))`
+
+No smoothing, resampling, pose-estimate substitution, minimum-motion deadband,
+or straight-line shortcut is applied. Duplicate ground-truth timestamps,
+non-monotonic stamps, non-finite values, a non-positive interval, a missing
+boundary bracket, or any gap above 0.25 s invalidates the metric. Store raw and
+in-interval sample counts, the two boundary interpolation records, maximum
+gap, and the exact first/last stamps used.
 
 ### Planned path lengths
 
-For each received `nav_msgs/msg/Path`, length is the sum of planar distances
-between consecutive poses. Store:
+`FollowWaypoints` is a sequence of point-to-point navigation legs. For waypoint
+indices `0 ... N-1`, leg 0 begins at `T0`; leg `k>0` begins at the first valid
+action-feedback transition to `current_waypoint=k`. A later leg ends at the
+next valid transition, and the final leg ends at `T_terminal`. Feedback indices
+must start at 0, remain in range, and advance monotonically without skipping an
+index. Same-index feedback repetitions do not create a new leg.
 
-- `initial_planned_path_length_m`
-- `latest_planned_path_length_m`
-- `planned_path_lengths_m[]` with timestamps and path hashes
-- `replan_count`, counting a geometrically changed plan after the initial one
+A `nav_msgs/msg/Path` is valid only when it:
 
-Repeated publication of an identical path hash is not a replan.
+- arrives in the corresponding feedback-derived leg interval, ordered by
+  `(sim_stamp_ns, collector_sequence)`;
+- has frame `map`, at least two poses, finite planar coordinates, and a
+  length greater than the frozen `path_length_epsilon_m=0.000001`; and
+- ends within the frozen 0.05 m plan-to-waypoint matching tolerance of that
+  leg's configured waypoint.
+
+Leg 0 may accept a matching plan after `T0` but before its first feedback
+sample. A path for a later waypoint received before the corresponding feedback
+transition is retained as diagnostic evidence but is not reassigned across the
+action boundary. Missing or ambiguous feedback, a feedback regression/skip, or
+a leg with no valid matching plan makes the mission-level planned-path metrics
+null.
+
+Each valid path length is the sum of planar distances between consecutive raw
+finite pose coordinates; quantization is never used for the length. For the
+geometry hash only, map each coordinate in metres to a signed integer
+micrometre with round-half-away-from-zero:
+
+`q(v) = sign(v) * floor(abs(v) * 1,000,000 + 0.5)`
+
+Treat exact zero as integer zero, require the result to fit signed 64 bits, and
+collapse consecutive poses whose quantized `(q(x), q(y))` pair is identical.
+The geometry hash is SHA-256 over the ASCII version tag
+`robotest-plan-geometry-v1\0`, the UTF-8 frame ID with an unsigned 32-bit
+network-byte-order length prefix, the remaining point count as unsigned 64-bit
+network byte order, and each x/y pair as signed 64-bit two's-complement network
+byte order.
+Header stamps, pose stamps, z, and orientation are excluded. Therefore stamp
+changes and sub-micrometre jitter do not create a replan, while the metric
+length still reflects the raw published path.
+
+For each leg `k`, `leg_initial_plan_length_m[k]` is the first valid plan in
+that leg and `leg_latest_plan_length_m[k]` is the last. The mission fields are:
+
+```text
+initial_planned_path_length_m = sum(leg_initial_plan_length_m[k])
+latest_planned_path_length_m  = sum(leg_latest_plan_length_m[k])
+```
+
+The historical field name `initial_planned_path_length_m` therefore means the
+**cumulative first-valid-per-leg reference**, not the first global path message
+of the whole mission. Store `planned_path_lengths_m[]` with leg index, stamps,
+collector sequence, length, endpoint error, and geometry hash.
+
+Within each leg, the first valid plan is never a replan. Thereafter,
+`leg_replan_count[k]` increments when a valid plan's geometry hash differs from
+the most recently accepted valid plan hash for that same leg. Identical
+republication does not increment it. The first plan of every later leg starts a
+new comparison chain and is not counted merely because it differs from the
+previous leg's plan.
+
+`replan_count = sum(leg_replan_count[k])`
 
 ### Efficiency and overrun
 
-The reference is always the initial valid planned path:
+The reference is the cumulative first-valid-per-leg planned length:
 
 `path_efficiency = initial_planned_path_length_m / actual_path_length_m`
 
 `path_overrun_ratio = actual_path_length_m / initial_planned_path_length_m`
 
 Values are not clamped. They may expose map changes or measurement problems. If
-either length is missing or below the configured epsilon, both ratios are null
-with a reason.
+either length is missing or not greater than `path_length_epsilon_m`, both
+ratios are null with a reason.
 
 ## Collision events
 
-Gazebo may publish many contact samples during one physical contact. A collision
-event begins on the first contact involving a robot collision geometry and ends
-after the versioned `contact_release_gap_s` has elapsed with no such contact.
+### Coverage and exclusions
 
-Store event start/end, robot and counterpart collision names, maximum reported
-normal force when available, and duration. Contacts between robot-internal
-collision geometries are excluded by an explicit allowlist. No event is deleted
-because it is short.
+Zero contact messages do not by themselves prove zero collisions. Before a
+benchmark candidate is accepted, the rendered SDF is inspected and a canonical
+coverage manifest lists every collision geometry in the `robotest` model. For
+the current model that set includes the chassis, both wheels, both casters,
+LiDAR body, and IMU body after fixed-joint lumping/name conversion. The manifest
+stores every exact scoped Gazebo collision name, its semantic role, the contact
+source that covers it, the rendered-SDF SHA-256, and the source Xacro/world and
+bridge hashes.
 
-`collision_count` is the number of de-duplicated events, not the number of
-contact messages.
+The contact pipeline must observe robot-versus-environment contacts involving
+**any** member of that complete set. A chassis-only sensor is insufficient.
+Coverage may use one complete contact source or multiple bounded sources, but
+the manifest must prove their union equals the rendered robot collision set
+with no missing or unknown geometry.
+
+Contact pairs are unordered before classification. Exactly these contacts are
+excluded:
+
+1. a pair for which both collisions belong to the `robotest` model
+   (robot-internal contact); and
+2. the left/right wheel or front/rear caster support collision paired with the
+   exact `ground_plane` ground collision.
+
+Wheel or caster contact with a wall, obstacle, or any non-ground counterpart is
+counted. Chassis, LiDAR, or IMU contact with the ground is counted. No other
+counterpart, duration, depth, or force-based exclusion is permitted. The exact
+resolved support-pair allowlist is stored and hashed in the coverage manifest;
+substring matching such as `contains("ground")` is prohibited.
+
+### Positive-control qualification
+
+Each benchmark set is bound to a separate, bounded positive-control contact
+run made from the same built source and contact configuration. The control run
+uses a hash-identified scenario to drive the robot conservatively into one
+named test counterpart, observes at least one correctly named non-excluded
+contact event, publishes a final zero command, and shuts down its owned process
+group. The positive-control contact is intentional test evidence and is never
+included in a mission's `collision_count`.
+
+The positive-control canonical JSON stores its run ID, scenario hash, rendered
+SDF and coverage-manifest hashes, contact configuration/bridge hash, expected
+pair, observed normalized pair, event stamps, command trace, collector quality,
+and its own SHA-256 sidecar. Every benchmark run stores that run ID and JSON
+hash. Qualification fails when the control run did not pass, a referenced hash
+does not match, or any source/rendered/configuration hash differs between the
+control and benchmark candidates. In those cases `collision_count` is null and
+the benchmark fails; a silent mission contact topic cannot be reported as zero.
+
+### Event de-duplication
+
+Gazebo may publish many contact records during one physical contact. Normalize
+scoped collision names, identify the non-robot counterpart's top-level model,
+and group simultaneous robot-geometry records for that counterpart. A
+collision event begins with the first non-excluded contact for a counterpart
+model. It ends only after the frozen 0.25 s `contact_release_gap_s` has elapsed
+without another non-excluded contact for that same counterpart. A later contact
+starts a new event. Simultaneous contacts with two distinct counterpart models
+are distinct events.
+
+Contact collection remains active until simulation time reaches
+`T_terminal + 0.25 s`. This drain admits delayed delivery of records stamped on
+or before `T_terminal` and allows an event active at the terminal boundary to
+close. Only events with a first contact stamp in `[T0, T_terminal]` contribute
+to the mission count; later-stamped contacts are retained as post-terminal
+diagnostics. Failure to advance and complete the full drain, a stamp regression,
+or collector overflow invalidates `collision_count` rather than treating the
+undrained stream as quiet.
+
+Store event start/end, counterpart model, every robot/counterpart collision
+pair seen, sample count, maximum penetration depth, maximum reported normal
+force when available, and duration. No counted event is deleted because it is
+short or low force.
+
+`collision_count` is the number of de-duplicated counterpart episodes, not the
+number of contact messages, contact points, or collision pairs.
 
 ## Localization error
 
-The estimated pose is TF `map -> base_footprint`. Ground truth is transformed
-to `map` by the fixed validation-only `world -> map` alignment.
+The validation-only `world -> map` SE(2) alignment is frozen to the identity
+transform: translation `(0.0 m, 0.0 m)` and yaw `0.0 rad`. It is stored in the
+scenario targets and source hash. It may not be fitted, learned, shifted to the
+first pose, or changed after observing a trajectory. Ground-truth poses in
+`world` therefore map to the same x/y/yaw values in `map`.
 
-For each estimate timestamp, ground truth is linearly interpolated between
-bracketing samples for x/y and by the shortest angular arc for yaw. If the
-bracketing gap exceeds the frozen maximum, that sample is unavailable.
+Ground-truth stamps, not independent TF callback times, define the localization
+sample grid. For every valid ground-truth sample in `[T0, T_terminal]`, query
+TF at that exact simulation stamp and compose `map -> odom` with
+`odom -> base_footprint` to obtain the estimated `map -> base_footprint` pose.
+Using the latest transform, receipt-time pairing, or nearest-neighbour TF is
+prohibited. tf2 interpolation between bracketing transforms is permitted only
+when both required edges are available without extrapolation and each bracket
+gap is at most the frozen 0.25 s alignment limit. Otherwise that ground-truth
+stamp is unavailable.
 
 `position_error_m = hypot(x_est-x_truth, y_est-y_truth)`
 
 `yaw_error_rad = abs(normalize_angle(yaw_est-yaw_truth))`
 
 Report sample count, unavailable count, RMSE, median, p95, and maximum for
-position and yaw. A run below the frozen coverage ratio is invalid rather than
-reported as low error.
+position and yaw. Coverage is available aligned samples divided by eligible
+valid ground-truth samples in the mission interval. Store each TF edge's
+bracket stamps/gaps and lookup reason. A run below the frozen 95% coverage
+ratio is invalid rather than reported as low error.
 
 ## Fault and recovery metrics
 
 Fault events distinguish:
 
 - configured activation/deactivation times;
-- actual first-affected and first-restored message times;
+- actual first-affected, last-affected, and first-restored message times;
 - raw input count, validated output count, and affected count.
 
 For LiDAR dropout, raw scans must continue while the validated count is zero in
-the actual active interval.
+the actual active interval. The proxy's half-open interval and binding event
+are governed by
+[ADR 0005](../decisions/0005-phase3-deterministic-fault-protocol.md). For
+metrics, `actual_deactivation_stamp` is the stamp of the first raw scan at or
+after the configured interval end that is published unchanged on the validated
+stream. The raw/validated stamps and proxy restoration event must reconcile.
 
 Sensor recovery time is:
 
 `sensor_recovery_time_sim_s = recovered_stamp - actual_deactivation_stamp`
 
-`recovered_stamp` is the first time all of these remain true for the frozen
-stability window:
+The Phase 3 stability window is 1.0 simulation second. Evaluate every candidate
+closed window `[w_start, w_end]` with `w_start >= actual_deactivation_stamp`
+in deterministic timestamp/collector-sequence order. The first `w_end` for
+which every rule below passes is `recovered_stamp`:
 
-- the restored stream is fresh at its accepted rate;
-- required Nav2 lifecycle nodes are active;
-- the mission has not failed; and
-- navigation progress resumes or the goal succeeds.
+1. A restored validated scan exists at or before `w_start`, no scan stamp
+   regresses, every adjacent restored-scan gap intersecting the window is at
+   most 0.40 simulation seconds, and the most recent scan at `w_end` is no more
+   than 0.40 s old.
+2. Every required Nav2 lifecycle node has an `active` snapshot no more than
+   0.20 simulation seconds before `w_start`, another `active` snapshot at or no
+   more than 0.20 s after `w_end`, and no observed transition away from
+   `active` between them. Missing, unknown, stale, or overflowed lifecycle
+   evidence fails the candidate window.
+3. The bound mission has no rejected, canceled, aborted, timed-out, or
+   infrastructure-error terminal state, and no disallowed collision begins in
+   the window.
+4. Navigation progress is demonstrated within the same window by at least one
+   of: ground-truth planar displacement of 0.05 m or more; absolute
+   shortest-arc yaw change of 0.10 rad or more; a monotonic
+   `current_waypoint` advance; or the bound action reaching `SUCCEEDED`.
+
+Ground-truth displacement is measured between the boundary-interpolated poses
+at `w_start` and `w_end`; it is not accumulated odometry. A candidate window
+is reset by a stale scan, inactive/unknown lifecycle sample, failed mission,
+collision, non-monotonic evidence, or data-quality failure. The JSON stores
+the window bounds, scan count/maximum gap, lifecycle samples, chosen progress
+predicate and value, and all rejected candidate reasons. Recovery is null when
+no qualifying window exists; a single restored message is never recovery.
 
 Supervisor recovery is separate:
 
@@ -189,7 +427,9 @@ start is not a restart. `restart_count` increments only on a structured
 Use the action feedback's recovery counter when present. Store the maximum
 monotonic value and the feedback source. If the installed interface lacks that
 field, store null and a compatibility reason; do not infer the count by parsing
-human log text.
+human log text. The installed Jazzy `FollowWaypoints` feedback exposes only
+`current_waypoint`, so a Phase 3 run using that interface records null unless a
+separately versioned, structured Nav2 recovery source is added and named.
 
 ## Real-time factor
 
@@ -221,14 +461,69 @@ samples or PID reuse invalidates the corresponding interval.
 
 ## Repeated trials and aggregation
 
-- Store every trial, including failures and timeouts.
-- Never discard an outlier without preserving it and recording the predeclared
-  exclusion rule.
-- Scenario acceptance uses the repetition count frozen in the acceptance
-  criteria.
-- Aggregate reports include numerator/denominator, success rate, median, p95
-  where meaningful, and the full run IDs.
-- A single CI smoke run proves integration only; it is not benchmark evidence.
+The Phase 3 candidate suite is exactly 15 cold-stack trials: Scenarios 1
+through 5 in numerical order, with repetition indices 0, 1, and 2 for each
+scenario before advancing to the next scenario. All 15 use the same clean Git
+commit and dirty-worktree flag `false`. Each trial starts a new Gazebo/ROS/Nav2,
+fault-proxy, mission, and metrics process group with a new run ID, ROS domain,
+Gazebo partition, reset simulation/fault state, and empty run-artifact
+directory. The previous process group and discovery endpoints must be proven
+gone first. Reusing a warm simulator, proxy generation, localization state, or
+collector is prohibited; rebuilding unchanged sources between trials is not
+required.
+
+The scenario file supplies every seed. The repetition index never silently
+changes a seed; a multi-seed policy must be explicit in, and hashed with, the
+frozen scenario. A failed, timed-out, invalid, or infrastructure-error trial
+remains at its ordered index. It cannot be replaced by a fourth attempt. After
+a code, configuration, target, or source-bound evidence change, a new candidate
+suite uses 15 new run IDs rather than mixing old and new trials.
+
+The Phase 3 canonical `run-result.json` is the sole per-trial benchmark
+verdict. Mission, fault, probe, resource, and positive-control files are hashed
+inputs to that result, not independent PASS authorities. The process exit code,
+flattened CSV, and report must agree with `run-result.json`; any disagreement or
+artifact-finalization failure makes the trial fail. Aggregate reports consume
+only those 15 canonical run results.
+
+An aggregate group requires identical scenario, target-set, metrics-contract,
+collector, source/configuration, collision-coverage, and positive-control
+hashes wherever those fields are expected to match. Preserve ordered run IDs
+and per-run verdicts. Report success numerator, frozen denominator, success
+rate, valid numeric count, null count and reasons, and every source value.
+Failures and nulls remain in the acceptance denominator even though a numeric
+statistic can only use finite available values. Scenario acceptance remains
+3 of 3; no statistical summary can turn a failed trial into a pass.
+
+For finite values sorted ascending as `x_1 ... x_n`, the median is `x_((n+1)/2)`
+for odd `n` and `(x_(n/2) + x_(n/2+1))/2` for even `n`. Every reported
+percentile uses nearest rank: `p_r = x_(ceil(r*n))`, with one-based indexing;
+therefore p95 is `x_(ceil(0.95*n))` and p5 is `x_(ceil(0.05*n))`. Empty inputs
+produce null, never zero. No interpolation, library-default percentile method,
+outlier trimming, winsorization, or post-observation exclusion is allowed.
+
+A single CI smoke run proves integration only; it is not benchmark evidence.
+
+## Artifact byte limits
+
+Artifact production is bounded in addition to the in-memory collector:
+
+| Artifact scope | Hard cap |
+| --- | ---: |
+| One canonical per-run JSON | 32 MiB (33,554,432 bytes) |
+| One per-run flattened CSV | 1 MiB (1,048,576 bytes) |
+| One captured stdout/stderr log | 8 MiB (8,388,608 bytes) |
+| One PNG chart | 4 MiB (4,194,304 bytes), at most 8 charts per run |
+| Complete per-run artifact directory, including any bounded bag | 256 MiB (268,435,456 bytes) |
+| Complete 15-trial aggregate/report directory | 64 MiB (67,108,864 bytes) |
+
+Record actual byte counts and cap configuration in the manifest. Writers must
+use bounded capture/rotation or recorder size limits; discovering the cap only
+after unbounded production is not compliance. Exceeding a cap sets an explicit
+quality failure, stops further optional artifact generation safely, and makes
+the run or aggregate fail. Required canonical JSON/CSV may not be truncated.
+Generated Markdown/HTML lives within its enclosing directory cap and may not
+embed raw bags or unbounded data URIs.
 
 ## Artifact integrity
 
