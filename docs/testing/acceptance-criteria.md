@@ -59,6 +59,8 @@ Unless a scenario below overrides a value:
   interval; the gate measures source cadence from causally ordered finalized
   raw stamps and separately detects pending/raw silence, while evidence
   consumers measure callback skew without treating it as DDS transport age;
+  no stricter consecutive-private-callback spacing is inferred from the
+  simulator's delivered raw sequence;
 - terminal drain is an actually retained, collector-acknowledged public
   snapshot `q`, with `q > T_terminal + 0.25 s`; the target boundary alone is
   not completion evidence;

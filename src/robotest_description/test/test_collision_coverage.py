@@ -120,6 +120,14 @@ def test_manifest_hashes_real_rendered_and_source_evidence(
         'sensors': sensor_projection,
     }
     assert generated_manifest['contact_stream'] == contact_stream
+    policy = contact_stream['policy']
+    assert policy['accepted_run_scope'] == (
+        'bounded_pending_raw_and_public_source_liveness_required'
+    )
+    assert policy['raw_stamp_gap_semantics'] == (
+        'consecutive_nonempty_raw_gaps_are_not_absence_evidence_and_have_no_independent_bound'
+    )
+    assert 'max_raw_stamp_advance_ns' not in policy['limits']
     assert generated_manifest['contact_configuration_sha256'] == generator.canonical_sha256(
         contact_configuration
     )

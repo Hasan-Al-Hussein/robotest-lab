@@ -76,7 +76,7 @@ CONTACT_GATE_SOURCE_PATHS = (
 CONTACT_STREAM_POLICY = {
     'active_pair_expiry_ns': 250_000_000,
     'active_pair_scope': 'support_robot_internal_and_countable_robot_external',
-    'accepted_run_scope': 'continuous_sensed_support_contact_required',
+    'accepted_run_scope': 'bounded_pending_raw_and_public_source_liveness_required',
     'capacity_claim_scope': 'unchanged_pair_set_heartbeat_only',
     'completed_stamp_batching': 'finalize_on_strictly_greater_raw_stamp',
     'delivery_semantics': 'authoritative_delivered_active_pair_snapshot',
@@ -105,12 +105,13 @@ CONTACT_STREAM_POLICY = {
         'max_frame_id_bytes': 256,
         'max_raw_contact_records': 16,
         'max_raw_messages_per_completed_stamp': 7,
-        'max_raw_stamp_advance_ns': 20_000_000,
         'max_raw_string_bytes_per_completed_stamp': 65_536,
     },
     'release_comparison': 'completed_absent_stamp_strictly_greater_than_last_seen_plus_gap',
     'raw_contact_positions': 'required_nonempty_1_to_64',
-    'raw_stamp_gap_semantics': 'greater_than_20ms_is_invalid_not_zero_contact',
+    'raw_stamp_gap_semantics': (
+        'consecutive_nonempty_raw_gaps_are_not_absence_evidence_and_have_no_independent_bound'
+    ),
     'raw_messages_require_nonempty_contacts': True,
     'required_raw_frame_id': '',
     'retained_contact_payload': 'exact_nested_contact_record_copy',

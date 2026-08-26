@@ -524,11 +524,6 @@ ContactGateDecision ContactStreamPolicy::observe(
   if (last_raw_stamp_ns_.has_value() && *incoming_stamp < *last_raw_stamp_ns_) {
     return fatal_current("raw contact simulation stamp regressed");
   }
-  if (last_raw_stamp_ns_.has_value() && *incoming_stamp > *last_raw_stamp_ns_ &&
-    *incoming_stamp - *last_raw_stamp_ns_ > kMaxRawStampAdvanceNs)
-  {
-    return fatal_current("raw contact simulation stamp advanced by more than 20 ms");
-  }
   if (!message.header.frame_id.empty()) {
     return fatal_current("raw Gazebo contact frame_id must be empty");
   }

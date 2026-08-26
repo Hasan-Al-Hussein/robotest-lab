@@ -463,7 +463,7 @@ TEST(ContactStreamPolicy, StringBudgetsIncludeOneNormalizedKeyCopyPerStoredPair)
   }
 }
 
-TEST(ContactStreamPolicy, FrameRegressionAndLargeAdvanceFailClosed)
+TEST(ContactStreamPolicy, FrameAndRegressionFailClosed)
 {
   {
     ContactStreamPolicy policy;
@@ -477,20 +477,6 @@ TEST(ContactStreamPolicy, FrameRegressionAndLargeAdvanceFailClosed)
     ASSERT_FALSE(observe(policy, 1000000000LL, {{kChassis, kWall}}).fatal);
     ASSERT_FALSE(observe(policy, 1002000000LL, {{kChassis, kWall}}).fatal);
     const auto decision = observe(policy, 1000000000LL, {{kChassis, kWall}});
-    EXPECT_TRUE(decision.fatal);
-    EXPECT_FALSE(decision.output.has_value());
-  }
-  {
-    ContactStreamPolicy policy;
-    ASSERT_FALSE(observe(policy, 1000000000LL, {{kChassis, kWall}}).fatal);
-    EXPECT_FALSE(observe(
-      policy, 1000000000LL + kMaxRawStampAdvanceNs, {{kChassis, kWall}}).fatal);
-  }
-  {
-    ContactStreamPolicy policy;
-    ASSERT_FALSE(observe(policy, 1000000000LL, {{kChassis, kWall}}).fatal);
-    const auto decision = observe(
-      policy, 1000000000LL + kMaxRawStampAdvanceNs + 1LL, {{kChassis, kWall}});
     EXPECT_TRUE(decision.fatal);
     EXPECT_FALSE(decision.output.has_value());
   }
@@ -553,6 +539,41 @@ TEST(ContactStreamPolicy, IrregularRawProgressKeepsCausalHeartbeatWithinGap)
   EXPECT_EQ(heartbeat.reason, ContactForwardReason::kSteadyStateHeartbeat);
   EXPECT_EQ(heartbeat.output->header.stamp.sec, 1);
   EXPECT_EQ(heartbeat.output->header.stamp.nanosec, 219999999U);
+}
+
+TEST(ContactStreamPolicy, SparseRawProgressRespectsCausalPublicGapBoundary)
+{
+  {
+    ContactStreamPolicy policy;
+    EXPECT_FALSE(observe(policy, 998000000LL, {{kLeftWheel, kGround}}).fatal);
+    EXPECT_FALSE(observe(policy, 1000000000LL, {{kChassis, kWall}}).fatal);
+    ASSERT_TRUE(observe(policy, 1002000000LL, {{kChassis, kWall}}).output.has_value());
+
+    // A sparse private callback sequence is valid when the causally completed
+    // public heartbeat still lands on the accepted 220 ms source-gap boundary,
+    // even when the independently scheduled clock callback overtakes it.
+    EXPECT_FALSE(policy.observe_clock(1220000001LL).fatal);
+    EXPECT_FALSE(observe(policy, 1220000000LL, {{kChassis, kWall}}).fatal);
+    const auto boundary = observe(policy, 1222000000LL, {{kChassis, kWall}});
+    ASSERT_TRUE(boundary.output.has_value());
+    EXPECT_FALSE(boundary.fatal);
+    EXPECT_EQ(boundary.reason, ContactForwardReason::kSteadyStateHeartbeat);
+    EXPECT_EQ(boundary.output->header.stamp.sec, 1);
+    EXPECT_EQ(boundary.output->header.stamp.nanosec, 220000000U);
+  }
+
+  {
+    ContactStreamPolicy policy;
+    EXPECT_FALSE(observe(policy, 998000000LL, {{kLeftWheel, kGround}}).fatal);
+    EXPECT_FALSE(observe(policy, 1000000000LL, {{kChassis, kWall}}).fatal);
+    ASSERT_TRUE(observe(policy, 1002000000LL, {{kChassis, kWall}}).output.has_value());
+
+    EXPECT_FALSE(observe(policy, 1221000000LL, {{kChassis, kWall}}).fatal);
+    const auto exceeded = observe(policy, 1223000000LL, {{kChassis, kWall}});
+    EXPECT_TRUE(exceeded.fatal);
+    EXPECT_FALSE(exceeded.output.has_value());
+    EXPECT_NE(exceeded.detail.find("completed raw contact stream"), std::string::npos);
+  }
 }
 
 TEST(ContactStreamPolicy, RawClockWatchdogAllowsPauseAndFailsOnSilence)

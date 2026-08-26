@@ -346,6 +346,11 @@ remains continuous. Offline analysis never infers release from elapsed clock
 time. Pair migration for one counterpart remains one episode; simultaneous
 distinct counterpart models remain distinct episodes.
 
+Consecutive delivered private callbacks have no independent maximum spacing:
+their stamps must remain monotonic, while causal finalized-public source gaps
+and pending/raw lag against `/clock` each remain bounded at 0.22 s. This avoids
+misclassifying a sparse but timely delivered raw sequence as a source failure.
+
 Snapshot records are grouped in canonical normalized-pair order. Duplicate
 records within one pair retain the sole private bridge's delivered callback
 order; deterministic here means deterministic for that delivered ordered
