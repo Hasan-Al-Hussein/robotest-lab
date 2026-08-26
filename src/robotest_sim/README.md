@@ -17,6 +17,12 @@ ros2 launch robotest_sim sim.launch.py headless:=true rviz:=false seed:=42
 
 Use `headless:=false` to launch the Gazebo GUI. All simulation participants use
 `/clock`; ground truth, contacts, and world statistics remain validation-only.
+Phase 3 also exposes bounded Gazebo user-command services below
+`/robotest/scenario/{spawn_entity,set_entity_pose,delete_entity}` and bridges
+the observed 10 Hz actor pose stream to
+`/robotest/validation/scenario_entity_poses`. The fixed actor SDF assets embed a
+Gazebo PosePublisher; the validation stream therefore reports simulator state,
+not controller request echoes.
 The configured Gaussian LiDAR and IMU noise is deterministic only relative to
 the recorded simulator seed and identical simulation inputs. Gazebo remains
 tolerance-repeatable rather than bitwise deterministic across platforms.

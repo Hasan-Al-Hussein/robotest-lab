@@ -161,6 +161,27 @@ def _launch_runtime(context):
         ],
     )
 
+    scenario_bridge = Node(
+        package='ros_gz_bridge',
+        executable='parameter_bridge',
+        namespace=namespace,
+        name='scenario_bridge',
+        output='screen',
+        arguments=[
+            '/world/robotest_lab/create@ros_gz_interfaces/srv/SpawnEntity',
+            '/world/robotest_lab/set_pose@ros_gz_interfaces/srv/SetEntityPose',
+            '/world/robotest_lab/remove@ros_gz_interfaces/srv/DeleteEntity',
+        ],
+        remappings=[
+            ('/world/robotest_lab/create', 'scenario/spawn_entity'),
+            ('/world/robotest_lab/set_pose', 'scenario/set_entity_pose'),
+            ('/world/robotest_lab/remove', 'scenario/delete_entity'),
+        ],
+        parameters=[
+            {'use_sim_time': ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool)}
+        ],
+    )
+
     fault_proxy = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(fault_launch),
         launch_arguments={
@@ -186,6 +207,7 @@ def _launch_runtime(context):
         gazebo,
         state_publisher,
         bridge,
+        scenario_bridge,
         fault_proxy,
         TimerAction(period=spawn_delay, actions=[spawn]),
         rviz,

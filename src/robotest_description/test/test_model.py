@@ -19,9 +19,36 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 import pytest
+import yaml
 
 PACKAGE_ROOT = pathlib.Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = PACKAGE_ROOT.parents[1]
 MODEL_XACRO = PACKAGE_ROOT / 'urdf' / 'robotest.urdf.xacro'
+COLLISION_COVERAGE = REPOSITORY_ROOT / 'config' / 'collision-coverage.yaml'
+CONTACT_SENSORS = {
+    'chassis_contact_sensor': (
+        'base_footprint',
+        'base_footprint_fixed_joint_lump__base_link_collision_collision',
+    ),
+    'left_wheel_contact_sensor': (
+        'left_wheel_link',
+        'left_wheel_link_fixed_joint_lump__left_wheel_collision_collision',
+    ),
+    'right_wheel_contact_sensor': (
+        'right_wheel_link',
+        'right_wheel_link_fixed_joint_lump__right_wheel_collision_collision',
+    ),
+    'front_caster_contact_sensor': (
+        'front_caster_link',
+        'front_caster_link_fixed_joint_lump__front_caster_collision_collision',
+    ),
+    'rear_caster_contact_sensor': (
+        'rear_caster_link',
+        'rear_caster_link_fixed_joint_lump__rear_caster_collision_collision',
+    ),
+    'lidar_body_contact_sensor': ('lidar_link', 'lidar_link_collision_collision'),
+    'imu_body_contact_sensor': ('imu_link', 'imu_link_collision_collision'),
+}
 
 
 def _render(
@@ -151,10 +178,40 @@ def test_sensor_contract(robot_xml: ET.Element) -> None:
     assert imu.findtext('gz_frame_id') == 'imu_link'
     assert imu.findtext('update_rate') == '50'
 
-    contact = _sensor(robot_xml, 'chassis_contact_sensor')
-    assert contact.attrib['type'] == 'contact'
-    assert contact.findtext('contact/topic') == '/robotest/validation/contacts'
-    assert 'base_link_collision' in contact.findtext('contact/collision')
+    for sensor_name, (_, collision_name) in CONTACT_SENSORS.items():
+        contact = _sensor(robot_xml, sensor_name)
+        assert contact.attrib['type'] == 'contact'
+        assert contact.findtext('update_rate') == '5'
+        assert contact.findtext('contact/topic') == '/robotest/validation/contacts'
+        assert contact.findtext('contact/collision') == collision_name
+
+
+def test_collision_coverage_manifest_matches_contact_sensors() -> None:
+    coverage = yaml.safe_load(COLLISION_COVERAGE.read_text(encoding='utf-8'))
+    entries = coverage['collision_geometries']
+
+    assert coverage['schema_version'] == 1
+    assert coverage['model_name'] == 'robotest'
+    assert coverage['contact_topic'] == '/robotest/validation/contacts'
+    assert len(entries) == len(CONTACT_SENSORS)
+    assert {entry['contact_sensor'] for entry in entries} == set(CONTACT_SENSORS)
+    assert {entry['collision'] for entry in entries} == {
+        collision_name for _, collision_name in CONTACT_SENSORS.values()
+    }
+    assert len({entry['scoped_collision'] for entry in entries}) == len(entries)
+
+    excluded_roles = {
+        entry['robot_collision'].split('::')[1] for entry in coverage['support_ground_exclusions']
+    }
+    assert excluded_roles == {
+        'left_wheel_link',
+        'right_wheel_link',
+        'front_caster_link',
+        'rear_caster_link',
+    }
+    assert {entry['counterpart_collision'] for entry in coverage['support_ground_exclusions']} == {
+        'ground_plane::ground_link::ground_collision'
+    }
 
 
 def test_drive_joint_state_and_ground_truth_contract(
@@ -210,7 +267,7 @@ def test_namespace_and_feature_switches() -> None:
     assert urdf_only.findall('./gazebo') == []
 
 
-def test_sdformat_conversion_preserves_contact_target() -> None:
+def test_sdformat_conversion_preserves_complete_contact_coverage() -> None:
     gz = shutil.which('gz')
     assert gz is not None
 
@@ -227,14 +284,25 @@ def test_sdformat_conversion_preserves_contact_target() -> None:
     sdf = ET.fromstring(conversion.stdout)
     model = sdf.find('model')
     assert model is not None
-    root_link = model.find("./link[@name='base_footprint']")
-    assert root_link is not None
-    collision_names = {collision.attrib['name'] for collision in root_link.findall('collision')}
-    contact = root_link.find("./sensor[@name='chassis_contact_sensor']")
-    assert contact is not None
-    target = contact.findtext('contact/collision')
-    assert target in collision_names
-    assert contact.findtext('contact/topic') == ('/robotest/validation/contacts')
+    rendered_collisions = {
+        collision.attrib['name']
+        for link in model.findall('link')
+        for collision in link.findall('collision')
+    }
+    covered_collisions = set()
+    for sensor_name, (link_name, expected_collision) in CONTACT_SENSORS.items():
+        link = model.find(f"./link[@name='{link_name}']")
+        assert link is not None
+        link_collisions = {collision.attrib['name'] for collision in link.findall('collision')}
+        contact = link.find(f"./sensor[@name='{sensor_name}']")
+        assert contact is not None
+        target = contact.findtext('contact/collision')
+        assert target == expected_collision
+        assert target in link_collisions
+        assert contact.findtext('contact/topic') == '/robotest/validation/contacts'
+        covered_collisions.add(target)
+
+    assert covered_collisions == rendered_collisions
 
     assert model.find("./link[@name='lidar_link']/sensor[@name='lidar']") is not None
     assert model.find("./link[@name='imu_link']/sensor[@name='imu']") is not None

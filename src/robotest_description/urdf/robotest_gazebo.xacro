@@ -4,6 +4,25 @@
   SPDX-License-Identifier: Apache-2.0
 -->
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="robotest_contact_sensor"
+               params="reference sensor_name collision_name topic_namespace">
+    <gazebo reference="${reference}">
+      <sensor name="${sensor_name}" type="contact">
+        <always_on>true</always_on>
+        <!--
+          Five hertz keeps four normal support-contact streams below the
+          Phase 3 bounded collector budget while still resolving the frozen
+          0.25 s contact-release gap.
+        -->
+        <update_rate>5</update_rate>
+        <contact>
+          <collision>${collision_name}</collision>
+          <topic>${topic_namespace}/validation/contacts</topic>
+        </contact>
+      </sensor>
+    </gazebo>
+  </xacro:macro>
+
   <xacro:macro name="robotest_gazebo" params="topic_namespace enable_ground_truth">
     <!-- Keep named fixed links so Gazebo sensor frames and collisions remain stable. -->
     <gazebo reference="front_caster_joint">
@@ -19,21 +38,48 @@
       <preserveFixedJoint>true</preserveFixedJoint>
     </gazebo>
 
+    <!--
+      Cover every rendered robot collision geometry. Metrics excludes only
+      exact wheel/caster-to-ground support pairs and robot-internal pairs.
+    -->
+    <xacro:robotest_contact_sensor
+      reference="base_link"
+      sensor_name="chassis_contact_sensor"
+      collision_name="base_footprint_fixed_joint_lump__base_link_collision_collision"
+      topic_namespace="${topic_namespace}"/>
+    <xacro:robotest_contact_sensor
+      reference="left_wheel_link"
+      sensor_name="left_wheel_contact_sensor"
+      collision_name="left_wheel_link_fixed_joint_lump__left_wheel_collision_collision"
+      topic_namespace="${topic_namespace}"/>
+    <xacro:robotest_contact_sensor
+      reference="right_wheel_link"
+      sensor_name="right_wheel_contact_sensor"
+      collision_name="right_wheel_link_fixed_joint_lump__right_wheel_collision_collision"
+      topic_namespace="${topic_namespace}"/>
+    <xacro:robotest_contact_sensor
+      reference="front_caster_link"
+      sensor_name="front_caster_contact_sensor"
+      collision_name="front_caster_link_fixed_joint_lump__front_caster_collision_collision"
+      topic_namespace="${topic_namespace}"/>
+    <xacro:robotest_contact_sensor
+      reference="rear_caster_link"
+      sensor_name="rear_caster_contact_sensor"
+      collision_name="rear_caster_link_fixed_joint_lump__rear_caster_collision_collision"
+      topic_namespace="${topic_namespace}"/>
+    <xacro:robotest_contact_sensor
+      reference="lidar_link"
+      sensor_name="lidar_body_contact_sensor"
+      collision_name="lidar_link_collision_collision"
+      topic_namespace="${topic_namespace}"/>
+    <xacro:robotest_contact_sensor
+      reference="imu_link"
+      sensor_name="imu_body_contact_sensor"
+      collision_name="imu_link_collision_collision"
+      topic_namespace="${topic_namespace}"/>
+
     <gazebo reference="base_link">
       <material>Gazebo/Blue</material>
-      <!-- Contact is limited to the chassis so normal wheel-ground support is quiet. -->
-      <sensor name="chassis_contact_sensor" type="contact">
-        <always_on>true</always_on>
-        <update_rate>20</update_rate>
-        <contact>
-          <!--
-            URDF-to-SDF correctly lumps the massless base_footprint joint.
-            sdformat gives the chassis collision this deterministic target name.
-          -->
-          <collision>base_footprint_fixed_joint_lump__base_link_collision_collision</collision>
-          <topic>${topic_namespace}/validation/contacts</topic>
-        </contact>
-      </sensor>
     </gazebo>
 
     <gazebo reference="left_wheel_link">

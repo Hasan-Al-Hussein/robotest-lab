@@ -45,9 +45,10 @@ def test_package_is_apache_ament_cmake_and_installs_runtime_assets() -> None:
     assert root.findtext('name') == 'robotest_sim'
     assert root.findtext('license') == 'Apache-2.0'
     assert root.find('./export/build_type').text == 'ament_cmake'
-    assert 'robotest_interfaces' in {element.text for element in root.findall('exec_depend')}
+    runtime_dependencies = {element.text for element in root.findall('exec_depend')}
+    assert {'robotest_interfaces', 'ros_gz_interfaces', 'tf2_msgs'} <= runtime_dependencies
     cmake = (PACKAGE / 'CMakeLists.txt').read_text(encoding='utf-8')
-    for directory in ('config', 'launch', 'rviz', 'worlds'):
+    for directory in ('config', 'launch', 'models', 'rviz', 'worlds'):
         assert directory in cmake
     assert 'phase1_runtime_probe.py' in cmake
 
@@ -86,7 +87,14 @@ def test_world_is_local_enclosed_and_deterministic_friendly() -> None:
 def test_bridge_matches_the_frozen_data_plane() -> None:
     bridges = yaml.safe_load((PACKAGE / 'config' / 'bridge.yaml').read_text(encoding='utf-8'))
     assert isinstance(bridges, list)
-    by_ros_name = {entry['ros_topic_name']: entry for entry in bridges}
+    scenario_pose_bridges = [
+        entry for entry in bridges if entry['ros_topic_name'] == 'validation/scenario_entity_poses'
+    ]
+    by_ros_name = {
+        entry['ros_topic_name']: entry
+        for entry in bridges
+        if entry['ros_topic_name'] != 'validation/scenario_entity_poses'
+    }
     expected = {
         '/clock': ('rosgraph_msgs/msg/Clock', 'gz.msgs.Clock', 'GZ_TO_ROS', 'CLOCK'),
         'raw/scan': (
@@ -138,6 +146,19 @@ def test_bridge_matches_the_frozen_data_plane() -> None:
         assert 1 <= int(entry['subscriber_queue']) <= 100
         assert entry['qos_profile'] == qos_profile
 
+    assert {entry['gz_topic_name'] for entry in scenario_pose_bridges} == {
+        '/model/phase3_static_block/pose',
+        '/model/phase3_dynamic_block/pose',
+        '/model/phase3_contact_control_wall/pose',
+    }
+    for entry in scenario_pose_bridges:
+        assert entry['ros_type_name'] == 'tf2_msgs/msg/TFMessage'
+        assert entry['gz_type_name'] == 'gz.msgs.Pose_V'
+        assert entry['direction'] == 'GZ_TO_ROS'
+        assert entry['publisher_queue'] == 10
+        assert entry['subscriber_queue'] == 10
+        assert entry['qos_profile'] == 'SERVICES'
+
 
 def test_launch_uses_context_safe_headless_logic_and_all_core_stages() -> None:
     launch_path = PACKAGE / 'launch' / 'sim.launch.py'
@@ -149,6 +170,13 @@ def test_launch_uses_context_safe_headless_logic_and_all_core_stages() -> None:
         'gz_sim.launch.py',
         'robot_state_publisher',
         'parameter_bridge',
+        'scenario_bridge',
+        'ros_gz_interfaces/srv/SpawnEntity',
+        'ros_gz_interfaces/srv/SetEntityPose',
+        'ros_gz_interfaces/srv/DeleteEntity',
+        'scenario/spawn_entity',
+        'scenario/set_entity_pose',
+        'scenario/delete_entity',
         'fault_proxy.launch.py',
         'TimerAction',
         'spawn_robotest',
@@ -210,6 +238,35 @@ def test_launch_uses_context_safe_headless_logic_and_all_core_stages() -> None:
         and element.args[0].id == 'simulator_seed'
         for element in gz_args_value.elts
     )
+
+
+def test_phase3_actor_assets_are_fixed_static_boxes_with_observed_pose_publishers() -> None:
+    expected = {
+        'phase3_static_block': (0.40, 0.40, 0.80),
+        'phase3_dynamic_block': (0.35, 0.35, 0.80),
+        'phase3_contact_control_wall': (0.10, 0.80, 0.80),
+    }
+    for model_name, expected_size in expected.items():
+        root = ET.parse(PACKAGE / 'models' / f'{model_name}.sdf').getroot()
+        assert root.attrib['version'] == '1.10'
+        model = root.find('model')
+        assert model is not None and model.attrib['name'] == model_name
+        assert model.findtext('static') == 'true'
+
+        collision = model.find("./link[@name='link']/collision[@name='collision']")
+        assert collision is not None
+        size = tuple(float(value) for value in collision.findtext('./geometry/box/size').split())
+        assert size == expected_size
+
+        plugin = model.find("./plugin[@name='gz::sim::systems::PosePublisher']")
+        assert plugin is not None
+        assert plugin.attrib['filename'] == 'gz-sim-pose-publisher-system'
+        assert plugin.findtext('publish_model_pose') == 'true'
+        assert plugin.findtext('publish_link_pose') == 'false'
+        assert plugin.findtext('use_pose_vector_msg') == 'true'
+        assert float(plugin.findtext('update_frequency')) == 10.0
+        assert plugin.findtext('static_publisher') == 'false'
+        assert plugin.find('topic') is None
 
 
 def test_launch_rejects_invalid_simulator_seeds() -> None:
