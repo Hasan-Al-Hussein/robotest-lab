@@ -29,6 +29,16 @@ ros2 run robotest_scenarios contact_control_driver \
   --coverage-manifest config/collision-coverage.yaml
 ```
 
+The driver emits READY only after a positive `/clock` sample and a later
+authoritative contact snapshot have both been observed. Contact callbacks that
+arrive before the first positive `/clock` are counted as a discarded
+pre-evidence prefix; post-clock snapshots retain the full active safety checks.
+READY also requires graph prerequisites to pass for 100 ms. One missing
+observation-source publisher query is treated as a graph discovery diagnostic;
+the driver fails when the same source is missing in another observation at
+least 100 ms later. Command ownership, forbidden nodes, and contact endpoint
+identity or QoS changes remain immediately fatal.
+
 Both executables use relative RoboTest names under their launch namespace.
 The standardized Gazebo `/clock` topic is the single global-name exception.
 Artifacts are canonical UTF-8 JSON written atomically with a sibling

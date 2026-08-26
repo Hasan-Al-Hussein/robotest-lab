@@ -1375,6 +1375,14 @@ def _positive_control_evidence(
             raise MetricUnavailable(f'positive-control quality gate {field} did not pass')
     if quality.get('cmd_vel_publisher_count') != 1 or quality.get('protocol_error_count') != 0:
         raise MetricUnavailable('positive-control graph/protocol counters are invalid')
+    if (
+        require_int(
+            quality.get('source_publisher_missing_observation_count'),
+            'positive_control.source_publisher_missing_observation_count',
+        )
+        < 0
+    ):
+        raise MetricUnavailable('positive-control source publisher miss count is invalid')
     if quality.get('forbidden_nodes') != []:
         raise MetricUnavailable('positive-control forbidden navigation nodes were present')
     topology = quality.get('contact_graph_topology')
@@ -1438,6 +1446,7 @@ def _positive_control_evidence(
         'future_delivery_count',
         'latest_stamp_ns',
         'max_gap_ns',
+        'pre_clock_discard_count',
         'snapshot_count',
     }:
         raise MetricUnavailable('positive-control contact heartbeat is incomplete')
@@ -1457,6 +1466,12 @@ def _positive_control_evidence(
         heartbeat.get('future_delivery_count'),
         'positive_control.contact_heartbeat.future_delivery_count',
     )
+    heartbeat_pre_clock_discard_count = require_int(
+        heartbeat.get('pre_clock_discard_count'),
+        'positive_control.contact_heartbeat.pre_clock_discard_count',
+    )
+    if heartbeat_pre_clock_discard_count < 0:
+        raise MetricUnavailable('positive-control contact heartbeat discard count is invalid')
     expected_future_count = sum(
         summary['delivery_clock_offset_ns'] < 0 for summary in contact['snapshots']
     )

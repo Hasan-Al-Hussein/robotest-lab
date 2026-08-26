@@ -459,6 +459,18 @@ def test_positive_control_rejects_rebound_command_trace_without_hold() -> None:
             ),
             'heartbeat',
         ),
+        (
+            lambda positive: positive['quality']['public_contact_snapshot_heartbeat'].__setitem__(
+                'pre_clock_discard_count', -1
+            ),
+            'heartbeat',
+        ),
+        (
+            lambda positive: positive['quality'].__setitem__(
+                'source_publisher_missing_observation_count', -1
+            ),
+            'source publisher miss count',
+        ),
     ],
 )
 def test_positive_control_derived_evidence_relations_fail_closed(

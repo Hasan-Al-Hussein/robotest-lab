@@ -73,6 +73,7 @@ from robotest_scenarios.constants import (
     CONTROL_REVERSE_MPS,
     CONTROL_REVERSE_NS,
     CONTROL_ROBOT_START,
+    CONTROL_SOURCE_GRAPH_MISSING_CONFIRM_NS,
     CONTROL_STOP_DEADLINE_NS,
     CONTROL_WALL_POSE,
     DDS_DRAIN_GRACE_S,
@@ -189,6 +190,7 @@ class ContactControlNode(Node):
         self.last_contact_stamp_ns: int | None = None
         self.contact_first_stamp_ns: int | None = None
         self.contact_snapshot_count = 0
+        self.pre_clock_contact_message_count = 0
         self.contact_max_gap_ns = 0
         self.fatal_error: RobotestScenarioError | None = None
         self.cleanup_mode = False
@@ -348,6 +350,9 @@ class ContactControlNode(Node):
         return value
 
     def _on_contacts(self, message: Contacts) -> None:
+        if not self.clock_seen or self.current_sim_stamp_ns <= 0:
+            self.pre_clock_contact_message_count += 1
+            return
         if message.header.frame_id != '':
             self.contact_snapshots.reject_invalid()
             raise ProtocolError('authoritative contact snapshot frame_id must be empty')
@@ -681,6 +686,8 @@ class ContactControlNode(Node):
         publisher_count: int,
         forbidden_nodes: Sequence[str],
         contact_graph_topology: Mapping[str, Any],
+        source_publisher_counts: Mapping[str, int],
+        source_publisher_missing_observation_count: int,
     ) -> dict[str, Any]:
         """Return bounded collection and graph-isolation evidence."""
         buffers = {
@@ -690,10 +697,9 @@ class ContactControlNode(Node):
             'contact_snapshots': self.contact_snapshots.quality(),
             'ground_truth': self.ground_truth.quality(),
         }
-        source_publisher_counts = {
-            'contacts': self.count_publishers(CONTACT_TOPIC),
-            'entity_pose': self.count_publishers(ENTITY_POSE_TOPIC),
-            'ground_truth': self.count_publishers(GROUND_TRUTH_TOPIC),
+        source_counts = {
+            name: int(source_publisher_counts[name])
+            for name in ('contacts', 'entity_pose', 'ground_truth')
         }
         return {
             'all_buffers_bounded': True,
@@ -728,12 +734,16 @@ class ContactControlNode(Node):
                 'future_delivery_count': self.future_snapshot_delivery_count,
                 'latest_stamp_ns': self.last_contact_stamp_ns,
                 'max_gap_ns': self.contact_max_gap_ns,
+                'pre_clock_discard_count': self.pre_clock_contact_message_count,
                 'snapshot_count': self.contact_snapshot_count,
             },
             'relative_project_names': True,
             'sole_cmd_vel_publisher': publisher_count == 1,
-            'source_publisher_counts': source_publisher_counts,
-            'source_streams_live': all(count >= 1 for count in source_publisher_counts.values()),
+            'source_publisher_counts': source_counts,
+            'source_publisher_missing_observation_count': (
+                source_publisher_missing_observation_count
+            ),
+            'source_streams_live': all(count >= 1 for count in source_counts.values()),
             'cmd_vel_publisher_count': publisher_count,
         }
 
@@ -776,6 +786,13 @@ class ContactControlApp:
             'entity_pose': 0,
             'ground_truth': 0,
         }
+        self.source_publisher_missing_since_ns: dict[str, int | None] = {
+            'contacts': None,
+            'entity_pose': None,
+            'ground_truth': None,
+        }
+        self.source_publisher_missing_observation_count = 0
+        self.source_graph_stable_since_ns: int | None = None
         self.contact_graph_audit_count = 0
         self.contact_graph_first_snapshot: dict[str, Any] | None = None
         self.contact_graph_last_snapshot: dict[str, Any] | None = None
@@ -967,6 +984,17 @@ class ContactControlApp:
         snapshot = self._contact_graph_snapshot()
         if not self._contact_graph_is_exact(snapshot):
             raise InfrastructureError('contact stream graph ownership, type, or QoS changed')
+        if self.contact_graph_first_snapshot is not None:
+            for group in (
+                'private_raw_publishers',
+                'private_raw_subscribers',
+                'public_snapshot_publishers',
+            ):
+                if (
+                    snapshot[group][0]['endpoint_gid']
+                    != self.contact_graph_first_snapshot[group][0]['endpoint_gid']
+                ):
+                    raise InfrastructureError('contact stream endpoint identity changed')
         sha256 = hashlib.sha256(canonical_json_bytes(snapshot)).hexdigest()
         self.contact_graph_audit_count += 1
         if self.contact_graph_first_snapshot is None:
@@ -975,7 +1003,7 @@ class ContactControlApp:
         self.contact_graph_last_snapshot = snapshot
         self.contact_graph_last_sha256 = sha256
 
-    def _enforce_graph_isolation(self) -> None:
+    def _enforce_graph_isolation(self) -> bool:
         publisher_count, forbidden = self._graph_state()
         self.last_publisher_count = publisher_count
         self.forbidden_nodes = forbidden
@@ -996,11 +1024,40 @@ class ContactControlApp:
         missing_sources = [
             name for name, count in self.last_source_publisher_counts.items() if count < 1
         ]
+        if self.last_source_publisher_counts['contacts'] >= 1:
+            self._audit_contact_graph()
         if missing_sources:
-            raise InfrastructureError(
-                'positive-control observation sources disappeared: ' + ', '.join(missing_sources)
-            )
-        self._audit_contact_graph()
+            self.source_publisher_missing_observation_count += 1
+            now_ns = time.monotonic_ns()
+            confirmed_missing: list[str] = []
+            for name in self.source_publisher_missing_since_ns:
+                if name not in missing_sources:
+                    self.source_publisher_missing_since_ns[name] = None
+                    continue
+                missing_since_ns = self.source_publisher_missing_since_ns[name]
+                if missing_since_ns is None:
+                    self.source_publisher_missing_since_ns[name] = now_ns
+                elif now_ns - missing_since_ns >= CONTROL_SOURCE_GRAPH_MISSING_CONFIRM_NS:
+                    confirmed_missing.append(name)
+            if confirmed_missing:
+                raise InfrastructureError(
+                    'positive-control observation sources disappeared: '
+                    + ', '.join(confirmed_missing)
+                )
+            return False
+        for name in self.source_publisher_missing_since_ns:
+            self.source_publisher_missing_since_ns[name] = None
+        return True
+
+    def _startup_graph_is_stable(self) -> bool:
+        if not self._enforce_graph_isolation():
+            self.source_graph_stable_since_ns = None
+            return False
+        now_ns = time.monotonic_ns()
+        if self.source_graph_stable_since_ns is None:
+            self.source_graph_stable_since_ns = now_ns
+            return False
+        return now_ns - self.source_graph_stable_since_ns >= CONTROL_SOURCE_GRAPH_MISSING_CONFIRM_NS
 
     def _spin_once(self, timeout_s: float = 0.02, *, check_fatal: bool = True) -> None:
         if time.monotonic() >= self.wall_deadline:
@@ -1282,7 +1339,10 @@ class ContactControlApp:
             self._base_prerequisites,
             reason='contact-control graph did not become ready',
         )
-        self._enforce_graph_isolation()
+        self._wait_for(
+            self._startup_graph_is_stable,
+            reason='contact-control observation sources did not stabilize',
+        )
         self.graph_gate_active = True
         spawn = self._spawn_wall()
         observed_wall = self._observe_wall(spawn)
@@ -1541,6 +1601,10 @@ class ContactControlApp:
             publisher_count=self.last_publisher_count,
             forbidden_nodes=self.forbidden_nodes,
             contact_graph_topology=self._contact_graph_evidence(),
+            source_publisher_counts=self.last_source_publisher_counts,
+            source_publisher_missing_observation_count=(
+                self.source_publisher_missing_observation_count
+            ),
         )
         release_boundary_ns = self._release_boundary_ns()
         topology = quality['contact_graph_topology']
@@ -1692,7 +1756,13 @@ class ContactControlApp:
         }
 
     def _result(self, error: RobotestScenarioError | None) -> tuple[dict[str, Any], int]:
-        self._enforce_graph_isolation()
+        if error is not None:
+            return self._result_without_graph(error)
+        self.graph_gate_active = False
+        self._wait_for(
+            self._enforce_graph_isolation,
+            reason='final contact-control observation sources did not stabilize',
+        )
         criteria = self._criteria()
         if error is None and not all(criteria.values()):
             error = ScenarioFailureError('positive-control frozen criteria did not all pass')
@@ -1721,6 +1791,10 @@ class ContactControlApp:
                 publisher_count=self.last_publisher_count,
                 forbidden_nodes=self.forbidden_nodes,
                 contact_graph_topology=self._contact_graph_evidence(),
+                source_publisher_counts=self.last_source_publisher_counts,
+                source_publisher_missing_observation_count=(
+                    self.source_publisher_missing_observation_count
+                ),
             ),
             'schema_version': 1,
             'status': status,
@@ -1802,6 +1876,10 @@ class ContactControlApp:
                     publisher_count=self.last_publisher_count,
                     forbidden_nodes=self.forbidden_nodes,
                     contact_graph_topology=self._contact_graph_evidence(),
+                    source_publisher_counts=self.last_source_publisher_counts,
+                    source_publisher_missing_observation_count=(
+                        self.source_publisher_missing_observation_count
+                    ),
                 ),
                 'schema_version': 1,
                 'status': 'FAIL',

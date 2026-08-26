@@ -203,7 +203,8 @@
         "forbidden_nodes", "nav2_absent", "overflow_free", "protocol_error_count",
         "clock", "public_contact_snapshot_heartbeat", "public_contact_snapshot_stream",
         "relative_project_names", "sole_cmd_vel_publisher", "source_publisher_counts",
-        "source_streams_live", "cmd_vel_publisher_count"
+        "source_publisher_missing_observation_count", "source_streams_live",
+        "cmd_vel_publisher_count"
       ],
       "properties": {
         "all_buffers_bounded": {"const": true},
@@ -227,13 +228,14 @@
           "additionalProperties": false,
           "required": [
             "first_stamp_ns", "future_delivery_count", "latest_stamp_ns", "max_gap_ns",
-            "snapshot_count"
+            "pre_clock_discard_count", "snapshot_count"
           ],
           "properties": {
             "first_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
             "future_delivery_count": {"type": "integer", "minimum": 0},
             "latest_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
             "max_gap_ns": {"type": "integer", "minimum": 0},
+            "pre_clock_discard_count": {"type": "integer", "minimum": 0},
             "snapshot_count": {"type": "integer", "minimum": 0}
           }
         },
@@ -254,6 +256,7 @@
             "ground_truth": {"type": "integer", "minimum": 0}
           }
         },
+        "source_publisher_missing_observation_count": {"type": "integer", "minimum": 0},
         "source_streams_live": {"type": "boolean"},
         "cmd_vel_publisher_count": {"type": "integer", "minimum": 0}
       }

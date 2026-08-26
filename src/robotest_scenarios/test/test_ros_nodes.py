@@ -25,7 +25,7 @@ from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from robotest_scenarios.contact_control_driver import ContactControlApp, ContactControlNode
 from robotest_scenarios.contact_evidence import load_coverage_manifest
-from robotest_scenarios.errors import ProtocolError, ScenarioFailureError
+from robotest_scenarios.errors import InfrastructureError, ProtocolError, ScenarioFailureError
 from robotest_scenarios.models import load_scenario
 from robotest_scenarios.scenario_controller import ScenarioControllerApp, ScenarioControllerNode
 from ros_gz_interfaces.msg import Contact, Contacts
@@ -139,6 +139,197 @@ def test_contact_node_stops_on_exact_manifest_pair() -> None:
     finally:
         node.destroy_node()
         rclpy.try_shutdown()
+
+
+def test_contact_node_discards_pre_positive_clock_contacts_then_seeds() -> None:
+    _init_ros()
+    manifest = load_coverage_manifest(str(REPOSITORY / 'config' / 'collision-coverage.yaml'))
+    node = ContactControlNode(manifest)
+    try:
+        support_pair = tuple(next(iter(manifest.support_exclusions)))
+        message = Contacts()
+        message.header.stamp.sec = 1
+        contact = Contact()
+        contact.collision1.name, contact.collision2.name = support_pair
+        message.contacts = [contact]
+
+        node._on_contacts(message)
+        node._on_clock(_clock(0))
+        node._on_contacts(message)
+        assert node.pre_clock_contact_message_count == 2
+        assert node.contact_snapshot_count == 0
+
+        node._on_clock(_clock(1_000_000_000))
+        node._on_contacts(message)
+        assert node.pre_clock_contact_message_count == 2
+        assert node.contact_snapshot_count == 1
+        assert node.contact_snapshots.quality()['invalid_count'] == 0
+        assert node.protocol_error_count == 0
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_contact_result_skips_final_graph_audit_after_primary_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = object.__new__(ContactControlApp)
+    primary = ProtocolError('primary callback failure')
+
+    def unexpected_graph_audit() -> None:
+        raise AssertionError('final graph audit must not replace a primary error')
+
+    monkeypatch.setattr(app, '_enforce_graph_isolation', unexpected_graph_audit)
+    monkeypatch.setattr(
+        app,
+        '_result_without_graph',
+        lambda error: ({'reason': str(error)}, int(error.exit_code)),
+    )
+
+    result, exit_code = app._result(primary)
+    assert result['reason'] == 'primary callback failure'
+    assert exit_code == int(primary.exit_code)
+
+
+def test_contact_graph_missing_source_requires_two_observations_spanning_100ms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = object.__new__(ContactControlApp)
+    counts = {
+        'validation/contacts': 1,
+        'validation/scenario_entity_poses': 0,
+        'validation/ground_truth': 1,
+    }
+    app.node = SimpleNamespace(count_publishers=lambda topic: counts[topic])
+    app.last_publisher_count = 0
+    app.forbidden_nodes = []
+    app.last_source_publisher_counts = {}
+    app.source_publisher_missing_since_ns = {
+        'contacts': None,
+        'entity_pose': None,
+        'ground_truth': None,
+    }
+    app.source_publisher_missing_observation_count = 0
+    audit_count = 0
+    now_ns = 1_000_000_000
+
+    def audit_contact_graph() -> None:
+        nonlocal audit_count
+        audit_count += 1
+
+    monkeypatch.setattr(app, '_graph_state', lambda: (1, []))
+    monkeypatch.setattr(app, '_audit_contact_graph', audit_contact_graph)
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.time.monotonic_ns',
+        lambda: now_ns,
+    )
+
+    assert app._enforce_graph_isolation() is False
+    assert audit_count == 1
+    counts['validation/scenario_entity_poses'] = 4
+    assert app._enforce_graph_isolation() is True
+    assert audit_count == 2
+    assert all(value is None for value in app.source_publisher_missing_since_ns.values())
+
+    counts['validation/ground_truth'] = 0
+    now_ns += 1_000_000
+    assert app._enforce_graph_isolation() is False
+    now_ns += 99_999_999
+    assert app._enforce_graph_isolation() is False
+    now_ns += 1
+    with pytest.raises(InfrastructureError, match='ground_truth'):
+        app._enforce_graph_isolation()
+    assert app.last_source_publisher_counts == {
+        'contacts': 1,
+        'entity_pose': 4,
+        'ground_truth': 0,
+    }
+
+
+def test_contact_graph_contamination_is_immediately_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = object.__new__(ContactControlApp)
+    app.node = SimpleNamespace(count_publishers=lambda _topic: 1)
+    app.last_publisher_count = 0
+    app.forbidden_nodes = []
+    app.last_source_publisher_counts = {}
+    app.source_publisher_missing_since_ns = {
+        'contacts': None,
+        'entity_pose': None,
+        'ground_truth': None,
+    }
+    app.source_publisher_missing_observation_count = 0
+    monkeypatch.setattr(app, '_graph_state', lambda: (2, []))
+
+    with pytest.raises(InfrastructureError, match='requires one publisher'):
+        app._enforce_graph_isolation()
+
+    monkeypatch.setattr(app, '_graph_state', lambda: (1, ['controller_server']))
+    with pytest.raises(InfrastructureError, match='Nav2/collision-monitor'):
+        app._enforce_graph_isolation()
+
+    def fail_contact_graph() -> None:
+        raise InfrastructureError('contact topology changed')
+
+    app.node = SimpleNamespace(
+        count_publishers=lambda topic: 0 if topic == 'validation/scenario_entity_poses' else 1
+    )
+    monkeypatch.setattr(app, '_graph_state', lambda: (1, []))
+    monkeypatch.setattr(app, '_audit_contact_graph', fail_contact_graph)
+    with pytest.raises(InfrastructureError, match='contact topology changed'):
+        app._enforce_graph_isolation()
+
+
+def test_contact_graph_startup_requires_100ms_stability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = object.__new__(ContactControlApp)
+    app.source_graph_stable_since_ns = None
+    now_ns = 2_000_000_000
+    graph_ready = True
+    monkeypatch.setattr(app, '_enforce_graph_isolation', lambda: graph_ready)
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.time.monotonic_ns',
+        lambda: now_ns,
+    )
+
+    assert app._startup_graph_is_stable() is False
+    now_ns += 99_999_999
+    assert app._startup_graph_is_stable() is False
+    now_ns += 1
+    assert app._startup_graph_is_stable() is True
+
+    graph_ready = False
+    assert app._startup_graph_is_stable() is False
+    assert app.source_graph_stable_since_ns is None
+
+
+def test_contact_graph_endpoint_gid_cannot_change_between_audits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = object.__new__(ContactControlApp)
+    app.contact_graph_audit_count = 0
+    app.contact_graph_first_snapshot = None
+    app.contact_graph_last_snapshot = None
+    app.contact_graph_first_sha256 = None
+    app.contact_graph_last_sha256 = None
+
+    def snapshot(gid: str) -> dict[str, list[dict[str, str]]]:
+        return {
+            'private_raw_publishers': [{'endpoint_gid': gid}],
+            'private_raw_subscribers': [{'endpoint_gid': gid}],
+            'public_snapshot_publishers': [{'endpoint_gid': gid}],
+        }
+
+    snapshots = iter((snapshot('aa' * 16), snapshot('bb' * 16)))
+    monkeypatch.setattr(app, '_contact_graph_snapshot', lambda: next(snapshots))
+    monkeypatch.setattr(app, '_contact_graph_is_exact', lambda _snapshot: True)
+
+    app._audit_contact_graph()
+    with pytest.raises(InfrastructureError, match='endpoint identity changed'):
+        app._audit_contact_graph()
+    assert app.contact_graph_audit_count == 1
 
 
 def test_contact_node_validates_whole_snapshot_before_stop_and_rejects_nonrobot() -> None:

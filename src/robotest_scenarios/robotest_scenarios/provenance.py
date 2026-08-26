@@ -132,6 +132,7 @@ def contact_control_configuration() -> dict[str, object]:
         'reverse_mps': constants.CONTROL_REVERSE_MPS,
         'reverse_ns': constants.CONTROL_REVERSE_NS,
         'robot_start': list(constants.CONTROL_ROBOT_START),
+        'source_graph_missing_confirmation_ns': (constants.CONTROL_SOURCE_GRAPH_MISSING_CONFIRM_NS),
         'stop_deadline_ns': constants.CONTROL_STOP_DEADLINE_NS,
         'wall_collision': constants.CONTROL_WALL_COLLISION,
         'wall_pose': list(constants.CONTROL_WALL_POSE),
