@@ -532,7 +532,7 @@ set +u
 # shellcheck disable=SC1090
 source "${WORK_ROOT}/install/setup.bash"
 set -u
-run_check colcon-test 900s \
+run_check colcon-test 1500s \
   colcon --log-base "${WORK_ROOT}/test-log" test \
     --build-base "${WORK_ROOT}/build" \
     --install-base "${WORK_ROOT}/install" \

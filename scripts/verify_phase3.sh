@@ -150,7 +150,7 @@ set -u
 run_logged rosdep-check 180s \
   rosdep check --from-paths src --ignore-src
 
-run_logged colcon-test 900s \
+run_logged colcon-test 1500s \
   colcon test --parallel-workers 4 \
     --packages-select \
       robotest_interfaces robotest_description robotest_faults robotest_sim \

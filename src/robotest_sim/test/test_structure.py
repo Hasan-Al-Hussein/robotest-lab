@@ -222,6 +222,24 @@ def test_phase1_and_phase2_attest_the_loaded_contact_aggregator_dso() -> None:
     assert 'contact aggregator runtime differs from installed source binding' in phase2
 
 
+def test_provenance_build_timeout_hierarchy_is_bounded_and_nested() -> None:
+    build_test = (PACKAGE / 'test/test_contact_stream_gate_build.py').read_text(encoding='utf-8')
+    cmake = (PACKAGE / 'CMakeLists.txt').read_text(encoding='utf-8')
+    assert 'CONFIGURE_TIMEOUT_SECONDS = 180' in build_test
+    assert 'BUILD_TIMEOUT_SECONDS = 360' in build_test
+    assert 'TIMEOUT 960' in cmake
+
+    expected_markers = {
+        1: 'timeout --signal=TERM --kill-after=10s 1500s \\\n  colcon test',
+        2: 'timeout --signal=TERM --kill-after=10s 1500s \\\n  colcon test',
+        3: 'run_logged colcon-test 1500s \\\n  colcon test',
+        5: 'run_check colcon-test 1500s \\\n  colcon --log-base',
+    }
+    for phase, marker in expected_markers.items():
+        verifier = (WORKSPACE / 'scripts' / f'verify_phase{phase}.sh').read_text(encoding='utf-8')
+        assert marker in verifier
+
+
 def test_runtime_attestor_dynamic_import_supports_dataclass_annotations() -> None:
     tests_path = str(WORKSPACE / 'tests')
     module_name = 'robotest_contact_gate_attestor_structure_test'

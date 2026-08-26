@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -29,6 +30,7 @@ TAG = b'ROBOTEST_CONTACT_GATE_SOURCE_INVENTORY_SHA256='
 # generous enough for cold CI hosts while retaining deterministic termination.
 CONFIGURE_TIMEOUT_SECONDS = 180
 BUILD_TIMEOUT_SECONDS = 360
+WINDOWS_DRIVE_MOUNT = re.compile(r'^/mnt/[A-Za-z](?:/|$)')
 SOURCE_PATHS = (
     (
         'src/robotest_description/urdf/robotest_gazebo.xacro',
@@ -54,6 +56,21 @@ SOURCE_PATHS = (
     ('src/robotest_sim/src/contact_stream_gate_node.cpp', 'src/contact_stream_gate_node.cpp'),
     ('src/robotest_sim/worlds/robotest_lab.sdf', 'worlds/robotest_lab.sdf'),
 )
+
+
+def _linux_tool_environment() -> dict[str, str]:
+    """Exclude inherited Windows tools from the isolated WSL build proof."""
+
+    environment = os.environ.copy()
+    path_entries = [
+        entry
+        for entry in environment.get('PATH', '').split(os.pathsep)
+        if entry and WINDOWS_DRIVE_MOUNT.match(entry) is None
+    ]
+    if not path_entries:
+        raise RuntimeError('isolated build proof has no Linux tool path')
+    environment['PATH'] = os.pathsep.join(path_entries)
+    return environment
 
 
 def _inventory_sha256(source_root: Path) -> str:
@@ -86,7 +103,7 @@ def _embedded_sha256(executable: Path) -> str:
     return matches.pop().decode('ascii')
 
 
-def _build(source_root: Path, build_root: Path) -> None:
+def _build(source_root: Path, build_root: Path, environment: dict[str, str]) -> None:
     subprocess.run(
         [
             'cmake',
@@ -99,13 +116,23 @@ def _build(source_root: Path, build_root: Path) -> None:
         ],
         check=True,
         cwd=source_root,
+        env=environment,
         timeout=BUILD_TIMEOUT_SECONDS,
     )
+
+
+def test_linux_tool_environment_excludes_wsl_windows_drive_mounts(monkeypatch) -> None:
+    monkeypatch.setenv(
+        'PATH',
+        '/usr/local/bin:/mnt/c/WINDOWS/system32:/usr/bin:/mnt/d/custom/bin',
+    )
+    assert _linux_tool_environment()['PATH'] == '/usr/local/bin:/usr/bin'
 
 
 def test_incremental_build_reconfigures_and_rebinds_pipeline_inventory(tmp_path: Path) -> None:
     source_root = tmp_path / 'robotest_sim'
     build_root = tmp_path / 'build'
+    environment = _linux_tool_environment()
     shutil.copytree(PACKAGE_ROOT, source_root)
     shutil.copytree(PACKAGE_ROOT.parent / 'robotest_description', tmp_path / 'robotest_description')
     subprocess.run(
@@ -119,9 +146,10 @@ def test_incremental_build_reconfigures_and_rebinds_pipeline_inventory(tmp_path:
         ],
         check=True,
         cwd=source_root,
+        env=environment,
         timeout=CONFIGURE_TIMEOUT_SECONDS,
     )
-    _build(source_root, build_root)
+    _build(source_root, build_root, environment)
     executable = build_root / 'contact_stream_gate'
     plugin = build_root / 'librobotest_contact_aggregator_system.so'
     initial = _embedded_sha256(executable)
@@ -133,7 +161,7 @@ def test_incremental_build_reconfigures_and_rebinds_pipeline_inventory(tmp_path:
     policy_source.write_bytes(
         policy_source.read_bytes() + b'\n// Configure-dependency regression probe.\n'
     )
-    _build(source_root, build_root)
+    _build(source_root, build_root, environment)
     updated = _embedded_sha256(executable)
     updated_plugin = _embedded_sha256(plugin)
     assert updated == _inventory_sha256(source_root)

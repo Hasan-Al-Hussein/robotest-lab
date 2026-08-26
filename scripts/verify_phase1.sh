@@ -1303,7 +1303,7 @@ set +u
 source "$WORKSPACE/install/setup.bash"
 set -u
 
-timeout --signal=TERM --kill-after=10s 420s \
+timeout --signal=TERM --kill-after=10s 1500s \
   colcon test --parallel-workers 4 \
   --packages-select robotest_interfaces robotest_description robotest_faults robotest_sim \
   --event-handlers console_direct+ 2>&1 | tee "$RUN_DIR/colcon-test.txt"

@@ -2551,7 +2551,7 @@ source "$WORKSPACE/install/setup.bash"
 set -u
 
 TEST_STARTED_EPOCH_NS="$(date +%s%N)"
-timeout --signal=TERM --kill-after=10s 600s \
+timeout --signal=TERM --kill-after=10s 1500s \
   colcon test --parallel-workers 4 \
   --packages-select \
     robotest_interfaces robotest_description robotest_faults robotest_sim \
