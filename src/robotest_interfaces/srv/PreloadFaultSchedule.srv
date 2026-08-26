@@ -1,0 +1,18 @@
+# Copyright 2026 Hasan Ahmed
+# SPDX-License-Identifier: Apache-2.0
+
+# Claimed lowercase SHA-256 of the ADR 0005 canonical schedule bytes.
+string<=64 schedule_hash
+robotest_interfaces/FaultSpec[<=16] faults
+---
+uint8 STATE_RESET=0
+uint8 STATE_PREPARED=1
+uint8 STATE_ARMED=2
+
+bool accepted
+bool replayed
+uint8 state
+string<=64 schedule_hash
+uint32 loaded_count
+uint64 generation
+string<=256 message

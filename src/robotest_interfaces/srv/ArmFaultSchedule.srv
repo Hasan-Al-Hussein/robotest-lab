@@ -1,0 +1,23 @@
+# Copyright 2026 Hasan Ahmed
+# SPDX-License-Identifier: Apache-2.0
+
+# These values must match one committed PREPARED generation.
+string<=64 schedule_hash
+uint64 generation
+unique_identifier_msgs/UUID goal_uuid
+builtin_interfaces/Time accepted_goal_stamp
+---
+uint8 STATE_RESET=0
+uint8 STATE_PREPARED=1
+uint8 STATE_ARMED=2
+
+bool accepted
+bool replayed
+uint8 state
+string<=64 schedule_hash
+uint64 generation
+unique_identifier_msgs/UUID goal_uuid
+builtin_interfaces/Time accepted_goal_stamp
+builtin_interfaces/Time arm_commit_stamp
+int64 arm_margin_ns
+string<=256 message

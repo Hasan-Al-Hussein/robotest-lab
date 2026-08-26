@@ -18,12 +18,14 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
-#include "robotest_faults/phase1_schedule.hpp"
+#include "robotest_faults/fault_protocol.hpp"
 #include "robotest_interfaces/msg/fault_event.hpp"
-#include "robotest_interfaces/srv/load_fault_schedule.hpp"
+#include "robotest_interfaces/srv/arm_fault_schedule.hpp"
+#include "robotest_interfaces/srv/preload_fault_schedule.hpp"
 #include "sensor_msgs/msg/imu.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "std_srvs/srv/trigger.hpp"
@@ -42,20 +44,24 @@ private:
   void on_odom(nav_msgs::msg::Odometry::ConstSharedPtr message);
   void on_imu(sensor_msgs::msg::Imu::ConstSharedPtr message);
 
-  void on_load_schedule(
+  void on_preload_schedule(
     const std::shared_ptr<
-      robotest_interfaces::srv::LoadFaultSchedule::Request>
+      robotest_interfaces::srv::PreloadFaultSchedule::Request>
     request,
-    std::shared_ptr<robotest_interfaces::srv::LoadFaultSchedule::Response>
+    std::shared_ptr<robotest_interfaces::srv::PreloadFaultSchedule::Response>
+    response);
+  void on_arm_schedule(
+    const std::shared_ptr<
+      robotest_interfaces::srv::ArmFaultSchedule::Request>
+    request,
+    std::shared_ptr<robotest_interfaces::srv::ArmFaultSchedule::Response>
     response);
   void on_reset(
     const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
     std::shared_ptr<std_srvs::srv::Trigger::Response> response);
 
-  void publish_control_event(
-    uint8_t event_type,
-    const std::string & schedule_hash,
-    const std::string & detail);
+  void publish_events(
+    const std::vector<robotest_interfaces::msg::FaultEvent> & events);
 
   const std::string expected_scan_frame_;
   const std::string expected_odom_frame_;
@@ -73,13 +79,15 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_subscription_;
 
-  rclcpp::Service<robotest_interfaces::srv::LoadFaultSchedule>::SharedPtr
-    load_service_;
+  rclcpp::Service<robotest_interfaces::srv::PreloadFaultSchedule>::SharedPtr
+    preload_service_;
+  rclcpp::Service<robotest_interfaces::srv::ArmFaultSchedule>::SharedPtr
+    arm_service_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_service_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> transform_broadcaster_;
 
-  std::mutex schedule_mutex_;
-  Phase1ScheduleState schedule_state_;
+  std::mutex control_transaction_mutex_;
+  FaultProtocol protocol_;
 };
 
 }  // namespace robotest_faults

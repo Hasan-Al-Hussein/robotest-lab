@@ -14,15 +14,20 @@ find_package(ament_cmake REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(nlohmann_json REQUIRED)
+find_package(OpenSSL REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(robotest_interfaces REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(unique_identifier_msgs REQUIRED)
 
 add_library(robotest_faults_core SHARED
+  src/fault_protocol.cpp
   src/pass_through.cpp
-  src/phase1_schedule.cpp
 )
 target_include_directories(robotest_faults_core
   PUBLIC
@@ -30,12 +35,19 @@ target_include_directories(robotest_faults_core
     $<INSTALL_INTERFACE:include>
 )
 target_compile_options(robotest_faults_core PRIVATE -Wall -Wextra -Wpedantic -Wconversion)
+target_link_libraries(robotest_faults_core
+  OpenSSL::Crypto
+  nlohmann_json::nlohmann_json
+)
 ament_target_dependencies(robotest_faults_core
   builtin_interfaces
   geometry_msgs
   nav_msgs
   robotest_interfaces
   sensor_msgs
+  tf2
+  tf2_geometry_msgs
+  unique_identifier_msgs
 )
 
 add_executable(fault_proxy_node
@@ -63,6 +75,10 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 install(
+  FILES LICENSE README.md
+  DESTINATION share/${PROJECT_NAME}
+)
+install(
   TARGETS robotest_faults_core fault_proxy_node
   EXPORT export_robotest_faults
   ARCHIVE DESTINATION lib
@@ -79,8 +95,11 @@ if(BUILD_TESTING)
   target_link_libraries(test_pass_through robotest_faults_core)
   ament_target_dependencies(test_pass_through rclcpp)
 
-  ament_add_gtest(test_phase1_schedule test/test_phase1_schedule.cpp)
-  target_link_libraries(test_phase1_schedule robotest_faults_core)
+  ament_add_gtest(test_fault_protocol test/test_fault_protocol.cpp)
+  target_link_libraries(test_fault_protocol robotest_faults_core)
+
+  ament_add_gtest(test_fault_application test/test_fault_application.cpp)
+  target_link_libraries(test_fault_application robotest_faults_core)
 
   ament_lint_auto_find_test_dependencies()
 endif()
@@ -93,5 +112,10 @@ ament_export_dependencies(
   rclcpp
   robotest_interfaces
   sensor_msgs
+  std_srvs
+  tf2
+  tf2_geometry_msgs
+  tf2_ros
+  unique_identifier_msgs
 )
 ament_package()

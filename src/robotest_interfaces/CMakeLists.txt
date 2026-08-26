@@ -8,12 +8,19 @@ find_package(ament_cmake REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(unique_identifier_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/FaultSpec.msg"
   "msg/FaultEvent.msg"
-  "srv/LoadFaultSchedule.srv"
-  DEPENDENCIES builtin_interfaces std_msgs
+  "srv/ArmFaultSchedule.srv"
+  "srv/PreloadFaultSchedule.srv"
+  DEPENDENCIES builtin_interfaces std_msgs unique_identifier_msgs
+)
+
+install(
+  FILES LICENSE README.md
+  DESTINATION share/${PROJECT_NAME}
 )
 
 if(BUILD_TESTING)

@@ -82,10 +82,17 @@ FaultProxyNode::FaultProxyNode(const rclcpp::NodeOptions & options)
       "raw/imu", imu_sensor_qos(),
       std::bind(&FaultProxyNode::on_imu, this, std::placeholders::_1));
 
-  load_service_ = create_service<robotest_interfaces::srv::LoadFaultSchedule>(
-      "faults/load_schedule",
-      std::bind(&FaultProxyNode::on_load_schedule, this, std::placeholders::_1,
-                std::placeholders::_2));
+  preload_service_ =
+    create_service<robotest_interfaces::srv::PreloadFaultSchedule>(
+      "faults/preload_schedule",
+      std::bind(
+        &FaultProxyNode::on_preload_schedule, this,
+        std::placeholders::_1, std::placeholders::_2));
+  arm_service_ = create_service<robotest_interfaces::srv::ArmFaultSchedule>(
+      "faults/arm_schedule",
+      std::bind(
+        &FaultProxyNode::on_arm_schedule, this,
+        std::placeholders::_1, std::placeholders::_2));
   reset_service_ = create_service<std_srvs::srv::Trigger>(
       "faults/reset", std::bind(&FaultProxyNode::on_reset, this,
                                 std::placeholders::_1, std::placeholders::_2));
@@ -94,70 +101,99 @@ FaultProxyNode::FaultProxyNode(const rclcpp::NodeOptions & options)
     std::make_unique<tf2_ros::TransformBroadcaster>(*this);
   RCLCPP_INFO(
       get_logger(),
-      "Phase 1 fault proxy is active in deterministic pass-through mode");
+      "Phase 3 fault proxy is active in RESET pass-through state");
 }
 
 void FaultProxyNode::on_scan(
   sensor_msgs::msg::LaserScan::ConstSharedPtr message)
 {
-  auto result = validate_and_copy_scan(*message, expected_scan_frame_);
+  auto result = protocol_.process_scan(*message, expected_scan_frame_);
   if (!result.accepted) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                          "Rejected raw scan: %s", result.reason.c_str());
     return;
   }
-  scan_publisher_->publish(result.message);
+  if (result.publish) {
+    scan_publisher_->publish(result.message);
+  }
+  publish_events(result.events);
 }
 
 void FaultProxyNode::on_odom(nav_msgs::msg::Odometry::ConstSharedPtr message)
 {
-  auto result = validate_and_copy_odom(*message, expected_odom_frame_,
-                                       expected_base_frame_);
+  auto result = protocol_.process_odom(
+    *message, expected_odom_frame_, expected_base_frame_);
   if (!result.accepted) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                          "Rejected raw odometry: %s", result.reason.c_str());
     return;
   }
 
-  // Both outputs derive from the same validated message and therefore retain
-  // exactly the input odometry stamp, frames, pose, twist, and covariance.
-  odom_publisher_->publish(result.message);
-  transform_broadcaster_->sendTransform(make_odom_transform(result.message));
+  if (result.publish) {
+    // Both outputs derive from this one validated pose and stamp. There is no
+    // separate odometry-to-TF transformation state path.
+    odom_publisher_->publish(result.message);
+    transform_broadcaster_->sendTransform(make_odom_transform(result.message));
+  }
+  publish_events(result.events);
 }
 
 void FaultProxyNode::on_imu(sensor_msgs::msg::Imu::ConstSharedPtr message)
 {
-  auto result = validate_and_copy_imu(*message, expected_imu_frame_);
+  auto result = protocol_.process_imu(*message, expected_imu_frame_);
   if (!result.accepted) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                          "Rejected raw IMU: %s", result.reason.c_str());
     return;
   }
-  imu_publisher_->publish(result.message);
+  if (result.publish) {
+    imu_publisher_->publish(result.message);
+  }
+  publish_events(result.events);
 }
 
-void FaultProxyNode::on_load_schedule(
-  const std::shared_ptr<robotest_interfaces::srv::LoadFaultSchedule::Request>
+void FaultProxyNode::on_preload_schedule(
+  const std::shared_ptr<
+    robotest_interfaces::srv::PreloadFaultSchedule::Request>
   request,
-  std::shared_ptr<robotest_interfaces::srv::LoadFaultSchedule::Response>
+  std::shared_ptr<robotest_interfaces::srv::PreloadFaultSchedule::Response>
   response)
 {
-  ScheduleLoadResult result;
-  {
-    std::lock_guard<std::mutex> lock(schedule_mutex_);
-    result = schedule_state_.validate_and_replace(*request);
-  }
+  std::lock_guard<std::mutex> transaction_lock(control_transaction_mutex_);
+  const builtin_interfaces::msg::Time operation_stamp = now();
+  const auto result = protocol_.preload(*request, operation_stamp);
 
   response->accepted = result.accepted;
-  response->schedule_hash = request->schedule_hash;
-  response->loaded_count = static_cast<uint32_t>(result.loaded_count);
+  response->replayed = result.replayed;
+  response->state = static_cast<std::uint8_t>(result.state);
+  response->schedule_hash = result.schedule_hash;
+  response->loaded_count = result.loaded_count;
+  response->generation = result.generation;
   response->message = result.message;
+  event_publisher_->publish(result.event);
+}
 
-  const auto event_type =
-    result.accepted ?
-    robotest_interfaces::msg::FaultEvent::EVENT_SCHEDULE_LOADED :
-    robotest_interfaces::msg::FaultEvent::EVENT_SCHEDULE_REJECTED;
-  publish_control_event(event_type, request->schedule_hash, result.message);
+void FaultProxyNode::on_arm_schedule(
+  const std::shared_ptr<robotest_interfaces::srv::ArmFaultSchedule::Request>
+  request,
+  std::shared_ptr<robotest_interfaces::srv::ArmFaultSchedule::Response>
+  response)
+{
+  std::lock_guard<std::mutex> transaction_lock(control_transaction_mutex_);
+  const builtin_interfaces::msg::Time operation_stamp = now();
+  const auto result = protocol_.arm(*request, operation_stamp);
+
+  response->accepted = result.accepted;
+  response->replayed = result.replayed;
+  response->state = static_cast<std::uint8_t>(result.state);
+  response->schedule_hash = result.schedule_hash;
+  response->generation = result.generation;
+  response->goal_uuid = result.goal_uuid;
+  response->accepted_goal_stamp = result.accepted_goal_stamp;
+  response->arm_commit_stamp = result.arm_commit_stamp;
+  response->arm_margin_ns = result.arm_margin_ns;
+  response->message = result.message;
+  event_publisher_->publish(result.event);
 }
 
 void FaultProxyNode::on_reset(
@@ -165,34 +201,20 @@ void FaultProxyNode::on_reset(
   std::shared_ptr<std_srvs::srv::Trigger::Response> response)
 {
   static_cast<void>(request);
-  {
-    std::lock_guard<std::mutex> lock(schedule_mutex_);
-    schedule_state_.reset();
-  }
-
+  std::lock_guard<std::mutex> transaction_lock(control_transaction_mutex_);
+  const builtin_interfaces::msg::Time operation_stamp = now();
+  const auto result = protocol_.reset(operation_stamp);
   response->success = true;
-  response->message =
-    "fault state cleared; deterministic pass-through mode active";
-  publish_control_event(robotest_interfaces::msg::FaultEvent::EVENT_RESET, "",
-                        response->message);
+  response->message = result.message;
+  event_publisher_->publish(result.event);
 }
 
-void FaultProxyNode::publish_control_event(
-  const uint8_t event_type,
-  const std::string & schedule_hash,
-  const std::string & detail)
+void FaultProxyNode::publish_events(
+  const std::vector<robotest_interfaces::msg::FaultEvent> & events)
 {
-  robotest_interfaces::msg::FaultEvent event;
-  event.header.stamp = now();
-  event.schema_version = robotest_interfaces::msg::FaultEvent::SCHEMA_VERSION;
-  event.event_type = event_type;
-  event.target = robotest_interfaces::msg::FaultSpec::TARGET_UNSPECIFIED;
-  event.mode = robotest_interfaces::msg::FaultSpec::MODE_PASS_THROUGH;
-  event.configured_time = event.header.stamp;
-  event.actual_time = event.header.stamp;
-  event.schedule_hash = schedule_hash;
-  event.detail = detail;
-  event_publisher_->publish(event);
+  for (const auto & event : events) {
+    event_publisher_->publish(event);
+  }
 }
 
 }  // namespace robotest_faults

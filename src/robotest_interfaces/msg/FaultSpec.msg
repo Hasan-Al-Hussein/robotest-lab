@@ -26,11 +26,13 @@ string<=64 fault_id
 uint8 target
 uint8 mode
 
-# Both values are measured in simulation time from the supplied mission start.
+# Both values are measured in simulation time from the UUID-bound authoritative
+# accepted-goal stamp T0.
 builtin_interfaces/Duration start_offset
 builtin_interfaces/Duration duration
 uint64 seed
 
-# Canonical JSON object containing parameters defined by the selected mode.
-# Keeping extension data in one bounded field avoids ambiguous positional values.
+# Strict JSON object containing parameters defined by ADR 0005. The proxy
+# rejects duplicate keys, unknown keys, non-integer drift rates, and malformed
+# UTF-8 before constructing the canonical schedule bytes.
 string<=1024 parameters_json
