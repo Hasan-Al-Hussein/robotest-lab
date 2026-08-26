@@ -1326,6 +1326,8 @@ class ContactControlApp:
         next_publish_ns = node.stop_latency_clock_stamp_ns + CONTROL_COMMAND_PERIOD_NS
         while node.current_sim_stamp_ns < hold_until_ns:
             self._spin_once()
+            if node.current_sim_stamp_ns >= hold_until_ns:
+                break
             if node.current_sim_stamp_ns >= next_publish_ns:
                 node.publish_command(0.0, phase='HOLD')
                 next_publish_ns = self._advance_schedule(next_publish_ns, node.current_sim_stamp_ns)
@@ -1355,6 +1357,8 @@ class ContactControlApp:
         next_publish_ns = self.reverse_start_stamp_ns + CONTROL_COMMAND_PERIOD_NS
         while node.current_sim_stamp_ns < reverse_until_ns:
             self._spin_once()
+            if node.current_sim_stamp_ns >= reverse_until_ns:
+                break
             if node.current_sim_stamp_ns >= next_publish_ns:
                 node.publish_command(CONTROL_REVERSE_MPS, phase='REVERSE')
                 next_publish_ns = self._advance_schedule(next_publish_ns, node.current_sim_stamp_ns)

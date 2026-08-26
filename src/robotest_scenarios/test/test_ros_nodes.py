@@ -498,3 +498,71 @@ def test_scenario_cleanup_retains_successful_response_when_quiet_wait_fails(
     finally:
         node.destroy_node()
         rclpy.try_shutdown()
+
+
+def test_contact_control_phase_boundaries_publish_only_the_new_phase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = object.__new__(ContactControlApp)
+    commands: list[dict[str, object]] = []
+
+    def publish_command(linear_x: float, *, phase: str) -> dict[str, object]:
+        record = {
+            'angular_z': 0.0,
+            'linear_x': linear_x,
+            'phase': phase,
+            'sim_stamp_ns': node.current_sim_stamp_ns,
+        }
+        commands.append(record)
+        return record
+
+    node = SimpleNamespace(
+        contact_snapshot_count=0,
+        current_sim_stamp_ns=1_000_000_000,
+        phase='HOLD',
+        publish_command=publish_command,
+        qualified_release_snapshot=None,
+        release_required_through_stamp_ns=None,
+        stop_command_stamp_ns=1_000_000_000,
+        stop_latency_clock_stamp_ns=1_000_000_000,
+        tracker=SimpleNamespace(active_start_ns=None),
+    )
+    app.node = node
+    app.hold_complete_stamp_ns = None
+    app.reverse_start_stamp_ns = None
+    app.final_zero_stamp_ns = None
+    app.release_complete_stamp_ns = None
+    app.release_observed_clock_stamp_ns = None
+    app.contact_clock_bracket = None
+    app.release_contact_snapshot_start_count = None
+    app.manifest = SimpleNamespace(contact_snapshot_max_clock_lag_ns=220_000_000)
+
+    monkeypatch.setattr(
+        app,
+        '_spin_once',
+        lambda: setattr(node, 'current_sim_stamp_ns', 2_000_000_000),
+    )
+    app._hold_zero()
+    assert commands == []
+    assert app.hold_complete_stamp_ns == 2_000_000_000
+
+    commands.clear()
+    node.current_sim_stamp_ns = 3_000_000_000
+
+    def wait_for_release(predicate: object, **_kwargs: object) -> None:
+        node.qualified_release_snapshot = {
+            'sim_stamp_ns': node.release_required_through_stamp_ns + 2_000_000
+        }
+        node.current_sim_stamp_ns = node.qualified_release_snapshot['sim_stamp_ns']
+        assert predicate()
+
+    monkeypatch.setattr(
+        app,
+        '_spin_once',
+        lambda: setattr(node, 'current_sim_stamp_ns', 4_000_000_000),
+    )
+    monkeypatch.setattr(app, '_wait_for', wait_for_release)
+    app._reverse_and_release()
+    assert [command['phase'] for command in commands] == ['REVERSE', 'FINAL_ZERO']
+    assert commands[0]['sim_stamp_ns'] == 3_000_000_000
+    assert commands[1]['sim_stamp_ns'] == 4_000_000_000
