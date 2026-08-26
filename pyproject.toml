@@ -49,3 +49,6 @@ ignore = []
 [tool.ruff.lint.per-file-ignores]
 "src/**/test/**/*.py" = ["S101"]
 "tests/**/*.py" = ["S101"]
+# ROS 2's ament_flake8 import-order policy conflicts with Ruff's I001 ordering.
+"src/robotest_navigation/test/test_navigation_contract.py" = ["I001"]
+"src/robotest_navigation/tools/generate_map.py" = ["I001"]

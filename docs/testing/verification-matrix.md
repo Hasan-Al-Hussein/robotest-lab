@@ -51,23 +51,33 @@ logs/bags remain in the ignored artifact area with tracked hashes.
 
 ## Phase 2 — navigation and missions
 
+Phase 2 implements the command boundary in
+[ADR 0004](../decisions/0004-phase2-command-ownership.md). It runs an empty,
+no-fault baseline and preserves the future PRELOAD/ARM ordering in
+[ADR 0003](../decisions/0003-two-phase-fault-schedule-arming.md) without
+claiming that fault arming, goal binding, or the future proxy states exist.
+
 Canonical command:
 
 ```powershell
-wsl -d Ubuntu -- bash -lc 'cd /home/hasan/robotest-lab && taskset -c 0-5 scripts/verify_phase2.sh'
+wsl -d Ubuntu -- bash -lc 'cd /home/hasan/robotest-lab && ROBOTEST_SIM_SEED=42 ROBOTEST_CPUSET=0-5 scripts/verify_phase2.sh'
 ```
 
 | Criterion | Proof method | Expected result and evidence | Failure signal | Recovery trigger |
 | --- | --- | --- | --- | --- |
-| P2-01 Map, localization, and Nav2 readiness | Launch test plus lifecycle, map, scan, costmap, and TF probes | Required lifecycle nodes active; map/world alignment and costmap observations valid; no validation subscriber in autonomy | Inactive node, plugin/config failure, bad map alignment, validation leak | Fix navigation contract before submitting a mission |
-| P2-02 Mission schema and exits | Pytest parameterized valid/invalid YAML and terminal outcomes | Unknown/missing/invalid fields rejected; success/cancel/reject/abort/timeout/infrastructure codes distinct | Invalid mission accepted, exception swallowed, incomplete returns zero | Fix schema/state machine and rerun unit tests |
-| P2-03 Baseline action integration | Three-waypoint headless action run before the metrics package exists | All waypoints complete with a succeeded terminal action result; mission YAML, action trace, matching mission-result JSON/CSV, and exit code are preserved | Any missed waypoint, timeout, false success, or JSON/CSV mismatch | Diagnose first failed layer; rerun only after unit/launch gate is green |
-| P2-04 Cancellation and escape timeout | Deliberately cancel and stall one test fixture | Goal cancellation acknowledged; wall escape ends a stopped-clock test; neither reports success | Hanging verifier or success after cancellation/timeout | Repair bounded wait/cancel logic before fault work |
-| P2-05 Acceptance freeze | Hash target criteria and scenario inputs before Phase 3 | Target-set hash and numerical scenario configurations committed before fault results | Target changes after observation or missing hash | Invalidate affected results; create prior decision record and rerun |
+| P2-01 Map, localization, and Nav2 readiness | Launch test plus lifecycle, map, scan, costmap, TF, and simulation-time probes | Required lifecycle nodes active; map/world alignment and costmap observations valid; exactly one allowed owner for each required TF publisher set; no validation subscriber in autonomy | Inactive node, plugin/config failure, bad map alignment, mixed time, duplicate TF owner, or validation leak | Fix navigation contract before submitting a mission |
+| P2-02 Mission schema and exits | Pytest parameterized valid/invalid YAML and terminal outcomes | Unknown/missing/invalid fields rejected; success/cancel/reject/abort/timeout/infrastructure codes distinct; artifact-write failure is nonzero | Invalid mission accepted, exception swallowed, incomplete returns zero, or an artifact failure reports success | Fix schema/state machine and rerun unit tests |
+| P2-03 Baseline action integration | Three-waypoint headless action run before the metrics package exists | Seed 42, empty fault schedule, all three waypoints complete, terminal action result is succeeded, and mission YAML, bounded action trace, matching mission-result JSON/CSV, command/exit evidence are preserved | Any missed waypoint, timeout, false success, non-empty fault path, missing trace, or JSON/CSV mismatch | Diagnose first failed layer; rerun only after unit/launch gate is green |
+| P2-04 Cancellation and escape timeout | Bounded cancellation fixture plus a frozen-simulation-clock fixture | Goal cancellation is acknowledged and reaches a non-success terminal result; a steady wall escape ends the stopped-clock case; fixture logs and test-result XML are retained | Hanging verifier, success after cancellation/timeout, or no executable fixture evidence | Repair bounded wait/cancel logic before fault work |
+| P2-05 Acceptance freeze | Hash target criteria and scenario inputs before Phase 3 | Target-set hash and numerical scenario configurations are frozen before fault results; provenance binds the exact scenario and source files | Target changes after observation, missing hash, or source/install mismatch | Invalidate affected results; create prior decision record and rerun |
+| P2-06 Command-chain ownership | Static launch/config tests plus live endpoint, QoS, process, and bounded command-trace probes | Exact ADR 0004 chain: controller only publishes `cmd_vel_nav`, smoother only publishes `cmd_vel_smoothed`, collision monitor only publishes final `cmd_vel`; expected connected subscribers; behavior output has no subscriber; final zero observed | Extra/missing owner, bypass, behavior subscriber, incompatible QoS, `KEEP_ALL`, or missing final zero | Stop the owned process group; repair remaps/plugins/queues and repeat readiness before motion |
+| P2-07 Resource, isolation, and evidence integrity | Process-tree sampler, world-statistics windows, graph audit, cleanup audit, canonical artifact finalization | Affinity remains within CPUs 0–5; peak RSS sum <=6 GiB; median RTF >=0.80 and p5 >=0.50; no autonomy validation subscriber; owned PGID is gone; hashes and provenance reconcile | Affinity escape, memory/RTF miss, validation leak, orphan, checksum mismatch, or missing source/version/seed evidence | Preserve failed run, clean only owned processes, fix the first failed layer, and rerun the full Phase 2 verifier |
 
-Phase 2 passes the mission/action integration subset. Full Scenario 1
-collision, path, efficiency, resource, and repeated-trial acceptance is proved
-in P3-03 after `robotest_metrics` exists.
+Phase 2 passes the mission/action integration subset plus the global
+resource/isolation gates. Full Scenario 1 collision, path, efficiency, and
+repeated-trial acceptance is proved in P3-03 after `robotest_metrics` exists.
+Phase 2 evidence must mark those metrics `DEFERRED_TO_PHASE3`; it must not copy
+their frozen targets into measured-result fields.
 
 ## Phase 3 — metrics and scenarios 1–5
 

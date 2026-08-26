@@ -1,6 +1,6 @@
 # RoboTest Lab Topic and TF Contract
 
-Status: **Phase 0 normative contract**
+Status: **Normative contract, revised for Phase 2**
 Default ROS namespace: `/robotest`
 Target platform: ROS 2 Jazzy, Gazebo Harmonic, Nav2
 
@@ -32,15 +32,18 @@ must compare them with the live endpoints using `ros2 topic info -v`.
 | Default topic | ROS type | Direction and owner | Allowed consumers | QoS contract |
 | --- | --- | --- | --- | --- |
 | `/clock` | `rosgraph_msgs/msg/Clock` | Gazebo -> ROS through a one-way `ros_gz_bridge` | Every simulation-time ROS node | BEST_EFFORT, VOLATILE, KEEP_LAST(1) |
+| `/robotest/map` | `nav_msgs/msg/OccupancyGrid` | Nav2 map server | AMCL, global costmap, visualization, and evidence probes | RELIABLE, TRANSIENT_LOCAL, KEEP_LAST(1) |
 | `/robotest/raw/scan` | `sensor_msgs/msg/LaserScan` | Gazebo -> bridge | Fault proxy; validation probes only | BEST_EFFORT, VOLATILE, KEEP_LAST(5) |
 | `/robotest/scan` | `sensor_msgs/msg/LaserScan` | Fault proxy | Nav2 obstacle layers, collision monitor, metrics | BEST_EFFORT, VOLATILE, KEEP_LAST(5) |
 | `/robotest/raw/odom` | `nav_msgs/msg/Odometry` | Gazebo differential-drive odometry -> bridge | Fault proxy; validation probes only | BEST_EFFORT, VOLATILE, KEEP_LAST(10) |
 | `/robotest/odom` | `nav_msgs/msg/Odometry` | Fault proxy | Nav2 consumers, collision monitor, metrics | BEST_EFFORT, VOLATILE, KEEP_LAST(10) |
 | `/robotest/raw/imu` | `sensor_msgs/msg/Imu` | Gazebo -> bridge | Fault proxy; validation probes only | BEST_EFFORT, VOLATILE, KEEP_LAST(10) |
 | `/robotest/imu` | `sensor_msgs/msg/Imu` | Fault proxy | Autonomy consumers and metrics | BEST_EFFORT, VOLATILE, KEEP_LAST(10) |
-| `/robotest/navigation/plan` | `nav_msgs/msg/Path` | Remapped Nav2 planner output | Metrics and visualization | RELIABLE, VOLATILE, KEEP_LAST(5) |
-| `/robotest/cmd_vel_nav` | `geometry_msgs/msg/Twist` | Nav2 controller | Collision monitor or the configured final-command arbiter | RELIABLE, VOLATILE, KEEP_LAST(1) |
-| `/robotest/cmd_vel` | `geometry_msgs/msg/Twist` | Collision monitor/final-command arbiter | Gazebo command bridge and metrics | RELIABLE, VOLATILE, KEEP_LAST(1) |
+| `/robotest/navigation/plan` | `nav_msgs/msg/Path` | Nav2 planner server | Metrics and visualization | RELIABLE, VOLATILE, KEEP_LAST(5) |
+| `/robotest/cmd_vel_nav` | `geometry_msgs/msg/Twist` | Nav2 controller server only | Velocity smoother | RELIABLE, VOLATILE, KEEP_LAST(1) |
+| `/robotest/cmd_vel_smoothed` | `geometry_msgs/msg/Twist` | Velocity smoother only | Collision monitor | RELIABLE, VOLATILE, KEEP_LAST(1) |
+| `/robotest/cmd_vel` | `geometry_msgs/msg/Twist` | Collision monitor only | Gazebo command bridge and evidence probes | RELIABLE, VOLATILE, KEEP_LAST(1) |
+| `/robotest/cmd_vel_behavior_unused` | `geometry_msgs/msg/Twist` | Isolated Nav2 behavior-server output | None; this topic is not bridged or connected to an actuator path | RELIABLE, VOLATILE, KEEP_LAST(1) |
 | `/robotest/validation/ground_truth` | `nav_msgs/msg/Odometry` | Gazebo model truth -> bridge | Metrics, validation tests, evidence recorder | RELIABLE, VOLATILE, KEEP_LAST(10) |
 | `/robotest/validation/contacts` | `ros_gz_interfaces/msg/Contacts` | Gazebo contact sensor -> bridge | Metrics and validation tests | RELIABLE, VOLATILE, KEEP_LAST(10) |
 | `/robotest/validation/world_stats` | `ros_gz_interfaces/msg/WorldStatistics` | Gazebo world statistics -> bridge | Metrics and resource recorder | RELIABLE, VOLATILE, KEEP_LAST(10) |
@@ -54,13 +57,33 @@ Bidirectional bridges are not used where direction is known.
 
 - Phase 1 bounded-motion verification uses one test command publisher. It must
   publish a final zero command and exit before another command source starts.
-- Phase 2 onward Nav2 publishes `cmd_vel_nav`; the collision monitor or
-  configured arbiter alone publishes `cmd_vel`.
+- Phase 2 implements the exact chain approved in
+  [ADR 0004](../decisions/0004-phase2-command-ownership.md):
+  `controller_server -> cmd_vel_nav -> velocity_smoother ->`
+  `cmd_vel_smoothed -> collision_monitor -> cmd_vel ->` the one-way Gazebo
+  bridge.
+- The behavior server is Wait-only. Its generic command output is remapped to
+  `cmd_vel_behavior_unused`, which has no subscribers. Spin, BackUp,
+  DriveOnHeading, AssistedTeleop, and other motion recoveries are prohibited
+  until a prior arbitration decision changes this contract.
+- The collision monitor alone publishes `cmd_vel`; the controller alone
+  publishes `cmd_vel_nav`; the smoother alone publishes `cmd_vel_smoothed`.
 - Multiple compatible publishers on `/robotest/cmd_vel` are a gate failure.
 
 Jazzy's default Nav2 command type is `geometry_msgs/msg/Twist`. Any later
 decision to enable stamped commands must change the controller, arbiter,
 bridge, tests, and this contract atomically.
+
+### Phase 2 action and lifecycle interface
+
+The mission runner is a direct `nav2_msgs/action/FollowWaypoints` client of
+`/robotest/follow_waypoints`; it does not use a convenience navigator that can
+hide goals or terminal results. Before submitting the three-waypoint baseline,
+the verifier requires active lifecycle state for `map_server`, `amcl`,
+`planner_server`, `controller_server`, `behavior_server`, `bt_navigator`,
+`waypoint_follower`, `velocity_smoother`, and `collision_monitor`. Collision
+monitor activation is checked again immediately before the goal. Action,
+cancellation, and terminal-result waits retain steady wall-clock deadlines.
 
 ## Fault-control interfaces
 
@@ -70,11 +93,11 @@ The interface package owns:
 - `robotest_interfaces/msg/FaultEvent`
 - `robotest_interfaces/srv/LoadFaultSchedule`
 
-The proxy exposes:
+The Phase 1 proxy currently exposes:
 
 | Service | Type | Contract |
 | --- | --- | --- |
-| `/robotest/faults/load_schedule` | `robotest_interfaces/srv/LoadFaultSchedule` | Atomically validate and preload all specifications before mission motion |
+| `/robotest/faults/load_schedule` | `robotest_interfaces/srv/LoadFaultSchedule` | Atomically validate and replace the current Phase 1 pass-through schedule representation |
 | `/robotest/faults/reset` | `std_srvs/srv/Trigger` | Disable every fault, clear schedule state, reset deterministic generators, and confirm the pass-through state |
 
 Generated service/action QoS remains the Jazzy default reliable profile unless
@@ -84,13 +107,31 @@ service future.
 
 Each `FaultSpec` conveys a stable fault ID, target stream, mode, simulation
 offset from mission start, duration, deterministic seed, and mode-specific
-parameters. The load request includes the canonical schedule hash. A rejected
-schedule activates nothing.
+parameters. The current load request includes the canonical schedule hash. A
+rejected schedule activates nothing.
+
+[ADR 0003](../decisions/0003-two-phase-fault-schedule-arming.md) resolves the
+future ordering requirement with separate PRELOAD and ARM operations. A
+prepared schedule remains inert; after `FollowWaypoints` accepts the goal, ARM
+will bind that exact generation to the server-returned goal UUID and accepted
+stamp. The current `LoadFaultSchedule` interface and proxy do **not** implement
+those operations, states, goal binding, or fault arming. Phase 2 therefore runs
+an empty no-fault baseline and must not report ADR 0003 as implemented or
+verified.
 
 ## Simulation-time semantics
 
-1. The mission runner samples mission start `T0` from `/clock`.
-2. The complete schedule is accepted before the first navigation goal.
+The following semantics apply to the future fault implementation specified by
+ADR 0003, not to the Phase 2 no-fault baseline:
+
+1. The complete schedule is preloaded, validated, and inert before the first
+   navigation goal.
+2. After the action server accepts the goal, the mission runner uses the goal
+   handle's UUID and the immutable, exact UUID-matched
+   `GoalStatusArray.goal_info.stamp` as `T0`, then arms the exact prepared
+   generation before its earliest activation boundary. The installed Jazzy
+   `rclcpp_action` SendGoal response stamp is zero and is retained only as
+   unavailable-response provenance.
 3. For an input message stamped `t`, the proxy applies a specification only
    when `T0 + start_offset <= t < T0 + start_offset + duration`.
 4. Configured activation time and actual first-affected-message time are both
@@ -100,6 +141,10 @@ schedule activates nothing.
    cannot hang a test.
 6. Resetting a run resets all PRNG state. Seeds, schedule hash, input sequence
    counts, and affected message counts are evidence fields.
+
+Every control, action, cancellation, and reset wait has a steady wall-clock
+deadline. A stopped simulation clock must not hang either the Phase 2 mission
+runner or a future schedule-control operation.
 
 LiDAR dropout means omission: raw scans continue, while matching validated
 scans are not published. It must not publish an empty or stale scan. Frozen
@@ -175,3 +220,28 @@ The topic/TF portion of `scripts/verify_phase1.sh` must:
 
 Raw-versus-validated dropout behavior is a Phase 3 proof after that fault mode
 exists.
+
+## Phase 2 proof
+
+The topic/TF portion of `scripts/verify_phase2.sh` must:
+
+1. prove the map is available, required Nav2 lifecycle nodes are active, and
+   both `map -> odom` and the Phase 1 robot-local TF chain are present;
+2. prove the exact ADR 0004 publisher and connected-subscriber sets for
+   `cmd_vel_nav`, `cmd_vel_smoothed`, and `cmd_vel` at one live observation
+   point, plus no subscriber on `cmd_vel_behavior_unused`;
+3. compare command QoS with this contract, reject `KEEP_ALL`, and report
+   unknown live history/depth honestly while retaining the static bounded-queue
+   proof;
+4. retain a bounded trace through all connected command stages, including a
+   final command within the frozen zero tolerance;
+5. fail on any autonomy subscriber to `/robotest/validation/*`, any extra
+   command owner, duplicate required TF owner, or mixed simulation time;
+6. preserve the no-fault three-waypoint action result, waypoint progress,
+   mission JSON/CSV, seed, resource/RTF evidence, source hashes, and process
+   cleanup evidence; and
+7. label full Scenario 1 collision/path/efficiency/repeated-trial metrics as
+   deferred to Phase 3 rather than copying target values into measurements.
+
+The Phase 2 baseline does not call fault preload or arm operations and does not
+claim that ADR 0003's future state machine exists.

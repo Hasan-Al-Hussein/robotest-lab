@@ -32,6 +32,7 @@ cmake-build-*/
 *.active
 /benchmarks/raw/
 /artifacts/evidence/phase1/
+/artifacts/evidence/phase2/
 /artifacts/evidence/**/.tmp/
 /artifacts/evidence/**/*.partial
 

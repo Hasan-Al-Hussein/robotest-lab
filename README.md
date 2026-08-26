@@ -4,11 +4,12 @@ RoboTest Lab is a CPU-only ROS 2 software-in-the-loop platform for testing,
 measuring, fault-injecting, observing, and recovering an autonomous
 differential-drive robot.
 
-> **Current status — Phase 1 verified development:** the Ubuntu 24.04 platform
-> gate and the local minimal robot/world, pass-through fault proxy, bounded
-> headless simulation, and separate RViz inspection have passing evidence.
-> The run used a dirty worktree, so it is not release or benchmark evidence.
-> Nav2, fault campaigns, recovery, packaging, and public CI remain future work.
+> **Current status — Phase 2 verified development:** the Ubuntu 24.04 platform,
+> minimal robot/world, pass-through fault proxy, bounded simulation, Nav2
+> lifecycle stack, and one seeded three-waypoint mission/action integration gate
+> have passing local evidence. The accepted Phase 2 run used a dirty worktree,
+> so it is not release or benchmark evidence. Full Scenario 1 metrics, fault
+> campaigns, recovery, packaging, and public CI remain future work.
 
 ## Why this project exists
 
@@ -32,8 +33,9 @@ traceable to a command, configuration hash, and recorded run.
   least 20 GiB projected free space retained on the Windows host drive.
 
 The [environment audit](docs/environment-audit.md),
-[dependency plan](docs/dependencies.md), and
-[Phase 1 result](docs/results/phase-1/20260825T200725Z-1333.md) distinguish
+[dependency plan](docs/dependencies.md),
+[Phase 1 result](docs/results/phase-1/20260825T200725Z-1333.md), and
+[Phase 2 result](docs/results/phase-2/20260826T010218Z-466.md) distinguish
 measured evidence from planned work.
 
 ## Planned architecture
@@ -55,9 +57,9 @@ flowchart LR
     Supervisor -. monitors .-> Mission
 ```
 
-This diagram describes the approved design. The Gazebo, bridge, robot model,
-pass-through proxy, and Phase 1 evidence path are now implemented; Nav2 and the
-later mission, metrics, and supervisor stages remain planned.
+This diagram describes the approved design. The implementation now reaches the
+bounded Phase 2 Nav2 mission/action gate. Metrics, fault campaigns, and the Go
+supervisor remain planned and are not implied by the Phase 2 result.
 
 ## Phase 0 workflow
 
@@ -126,6 +128,44 @@ reliability and durability but reported endpoint history/depth as
 topic was silent, so collision absence is not established. Live TF endpoint and
 edge sets were recorded, but per-edge publisher-GID attribution was unavailable.
 
+## Phase 2 verification
+
+Run the bounded, headless mission/action gate inside the verified Ubuntu
+distribution:
+
+```bash
+cd /home/hasan/robotest-lab
+ROBOTEST_SIM_SEED=42 ROBOTEST_CPUSET=0-5 scripts/verify_phase2.sh
+```
+
+The development run `20260826T010218Z-466` passed the scoped Phase 2 gate with
+seed `42`, six logical CPUs (`0-5`), an empty fault schedule, and software
+rendering through `llvmpipe`. Nav2 returned `SUCCEEDED` after all three ordered
+waypoints. The authoritative UUID-matched action-status acceptance stamp was
+`68.308 s`; the Jazzy `rclcpp_action` response stamp was retained separately as
+zero/unavailable, and the terminal observation was `156.994 s`.
+
+Headline observations were 213 tests with zero errors and failures, calculated
+RTF median `0.9863`, calculated RTF p5 `0.9302`, and peak owned-process-group
+RSS `1,372,244 KiB`. All 111 checksum-manifest entries validated. Source/install
+binding, source/configuration non-mutation, bounded process cleanup, mission
+JSON/CSV reconciliation, action ownership, command/ground-truth correlation,
+and an independent post-run evidence audit passed.
+
+Evidence:
+
+- [full Phase 2 report](docs/results/phase-2/20260826T010218Z-466.md)
+- [compact canonical JSON](docs/results/phase-2/20260826T010218Z-466.json)
+- [matching one-row CSV](docs/results/phase-2/20260826T010218Z-466.csv)
+
+This is bounded mission/action acceptance, not full Scenario 1 acceptance. The
+dirty worktree makes it development evidence only. Fault injection and recovery
+are not implemented or exercised, while collision count, path length, path
+efficiency, and repeated-run acceptance remain deferred to Phase 3. Fast DDS
+reported live history/depth as `UNKNOWN`/`0`; bounded queues retain static
+source-and-test proof. Required TF edges and endpoint sets were observed, but
+Jazzy callbacks did not provide per-edge publisher-GID attribution.
+
 ## Safety properties of setup
 
 - Mutating setup scripts require an explicit `--apply` argument.
@@ -143,7 +183,7 @@ edge sets were recorded, but per-edge publisher-GID attribution was unavailable.
 | --- | --- | --- |
 | 0 | Verified locally | Environment foundation, exact install manifest, versions, and resource gates |
 | 1 | Verified development | Original robot/world, pass-through proxy, headless gates, and separate RViz evidence |
-| 2 | Planned | Nav2 mission with action result, matching JSON/CSV, and tests |
+| 2 | Verified development | Bounded seeded Nav2 mission/action result, command chain, matching JSON/CSV, and global resource/isolation gates |
 | 3 | Planned | Repeatable LiDAR-dropout and odometry-drift campaigns with metrics |
 | 4 | Planned | Go supervisor, systemd and Debian package with lifecycle proof |
 | 5 | Planned | Public CI and portfolio evidence on a documented clean commit |
