@@ -4,16 +4,22 @@ RoboTest Lab is a CPU-only ROS 2 software-in-the-loop platform for testing,
 measuring, fault-injecting, observing, and recovering an autonomous
 differential-drive robot.
 
-> **Current status — Phase 2 verified development:** the Ubuntu 24.04 platform,
-> minimal robot/world, pass-through fault proxy, bounded simulation, Nav2
-> lifecycle stack, and one seeded three-waypoint mission/action integration gate
-> have passing local evidence. The accepted Phase 2 run used a dirty worktree,
-> so it is not release or benchmark evidence. Full Scenario 1 metrics, fault
-> campaigns, recovery, packaging, and public CI remain future work.
+> **Current status:** the Phase 1 and Phase 2 development runs remain bounded,
+> non-release evidence. The Phase 3–5 implementation and static verification
+> surfaces are complete; their authoritative campaign, privileged acceptance,
+> public-CI, and final release-evidence gates remain separate.
+
+<!-- ROBOTEST_RELEASE_STATUS_START -->
+## Final acceptance status
+
+Implementation and static verification are complete. Authoritative Phase 3
+campaign evidence, Phase 4 privileged acceptance evidence, and Phase 5 public-CI
+and release-evidence validation remain pending.
+<!-- ROBOTEST_RELEASE_STATUS_END -->
 
 ## Why this project exists
 
-The goal is not another “robot moves in Gazebo” example. The planned system
+The goal is not another “robot moves in Gazebo” example. The system
 connects a small original Gazebo Harmonic robot and world to ROS 2 Jazzy,
 Nav2, deterministic sensor-fault proxies, mission validation, measured result
 artifacts, and a bounded Go process supervisor. Every result shown here must be
@@ -38,7 +44,7 @@ The [environment audit](docs/environment-audit.md),
 [Phase 2 result](docs/results/phase-2/20260826T010218Z-466.md) distinguish
 measured evidence from planned work.
 
-## Planned architecture
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -57,9 +63,9 @@ flowchart LR
     Supervisor -. monitors .-> Mission
 ```
 
-This diagram describes the approved design. The implementation now reaches the
-bounded Phase 2 Nav2 mission/action gate. Metrics, fault campaigns, and the Go
-supervisor remain planned and are not implied by the Phase 2 result.
+This diagram describes the implemented design. The Phase 1 and Phase 2 results
+remain limited to their documented development scopes; they do not imply that
+the later campaign, supervisor, packaging, or public-CI acceptance gates ran.
 
 ## Phase 0 workflow
 
@@ -86,7 +92,8 @@ scripts/verify_phase0_preinstall.sh
 # environment, and run the post-install verifier.
 scripts/install_dependencies.sh --apply
 
-# Repeatable post-install verification.
+# Repeatable post-install/static routing. The aggregate exits 3 (INCOMPLETE)
+# until exact caller-selected release evidence is validated separately.
 scripts/verify_phase0.sh
 scripts/verify_all.sh
 ```
@@ -160,8 +167,9 @@ Evidence:
 
 This is bounded mission/action acceptance, not full Scenario 1 acceptance. The
 dirty worktree makes it development evidence only. Fault injection and recovery
-are not implemented or exercised, while collision count, path length, path
-efficiency, and repeated-run acceptance remain deferred to Phase 3. Fast DDS
+were not exercised by that Phase 2 run; their authoritative acceptance, along
+with collision count, path length, path efficiency, and repeated-run evidence,
+remains in the separate Phase 3 gate. Fast DDS
 reported live history/depth as `UNKNOWN`/`0`; bounded queues retain static
 source-and-test proof. Required TF edges and endpoint sets were observed, but
 Jazzy callbacks did not provide per-edge publisher-GID attribution.
@@ -179,14 +187,16 @@ Jazzy callbacks did not provide per-edge publisher-GID attribution.
 
 ## Roadmap and evidence gates
 
+<!-- ROBOTEST_RELEASE_ROADMAP_START -->
 | Phase | Status | Deliverable and gate |
 | --- | --- | --- |
 | 0 | Verified locally | Environment foundation, exact install manifest, versions, and resource gates |
 | 1 | Verified development | Original robot/world, pass-through proxy, headless gates, and separate RViz evidence |
 | 2 | Verified development | Bounded seeded Nav2 mission/action result, command chain, matching JSON/CSV, and global resource/isolation gates |
-| 3 | Planned | Repeatable LiDAR-dropout and odometry-drift campaigns with metrics |
-| 4 | Planned | Go supervisor, systemd and Debian package with lifecycle proof |
-| 5 | Planned | Public CI and portfolio evidence on a documented clean commit |
+| 3 | Implemented; authoritative status is the bounded final-status block | Repeatable LiDAR-dropout and odometry-drift campaigns with metrics |
+| 4 | Implemented; authoritative status is the bounded final-status block | Go supervisor, systemd and Debian package with lifecycle proof |
+| 5 | Static-ready; authoritative status is the bounded final-status block | Public CI and portfolio evidence on a documented clean commit |
+<!-- ROBOTEST_RELEASE_ROADMAP_END -->
 
 ## Repository layout
 

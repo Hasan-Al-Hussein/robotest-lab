@@ -24,6 +24,8 @@ cmake-build-*/
 # Go
 /supervisor/bin/
 /supervisor/coverage.out
+/supervisor/robotest-supervisor
+/artifacts/packages/
 
 # ROS, Gazebo, and benchmark runtime data
 *.bag
@@ -33,6 +35,10 @@ cmake-build-*/
 /benchmarks/raw/
 /artifacts/evidence/phase1/
 /artifacts/evidence/phase2/
+/artifacts/evidence/phase3/
+/artifacts/evidence/phase3-benchmarks/
+/artifacts/evidence/phase4/
+/artifacts/evidence/phase5/
 /artifacts/evidence/**/.tmp/
 /artifacts/evidence/**/*.partial
 

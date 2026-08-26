@@ -1,6 +1,6 @@
 # ADR 0003: Two-Phase Fault-Schedule Arming
 
-- Status: Accepted for Phase 2 design; implementation pending
+- Status: Accepted and implemented; authoritative Phase 3 benchmark evidence pending
 - Date: 2026-08-26
 - Decision owners: RoboTest Lab fault and mission contract gate
 
@@ -206,3 +206,17 @@ text alone is not acceptable evidence.
 This is a contract-resolution decision only. As of this ADR, the two-phase
 interfaces, proxy states, mission-runner sequence, events, and runtime evidence
 described above are not implemented or verified.
+
+### Update — 2026-08-26
+
+The two-phase interfaces, proxy state machine, mission-runner ordering,
+machine-readable events, and their unit/contract tests are now implemented.
+The development Phase 3 verifier at
+`artifacts/evidence/phase3/20260826T052402Z-3022/` passed its static, fresh
+build, package-test, installed-interface, and dependency gates. The package
+lifecycle evidence at
+`artifacts/evidence/phase4/package-lifecycle-20260826T045138Z.json` also passed.
+
+Those records are implementation and package evidence only. The Phase 3
+positive control, runtime smoke, and exact 15-trial cold-stack candidate remain
+pending, so this update does not claim an authoritative benchmark PASS.

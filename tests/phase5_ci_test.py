@@ -1,0 +1,3886 @@
+#!/usr/bin/env python3
+# Copyright 2026 Hasan Ahmed
+# SPDX-License-Identifier: Apache-2.0
+
+"""Pure adversarial tests for the Phase 5 CI and remote-evidence contract."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import hashlib
+import importlib.util
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+import yaml
+
+TESTS = Path(__file__).resolve().parent
+REPOSITORY = TESTS.parent
+sys.path.insert(0, str(TESTS))
+
+import phase5_ci as phase5_module  # noqa: E402
+import phase5_release_docs as release_docs_module  # noqa: E402
+import phase5_release_evidence as release_module  # noqa: E402
+from phase5_ci import (  # noqa: E402
+    ACTION_PINS,
+    SOURCE_SNAPSHOT_INPUTS,
+    EvidenceError,
+    prune_local_runs,
+    select_successful_run,
+    source_snapshot,
+    validate_checksum_manifest,
+    validate_file_checksum_manifest,
+    validate_license_declarations,
+    validate_non_live_test_surface,
+    validate_release_claims,
+    validate_workflow,
+    write_checksum_manifest,
+    write_file_checksum_manifest,
+    write_remote_summary,
+)
+from phase5_release_evidence import validate_release_evidence  # noqa: E402
+
+WORKFLOW = REPOSITORY / '.github/workflows/robotest-ci.yml'
+
+_RELEASE_FIXTURE_TEMPLATE_DIRECTORY: tempfile.TemporaryDirectory | None = None
+_RELEASE_FIXTURE_TEMPLATE: dict[str, Path | str] | None = None
+_RELEASE_FIXTURE_LAST_REPOSITORY: Path | None = None
+
+
+def test_phase5_docs_freeze_clean_candidate_release_order() -> None:
+    document = (REPOSITORY / 'docs/testing/phase5-ci.md').read_text(encoding='utf-8')
+    ordered_steps = (
+        'Create and push the clean candidate commit C.',
+        'run the separately authorized Phase 3 campaign and\n   Phase 4 acceptance workflow',
+        'run bare `scripts/verify_all.sh`',
+        'capture its candidate remote proof',
+        'create the exact evidence-only child commit E',
+        "Capture E's successful workflow",
+        'Run `scripts/verify_all.sh --release-evidence`',
+    )
+    offsets = [document.index(step) for step in ordered_steps]
+    assert offsets == sorted(offsets)
+    assert 'Do not rerun a clean-start live or bare gate after this point.' in document
+
+
+def test_repository_workflow_is_pinned_non_live_and_standard_runner() -> None:
+    report = validate_workflow(WORKFLOW)
+    assert report['runner'] == 'ubuntu-24.04'
+    assert report['maximum_workers'] == 4
+    assert report['permissions'] == {'contents': 'read'}
+    assert report['action_pins'] == {name: ACTION_PINS[name] for name in sorted(ACTION_PINS)}
+    assert len(report['sha256']) == 64
+
+
+def _changed_workflow(tmp_path: Path, old: str, new: str) -> Path:
+    source = WORKFLOW.read_text(encoding='utf-8')
+    assert old in source
+    path = tmp_path / 'workflow.yml'
+    path.write_text(source.replace(old, new, 1), encoding='utf-8')
+    return path
+
+
+def test_workflow_rejects_movable_action_tag(tmp_path: Path) -> None:
+    checkout_pin = ACTION_PINS['actions/checkout']
+    path = _changed_workflow(tmp_path, f'actions/checkout@{checkout_pin}', 'actions/checkout@v6')
+    with pytest.raises(EvidenceError, match='full SHA'):
+        validate_workflow(path)
+
+
+def test_workflow_requires_explicit_rosdep_cache_refresh(tmp_path: Path) -> None:
+    path = _changed_workflow(tmp_path, 'rosdep update --rosdistro jazzy\n', '')
+    with pytest.raises(EvidenceError, match='refresh the Jazzy rosdep cache'):
+        validate_workflow(path)
+
+
+def test_workflow_rejects_job_permission_override(tmp_path: Path) -> None:
+    path = _changed_workflow(
+        tmp_path,
+        '    timeout-minutes: 60\n',
+        '    timeout-minutes: 60\n    permissions:\n      contents: write\n',
+    )
+    with pytest.raises(EvidenceError, match='quality job contract changed'):
+        validate_workflow(path)
+
+
+def test_workflow_rejects_unreviewed_run_command(tmp_path: Path) -> None:
+    path = _changed_workflow(
+        tmp_path,
+        'scripts/verify_phase5.sh --ci',
+        'echo unreviewed-command\n          scripts/verify_phase5.sh --ci',
+    )
+    with pytest.raises(EvidenceError, match='run-command contract changed'):
+        validate_workflow(path)
+
+
+def test_workflow_requires_failure_evidence_upload(tmp_path: Path) -> None:
+    path = _changed_workflow(tmp_path, 'if: always()', 'if: success()')
+    with pytest.raises(EvidenceError, match='evidence upload must run after failures'):
+        validate_workflow(path)
+
+
+@pytest.mark.parametrize(
+    'forbidden_command',
+    [
+        'scripts/run_benchmarks.sh campaign',
+        'scripts/verify_phase4.sh --apply',
+        'scripts/verify_all.sh',
+        'ros2 launch robotest_navigation phase2.launch.py',
+        'systemctl start robotest-supervisor.service',
+        'git push origin HEAD',
+    ],
+)
+def test_workflow_rejects_live_privileged_or_publication_commands(
+    tmp_path: Path, forbidden_command: str
+) -> None:
+    path = _changed_workflow(
+        tmp_path,
+        'scripts/verify_phase5.sh --ci',
+        f'scripts/verify_phase5.sh --ci\n          {forbidden_command}',
+    )
+    with pytest.raises(EvidenceError, match='workflow contains'):
+        validate_workflow(path)
+
+
+def test_workflow_yaml_parses_and_has_only_one_job() -> None:
+    document = yaml.safe_load(WORKFLOW.read_text(encoding='utf-8'))
+    assert set(document['jobs']) == {'quality'}
+
+
+def test_dependency_license_inventory_and_first_party_licenses_are_complete() -> None:
+    report = validate_license_declarations(REPOSITORY)
+    assert report['license'] == 'Apache-2.0'
+    assert report['package_count'] == 8
+    assert report['packages'] == sorted(report['packages'])
+    dependency_inventory = report['dependency_inventory']
+    assert dependency_inventory['apt_package_count'] == 42
+    assert dependency_inventory['github_action_count'] == 3
+    assert dependency_inventory['python_distribution_count'] == 1
+    assert dependency_inventory['ros_dependency_count'] == 57
+    assert dependency_inventory['rosdep_system_dependency_count'] == 6
+    assert 'Direct repository declarations only' in report['verification_scope']
+
+
+def _copy_license_fixture(destination: Path) -> None:
+    for relative in ('LICENSE', 'NOTICE.md', 'pyproject.toml'):
+        shutil.copy2(REPOSITORY / relative, destination / relative)
+    for directory in ('config', 'src', 'supervisor'):
+        shutil.copytree(
+            REPOSITORY / directory,
+            destination / directory,
+            ignore=shutil.ignore_patterns('__pycache__', '.pytest_cache', '.ruff_cache', '*.pyc'),
+        )
+
+
+def test_license_inventory_rejects_an_unrecorded_apt_dependency(tmp_path: Path) -> None:
+    repository = tmp_path / 'repository'
+    repository.mkdir()
+    _copy_license_fixture(repository)
+    path = repository / 'config/dependency-license-inventory.json'
+    inventory = json.loads(path.read_text(encoding='utf-8'))
+    del inventory['apt_packages']['shellcheck']
+    path.write_text(json.dumps(inventory) + '\n', encoding='utf-8')
+    with pytest.raises(EvidenceError, match='apt dependency inventory is incomplete'):
+        validate_license_declarations(repository)
+
+
+def test_license_inventory_requires_every_package_local_license(tmp_path: Path) -> None:
+    repository = tmp_path / 'repository'
+    repository.mkdir()
+    _copy_license_fixture(repository)
+    (repository / 'src/robotest_sim/LICENSE').unlink()
+    with pytest.raises(EvidenceError, match='robotest_sim is missing'):
+        validate_license_declarations(repository)
+
+
+def test_release_claims_resolve_to_checked_in_evidence() -> None:
+    report = validate_release_claims(REPOSITORY)
+    assert report['status'] == 'PASS'
+    assert report['claim_count'] == 12
+    assert report['evidence_file_count'] == 2
+
+
+def test_release_claim_audit_rejects_missing_evidence_text(tmp_path: Path) -> None:
+    repository = tmp_path / 'repository'
+    for relative in (
+        'README.md',
+        'config/release-claims.json',
+        'docs/results/phase-1/20260825T200725Z-1333.md',
+        'docs/results/phase-2/20260826T010218Z-466.md',
+    ):
+        source = REPOSITORY / relative
+        destination = repository / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    phase1 = repository / 'docs/results/phase-1/20260825T200725Z-1333.md'
+    phase1.write_text(
+        phase1.read_text(encoding='utf-8').replace('103 tests, 0 errors, 0 failures', 'removed'),
+        encoding='utf-8',
+    )
+    with pytest.raises(EvidenceError, match='claim evidence text is absent'):
+        validate_release_claims(repository)
+
+
+def _source_snapshot_fixture(root: Path) -> dict[str, Path]:
+    directory_inputs = {
+        '.github',
+        'benchmarks',
+        'config',
+        'docs',
+        'packaging',
+        'scenarios',
+        'scripts',
+        'src',
+        'supervisor',
+        'tests',
+    }
+    representatives: dict[str, Path] = {}
+    for entry in SOURCE_SNAPSHOT_INPUTS:
+        path = root / entry
+        if entry in directory_inputs:
+            path.mkdir(parents=True, exist_ok=True)
+            representative = path / 'representative.txt'
+            representative.write_text(f'{entry}\n', encoding='utf-8')
+            representatives[entry] = representative
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f'{entry}\n', encoding='utf-8')
+            representatives[entry] = path
+    return representatives
+
+
+def test_source_snapshot_binds_every_release_surface_input(tmp_path: Path) -> None:
+    representatives = _source_snapshot_fixture(tmp_path)
+    baseline = source_snapshot(tmp_path)
+    assert baseline['inputs'] == list(SOURCE_SNAPSHOT_INPUTS)
+    for entry, representative in representatives.items():
+        original = representative.read_text(encoding='utf-8')
+        representative.write_text(f'{original}changed\n', encoding='utf-8')
+        changed = source_snapshot(tmp_path)
+        assert changed['aggregate_sha256'] != baseline['aggregate_sha256'], entry
+        representative.write_text(original, encoding='utf-8')
+
+
+def test_source_snapshot_excludes_generated_caches_and_benchmark_raw(tmp_path: Path) -> None:
+    _source_snapshot_fixture(tmp_path)
+    baseline = source_snapshot(tmp_path)
+    generated = (
+        tmp_path / 'tests/__pycache__/generated.pyc',
+        tmp_path / 'tests/.pytest_cache/state',
+        tmp_path / 'src/.ruff_cache/state',
+        tmp_path / 'benchmarks/raw/runtime.json',
+    )
+    for path in generated:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('generated\n', encoding='utf-8')
+    assert source_snapshot(tmp_path) == baseline
+
+
+def test_repository_package_test_surface_is_non_live() -> None:
+    report = validate_non_live_test_surface(REPOSITORY)
+    assert report['live_test_registration_found'] is False
+    assert report['scanned_file_count'] > 0
+
+
+def test_package_test_surface_rejects_launch_registration(tmp_path: Path) -> None:
+    package = tmp_path / 'src/example'
+    package.mkdir(parents=True)
+    (package / 'package.xml').write_text('<package/>\n', encoding='utf-8')
+    (package / 'CMakeLists.txt').write_text(
+        'add_launch_test(test/live.launch.py)\n', encoding='utf-8'
+    )
+    with pytest.raises(EvidenceError, match='launch test registration'):
+        validate_non_live_test_surface(tmp_path)
+
+
+def _run_record(
+    sha: str,
+    *,
+    run_id: int = 10,
+    status: str = 'completed',
+    conclusion: str = 'success',
+    workflow: str = 'RoboTest CI',
+) -> dict[str, object]:
+    return {
+        'conclusion': conclusion,
+        'createdAt': f'2026-08-26T00:00:{run_id:02d}Z',
+        'databaseId': run_id,
+        'headSha': sha,
+        'status': status,
+        'url': f'https://github.com/example/robotest/actions/runs/{run_id}',
+        'workflowName': workflow,
+    }
+
+
+def test_remote_run_selection_is_exact_sha_and_newest_success() -> None:
+    sha = '1' * 40
+    records = [
+        _run_record('2' * 40, run_id=30),
+        _run_record(sha, run_id=10),
+        _run_record(sha, run_id=20, conclusion='failure'),
+        _run_record(sha, run_id=15),
+    ]
+    selected = select_successful_run(records, sha)
+    assert selected['run_id'] == 15
+    assert selected['head_sha'] == sha
+    assert selected['conclusion'] == 'success'
+
+
+@pytest.mark.parametrize(
+    ('records', 'sha', 'message'),
+    [
+        ([], '1' * 40, 'no successful'),
+        ([_run_record('1' * 40, status='in_progress', conclusion='')], '1' * 40, 'no successful'),
+        ([_run_record('1' * 40, workflow='Another Workflow')], '1' * 40, 'no successful'),
+        ([_run_record('1' * 40)], 'ABC', '40 lowercase'),
+    ],
+)
+def test_remote_run_selection_fails_closed(
+    records: list[dict[str, object]], sha: str, message: str
+) -> None:
+    with pytest.raises(EvidenceError, match=message):
+        select_successful_run(records, sha)
+
+
+def test_remote_summary_binds_command_repository_run_and_local_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sha = '1' * 40
+    runs = tmp_path / 'runs.json'
+    runs.write_text(json.dumps([_run_record(sha)]) + '\n', encoding='utf-8')
+    output = tmp_path / 'remote.json'
+    monkeypatch.setattr(
+        phase5_module,
+        '_command_version',
+        lambda command, _cwd: {'argv': command, 'executable': command[0], 'output': 'test'},
+    )
+    arguments = argparse.Namespace(
+        command_argument=['scripts/verify_phase5.sh', '--remote', sha],
+        cwd=tmp_path,
+        local_resolved_sha=sha,
+        output=output,
+        remote_sha=sha,
+        repository='example/robotest',
+        repository_path=tmp_path,
+        repository_url='https://github.com/example/robotest',
+        runs_json=runs,
+        sha=sha,
+        visibility='PUBLIC',
+    )
+    write_remote_summary(arguments)
+    result = json.loads(output.read_text(encoding='utf-8'))
+    assert result['run']['run_url'] == 'https://github.com/example/robotest/actions/runs/10'
+    assert result['provenance']['command']['argv'] == [
+        'scripts/verify_phase5.sh',
+        '--remote',
+        sha,
+    ]
+    assert result['provenance']['local_resolved_sha'] == sha
+
+
+def test_bounded_log_drains_input_and_records_truncation(tmp_path: Path) -> None:
+    output = tmp_path / 'output.log'
+    metadata = tmp_path / 'metadata.json'
+    payload = b'0123456789abcdef'
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TESTS / 'phase5_ci.py'),
+            'bounded-log',
+            '--output',
+            str(output),
+            '--metadata',
+            str(metadata),
+            '--maximum-bytes',
+            '8',
+        ],
+        input=payload,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert output.read_bytes() == payload[:8]
+    assert json.loads(metadata.read_text(encoding='utf-8')) == {
+        'maximum_bytes': 8,
+        'retained_bytes': 8,
+        'schema_version': 1,
+        'total_bytes': 16,
+        'truncated': True,
+    }
+
+
+def test_checksum_manifest_is_exact_and_detects_tampering(tmp_path: Path) -> None:
+    run = tmp_path / 'run'
+    nested = run / 'nested'
+    nested.mkdir(parents=True)
+    (run / 'summary.json').write_text('{"status":"PASS"}\n', encoding='utf-8')
+    (nested / 'test.log').write_text('passed\n', encoding='utf-8')
+    report = write_checksum_manifest(run)
+    assert report['file_count'] == 2
+    assert validate_checksum_manifest(run) == {'file_count': 2, 'status': 'PASS'}
+
+    (nested / 'test.log').write_text('tampered\n', encoding='utf-8')
+    with pytest.raises(EvidenceError, match='checksum mismatch'):
+        validate_checksum_manifest(run)
+
+
+def test_remote_checksum_sidecar_detects_tampering(tmp_path: Path) -> None:
+    evidence = tmp_path / 'remote.json'
+    manifest = tmp_path / 'remote.SHA256SUMS'
+    evidence.write_text('{"status":"PASS"}\n', encoding='utf-8')
+    write_file_checksum_manifest(evidence, manifest)
+    assert validate_file_checksum_manifest(evidence, manifest)['status'] == 'PASS'
+    strict = subprocess.run(
+        ['sha256sum', '-c', '--strict', manifest.name],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert strict.returncode == 0, strict.stdout + strict.stderr
+    evidence.write_text('{"status":"FAIL"}\n', encoding='utf-8')
+    with pytest.raises(EvidenceError, match='checksum mismatch'):
+        validate_file_checksum_manifest(evidence, manifest)
+
+
+def test_retention_keeps_current_and_four_newest_prior_direct_children(tmp_path: Path) -> None:
+    root = tmp_path / 'phase5'
+    root.mkdir()
+    runs = [root / f'20260826T00000{index}Z-{index}' for index in range(1, 8)]
+    for run in runs:
+        run.mkdir()
+        (run / 'sentinel').write_text(run.name, encoding='utf-8')
+    unrelated = root / 'manual-notes'
+    unrelated.mkdir()
+
+    report = prune_local_runs(root, runs[-1], maximum_prior=4)
+    assert report['current_run'] == runs[-1].name
+    assert report['retained_prior_runs'] == [run.name for run in runs[2:6]]
+    assert report['removed_runs'] == [run.name for run in runs[:2]]
+    assert [run.exists() for run in runs] == [False, False, True, True, True, True, True]
+    assert unrelated.is_dir()
+
+
+def test_retention_rejects_matching_symlink_without_deleting_target(tmp_path: Path) -> None:
+    root = tmp_path / 'phase5'
+    root.mkdir()
+    current = root / '20260826T000002Z-2'
+    current.mkdir()
+    external = tmp_path / 'external'
+    external.mkdir()
+    (external / 'sentinel').write_text('keep', encoding='utf-8')
+    (root / '20260826T000001Z-1').symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(EvidenceError, match='symlink'):
+        prune_local_runs(root, current, maximum_prior=4)
+    assert (external / 'sentinel').read_text(encoding='utf-8') == 'keep'
+
+
+def test_local_summary_keeps_live_and_remote_claims_out_of_scope(tmp_path: Path) -> None:
+    checks = tmp_path / 'checks.tsv'
+    checks.write_text('name\tstatus\texit_code\tlog\nunit\tpassed\t0\tunit.log\n', encoding='utf-8')
+    reports = {}
+    for name in ('workflow', 'licenses', 'claims', 'test-surface', 'retention'):
+        path = tmp_path / f'{name}.json'
+        path.write_text(json.dumps({'status': 'checked'}) + '\n', encoding='utf-8')
+        reports[name] = path
+    reports['source'] = tmp_path / 'source.json'
+    reports['source'].write_text(
+        json.dumps({'aggregate_sha256': 'a' * 64, 'file_count': 10}) + '\n',
+        encoding='utf-8',
+    )
+    reports['provenance'] = tmp_path / 'provenance.json'
+    reports['provenance'].write_text(
+        json.dumps(
+            {
+                'command': {'argv': ['scripts/verify_phase5.sh', '--local'], 'cwd': str(tmp_path)},
+                'platform': {'ros_distro': 'jazzy'},
+                'source': {'aggregate_sha256': 'a' * 64, 'file_count': 10},
+                'tool_distributions': {'pytest': 'test'},
+                'tools': {'python': {'output': 'test'}},
+            }
+        )
+        + '\n',
+        encoding='utf-8',
+    )
+    output = tmp_path / 'summary.json'
+    csv_output = tmp_path / 'summary.csv'
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(TESTS / 'phase5_ci.py'),
+            'summary',
+            '--checks',
+            str(checks),
+            '--claims-report',
+            str(reports['claims']),
+            '--csv-output',
+            str(csv_output),
+            '--git-dirty',
+            'true',
+            '--git-sha',
+            '1' * 40,
+            '--license-report',
+            str(reports['licenses']),
+            '--maximum-workers',
+            '3',
+            '--mode',
+            'local',
+            '--output',
+            str(output),
+            '--provenance-report',
+            str(reports['provenance']),
+            '--retention-report',
+            str(reports['retention']),
+            '--status',
+            'PASS',
+            '--source-snapshot',
+            str(reports['source']),
+            '--test-surface-report',
+            str(reports['test-surface']),
+            '--workflow-report',
+            str(reports['workflow']),
+        ],
+        check=False,
+    )
+    assert result.returncode == 0
+    summary = json.loads(output.read_text(encoding='utf-8'))
+    assert summary['status'] == 'PASS'
+    assert summary['verification_level'] == 'L2'
+    assert summary['source']['git_dirty'] is True
+    assert summary['ci_context']['present'] is False
+    assert not any(summary['runtime_scope'].values())
+    assert summary['check_counts'] == {'failed': 0, 'passed': 1, 'total': 1}
+    assert summary['maximum_workers'] == 3
+    with csv_output.open(encoding='utf-8', newline='') as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1
+    assert rows[0]['status'] == summary['status']
+    assert rows[0]['git_sha'] == summary['source']['git_sha']
+    assert rows[0]['source_aggregate_sha256'] == 'a' * 64
+
+
+def test_phase5_script_has_no_implicit_mode() -> None:
+    script = REPOSITORY / 'scripts/verify_phase5.sh'
+    script_text = script.read_text(encoding='utf-8')
+    assert 'run_check pure-python-tests 600s python3 -m pytest' in script_text
+    result = subprocess.run(['bash', str(script)], capture_output=True, text=True, check=False)
+    assert result.returncode == 2
+    assert 'There is deliberately no implicit mode.' in result.stderr
+    help_result = subprocess.run(
+        ['bash', str(script), '--help'], capture_output=True, text=True, check=False
+    )
+    assert help_result.returncode == 0
+    assert 'never start Gazebo' in help_result.stdout
+
+
+def test_phase5_ci_mode_cannot_be_claimed_outside_github_actions() -> None:
+    script = REPOSITORY / 'scripts/verify_phase5.sh'
+    environment = os.environ.copy()
+    environment.pop('GITHUB_ACTIONS', None)
+    environment.pop('GITHUB_RUN_ID', None)
+    environment.pop('GITHUB_SHA', None)
+    result = subprocess.run(
+        ['bash', str(script), '--ci'],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert '--ci is restricted to GitHub Actions' in result.stderr
+
+
+def test_phase5_remote_rejects_noncanonical_sha_before_network_access() -> None:
+    script = REPOSITORY / 'scripts/verify_phase5.sh'
+    result = subprocess.run(
+        ['bash', str(script), '--remote', 'ABC'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert '40 lowercase hexadecimal' in result.stderr
+
+
+def test_local_evidence_is_ignored_but_compact_remote_evidence_is_trackable() -> None:
+    sha = '1' * 40
+    ignored = subprocess.run(
+        ['git', 'check-ignore', '--no-index', 'artifacts/evidence/phase5/local.log'],
+        cwd=REPOSITORY,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ignored.returncode == 0, ignored.stderr
+    for suffix in ('json', 'SHA256SUMS', 'checksum-validation.txt'):
+        candidate = f'docs/results/phase-5/remote-{sha}.{suffix}'
+        trackable = subprocess.run(
+            ['git', 'check-ignore', '--no-index', candidate],
+            cwd=REPOSITORY,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert trackable.returncode == 1, f'{candidate}: {trackable.stdout}{trackable.stderr}'
+    script = (REPOSITORY / 'scripts/verify_phase5.sh').read_text(encoding='utf-8')
+    assert 'readonly REMOTE_EVIDENCE_ROOT="${PROJECT_ROOT}/docs/results/phase-5"' in script
+    assert (
+        'readonly EVIDENCE_COMMIT_REMOTE_ROOT="${EVIDENCE_ROOT}/remote-evidence-commit"' in script
+    )
+    assert 'output="${output_root}/remote-${REMOTE_SHA}.json"' in script
+    raw_second = subprocess.run(
+        [
+            'git',
+            'check-ignore',
+            '--no-index',
+            f'artifacts/evidence/phase5/remote-evidence-commit/remote-{sha}.json',
+        ],
+        cwd=REPOSITORY,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert raw_second.returncode == 0, raw_second.stderr
+
+
+def test_failed_gate_still_finalizes_checksums_csv_and_provenance(tmp_path: Path) -> None:
+    repository = tmp_path / 'repository'
+    for directory in (
+        '.github/workflows',
+        'benchmarks',
+        'config',
+        'docs/testing',
+        'packaging',
+        'scenarios',
+        'scripts',
+        'src',
+        'supervisor',
+        'tests',
+        '.venv/bin',
+    ):
+        (repository / directory).mkdir(parents=True, exist_ok=True)
+    shutil.copy2(REPOSITORY / 'scripts/verify_phase5.sh', repository / 'scripts/verify_phase5.sh')
+    shutil.copy2(TESTS / 'phase5_ci.py', repository / 'tests/phase5_ci.py')
+    shutil.copy2(TESTS / 'phase5_release_docs.py', repository / 'tests/phase5_release_docs.py')
+    shutil.copy2(REPOSITORY / 'docs/testing/phase5-ci.md', repository / 'docs/testing/phase5-ci.md')
+    workflow = WORKFLOW.read_text(encoding='utf-8').replace(
+        'permissions:\n  contents: read',
+        'permissions:\n  contents: write',
+        1,
+    )
+    (repository / '.github/workflows/robotest-ci.yml').write_text(workflow, encoding='utf-8')
+    for relative in (
+        '.editorconfig',
+        '.gitattributes',
+        '.pre-commit-config.yaml',
+        'CONTRIBUTING.md',
+        'LICENSE',
+        'NOTICE.md',
+        'README.md',
+        'SECURITY.md',
+        'config/input.yaml',
+        'pyproject.toml',
+        'src/input.txt',
+        'supervisor/input.txt',
+        'tests/smoke_test.py',
+    ):
+        (repository / relative).write_text('test input\n', encoding='utf-8')
+    (repository / '.gitignore').write_text(
+        '/.venv/\n/artifacts/evidence/phase5/\n', encoding='utf-8'
+    )
+    (repository / '.venv/bin/ruff').symlink_to(REPOSITORY / '.venv/bin/ruff')
+    subprocess.run(['git', 'init', '-q'], cwd=repository, check=True)
+    subprocess.run(['git', 'add', '.'], cwd=repository, check=True)
+    subprocess.run(
+        [
+            'git',
+            '-c',
+            'user.name=Phase5 Test',
+            '-c',
+            'user.email=phase5@example.invalid',
+            'commit',
+            '-q',
+            '--no-gpg-sign',
+            '-m',
+            'fixture',
+        ],
+        cwd=repository,
+        check=True,
+    )
+
+    script = repository / 'scripts/verify_phase5.sh'
+    result = subprocess.run(
+        ['bash', str(script), '--local'],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    runs = list((repository / 'artifacts/evidence/phase5').glob('20*T*-*'))
+    assert len(runs) == 1
+    run = runs[0]
+    summary = json.loads((run / 'verification-summary.json').read_text(encoding='utf-8'))
+    assert summary['status'] == 'FAIL'
+    assert summary['check_counts']['failed'] == 1
+    with (run / 'verification-summary.csv').open(encoding='utf-8', newline='') as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1 and rows[0]['status'] == 'FAIL'
+    provenance = json.loads((run / 'provenance.json').read_text(encoding='utf-8'))
+    assert provenance['command'] == {
+        'argv': [str(script), '--local'],
+        'cwd': str(repository),
+    }
+    checksum = subprocess.run(
+        ['sha256sum', '-c', '--strict', 'SHA256SUMS'],
+        cwd=run,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert checksum.returncode == 0, checksum.stdout + checksum.stderr
+    validation = (run / 'checksum-validation.txt').read_text(encoding='utf-8')
+    assert 'verification-summary.json: OK' in validation
+    assert validate_checksum_manifest(run)['status'] == 'PASS'
+
+
+def test_verify_all_routes_only_phase5_local(tmp_path: Path) -> None:
+    repository = tmp_path / 'repository'
+    scripts = repository / 'scripts'
+    scripts.mkdir(parents=True)
+    shutil.copy2(REPOSITORY / '.gitignore', repository / '.gitignore')
+    orchestrator = scripts / 'verify_all.sh'
+    shutil.copy2(REPOSITORY / 'scripts/verify_all.sh', orchestrator)
+    orchestrator.chmod(0o755)
+    call_log = tmp_path / 'calls.jsonl'
+    fake = """#!/usr/bin/env bash
+python3 - "$0" "$@" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+with pathlib.Path(os.environ['CALL_LOG']).open('a', encoding='utf-8') as output:
+    value = {'script': pathlib.Path(sys.argv[1]).name, 'args': sys.argv[2:]}
+    output.write(json.dumps(value) + '\\n')
+if pathlib.Path(sys.argv[1]).name == 'verify_phase0.sh':
+    evidence = pathlib.Path.cwd() / 'artifacts/evidence/phase0/phase0-versions.json'
+    evidence.write_text(
+        json.dumps(
+            {'checked_at': 'after', 'schema_version': 1},
+            separators=(',', ':'),
+            sort_keys=True,
+        )
+        + '\\n',
+        encoding='utf-8',
+    )
+PY
+"""
+    for phase in range(6):
+        verifier = scripts / f'verify_phase{phase}.sh'
+        verifier.write_text(fake, encoding='utf-8')
+        verifier.chmod(0o755)
+    phase0_version = repository / 'artifacts/evidence/phase0/phase0-versions.json'
+    _canonical_file(phase0_version, {'checked_at': 'before', 'schema_version': 1})
+    subprocess.run(['git', 'init', '-q'], cwd=repository, check=True)
+    _commit_all(repository, 'candidate')
+
+    environment = os.environ | {'CALL_LOG': str(call_log)}
+    result = subprocess.run(
+        ['bash', str(orchestrator)],
+        cwd=repository,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 3, result.stderr
+    calls = [json.loads(line) for line in call_log.read_text(encoding='utf-8').splitlines()]
+    assert calls == [
+        {'script': 'verify_phase0.sh', 'args': []},
+        {'script': 'verify_phase1.sh', 'args': []},
+        {'script': 'verify_phase2.sh', 'args': []},
+        {'script': 'verify_phase3.sh', 'args': []},
+        {'script': 'verify_phase4.sh', 'args': []},
+        {'script': 'verify_phase5.sh', 'args': ['--local']},
+    ]
+    all_arguments = [argument for call in calls for argument in call['args']]
+    assert '--apply' not in all_arguments
+    assert 'I_AUTHORIZE_EXACTLY_15_COLD_STACK_TRIALS_NO_RETRIES' not in all_arguments
+    aggregate = json.loads(
+        (repository / 'artifacts/evidence/phase0/verify-all.json').read_text(encoding='utf-8')
+    )
+    assert aggregate['status'] == 'incomplete'
+    assert aggregate['schema_version'] == 4
+    assert aggregate['source']['git_dirty_start'] is False
+    assert aggregate['source']['git_dirty_end'] is True
+    assert aggregate['source']['source_unchanged'] is True
+    assert aggregate['source']['generated_evidence_delta']['changed_files'][0]['path'] == (
+        'artifacts/evidence/phase0/phase0-versions.json'
+    )
+    checksum = subprocess.run(
+        ['sha256sum', '-c', '--strict', 'verify-all.SHA256SUMS'],
+        cwd=repository / 'artifacts/evidence/phase0',
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert checksum.returncode == 0, checksum.stdout + checksum.stderr
+    assert aggregate['release_eligible'] is False
+    assert len(aggregate['outstanding_gates']) == 3
+    assert 'INCOMPLETE' in result.stderr
+
+
+def test_verify_all_refuses_dirty_worktree_before_routing(tmp_path: Path) -> None:
+    repository = tmp_path / 'repository'
+    scripts = repository / 'scripts'
+    scripts.mkdir(parents=True)
+    shutil.copy2(REPOSITORY / '.gitignore', repository / '.gitignore')
+    orchestrator = scripts / 'verify_all.sh'
+    shutil.copy2(REPOSITORY / 'scripts/verify_all.sh', orchestrator)
+    orchestrator.chmod(0o755)
+    call_log = tmp_path / 'calls.log'
+    fake = """#!/usr/bin/env bash
+printf '%s\n' "$(basename "$0")" >>"${CALL_LOG}"
+"""
+    for phase in range(6):
+        verifier = scripts / f'verify_phase{phase}.sh'
+        verifier.write_text(fake, encoding='utf-8')
+        verifier.chmod(0o755)
+    phase0_version = repository / 'artifacts/evidence/phase0/phase0-versions.json'
+    _canonical_file(phase0_version, {'checked_at': 'before', 'schema_version': 1})
+    subprocess.run(['git', 'init', '-q'], cwd=repository, check=True)
+    _commit_all(repository, 'candidate')
+    _canonical_file(phase0_version, {'checked_at': 'already-dirty', 'schema_version': 1})
+
+    result = subprocess.run(
+        ['bash', str(orchestrator)],
+        cwd=repository,
+        env=os.environ | {'CALL_LOG': str(call_log)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert 'dirty worktree' in result.stderr
+    assert not call_log.exists()
+    assert not (repository / 'artifacts/evidence/phase0/verify-all.json').exists()
+
+
+def test_verify_all_rejects_source_delta_outside_phase0_allowlist(tmp_path: Path) -> None:
+    repository = tmp_path / 'repository'
+    scripts = repository / 'scripts'
+    scripts.mkdir(parents=True)
+    shutil.copy2(REPOSITORY / '.gitignore', repository / '.gitignore')
+    shutil.copy2(REPOSITORY / 'scripts/verify_all.sh', scripts / 'verify_all.sh')
+    fake = """#!/usr/bin/env bash
+set -Eeuo pipefail
+case "$(basename "$0")" in
+  verify_phase0.sh)
+    printf '{"checked_at":"after","schema_version":1}\n' \
+      > artifacts/evidence/phase0/phase0-versions.json
+    ;;
+  verify_phase1.sh)
+    printf 'changed\n' > config/source.txt
+    ;;
+esac
+"""
+    for phase in range(6):
+        verifier = scripts / f'verify_phase{phase}.sh'
+        verifier.write_text(fake, encoding='utf-8')
+        verifier.chmod(0o755)
+    _canonical_file(
+        repository / 'artifacts/evidence/phase0/phase0-versions.json',
+        {'checked_at': 'before', 'schema_version': 1},
+    )
+    source = repository / 'config/source.txt'
+    source.parent.mkdir()
+    source.write_text('before\n', encoding='utf-8')
+    subprocess.run(['git', 'init', '-q'], cwd=repository, check=True)
+    _commit_all(repository, 'candidate')
+    result = subprocess.run(
+        ['bash', str(scripts / 'verify_all.sh')],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    aggregate = json.loads(
+        (repository / 'artifacts/evidence/phase0/verify-all.json').read_text(encoding='utf-8')
+    )
+    assert aggregate['status'] == 'failed'
+    assert aggregate['source']['source_unchanged'] is False
+    assert 'config/source.txt' in aggregate['source']['git_status_porcelain_end']
+
+
+def _canonical_file(path: Path, value: object, *, sidecar: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(phase5_module.canonical_json_bytes(value))
+    if sidecar:
+        Path(f'{path}.sha256').write_text(
+            f'{phase5_module.file_sha256(path)}  {path.name}\n',
+            encoding='ascii',
+        )
+
+
+def _phase3_fault_event(
+    metrics_fixture: object,
+    *,
+    sequence: int,
+    event_type: int,
+    stamp_ns: int,
+    goal_uuid: str,
+    accepted_goal_stamp_ns: int,
+    schedule_sha256: str,
+    fault: dict | None,
+    affected_message_count: int = 0,
+) -> dict:
+    event = metrics_fixture._fault_event(sequence, event_type, stamp_ns, goal_uuid=goal_uuid)
+    event['bound_t0_ns'] = accepted_goal_stamp_ns if event_type == 7 else 0
+    event['requested_t0_ns'] = accepted_goal_stamp_ns if event_type == 7 else 0
+    if fault is None:
+        return event
+    activation = accepted_goal_stamp_ns + int(fault['start_offset_ns'])
+    deactivation = activation + int(fault['duration_ns'])
+    if event_type in {1, 4, 5, 7, 8, 9}:
+        event.update(
+            {
+                'committed_fault_count': 1,
+                'committed_generation': 1,
+                'committed_schedule_hash': schedule_sha256,
+                'configured_activation_stamp_ns': activation,
+                'configured_deactivation_stamp_ns': deactivation,
+                'fault_id': fault['fault_id'],
+                'mode': fault['mode'],
+                'seed': fault['seed'],
+                'target': fault['target'],
+            }
+        )
+    if event_type in {1, 7}:
+        event.update(
+            {
+                'requested_fault_count': 1,
+                'requested_generation': 1,
+                'requested_schedule_hash': schedule_sha256,
+            }
+        )
+    if event_type == 7:
+        event['arm_margin_ns'] = 500_000_000
+    if event_type in {5, 9}:
+        event['actual_stamp_ns'] = stamp_ns
+        event['affected_message_count'] = affected_message_count
+    return event
+
+
+def _phase3_capture_fixture(
+    metrics_fixture: object,
+    *,
+    scenario_id: int,
+    goal_uuid: str,
+    accepted_goal_stamp_ns: int,
+    terminal_action_stamp_ns: int,
+    fault_events: list[dict],
+    fault: dict | None,
+) -> dict:
+    core = metrics_fixture.CollectorCore()
+    activation = (
+        accepted_goal_stamp_ns + int(fault['start_offset_ns']) if fault is not None else None
+    )
+    deactivation = activation + int(fault['duration_ns']) if activation is not None else None
+    x_rate = 0.0 if scenario_id != 5 else int(fault['parameters']['x_rate_nm_per_s']) * 1e-9
+    yaw_rate = 0.0 if scenario_id != 5 else int(fault['parameters']['yaw_rate_nrad_per_s']) * 1e-9
+    odometry_integrity = {
+        'pose_covariance_sha256': 'a' * 64,
+        'twist': {'angular': [0.0, 0.0, 0.1], 'linear': [0.2, 0.0, 0.0]},
+        'twist_covariance_sha256': 'b' * 64,
+        'z_m': 0.2,
+    }
+    for stamp_ns in range(0, terminal_action_stamp_ns + 1, 200_000_000):
+        raw_x = stamp_ns / 10_000_000_000
+        raw_y = 0.0
+        raw_yaw = 0.0
+        active_drift = (
+            scenario_id == 5
+            and activation is not None
+            and deactivation is not None
+            and activation <= stamp_ns < deactivation
+        )
+        elapsed_s = 0.0 if not active_drift else (stamp_ns - activation) / 1_000_000_000
+        dx = x_rate * elapsed_s
+        dyaw = yaw_rate * elapsed_s
+        validated_x = math.cos(dyaw) * raw_x - math.sin(dyaw) * raw_y + dx
+        validated_y = math.sin(dyaw) * raw_x + math.cos(dyaw) * raw_y
+        validated_yaw = raw_yaw + dyaw
+        core.record(
+            'ground_truth',
+            {
+                'frame_id': 'world',
+                'stamp_ns': stamp_ns,
+                'x_m': raw_x,
+                'y_m': raw_y,
+                'yaw_rad': raw_yaw,
+            },
+        )
+        core.record(
+            'tf_map_odom',
+            {
+                'frame_id': 'map',
+                'stamp_ns': stamp_ns,
+                'x_m': 0.0,
+                'y_m': 0.0,
+                'yaw_rad': 0.0,
+            },
+        )
+        core.record(
+            'tf_odom_base_footprint',
+            {
+                'child_frame_id': 'base_footprint',
+                'frame_id': 'odom',
+                'orientation_xyzw': [
+                    0.0,
+                    0.0,
+                    math.sin(validated_yaw / 2.0),
+                    math.cos(validated_yaw / 2.0),
+                ],
+                'stamp_ns': stamp_ns,
+                'x_m': validated_x,
+                'y_m': validated_y,
+                'yaw_rad': validated_yaw,
+            },
+        )
+        if (
+            scenario_id == 5
+            and activation is not None
+            and deactivation is not None
+            and (activation <= stamp_ns <= deactivation)
+        ):
+            raw_odometry = {
+                'child_frame_id': 'base_footprint',
+                'frame_id': 'odom',
+                'nonplanar_integrity': copy.deepcopy(odometry_integrity),
+                'orientation_xyzw': [0.0, 0.0, 0.0, 1.0],
+                'stamp_ns': stamp_ns,
+                'x_m': raw_x,
+                'y_m': raw_y,
+                'yaw_rad': raw_yaw,
+            }
+            validated_odometry = copy.deepcopy(raw_odometry)
+            validated_odometry.update(
+                {
+                    'orientation_xyzw': [
+                        0.0,
+                        0.0,
+                        math.sin(validated_yaw / 2.0),
+                        math.cos(validated_yaw / 2.0),
+                    ],
+                    'x_m': validated_x,
+                    'y_m': validated_y,
+                    'yaw_rad': validated_yaw,
+                }
+            )
+            core.record('raw_odom', raw_odometry)
+            core.record('odom', validated_odometry)
+
+    core.record_state_transition(
+        kind='waypoint_feedback',
+        subject=goal_uuid,
+        value=0,
+        stamp_ns=accepted_goal_stamp_ns,
+    )
+    core.record_state_transition(
+        kind='waypoint_feedback',
+        subject=goal_uuid,
+        value=1,
+        stamp_ns=1_500_000_000,
+    )
+    core.record_state_transition(
+        kind='waypoint_feedback',
+        subject=goal_uuid,
+        value=2,
+        stamp_ns=2_000_000_000,
+    )
+    core.record_plan(
+        {
+            'frame_id': 'map',
+            'poses': [{'x_m': 0.1, 'y_m': 0.0}, {'x_m': 1.0, 'y_m': 0.0}],
+            'stamp_ns': 1_200_000_000,
+        }
+    )
+    core.record_plan(
+        {
+            'frame_id': 'map',
+            'poses': [{'x_m': 1.0, 'y_m': 0.0}, {'x_m': 2.0, 'y_m': 0.0}],
+            'stamp_ns': 1_700_000_000,
+        }
+    )
+    core.record_plan(
+        {
+            'frame_id': 'map',
+            'poses': [{'x_m': 2.0, 'y_m': 0.0}, {'x_m': 3.0, 'y_m': 0.0}],
+            'stamp_ns': 10_000_000_000,
+        }
+    )
+    core.record_plan(
+        {
+            'frame_id': 'map',
+            'poses': [
+                {'x_m': 2.0, 'y_m': 0.0},
+                {'x_m': 2.5, 'y_m': 0.1},
+                {'x_m': 3.0, 'y_m': 0.0},
+            ],
+            'stamp_ns': 11_000_000_000,
+        }
+    )
+    core.record('contacts', {'contacts': [], 'stamp_ns': accepted_goal_stamp_ns + 100_000_000})
+    core.record('contacts', {'contacts': [], 'stamp_ns': terminal_action_stamp_ns - 100_000_000})
+    for index, stamp_ns in enumerate(
+        (accepted_goal_stamp_ns, 18_000_000_000, terminal_action_stamp_ns)
+    ):
+        core.record(
+            'world_stats',
+            {
+                'paused': False,
+                'reported_real_time_factor': 1.0,
+                'sim_stamp_ns': stamp_ns,
+                'stamp_ns': stamp_ns,
+                'steady_wall_ns': index * 17_000_000_000,
+            },
+        )
+    if scenario_id == 3:
+        core.record_state_transition(
+            kind='collision_monitor', subject='safety', value=1, stamp_ns=3_900_000_000
+        )
+        core.record_state_transition(
+            kind='collision_monitor', subject='safety', value=0, stamp_ns=12_200_000_000
+        )
+        for stamp_ns, linear_x in (
+            (3_800_000_000, 0.2),
+            (3_900_000_000, 0.0),
+            (8_000_000_000, 0.0),
+            (12_100_000_000, 0.0),
+            (12_200_000_000, 0.2),
+        ):
+            core.record(
+                'cmd_vel',
+                {
+                    'angular_z_rad_s': 0.0,
+                    'linear_x_m_s': linear_x,
+                    'linear_y_m_s': 0.0,
+                    'stamp_ns': stamp_ns,
+                },
+            )
+    if scenario_id == 4 and activation is not None and deactivation is not None:
+        for stamp_ns in range(activation - 400_000_000, deactivation + 1_200_000_001, 200_000_000):
+            scan = {'payload_sha256': 'c' * 64, 'stamp_ns': stamp_ns}
+            core.record('raw_scan', scan)
+            if stamp_ns < activation or stamp_ns >= deactivation:
+                core.record('scan', scan)
+        for stamp_ns, linear_x in (
+            (activation - 200_000_000, 0.2),
+            (activation + 400_000_000, 0.0),
+            (deactivation - 200_000_000, 0.0),
+            (deactivation + 200_000_000, 0.2),
+        ):
+            core.record(
+                'cmd_vel',
+                {
+                    'angular_z_rad_s': 0.0,
+                    'linear_x_m_s': linear_x,
+                    'linear_y_m_s': 0.0,
+                    'stamp_ns': stamp_ns,
+                },
+            )
+    for event in fault_events:
+        core.record('fault_events', {**event, 'stamp_ns': event['header_stamp_ns']})
+    for stamp_ns in (0, 18_000_000_000, terminal_action_stamp_ns):
+        core.observe_clock(stamp_ns)
+    capture = core.snapshot()
+    capture.update(
+        {
+            'capture_schema_version': 1,
+            'finished_steady_wall_ns': terminal_action_stamp_ns,
+            'started_steady_wall_ns': 0,
+            'stop_reason': 'stop_file',
+        }
+    )
+    return capture
+
+
+def _phase3_bundle(
+    repository: Path,
+    directory: Path,
+    *,
+    orchestration: object,
+    plan: dict,
+    git_sha: str,
+    build_binding: dict,
+    positive_binding_path: Path,
+) -> str:
+    directory.mkdir(parents=True)
+    metrics_fixture = release_module._load_repository_module(
+        repository,
+        'src/robotest_metrics/test/conftest.py',
+        'Phase 3 metrics producer fixture',
+    )
+    request_fixture = metrics_fixture.complete_request()
+    scenario_id = int(plan['scenario_id'])
+    scenario_document = yaml.safe_load(
+        (repository / plan['scenario_path']).read_text(encoding='utf-8')
+    )
+    fault = copy.deepcopy(scenario_document.get('fault'))
+    faults = [] if fault is None else [fault]
+    schedule_document = {'schema_version': 1, 'faults': faults}
+    schedule_canonical = json.dumps(schedule_document, separators=(',', ':'))
+    schedule_sha256 = hashlib.sha256(schedule_canonical.encode()).hexdigest()
+    assert schedule_sha256 == scenario_document['fault_schedule_sha256']
+    accepted_goal_stamp_ns = 1_000_000_000
+    terminal_action_stamp_ns = 35_000_000_000
+    goal_uuid = f'goal-{plan["run_id"]}'
+    event_types = [3, 1, 7]
+    event_stamps = [500_000_000, 700_000_000, accepted_goal_stamp_ns]
+    affected_count = 0
+    if fault is not None:
+        activation = accepted_goal_stamp_ns + int(fault['start_offset_ns'])
+        deactivation = activation + int(fault['duration_ns'])
+        event_types.extend([5, 9])
+        event_stamps.extend([activation, deactivation])
+        if scenario_id == 4:
+            affected_count = int(fault['duration_ns']) // 200_000_000
+    event_types.append(3)
+    event_stamps.append(terminal_action_stamp_ns + 100_000_000)
+    fault_events = [
+        _phase3_fault_event(
+            metrics_fixture,
+            sequence=index,
+            event_type=event_type,
+            stamp_ns=stamp_ns,
+            goal_uuid=goal_uuid,
+            accepted_goal_stamp_ns=accepted_goal_stamp_ns,
+            schedule_sha256=schedule_sha256,
+            fault=fault,
+            affected_message_count=(1 if event_type == 5 else affected_count),
+        )
+        for index, (event_type, stamp_ns) in enumerate(
+            zip(event_types, event_stamps, strict=True), start=1
+        )
+    ]
+    identity = {
+        'candidate_id': plan['candidate_id'],
+        'cold_stack': True,
+        'git_dirty': False,
+        'git_sha': git_sha,
+        'gz_partition': plan['gz_partition'],
+        'repetition_index': plan['repetition_index'],
+        'ros_domain_id': plan['ros_domain_id'],
+        'run_id': plan['run_id'],
+        'scenario_id': scenario_id,
+        'scenario_index': scenario_id,
+        'scenario_name': plan['scenario_name'],
+        'scenario_sha256': plan['scenario_sha256'],
+        'suite_index': plan['suite_index'],
+    }
+    mission_measurements = {
+        'accepted_goal_stamp_ns': accepted_goal_stamp_ns,
+        'accepted_goal_uuid': goal_uuid,
+        'completed_waypoint_count': 3,
+        'goal_status': 'SUCCEEDED',
+        'goal_status_code': 4,
+        'missed_waypoint_count': 0,
+        'terminal_action_stamp_ns': terminal_action_stamp_ns,
+    }
+    mission = copy.deepcopy(request_fixture['mission']['result'])
+    mission['targets'] = {
+        'waypoint_count': 3,
+        'waypoints': [
+            {'x_m': 1.0, 'y_m': 0.0},
+            {'x_m': 2.0, 'y_m': 0.0},
+            {'x_m': 3.0, 'y_m': 0.0},
+        ],
+    }
+    mission['identity'].update(
+        {
+            'candidate_id': plan['candidate_id'],
+            'fault_schedule_hash': schedule_sha256,
+            'mission_sha256': plan['scenario_sha256'],
+            'repetition_index': plan['repetition_index'],
+            'run_id': plan['run_id'],
+            'scenario_id': scenario_id,
+            'suite_index': plan['suite_index'],
+        }
+    )
+    mission['measurements'] = mission_measurements
+    mission['fault'] = {
+        'control': {
+            'arm_commit_stamp_ns': accepted_goal_stamp_ns,
+            'arm_margin_ns': 0 if fault is None else 500_000_000,
+            'arm_replayed': False,
+            'event_count': len(fault_events),
+            'event_trace_capacity': 512,
+            'event_trace_overflow': False,
+            'event_trace_overflow_count': 0,
+            'generation': 1,
+            'preload_replayed': False,
+            'protocol_status': 'RESET_CONFIRMED_AFTER_GOAL',
+            'reset_after_goal': True,
+            'reset_before_goal': True,
+        },
+        'events': fault_events,
+        'schedule': {
+            'canonical_json': schedule_canonical,
+            'fault_count': len(faults),
+            'faults': faults,
+            'schema_version': 1,
+            'sha256': schedule_sha256,
+        },
+    }
+    capture = _phase3_capture_fixture(
+        metrics_fixture,
+        scenario_id=scenario_id,
+        goal_uuid=goal_uuid,
+        accepted_goal_stamp_ns=accepted_goal_stamp_ns,
+        terminal_action_stamp_ns=terminal_action_stamp_ns,
+        fault_events=fault_events,
+        fault=fault,
+    )
+    if scenario_id in {2, 3}:
+        scenario_fixture = release_module._load_repository_module(
+            repository,
+            'src/robotest_metrics/test/test_candidate_validation.py',
+            f'Phase 3 Scenario {scenario_id} producer fixture',
+        )
+        _, scenario_wrapper, _ = getattr(scenario_fixture, f'_scenario{scenario_id}')()
+        scenario = copy.deepcopy(scenario_wrapper['result'])
+        scenario['identity'] = {
+            key: identity[key]
+            for key in (
+                'candidate_id',
+                'repetition_index',
+                'run_id',
+                'scenario_id',
+                'scenario_name',
+                'scenario_sha256',
+                'suite_index',
+            )
+        }
+        scenario['binding'].update(
+            {
+                'accepted_goal_stamp_ns': accepted_goal_stamp_ns,
+                'goal_uuid': goal_uuid,
+                'terminal_status': 4,
+            }
+        )
+        if scenario_id == 3:
+            scenario['binding'].update(
+                {
+                    'terminal_observed_sequence': 500,
+                    'terminal_observed_stamp_ns': 34_000_000_000,
+                }
+            )
+    else:
+        scenario = metrics_fixture._scenario_result(identity, mission_measurements)
+    orchestrator = copy.deepcopy(request_fixture['orchestrator'])
+    orchestrator['identity'].update(
+        {
+            'candidate_id': plan['candidate_id'],
+            'gz_partition': plan['gz_partition'],
+            'repetition_index': plan['repetition_index'],
+            'ros_domain_id': plan['ros_domain_id'],
+            'run_id': plan['run_id'],
+            'scenario_id': scenario_id,
+            'scenario_sha256': plan['scenario_sha256'],
+            'suite_index': plan['suite_index'],
+        }
+    )
+    orchestrator['git'] = {
+        'dirty': False,
+        'end_head': git_sha,
+        'start_head': git_sha,
+        'status_porcelain': '',
+    }
+    orchestrator['source_binding'].update(
+        {
+            'collector_configuration_sha256': build_binding['collector_configuration_sha256'],
+            'install_end_sha256': build_binding['install']['aggregate_sha256'],
+            'install_start_sha256': build_binding['install']['aggregate_sha256'],
+            'metrics_contract_sha256': build_binding['metrics_contract_sha256'],
+            'source_configuration_sha256': build_binding['source_configuration_sha256'],
+            'source_end_sha256': build_binding['source']['aggregate_sha256'],
+            'source_start_sha256': build_binding['source']['aggregate_sha256'],
+            'target_set_sha256': build_binding['target_set_sha256'],
+        }
+    )
+    run_root = directory.parent
+    mission_path = run_root / 'mission-result.json'
+    scenario_path = run_root / 'scenario-result.json'
+    capture_path = run_root / 'capture.json'
+    orchestrator_path = run_root / 'orchestrator.json'
+    for path, document in (
+        (mission_path, mission),
+        (scenario_path, scenario),
+        (capture_path, capture),
+        (orchestrator_path, orchestrator),
+    ):
+        _canonical_file(path, document, sidecar=True)
+    lifecycle_path = None
+    if scenario_id == 4:
+        lifecycle_stamps = [13_000_000_000, 14_000_000_000]
+        schedule = {
+            'lifecycle_schedule_schema_version': 1,
+            'requested_stamps_ns': lifecycle_stamps,
+            'run_id': plan['run_id'],
+        }
+        records = []
+        for round_index, stamp_ns in enumerate(lifecycle_stamps):
+            for node in orchestration.REQUIRED_LIFECYCLE_NODES:
+                records.append(
+                    {
+                        'collector_sequence': len(records) + 1,
+                        'error': None,
+                        'missed': False,
+                        'node': node,
+                        'request_stamp_ns': stamp_ns,
+                        'requested_stamp_ns': stamp_ns,
+                        'response_stamp_ns': stamp_ns,
+                        'round_index': round_index,
+                        'state_id': 3,
+                        'state_label': 'active',
+                        'success': True,
+                    }
+                )
+        samples = [
+            {
+                'collector_sequence': record['collector_sequence'],
+                'node': record['node'],
+                'stamp_ns': record['response_stamp_ns'],
+                'state': record['state_label'],
+            }
+            for record in records
+        ]
+        lifecycle = {
+            'capacity': {
+                'round_capacity': 96,
+                'sample_capacity': 864,
+                'scheduled_round_count': len(lifecycle_stamps),
+                'scheduled_sample_count': len(records),
+            },
+            'clock': {
+                'count': len(lifecycle_stamps),
+                'latest_stamp_ns': lifecycle_stamps[-1],
+                'regression_count': 0,
+            },
+            'errors': [],
+            'identity': {
+                'run_id': plan['run_id'],
+                'sampler_node': 'lifecycle_sampler',
+                'schedule_sha256': release_module._canonical_sha256(schedule),
+            },
+            'lifecycle_snapshot_schema_version': 1,
+            'quality': {
+                'collector_overflow': False,
+                'complete': True,
+                'error_count': 0,
+                'error_counts': {},
+                'finished_steady_wall_ns': 2_000,
+                'first_overflow_sequence': None,
+                'first_overflow_stamp_ns': None,
+                'late_response_count': 0,
+                'missed_count': 0,
+                'overflow_count': 0,
+                'pending_count': 0,
+                'request_count': len(records),
+                'response_count': len(records),
+                'retained_count': len(records),
+                'runtime_error': None,
+                'started_steady_wall_ns': 1,
+                'stop_reason': 'stop_file',
+                'success_count': len(records),
+            },
+            'records': records,
+            'samples': samples,
+            'schedule': {
+                'nodes': list(orchestration.REQUIRED_LIFECYCLE_NODES),
+                'requested_stamps_ns': lifecycle_stamps,
+                'service_names': [
+                    f'{node}/get_state' for node in orchestration.REQUIRED_LIFECYCLE_NODES
+                ],
+            },
+        }
+        lifecycle_path = run_root / 'lifecycle-snapshot.json'
+        _canonical_file(lifecycle_path, lifecycle, sidecar=True)
+    trial_context = orchestration.make_trial_context(
+        plan,
+        workspace=repository,
+        git_sha=git_sha,
+        build=build_binding,
+        positive=json.loads(positive_binding_path.read_text(encoding='utf-8')),
+    )
+    analysis_request = orchestration.compose_analysis_request(
+        workspace=repository,
+        plan=plan,
+        mission_path=mission_path,
+        scenario_path=scenario_path,
+        capture_path=capture_path,
+        positive_binding_path=positive_binding_path,
+        orchestrator_path=orchestrator_path,
+        drain_completed_stamp_ns=terminal_action_stamp_ns + 250_000_000,
+        lifecycle_snapshot_path=lifecycle_path,
+    )
+    _canonical_file(run_root / 'trial-context.json', trial_context, sidecar=True)
+    _canonical_file(run_root / 'analysis-request.json', analysis_request, sidecar=True)
+    from robotest_metrics.analysis import analyze_run
+
+    result = analyze_run(analysis_request)
+    if result['verdict']['automated_status'] != 'PASS':
+        print(json.dumps({'quality': result['quality'], 'verdict': result['verdict']}, indent=2))
+    assert result['verdict']['automated_status'] == 'PASS', {
+        'quality': result['quality'],
+        'verdict': result['verdict'],
+    }
+    result_path = directory / 'run-result.json'
+    _canonical_file(result_path, result)
+    (directory / 'run-result.csv').write_bytes(release_module._one_row_csv_bytes(result))
+    (directory / 'report.md').write_text('PASS\n', encoding='utf-8')
+    (directory / 'report.html').write_text('<p>PASS</p>\n', encoding='utf-8')
+    records = [
+        {
+            'bytes': path.stat().st_size,
+            'path': path.name,
+            'sha256': phase5_module.file_sha256(path),
+        }
+        for path in sorted(directory.iterdir())
+    ]
+    result_sha = phase5_module.file_sha256(result_path)
+    manifest = {
+        'artifacts': records,
+        'identity': {'run_id': plan['run_id'], 'run_result_sha256': result_sha},
+        'producer': 'robotest_metrics/metrics_analyze',
+        'quality': {
+            'artifact_bytes_excluding_manifest': sum(record['bytes'] for record in records),
+            'artifact_count': len(records),
+            'caps_within_limits': True,
+            'hashes_verified': True,
+            'path_set_complete': True,
+        },
+        'schema_version': 1,
+    }
+    _canonical_file(directory / 'run-artifacts.manifest.json', manifest, sidecar=True)
+    return result_sha
+
+
+def _refresh_phase3_bundle(directory: Path) -> str:
+    result_path = directory / 'run-result.json'
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    _canonical_file(result_path, result)
+    (directory / 'run-result.csv').write_bytes(release_module._one_row_csv_bytes(result))
+    artifacts = [
+        path
+        for path in sorted(directory.iterdir())
+        if path.name not in {'run-artifacts.manifest.json', 'run-artifacts.manifest.json.sha256'}
+    ]
+    records = [
+        {
+            'bytes': path.stat().st_size,
+            'path': path.name,
+            'sha256': phase5_module.file_sha256(path),
+        }
+        for path in artifacts
+    ]
+    result_sha = phase5_module.file_sha256(result_path)
+    manifest_path = directory / 'run-artifacts.manifest.json'
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    manifest['artifacts'] = records
+    manifest['identity']['run_result_sha256'] = result_sha
+    manifest['quality']['artifact_bytes_excluding_manifest'] = sum(
+        record['bytes'] for record in records
+    )
+    manifest['quality']['artifact_count'] = len(records)
+    _canonical_file(manifest_path, manifest, sidecar=True)
+    return result_sha
+
+
+def _refresh_phase4_manifest(run_directory: Path) -> None:
+    manifest_path = run_directory / 'SHA256SUMS'
+    records = [
+        f'{phase5_module.file_sha256(path)}  {path.relative_to(run_directory).as_posix()}'
+        for path in sorted(run_directory.rglob('*'))
+        if path.is_file() and path != manifest_path
+    ]
+    manifest_path.write_text('\n'.join(records) + '\n', encoding='ascii')
+
+
+def _refresh_phase4_result(run_directory: Path) -> None:
+    result_path = run_directory / 'scenario6-result.json'
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    result['quality']['raw_evidence_sha256'] = {
+        path.relative_to(run_directory).as_posix(): phase5_module.file_sha256(path)
+        for path in sorted(run_directory.rglob('*'))
+        if path.is_file()
+        and path.relative_to(run_directory).as_posix()
+        not in {'SHA256SUMS', 'scenario6-result.csv', 'scenario6-result.json'}
+    }
+    _canonical_file(result_path, result)
+    (run_directory / 'scenario6-result.csv').write_bytes(release_module._phase4_csv_bytes(result))
+    _refresh_phase4_manifest(run_directory)
+
+
+def _refresh_remote_proof(path: Path, document: object) -> None:
+    _canonical_file(path, document)
+    path.with_suffix('.SHA256SUMS').write_text(
+        f'{phase5_module.file_sha256(path)}  {path.name}\n', encoding='ascii'
+    )
+    path.with_suffix('.checksum-validation.txt').write_text(f'{path.name}: OK\n', encoding='utf-8')
+
+
+def _refresh_phase3_positive_binding(
+    candidate_root: Path,
+    binding: dict,
+    *,
+    rebind_coverage: bool = False,
+) -> None:
+    coverage = binding['coverage_manifest']
+    positive_control = binding['positive_control']
+    benchmark_binding = binding['benchmark_binding']
+    if rebind_coverage:
+        semantic = dict(coverage)
+        semantic.pop('manifest_sha256', None)
+        coverage_sha = release_module._canonical_sha256(semantic)
+        coverage['manifest_sha256'] = coverage_sha
+        positive_control['configuration']['coverage_manifest_sha256'] = coverage_sha
+        for name in ('benchmark_provenance', 'positive_control_provenance'):
+            benchmark_binding[name]['coverage_manifest_sha256'] = coverage_sha
+    positive_sha = release_module._canonical_sha256(positive_control)
+    binding['positive_control_json_sha256'] = positive_sha
+    benchmark_binding['positive_control_json_sha256'] = positive_sha
+    path = candidate_root / 'positive-control/positive-binding.json'
+    _canonical_file(path, binding, sidecar=True)
+    marker_path = candidate_root / 'positive-control/PASS.json'
+    marker = json.loads(marker_path.read_text(encoding='utf-8'))
+    marker['positive_binding_sha256'] = phase5_module.file_sha256(path)
+    _canonical_file(marker_path, marker, sidecar=True)
+
+
+def _rebind_phase3_positive_raw(candidate_root: Path, repository: Path) -> None:
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 production orchestration test helper',
+    )
+    positive_directory = candidate_root / 'positive-control'
+    excluded_outputs = {
+        'PASS.json',
+        'PASS.json.sha256',
+        'component-manifest.json',
+        'component-manifest.json.sha256',
+        'positive-binding.json',
+        'positive-binding.json.sha256',
+    }
+    component_paths = sorted(
+        path
+        for path in positive_directory.rglob('*')
+        if path.is_file()
+        and path.relative_to(positive_directory).as_posix() not in excluded_outputs
+    )
+    component_manifest_path = positive_directory / 'component-manifest.json'
+    _canonical_file(
+        component_manifest_path,
+        orchestration.component_manifest(component_paths, positive_directory),
+        sidecar=True,
+    )
+    build_binding = json.loads((candidate_root / 'build-binding.json').read_text(encoding='utf-8'))
+    positive_binding_path = positive_directory / 'positive-binding.json'
+    binding = orchestration.reconcile_positive_control(
+        result_path=positive_directory / 'contact-control-result.json',
+        capture_path=positive_directory / 'capture.json',
+        manifest_path=repository / 'config/collision-coverage.yaml',
+        collector_configuration_sha256=build_binding['collector_configuration_sha256'],
+        owned_process_group_shutdown=True,
+        checksum_verified=True,
+    )
+    _canonical_file(positive_binding_path, binding, sidecar=True)
+    marker_path = positive_directory / 'PASS.json'
+    marker = json.loads(marker_path.read_text(encoding='utf-8'))
+    marker['positive_binding_sha256'] = phase5_module.file_sha256(positive_binding_path)
+    _canonical_file(marker_path, marker, sidecar=True)
+
+
+def _remote_proof(
+    repository: Path,
+    *,
+    sha: str,
+    mode: str,
+    run_id: int,
+    created_at: str,
+    checked_at: str,
+) -> dict[str, object]:
+    return {
+        'checked_at': checked_at,
+        'provenance': {
+            'command': {
+                'argv': ['scripts/verify_phase5.sh', mode, sha],
+                'cwd': str(repository),
+            },
+            'local_resolved_sha': sha,
+            'platform': {
+                'github_runner': {
+                    'architecture': 'X64',
+                    'environment': 'github-hosted',
+                    'image_os': 'ubuntu24',
+                    'image_version': '20260826.1',
+                    'operating_system': 'Linux',
+                },
+                'os_release': {
+                    'ID': 'ubuntu',
+                    'PRETTY_NAME': 'Ubuntu 24.04 LTS',
+                    'VERSION_ID': '24.04',
+                },
+                'python': {'executable': '/usr/bin/python3', 'version': '3.12.3'},
+                'ros_distro': 'jazzy',
+                'uname': ['Linux', 'runner', '6.8.0', '', 'x86_64', 'x86_64'],
+                'wsl_distro_name': None,
+            },
+            'tools': {
+                'gh': {
+                    'argv': ['gh', '--version'],
+                    'executable': '/usr/bin/gh',
+                    'output': 'gh version fixture',
+                },
+                'git': {
+                    'argv': ['git', '--version'],
+                    'executable': '/usr/bin/git',
+                    'output': 'git version fixture',
+                },
+                'sha256sum': {
+                    'argv': ['sha256sum', '--version'],
+                    'executable': '/usr/bin/sha256sum',
+                    'output': 'sha256sum fixture',
+                },
+            },
+        },
+        'repository': {
+            'name_with_owner': 'example/robotest',
+            'url': 'https://github.com/example/robotest',
+            'visibility': 'PUBLIC',
+        },
+        'run': {
+            'conclusion': 'success',
+            'created_at': created_at,
+            'head_sha': sha,
+            'run_id': run_id,
+            'run_url': f'https://github.com/example/robotest/actions/runs/{run_id}',
+            'status': 'completed',
+            'workflow_name': 'RoboTest CI',
+        },
+        'schema_version': 1,
+        'status': 'PASS',
+        'verification_scope': release_module.REMOTE_PROOF_SCOPE,
+    }
+
+
+def _commit_all(repository: Path, message: str) -> None:
+    subprocess.run(['git', 'add', '-A'], cwd=repository, check=True)
+    subprocess.run(
+        [
+            'git',
+            '-c',
+            'user.name=Phase5 Test',
+            '-c',
+            'user.email=phase5@example.invalid',
+            'commit',
+            '-q',
+            '--no-gpg-sign',
+            '-m',
+            message,
+        ],
+        cwd=repository,
+        check=True,
+    )
+
+
+def _producer_collision_fixture(repository: Path) -> tuple[dict, dict, dict]:
+    release_module._activate_repository_packages(repository)
+    package_root = repository / 'src/robotest_metrics'
+    package_root_text = str(package_root)
+    if package_root_text not in sys.path:
+        sys.path.insert(0, package_root_text)
+    fixture_path = package_root / 'test/conftest.py'
+    spec = importlib.util.spec_from_file_location('_phase5_collision_fixture', fixture_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f'cannot load collision fixture: {fixture_path}')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _, positive_control, benchmark_binding = module.collision_fixture()
+    manifest = yaml.safe_load(
+        (repository / 'config/collision-coverage.yaml').read_text(encoding='utf-8')
+    )
+    coverage_sha = manifest['manifest_sha256']
+    chassis = next(
+        item['name'] for item in manifest['robot_collisions'] if item['role'] == 'chassis'
+    )
+    wall = 'phase3_contact_control_wall::link::collision'
+    expected_pair = sorted((chassis, wall))
+    positive_control['configuration']['coverage_manifest_sha256'] = coverage_sha
+    positive_control['configuration']['coverage_manifest_provenance'] = {
+        field: manifest[field]
+        for field in (
+            'bridge_sha256',
+            'contact_configuration_sha256',
+            'rendered_sdf_sha256',
+            'robot_description_sha256',
+            'world_source_sha256',
+        )
+    } | {'coverage_manifest_sha256': coverage_sha}
+    positive_control['configuration']['coverage_manifest_path'] = str(
+        repository / 'config/collision-coverage.yaml'
+    )
+    positive_control['configuration']['expected_pair'] = expected_pair
+    positive_control['configuration']['fixture']['expected_pair'] = expected_pair
+    fixture_sha = release_module._canonical_sha256(positive_control['configuration']['fixture'])
+    positive_control['configuration']['fixture_sha256'] = fixture_sha
+    positive_control['identity']['scenario_sha256'] = fixture_sha
+    contact = positive_control['control']['contact']
+    contact['expected_pair'] = expected_pair
+    contact['first_qualifying_contact']['normalized_pair'] = expected_pair
+    contact['episodes'][0]['normalized_pairs'] = [expected_pair]
+    contact['records'][0].update(
+        {
+            'counterpart_collision': wall,
+            'counterpart_model': 'phase3_contact_control_wall',
+            'normalized_pair': expected_pair,
+            'robot_collision': chassis,
+        }
+    )
+    for name in ('benchmark_provenance', 'positive_control_provenance'):
+        benchmark_binding[name].update(
+            {
+                'bridge_sha256': manifest['bridge_sha256'],
+                'contact_configuration_sha256': manifest['contact_configuration_sha256'],
+                'coverage_manifest_sha256': coverage_sha,
+                'rendered_sdf_sha256': manifest['rendered_sdf_sha256'],
+                'robot_description_sha256': manifest['robot_description_sha256'],
+                'world_source_sha256': manifest['world_source_sha256'],
+            }
+        )
+    benchmark_binding['positive_control_scenario_sha256'] = fixture_sha
+    return manifest, positive_control, benchmark_binding
+
+
+def _build_release_fixture(tmp_path: Path) -> dict[str, Path | str]:
+    repository = tmp_path / 'repository'
+    repository.mkdir()
+    shutil.copy2(REPOSITORY / '.gitignore', repository / '.gitignore')
+    ignored = shutil.ignore_patterns('__pycache__', '.pytest_cache', '*.pyc')
+    for directory in ('config', 'docs', 'packaging', 'scenarios', 'scripts', 'supervisor', 'tests'):
+        shutil.copytree(REPOSITORY / directory, repository / directory, ignore=ignored)
+    for package in release_module.PHASE3_RUNTIME_PACKAGES:
+        shutil.copytree(
+            REPOSITORY / f'src/{package}',
+            repository / f'src/{package}',
+            ignore=ignored,
+        )
+        shutil.copytree(
+            REPOSITORY / f'install/{package}',
+            repository / f'install/{package}',
+            symlinks=False,
+            ignore=ignored,
+        )
+        python_source = repository / f'src/{package}/{package}'
+        if python_source.is_dir():
+            site_packages = next(
+                (repository / f'install/{package}/lib').glob('python*/site-packages')
+            )
+            for egg_link in site_packages.glob('*.egg-link'):
+                egg_link.unlink()
+            shutil.copytree(python_source, site_packages / package)
+    for name in ('.editorconfig', '.gitattributes', 'LICENSE', 'README.md', 'pyproject.toml'):
+        shutil.copy2(REPOSITORY / name, repository / name)
+    phase0_version = repository / 'artifacts/evidence/phase0/phase0-versions.json'
+    _canonical_file(phase0_version, {'checked_at': 'before', 'schema_version': 1})
+    call_log = tmp_path / 'release-calls.jsonl'
+    fake = """#!/usr/bin/env bash
+python3 - "$0" "$@" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+with pathlib.Path(os.environ['CALL_LOG']).open('a', encoding='utf-8') as output:
+    record = {'script': pathlib.Path(sys.argv[1]).name, 'args': sys.argv[2:]}
+    output.write(json.dumps(record) + '\\n')
+PY
+"""
+    for phase in (3, 4, 5):
+        verifier = repository / f'scripts/verify_phase{phase}.sh'
+        verifier.write_text(fake, encoding='utf-8')
+        verifier.chmod(0o755)
+    (repository / 'scripts/verify_all.sh').chmod(0o755)
+    subprocess.run(['git', 'init', '-q'], cwd=repository, check=True)
+    _commit_all(repository, 'candidate')
+    candidate_sha = subprocess.run(
+        ['git', 'rev-parse', 'HEAD'],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ['git', 'remote', 'add', 'origin', 'https://github.com/example/robotest.git'],
+        cwd=repository,
+        check=True,
+    )
+    _canonical_file(phase0_version, {'checked_at': 'after', 'schema_version': 1})
+
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 production orchestration fixture',
+    )
+    build_binding = orchestration.build_binding(
+        repository,
+        git_sha=candidate_sha,
+        git_status_porcelain='',
+    )
+
+    local_aggregate = repository / 'artifacts/evidence/phase0/verify-all.json'
+    _canonical_file(
+        local_aggregate,
+        {
+            'checked_at': '2026-08-26T00:00:00+00:00',
+            'command': {'argv': ['scripts/verify_all.sh'], 'cwd': str(repository)},
+            'mode': 'static',
+            'outstanding_gates': list(release_module.LOCAL_OUTSTANDING_GATES),
+            'release_eligible': False,
+            'release_evidence': None,
+            'results': [
+                {
+                    'exit_code': '0',
+                    'phase': str(phase),
+                    'status': 'passed',
+                    'verifier': f'scripts/verify_phase{phase}.sh',
+                }
+                for phase in range(6)
+            ],
+            'schema_version': 4,
+            'source': {
+                'git_dirty_end': True,
+                'git_dirty_start': False,
+                'git_sha_end': candidate_sha,
+                'git_sha_start': candidate_sha,
+                'git_status_porcelain_end': (' M artifacts/evidence/phase0/phase0-versions.json'),
+                'git_status_porcelain_start': '',
+                'generated_evidence_delta': {
+                    'allowed_paths': list(release_module.ALLOWED_GENERATED_DELTA),
+                    'changed_files': [
+                        {
+                            'bytes': phase0_version.stat().st_size,
+                            'path': 'artifacts/evidence/phase0/phase0-versions.json',
+                            'sha256': phase5_module.file_sha256(phase0_version),
+                        }
+                    ],
+                },
+                'source_unchanged': True,
+            },
+            'status': 'incomplete',
+            'verification_scope': release_module.LOCAL_AGGREGATE_SCOPE,
+        },
+    )
+    local_aggregate.with_suffix('.SHA256SUMS').write_text(
+        f'{phase5_module.file_sha256(local_aggregate)}  {local_aggregate.name}\n',
+        encoding='ascii',
+    )
+    local_aggregate.with_suffix('.checksum-validation.txt').write_text(
+        f'{local_aggregate.name}: OK\n', encoding='utf-8'
+    )
+
+    candidate_id = 'candidate-1'
+    candidate_root = repository / f'artifacts/evidence/phase3-benchmarks/{candidate_id}'
+    _, positive_control, benchmark_binding = _producer_collision_fixture(repository)
+    for name in ('benchmark_provenance', 'positive_control_provenance'):
+        benchmark_binding[name]['collector_configuration_sha256'] = build_binding[
+            'collector_configuration_sha256'
+        ]
+    positive_control['identity']['run_id'] = f'{candidate_id}-positive-control'
+    positive_sha = release_module._canonical_sha256(positive_control)
+    benchmark_binding['positive_control_json_sha256'] = positive_sha
+    benchmark_binding['positive_control_run_id'] = positive_control['identity']['run_id']
+    scenario_names = release_module.PHASE3_SCENARIO_NAMES
+    scenario_paths = {
+        1: 'scenarios/phase3_s1_baseline.yaml',
+        2: 'scenarios/phase3_s2_static_obstacle.yaml',
+        3: 'scenarios/phase3_s3_dynamic_obstacle.yaml',
+        4: 'scenarios/phase3_s4_lidar_dropout.yaml',
+        5: 'scenarios/phase3_s5_odom_drift.yaml',
+    }
+    trials = []
+    for index in range(15):
+        scenario_id = index // 3 + 1
+        repetition = index % 3
+        run_id = f'{candidate_id}-s{scenario_id}-r{repetition}-i{index:02d}'
+        scenario_path = repository / scenario_paths[scenario_id]
+        scenario_sha = phase5_module.file_sha256(scenario_path)
+        trials.append(
+            {
+                'candidate_id': candidate_id,
+                'gz_partition': f'robotest_p3_{candidate_id}_{index:02d}',
+                'repetition_index': repetition,
+                'ros_domain_id': 100 + index,
+                'run_id': run_id,
+                'scenario_id': scenario_id,
+                'scenario_name': scenario_names[scenario_id],
+                'scenario_path': scenario_paths[scenario_id],
+                'scenario_sha256': scenario_sha,
+                'suite_index': index,
+            }
+        )
+    smoke_id = f'{candidate_id}-smoke-s1-r0'
+    plan_path = candidate_root / 'suite-plan.json'
+    binding_path = candidate_root / 'build-binding.json'
+    _canonical_file(
+        plan_path,
+        {
+            'aggregate_metrics': list(release_module.PHASE3_AGGREGATE_METRICS),
+            'candidate_id': candidate_id,
+            'cpu_affinity': [0, 1, 2, 3, 4, 5],
+            'domain_base': 100,
+            'positive_control': {
+                'gz_partition': f'robotest_p3_{candidate_id}_positive_control',
+                'ros_domain_id': 115,
+                'run_id': f'{candidate_id}-positive-control',
+            },
+            'producer': 'robotest_phase3/benchmark_orchestrator',
+            'schema_version': 1,
+            'smoke': {
+                'gz_partition': f'robotest_p3_{candidate_id}_smoke',
+                'ros_domain_id': 116,
+                'run_id': smoke_id,
+                'scenario_path': scenario_paths[1],
+            },
+            'trials': trials,
+        },
+        sidecar=True,
+    )
+    _canonical_file(binding_path, build_binding, sidecar=True)
+    _canonical_file(
+        candidate_root / 'prepared.json',
+        {
+            'build_binding_sha256': phase5_module.file_sha256(binding_path),
+            'candidate_id': candidate_id,
+            'git_sha': candidate_sha,
+            'producer': 'robotest_phase3/benchmark_orchestrator',
+            'suite_plan_sha256': phase5_module.file_sha256(plan_path),
+        },
+        sidecar=True,
+    )
+    positive_directory = candidate_root / 'positive-control'
+    positive_result_path = positive_directory / 'contact-control-result.json'
+    positive_capture_path = positive_directory / 'capture.json'
+    positive_binding = positive_directory / 'positive-binding.json'
+    _canonical_file(positive_result_path, positive_control, sidecar=True)
+    metrics_fixture = release_module._load_repository_module(
+        repository,
+        'src/robotest_metrics/test/conftest.py',
+        'Phase 3 positive-control collector fixture',
+    )
+    core = metrics_fixture.CollectorCore()
+    expected_pair = positive_control['control']['contact']['expected_pair']
+    for stamp_ns, contacts in (
+        (1_000_000_000, []),
+        (
+            2_000_000_000,
+            [{'collision1': expected_pair[0], 'collision2': expected_pair[1]}],
+        ),
+        (3_500_000_000, []),
+    ):
+        core.record('contacts', {'contacts': contacts, 'stamp_ns': stamp_ns})
+    for command in positive_control['control']['command_trace']:
+        core.record(
+            'cmd_vel',
+            {
+                'angular_z_rad_s': command['angular_z'],
+                'linear_x_m_s': command['linear_x'],
+                'linear_y_m_s': 0.0,
+                'stamp_ns': command['sim_stamp_ns'],
+            },
+        )
+    for stamp_ns in (0, 1_000_000_000, 2_000_000_000, 3_500_000_000):
+        core.observe_clock(stamp_ns)
+    positive_capture = core.snapshot()
+    positive_capture.update(
+        {
+            'capture_schema_version': 1,
+            'finished_steady_wall_ns': 3_500_000_000,
+            'started_steady_wall_ns': 0,
+            'stop_reason': 'stop_file',
+        }
+    )
+    _canonical_file(positive_capture_path, positive_capture, sidecar=True)
+    resource_path = positive_directory / 'resources.jsonl'
+    resource_samples = [
+        {
+            'affinity_checked_pid_count': 1,
+            'affinity_escape_count': 0,
+            'affinity_escape_prefix': [],
+            'affinity_observed_cpu_union': [0, 1, 2, 3, 4, 5],
+            'affinity_unreadable_count': 0,
+            'affinity_unreadable_pid_prefix': [],
+            'cpu_percent': 50.0,
+            'missing_count': 0,
+            'oom_kill': False,
+            'phase': 'before_launch',
+            'pid_reuse_detected': False,
+            'rss_sum_bytes': 1024,
+            'wsl_memory_bytes': 2048,
+            'wsl_swap_bytes': 0,
+        },
+        {
+            'affinity_checked_pid_count': 1,
+            'affinity_escape_count': 0,
+            'affinity_escape_prefix': [],
+            'affinity_observed_cpu_union': [0, 1, 2, 3, 4, 5],
+            'affinity_unreadable_count': 0,
+            'affinity_unreadable_pid_prefix': [],
+            'cpu_percent': 25.0,
+            'missing_count': 0,
+            'oom_kill': False,
+            'phase': 'after_shutdown',
+            'pid_reuse_detected': False,
+            'rss_sum_bytes': 512,
+            'wsl_memory_bytes': 1536,
+            'wsl_swap_bytes': 0,
+        },
+    ]
+    resource_path.write_text(
+        ''.join(json.dumps(sample, sort_keys=True) + '\n' for sample in resource_samples),
+        encoding='utf-8',
+    )
+    resource_summary = orchestration.summarize_resources(resource_path)
+    component_manifest_path = positive_directory / 'component-manifest.json'
+    component_document = orchestration.component_manifest(
+        sorted(path for path in positive_directory.rglob('*') if path.is_file()),
+        positive_directory,
+    )
+    _canonical_file(component_manifest_path, component_document, sidecar=True)
+    assert orchestration.verify_component_manifest(component_document, positive_directory)
+    positive_binding_document = orchestration.reconcile_positive_control(
+        result_path=positive_result_path,
+        capture_path=positive_capture_path,
+        manifest_path=repository / 'config/collision-coverage.yaml',
+        collector_configuration_sha256=build_binding['collector_configuration_sha256'],
+        owned_process_group_shutdown=True,
+        checksum_verified=True,
+    )
+    assert positive_binding_document['positive_control_json_sha256'] == positive_sha
+    _canonical_file(positive_binding, positive_binding_document, sidecar=True)
+    _canonical_file(
+        positive_directory / 'PASS.json',
+        {
+            'positive_binding_sha256': phase5_module.file_sha256(positive_binding),
+            'producer': 'robotest_phase3/benchmark_orchestrator',
+            'resource_summary': resource_summary,
+            'status': 'PASS',
+        },
+        sidecar=True,
+    )
+    run_results = []
+    run_ids = []
+    result_hashes = []
+    for trial in trials:
+        index = trial['suite_index']
+        result_directory = candidate_root / f'runs/{index:02d}/result'
+        result_hashes.append(
+            _phase3_bundle(
+                repository,
+                result_directory,
+                orchestration=orchestration,
+                plan=trial,
+                git_sha=candidate_sha,
+                build_binding=build_binding,
+                positive_binding_path=positive_binding,
+            )
+        )
+        run_results.append(
+            json.loads((result_directory / 'run-result.json').read_text(encoding='utf-8'))
+        )
+        run_ids.append(trial['run_id'])
+    smoke_plan = {
+        **trials[0],
+        'candidate_id': f'{candidate_id}-smoke',
+        'gz_partition': f'robotest_p3_{candidate_id}-smoke_00',
+        'ros_domain_id': 116,
+        'run_id': smoke_id,
+    }
+    smoke_sha = _phase3_bundle(
+        repository,
+        candidate_root / 'smoke/result',
+        orchestration=orchestration,
+        plan=smoke_plan,
+        git_sha=candidate_sha,
+        build_binding=build_binding,
+        positive_binding_path=positive_binding,
+    )
+    _canonical_file(
+        candidate_root / 'smoke/PASS.json',
+        {
+            'producer': 'robotest_phase3/benchmark_orchestrator',
+            'run_result_sha256': smoke_sha,
+            'status': 'PASS',
+        },
+        sidecar=True,
+    )
+    aggregate = release_module._recompute_phase3_aggregate(repository, run_results, result_hashes)
+    aggregate_path = candidate_root / 'aggregate/aggregate-result.json'
+    _canonical_file(aggregate_path, aggregate)
+    (aggregate_path.parent / 'aggregate-result.csv').write_bytes(
+        release_module._one_row_csv_bytes(aggregate)
+    )
+
+    phase4_run = repository / 'artifacts/evidence/phase4/runs/phase4-20260826T100000Z-1'
+    phase4_run.mkdir(parents=True)
+    raw = phase4_run / 'timeline.jsonl'
+    raw.write_text('{"kind":"cleanup_complete"}\n' * 10, encoding='utf-8')
+    events = phase4_run / 'supervisor-events.jsonl'
+    events.write_text('{"event":"fixture"}\n' * 10, encoding='utf-8')
+    _canonical_file(phase4_run / 'supervisor-events.meta.json', {'dropped_events': 0})
+    context = {
+        'active_overlay_target': '/opt/robotest/overlay',
+        'baseline_package': {'path': '/tmp/robotest-baseline.deb', 'sha256': 'a' * 64},
+        'cpuset': '0-5',
+        'isolation': {
+            'domain_was_unused': True,
+            'gz_partition': 'robotest_p4_fixture',
+            'inspected_processes': 20,
+            'partition_was_unused': True,
+            'ros_domain_id': 120,
+            'run_id': phase4_run.name,
+            'schema_version': 1,
+            'unreadable_process_environments': 0,
+        },
+        'lifecycle_evidence': {'path': '/tmp/lifecycle.json', 'sha256': 'b' * 64},
+        'package_directory': '/tmp/packages',
+        'run_id': phase4_run.name,
+        'schema_version': 1,
+        'source_git_commit': candidate_sha,
+        'source_git_dirty': False,
+        'started_utc': '2026-08-26T00:00:00+00:00',
+        'upgrade_package': {'path': '/tmp/robotest-upgrade.deb', 'sha256': 'c' * 64},
+    }
+    _canonical_file(phase4_run / 'context.json', context)
+    for name in sorted(
+        release_module.PHASE4_REQUIRED_RAW
+        - {
+            'context.json',
+            'supervisor-events.jsonl',
+            'supervisor-events.meta.json',
+            'timeline.jsonl',
+        }
+    ):
+        path = phase4_run / name
+        if path.suffix == '.json':
+            _canonical_file(path, {'fixture': name})
+        else:
+            path.write_text('fixture\n', encoding='utf-8')
+    raw_hashes = {
+        path.relative_to(phase4_run).as_posix(): phase5_module.file_sha256(path)
+        for path in sorted(phase4_run.rglob('*'))
+        if path.is_file()
+    }
+    scenario6 = {
+        'identity': {
+            'completed_utc': '2026-08-26T00:01:00+00:00',
+            'gz_partition': 'robotest_p4_fixture',
+            'managed_child': 'robotest-stack',
+            'ros_domain_id': 120,
+            'run_id': phase4_run.name,
+            'source_git_commit': candidate_sha,
+            'source_git_dirty': False,
+            'started_utc': '2026-08-26T00:00:00+00:00',
+            'supervisor_unit': 'robotest-supervisor.service',
+        },
+        'measurements': {
+            'actual_restart_backoff_wall_s': 1.0,
+            'followup_mission_exit_code': 0,
+            'interrupted_mission_exit_code': 1,
+            'observed_ready_restore_after_503_wall_s': 2.0,
+            'original_child_pgid': 1001,
+            'original_child_pid': 1001,
+            'original_group_empty_after_injection_wall_s': 1.0,
+            'ready_503_after_injection_wall_s': 1.0,
+            'replacement_child_pgid': 1002,
+            'replacement_child_pid': 1002,
+            'replacement_child_start_count': 1,
+            'restart_scheduled_count': 1,
+            'supervisor_main_pid': 1000,
+            'supervisor_recovery_time_wall_s': 2.0,
+        },
+        'producer': 'robotest_phase4/acceptance_verifier',
+        'quality': {
+            'checks': {name: True for name in sorted(release_module.PHASE4_CHECKS)},
+            'event_count': 10,
+            'event_trace_dropped': 0,
+            'raw_evidence_sha256': raw_hashes,
+            'timeline_count': 10,
+        },
+        'schema_version': 1,
+        'targets': {
+            'heartbeat_period_wall_s': 0.5,
+            'heartbeat_stale_wall_s': 2.0,
+            'ready_failure_wall_s_max': 3.0,
+            'ready_restore_after_detection_wall_s_max': 30.0,
+            'restart_attempt_limit': 4,
+            'restart_backoff_wall_s': [1.0, 2.0, 4.0, 8.0],
+            'restart_window_wall_s': 60.0,
+            'stable_reset_wall_s': 60.0,
+            'termination_allowance_wall_s': 5.0,
+        },
+        'verdict': {'accepted': True, 'failure_count': 0, 'failures': [], 'status': 'PASS'},
+    }
+    scenario6_path = phase4_run / 'scenario6-result.json'
+    _canonical_file(scenario6_path, scenario6)
+    (phase4_run / 'scenario6-result.csv').write_bytes(release_module._phase4_csv_bytes(scenario6))
+    phase4_records = [
+        f'{phase5_module.file_sha256(path)}  {path.relative_to(phase4_run).as_posix()}'
+        for path in sorted(phase4_run.rglob('*'))
+        if path.is_file()
+    ]
+    (phase4_run / 'SHA256SUMS').write_text('\n'.join(phase4_records) + '\n', encoding='ascii')
+
+    phase4_run = repository / 'artifacts/evidence/phase4/runs/phase4-20260826T000000Z-999'
+    phase4_fixture_module = release_module._load_repository_module(
+        REPOSITORY,
+        'tests/phase4_acceptance_test.py',
+        'Phase 4 producer fixture',
+    )
+    phase4_fixture_module._write_pass_fixture(phase4_run)
+    context_path = phase4_run / 'context.json'
+    context = json.loads(context_path.read_text(encoding='utf-8'))
+    context['cpuset'] = '0-5'
+    context['source_git_commit'] = candidate_sha
+    context['source_git_dirty'] = False
+    context['isolation'].update(
+        {
+            'inspected_processes': 20,
+            'unreadable_process_environments': 0,
+        }
+    )
+    _canonical_file(context_path, context)
+    for name in ('runtime-staging.json', 'overlay-provenance.json'):
+        path = phase4_run / name
+        document = json.loads(path.read_text(encoding='utf-8'))
+        document['git_commit'] = candidate_sha
+        document['git_dirty'] = False
+        _canonical_file(path, document)
+    phase4_module = release_module._load_repository_module(
+        repository,
+        'tests/phase4_acceptance.py',
+        'Phase 4 production acceptance module',
+    )
+    package_manifest = phase4_run / 'packages/build-a/SOURCE-MANIFEST.json'
+    _canonical_file(
+        phase4_run / 'package-binding.json',
+        phase4_module.package_source_binding(repository, package_manifest),
+    )
+    original_utc_now = phase4_module.utc_now
+    phase4_module.utc_now = lambda: '2026-08-26T00:01:00.000000Z'
+    try:
+        scenario6 = phase4_module.write_result(phase4_run)
+    finally:
+        phase4_module.utc_now = original_utc_now
+    assert scenario6['verdict']['status'] == 'PASS', scenario6['verdict']
+    phase4_module.write_checksums(phase4_run)
+    scenario6_path = phase4_run / 'scenario6-result.json'
+
+    remote_root = repository / 'docs/results/phase-5'
+    remote_path = remote_root / f'remote-{candidate_sha}.json'
+    _canonical_file(
+        remote_path,
+        _remote_proof(
+            repository,
+            sha=candidate_sha,
+            mode='--remote',
+            run_id=42,
+            created_at='2026-08-26T00:00:00Z',
+            checked_at='2026-08-26T00:01:00+00:00',
+        ),
+    )
+    remote_manifest = remote_path.with_suffix('.SHA256SUMS')
+    remote_manifest.write_text(
+        f'{phase5_module.file_sha256(remote_path)}  {remote_path.name}\n', encoding='ascii'
+    )
+    remote_path.with_suffix('.checksum-validation.txt').write_text(
+        f'{remote_path.name}: OK\n', encoding='utf-8'
+    )
+    release_docs_module.write_release_documents(repository, aggregate_path, scenario6_path)
+    _commit_all(repository, 'evidence')
+    evidence_sha = subprocess.run(
+        ['git', 'rev-parse', 'HEAD'],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.strip()
+    evidence_remote = (
+        repository / f'artifacts/evidence/phase5/remote-evidence-commit/remote-{evidence_sha}.json'
+    )
+    evidence_proof = _remote_proof(
+        repository,
+        sha=evidence_sha,
+        mode='--remote-evidence-commit',
+        run_id=43,
+        created_at='2026-08-26T00:10:00Z',
+        checked_at='2026-08-26T00:11:00+00:00',
+    )
+    _canonical_file(evidence_remote, evidence_proof)
+    evidence_remote.with_suffix('.SHA256SUMS').write_text(
+        f'{phase5_module.file_sha256(evidence_remote)}  {evidence_remote.name}\n',
+        encoding='ascii',
+    )
+    evidence_remote.with_suffix('.checksum-validation.txt').write_text(
+        f'{evidence_remote.name}: OK\n', encoding='utf-8'
+    )
+    return {
+        'aggregate': aggregate_path,
+        'call_log': call_log,
+        'candidate_root': candidate_root,
+        'candidate_sha': candidate_sha,
+        'evidence_remote': evidence_remote,
+        'evidence_sha': evidence_sha,
+        'local_aggregate': local_aggregate,
+        'phase4_run': phase4_run,
+        'remote': remote_path,
+        'repository': repository,
+        'scenario6': scenario6_path,
+    }
+
+
+def _relocated_value(value: object, old_root: str, new_root: str) -> object:
+    if isinstance(value, dict):
+        return {key: _relocated_value(item, old_root, new_root) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_relocated_value(item, old_root, new_root) for item in value]
+    if isinstance(value, str):
+        return value.replace(old_root, new_root)
+    return value
+
+
+def _relocate_json(
+    path: Path,
+    old_root: str,
+    new_root: str,
+    *,
+    sidecar: bool = False,
+) -> dict:
+    document = json.loads(path.read_text(encoding='utf-8'))
+    relocated = _relocated_value(document, old_root, new_root)
+    assert isinstance(relocated, dict)
+    _canonical_file(path, relocated, sidecar=sidecar)
+    return relocated
+
+
+def _relocate_phase3_evidence(
+    repository: Path,
+    candidate_root: Path,
+    *,
+    candidate_sha: str,
+    old_root: str,
+) -> Path:
+    release_module._activate_repository_packages(repository)
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 production orchestration fixture clone',
+    )
+    build_binding = json.loads((candidate_root / 'build-binding.json').read_text(encoding='utf-8'))
+    positive_directory = candidate_root / 'positive-control'
+    positive_result_path = positive_directory / 'contact-control-result.json'
+    _relocate_json(positive_result_path, old_root, str(repository), sidecar=True)
+    excluded_outputs = {
+        'PASS.json',
+        'PASS.json.sha256',
+        'component-manifest.json',
+        'component-manifest.json.sha256',
+        'positive-binding.json',
+        'positive-binding.json.sha256',
+    }
+    component_paths = sorted(
+        path
+        for path in positive_directory.rglob('*')
+        if path.is_file()
+        and path.relative_to(positive_directory).as_posix() not in excluded_outputs
+    )
+    component_manifest_path = positive_directory / 'component-manifest.json'
+    component_manifest = orchestration.component_manifest(
+        component_paths,
+        positive_directory,
+    )
+    _canonical_file(component_manifest_path, component_manifest, sidecar=True)
+    positive_binding_path = positive_directory / 'positive-binding.json'
+    positive_binding = orchestration.reconcile_positive_control(
+        result_path=positive_result_path,
+        capture_path=positive_directory / 'capture.json',
+        manifest_path=repository / 'config/collision-coverage.yaml',
+        collector_configuration_sha256=build_binding['collector_configuration_sha256'],
+        owned_process_group_shutdown=True,
+        checksum_verified=True,
+    )
+    _canonical_file(positive_binding_path, positive_binding, sidecar=True)
+    positive_marker_path = positive_directory / 'PASS.json'
+    positive_marker = json.loads(positive_marker_path.read_text(encoding='utf-8'))
+    positive_marker['positive_binding_sha256'] = phase5_module.file_sha256(positive_binding_path)
+    _canonical_file(positive_marker_path, positive_marker, sidecar=True)
+
+    metrics_root = str(repository / 'src/robotest_metrics')
+    if metrics_root not in sys.path:
+        sys.path.insert(0, metrics_root)
+    analyze_run = importlib.import_module('robotest_metrics.analysis').analyze_run
+
+    def replay(plan: dict, run_root: Path) -> tuple[dict, str]:
+        result_directory = run_root / 'result'
+        lifecycle_path = run_root / 'lifecycle-snapshot.json'
+        context = orchestration.make_trial_context(
+            plan,
+            workspace=repository,
+            git_sha=candidate_sha,
+            build=build_binding,
+            positive=positive_binding,
+        )
+        mission = json.loads((run_root / 'mission-result.json').read_text(encoding='utf-8'))
+        drain_stamp = int(mission['measurements']['terminal_action_stamp_ns']) + int(
+            orchestration.CONTACT_DRAIN_NS
+        )
+        request = orchestration.compose_analysis_request(
+            workspace=repository,
+            plan=plan,
+            mission_path=run_root / 'mission-result.json',
+            scenario_path=run_root / 'scenario-result.json',
+            capture_path=run_root / 'capture.json',
+            positive_binding_path=positive_binding_path,
+            orchestrator_path=run_root / 'orchestrator.json',
+            drain_completed_stamp_ns=drain_stamp,
+            lifecycle_snapshot_path=(lifecycle_path if int(plan['scenario_id']) == 4 else None),
+        )
+        _canonical_file(run_root / 'trial-context.json', context, sidecar=True)
+        _canonical_file(run_root / 'analysis-request.json', request, sidecar=True)
+        result = analyze_run(request)
+        assert result['verdict']['automated_status'] == 'PASS', result['verdict']
+        _canonical_file(result_directory / 'run-result.json', result)
+        return result, _refresh_phase3_bundle(result_directory)
+
+    suite_plan = json.loads((candidate_root / 'suite-plan.json').read_text(encoding='utf-8'))
+    results: list[dict] = []
+    result_hashes: list[str] = []
+    for trial in suite_plan['trials']:
+        result, result_sha = replay(
+            trial,
+            candidate_root / f'runs/{int(trial["suite_index"]):02d}',
+        )
+        results.append(result)
+        result_hashes.append(result_sha)
+    first_trial = suite_plan['trials'][0]
+    smoke = suite_plan['smoke']
+    smoke_plan = {
+        **first_trial,
+        'candidate_id': f'{suite_plan["candidate_id"]}-smoke',
+        'gz_partition': f'robotest_p3_{suite_plan["candidate_id"]}-smoke_00',
+        'ros_domain_id': smoke['ros_domain_id'],
+        'run_id': smoke['run_id'],
+    }
+    _, smoke_sha = replay(smoke_plan, candidate_root / 'smoke')
+    smoke_marker_path = candidate_root / 'smoke/PASS.json'
+    smoke_marker = json.loads(smoke_marker_path.read_text(encoding='utf-8'))
+    smoke_marker['run_result_sha256'] = smoke_sha
+    _canonical_file(smoke_marker_path, smoke_marker, sidecar=True)
+
+    aggregate = release_module._recompute_phase3_aggregate(
+        repository,
+        results,
+        result_hashes,
+    )
+    aggregate_path = candidate_root / 'aggregate/aggregate-result.json'
+    _canonical_file(aggregate_path, aggregate)
+    (aggregate_path.parent / 'aggregate-result.csv').write_bytes(
+        release_module._one_row_csv_bytes(aggregate)
+    )
+    return aggregate_path
+
+
+def _relocate_phase4_evidence(
+    repository: Path,
+    run_directory: Path,
+    *,
+    old_root: str,
+) -> Path:
+    context_path = run_directory / 'context.json'
+    context = _relocate_json(context_path, old_root, str(repository))
+    followup_path = run_directory / 'followup-result.json'
+    followup = _relocate_json(followup_path, old_root, str(repository))
+    missions_root = str(repository / 'src/robotest_missions')
+    if missions_root not in sys.path:
+        sys.path.insert(0, missions_root)
+    mission_artifacts = importlib.import_module('robotest_missions.artifacts')
+    mission_artifacts.write_result_artifacts(
+        followup,
+        followup_path,
+        run_directory / 'followup-result.csv',
+    )
+    phase4 = release_module._load_repository_module(
+        repository,
+        'tests/phase4_acceptance.py',
+        'Phase 4 production acceptance fixture clone',
+    )
+    package_directory = Path(context['package_directory'])
+    upgrade_package = Path(context['upgrade_package']['path'])
+    baseline_package = Path(context['baseline_package']['path'])
+    _canonical_file(
+        run_directory / 'package-integrity.json',
+        phase4.verify_package_candidate(
+            package_directory,
+            upgrade_package,
+            baseline_package,
+        ),
+    )
+    package_manifest = package_directory / 'build-a/SOURCE-MANIFEST.json'
+    _canonical_file(
+        run_directory / 'package-binding.json',
+        phase4.package_source_binding(repository, package_manifest),
+    )
+    previous_result = json.loads(
+        (run_directory / 'scenario6-result.json').read_text(encoding='utf-8')
+    )
+    completed_utc = previous_result['identity']['completed_utc']
+    original_utc_now = phase4.utc_now
+    phase4.utc_now = lambda: completed_utc
+    try:
+        result = phase4.write_result(run_directory)
+    finally:
+        phase4.utc_now = original_utc_now
+    assert result['verdict']['status'] == 'PASS', result['verdict']
+    phase4.write_checksums(run_directory)
+    return run_directory / 'scenario6-result.json'
+
+
+def _release_fixture_template() -> dict[str, Path | str]:
+    global _RELEASE_FIXTURE_TEMPLATE, _RELEASE_FIXTURE_TEMPLATE_DIRECTORY
+    if _RELEASE_FIXTURE_TEMPLATE is None:
+        directory = tempfile.TemporaryDirectory(prefix='robotest-phase5-release-fixture-')
+        try:
+            fixture = _build_release_fixture(Path(directory.name))
+        except BaseException:
+            directory.cleanup()
+            raise
+        _RELEASE_FIXTURE_TEMPLATE_DIRECTORY = directory
+        _RELEASE_FIXTURE_TEMPLATE = fixture
+    return _RELEASE_FIXTURE_TEMPLATE
+
+
+def _release_fixture(tmp_path: Path) -> dict[str, Path | str]:
+    global _RELEASE_FIXTURE_LAST_REPOSITORY
+    template = _release_fixture_template()
+    template_repository = Path(template['repository'])
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    repository = tmp_path / 'repository'
+    previous_repository = _RELEASE_FIXTURE_LAST_REPOSITORY
+    if previous_repository is not None and previous_repository.is_dir():
+        assert previous_repository.name == 'repository'
+        shutil.rmtree(previous_repository)
+    repository.mkdir()
+    subprocess.run(
+        ['cp', '-a', '--', f'{template_repository}/.', str(repository)],
+        check=True,
+    )
+    _RELEASE_FIXTURE_LAST_REPOSITORY = repository
+    assert not any(path.is_symlink() for path in (repository / 'install').rglob('*'))
+    old_root = str(template_repository)
+    candidate_sha = str(template['candidate_sha'])
+    old_evidence_sha = str(template['evidence_sha'])
+
+    old_evidence_remote = (
+        repository
+        / f'artifacts/evidence/phase5/remote-evidence-commit/remote-{old_evidence_sha}.json'
+    )
+    for path in (
+        old_evidence_remote,
+        old_evidence_remote.with_suffix('.SHA256SUMS'),
+        old_evidence_remote.with_suffix('.checksum-validation.txt'),
+    ):
+        path.unlink(missing_ok=True)
+
+    local_aggregate = repository / 'artifacts/evidence/phase0/verify-all.json'
+    _relocate_json(local_aggregate, old_root, str(repository))
+    local_aggregate.with_suffix('.SHA256SUMS').write_text(
+        f'{phase5_module.file_sha256(local_aggregate)}  {local_aggregate.name}\n',
+        encoding='ascii',
+    )
+    local_aggregate.with_suffix('.checksum-validation.txt').write_text(
+        f'{local_aggregate.name}: OK\n',
+        encoding='utf-8',
+    )
+
+    candidate_root = repository / 'artifacts/evidence/phase3-benchmarks/candidate-1'
+    aggregate_path = _relocate_phase3_evidence(
+        repository,
+        candidate_root,
+        candidate_sha=candidate_sha,
+        old_root=old_root,
+    )
+    phase4_run = repository / 'artifacts/evidence/phase4/runs/phase4-20260826T000000Z-999'
+    scenario6_path = _relocate_phase4_evidence(
+        repository,
+        phase4_run,
+        old_root=old_root,
+    )
+    remote_path = repository / f'docs/results/phase-5/remote-{candidate_sha}.json'
+    _refresh_remote_proof(
+        remote_path,
+        _remote_proof(
+            repository,
+            sha=candidate_sha,
+            mode='--remote',
+            run_id=42,
+            created_at='2026-08-26T00:00:00Z',
+            checked_at='2026-08-26T00:01:00+00:00',
+        ),
+    )
+    for relative in ('README.md', 'config/release-claims.json'):
+        candidate_bytes = subprocess.run(
+            ['git', 'show', f'{candidate_sha}:{relative}'],
+            cwd=repository,
+            capture_output=True,
+            check=True,
+        ).stdout
+        (repository / relative).write_bytes(candidate_bytes)
+    for path in (
+        repository / 'docs/results/phase-3/candidate-1.csv',
+        repository / 'docs/results/phase-3/candidate-1.json',
+        repository / 'docs/results/phase-3/candidate-1.md',
+        repository / f'docs/results/phase-4/{phase4_run.name}.csv',
+        repository / f'docs/results/phase-4/{phase4_run.name}.json',
+        repository / f'docs/results/phase-4/{phase4_run.name}.md',
+    ):
+        path.unlink(missing_ok=True)
+    release_docs_module.write_release_documents(repository, aggregate_path, scenario6_path)
+    subprocess.run(['git', 'add', '-A'], cwd=repository, check=True)
+    subprocess.run(
+        [
+            'git',
+            '-c',
+            'user.name=Phase5 Test',
+            '-c',
+            'user.email=phase5@example.invalid',
+            'commit',
+            '-q',
+            '--amend',
+            '--no-edit',
+            '--no-gpg-sign',
+        ],
+        cwd=repository,
+        check=True,
+    )
+    evidence_sha = subprocess.run(
+        ['git', 'rev-parse', 'HEAD'],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.strip()
+    evidence_remote = (
+        repository / f'artifacts/evidence/phase5/remote-evidence-commit/remote-{evidence_sha}.json'
+    )
+    _refresh_remote_proof(
+        evidence_remote,
+        _remote_proof(
+            repository,
+            sha=evidence_sha,
+            mode='--remote-evidence-commit',
+            run_id=43,
+            created_at='2026-08-26T00:10:00Z',
+            checked_at='2026-08-26T00:11:00+00:00',
+        ),
+    )
+    return {
+        'aggregate': aggregate_path,
+        'call_log': tmp_path / 'release-calls.jsonl',
+        'candidate_root': candidate_root,
+        'candidate_sha': candidate_sha,
+        'evidence_remote': evidence_remote,
+        'evidence_sha': evidence_sha,
+        'local_aggregate': local_aggregate,
+        'phase4_run': phase4_run,
+        'remote': remote_path,
+        'repository': repository,
+        'scenario6': scenario6_path,
+    }
+
+
+def _validate_release_fixture(fixture: dict[str, Path | str]) -> dict[str, object]:
+    return validate_release_evidence(
+        Path(fixture['repository']),
+        Path(fixture['local_aggregate']),
+        Path(fixture['candidate_root']),
+        Path(fixture['aggregate']),
+        Path(fixture['phase4_run']),
+        Path(fixture['scenario6']),
+        Path(fixture['remote']),
+        Path(fixture['evidence_remote']),
+    )
+
+
+def _release_evidence_command(fixture: dict[str, Path | str]) -> list[str]:
+    return [
+        'bash',
+        str(Path(fixture['repository']) / 'scripts/verify_all.sh'),
+        '--release-evidence',
+        '--local-aggregate',
+        str(fixture['local_aggregate']),
+        '--phase3-candidate-root',
+        str(fixture['candidate_root']),
+        '--phase3-aggregate',
+        str(fixture['aggregate']),
+        '--phase4-run-directory',
+        str(fixture['phase4_run']),
+        '--phase4-scenario6',
+        str(fixture['scenario6']),
+        '--phase5-remote-proof',
+        str(fixture['remote']),
+        '--phase5-evidence-commit-remote-proof',
+        str(fixture['evidence_remote']),
+    ]
+
+
+def test_release_evidence_mode_passes_only_exact_selected_artifacts(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    report = _validate_release_fixture(fixture)
+    assert report['status'] == 'PASS'
+    assert report['release_eligible'] is True
+    assert report['candidate_git_sha'] == fixture['candidate_sha']
+    command = _release_evidence_command(fixture)
+    local_paths = [
+        Path(fixture['local_aggregate']),
+        Path(fixture['local_aggregate']).with_suffix('.SHA256SUMS'),
+        Path(fixture['local_aggregate']).with_suffix('.checksum-validation.txt'),
+    ]
+    local_before = {path: path.read_bytes() for path in local_paths}
+    result = subprocess.run(
+        command,
+        cwd=fixture['repository'],
+        env=os.environ | {'CALL_LOG': str(fixture['call_log'])},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert {path: path.read_bytes() for path in local_paths} == local_before
+    aggregate = json.loads(Path(fixture['local_aggregate']).read_text(encoding='utf-8'))
+    assert aggregate['status'] == 'incomplete'
+    assert aggregate['release_eligible'] is False
+    release_result = json.loads(
+        (
+            Path(fixture['repository']) / 'artifacts/evidence/phase5/release/release-evidence.json'
+        ).read_text(encoding='utf-8')
+    )
+    assert release_result['status'] == 'PASS'
+    assert release_result['release_eligible'] is True
+    assert release_result['candidate_git_sha'] == fixture['candidate_sha']
+    assert not Path(fixture['call_log']).exists()
+
+
+def test_release_fixture_clones_are_self_contained_and_reload_producers(
+    tmp_path: Path,
+) -> None:
+    first = _release_fixture(tmp_path / 'first')
+    first_repository = Path(first['repository'])
+    assert not any(path.is_symlink() for path in (first_repository / 'install').rglob('*'))
+    release_module._activate_repository_packages(first_repository)
+    first_analysis = importlib.import_module('robotest_metrics.analysis')
+    first_scenario_provenance = importlib.import_module('robotest_scenarios.provenance')
+    assert Path(first_analysis.__file__).resolve().is_relative_to(first_repository)
+    assert Path(first_scenario_provenance.__file__).resolve().is_relative_to(first_repository)
+
+    second = _release_fixture(tmp_path / 'second')
+    second_repository = Path(second['repository'])
+    release_module._activate_repository_packages(second_repository)
+    second_analysis = importlib.import_module('robotest_metrics.analysis')
+    second_scenario_provenance = importlib.import_module('robotest_scenarios.provenance')
+    assert second_analysis is not first_analysis
+    assert second_scenario_provenance is not first_scenario_provenance
+    assert Path(second_analysis.__file__).resolve().is_relative_to(second_repository)
+    assert Path(second_scenario_provenance.__file__).resolve().is_relative_to(second_repository)
+
+    candidate_root = Path(second['candidate_root'])
+    positive_directory = candidate_root / 'positive-control'
+    positive_control = json.loads(
+        (positive_directory / 'contact-control-result.json').read_text(encoding='utf-8')
+    )
+    benchmark_binding = json.loads(
+        (positive_directory / 'positive-binding.json').read_text(encoding='utf-8')
+    )['benchmark_binding']
+    coverage_manifest = yaml.safe_load(
+        (second_repository / 'config/collision-coverage.yaml').read_text(encoding='utf-8')
+    )
+    wall_asset = second_repository / 'src/robotest_sim/models/phase3_contact_control_wall.sdf'
+    collision_module = importlib.import_module('robotest_metrics.collision_metrics')
+    assert (
+        collision_module.validate_collision_qualification(
+            coverage_manifest,
+            positive_control,
+            benchmark_binding,
+            wall_asset_path=wall_asset,
+        )['status']
+        == 'PASS'
+    )
+    wall_asset_bytes = wall_asset.read_bytes()
+    wall_asset.write_bytes(wall_asset_bytes + b'\n')
+    try:
+        with pytest.raises(collision_module.MetricUnavailable, match='wall asset hash'):
+            collision_module.validate_collision_qualification(
+                coverage_manifest,
+                positive_control,
+                benchmark_binding,
+                wall_asset_path=wall_asset,
+            )
+    finally:
+        wall_asset.write_bytes(wall_asset_bytes)
+
+    analysis_path = second_repository / 'src/robotest_metrics/robotest_metrics/analysis.py'
+    analysis_path.write_text(
+        analysis_path.read_text(encoding='utf-8') + '\n_CACHE_RELOAD_SENTINEL = True\n',
+        encoding='utf-8',
+    )
+    release_module._activate_repository_packages(second_repository)
+    reloaded_analysis = importlib.import_module('robotest_metrics.analysis')
+    assert reloaded_analysis is not second_analysis
+    assert reloaded_analysis._CACHE_RELOAD_SENTINEL is True
+
+    provenance_path = second_repository / 'src/robotest_scenarios/robotest_scenarios/provenance.py'
+    initial_source_binding = second_scenario_provenance.contact_source_binding()
+    provenance_path.write_text(
+        provenance_path.read_text(encoding='utf-8') + '\n_CACHE_RELOAD_SENTINEL = True\n',
+        encoding='utf-8',
+    )
+    release_module._activate_repository_packages(second_repository)
+    reloaded_scenario_provenance = importlib.import_module('robotest_scenarios.provenance')
+    assert reloaded_scenario_provenance is not second_scenario_provenance
+    assert reloaded_scenario_provenance._CACHE_RELOAD_SENTINEL is True
+    provenance_source_binding = reloaded_scenario_provenance.contact_source_binding()
+    assert provenance_source_binding != initial_source_binding
+
+    scenario_schema = (
+        second_repository / 'src/robotest_scenarios/schema/contact-control-result.schema.json'
+    )
+    scenario_schema.write_text(
+        scenario_schema.read_text(encoding='utf-8') + '\n',
+        encoding='utf-8',
+    )
+    release_module._activate_repository_packages(second_repository)
+    schema_reloaded_provenance = importlib.import_module('robotest_scenarios.provenance')
+    assert schema_reloaded_provenance.contact_source_binding() != provenance_source_binding
+
+    phase4_path = second_repository / 'tests/phase4_acceptance.py'
+    original_phase4 = release_module._load_repository_module(
+        second_repository,
+        'tests/phase4_acceptance.py',
+        'Phase 4 reload fixture',
+    )
+    phase4_path.write_text(
+        phase4_path.read_text(encoding='utf-8') + '\n_CACHE_RELOAD_SENTINEL = True\n',
+        encoding='utf-8',
+    )
+    reloaded_phase4 = release_module._load_repository_module(
+        second_repository,
+        'tests/phase4_acceptance.py',
+        'Phase 4 reload fixture',
+    )
+    assert reloaded_phase4 is not original_phase4
+    assert reloaded_phase4._CACHE_RELOAD_SENTINEL is True
+
+
+def test_release_evidence_final_claim_extension_is_exact(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    report = validate_release_claims(Path(fixture['repository']))
+    assert report['claim_count'] == 15
+    assert report['evidence_file_count'] == 5
+
+
+def test_release_markdown_scalars_use_canonical_json_spelling() -> None:
+    assert release_docs_module._markdown_scalar(True) == 'true'
+    assert release_docs_module._markdown_scalar(False) == 'false'
+    assert release_docs_module._markdown_scalar('text') == '"text"'
+    assert release_docs_module._markdown_scalar({'value': True}) == '{"value":true}'
+
+
+@pytest.mark.parametrize(
+    'marker',
+    [
+        release_docs_module.RELEASE_STATUS_START,
+        release_docs_module.RELEASE_STATUS_END,
+        release_docs_module.RELEASE_ROADMAP_START,
+        release_docs_module.RELEASE_ROADMAP_END,
+    ],
+)
+@pytest.mark.parametrize('mutation', ['missing', 'duplicated'])
+def test_release_readme_renderer_rejects_marker_corruption(marker: str, mutation: str) -> None:
+    source = (REPOSITORY / 'README.md').read_text(encoding='utf-8')
+    if mutation == 'missing':
+        source = source.replace(marker, '', 1)
+    else:
+        source = source.replace(marker, f'{marker}\n{marker}', 1)
+
+    with pytest.raises(EvidenceError, match='candidate README marker'):
+        release_docs_module.render_final_readme(
+            source.encode(),
+            candidate_id='candidate-1',
+            phase4_run_id='phase4-20260826T100000Z-1',
+            git_sha='a' * 40,
+        )
+
+
+def test_release_evidence_shell_does_not_create_python_caches(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    for cache in list(repository.rglob('__pycache__')):
+        shutil.rmtree(cache)
+
+    result = subprocess.run(
+        _release_evidence_command(fixture),
+        cwd=repository,
+        env=os.environ | {'CALL_LOG': str(fixture['call_log'])},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not list(repository.rglob('__pycache__'))
+
+
+def test_release_evidence_shell_rejects_symlinked_result_destination(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    release_root = repository / 'artifacts/evidence/phase5/release'
+    external = tmp_path / 'external-release'
+    external.mkdir()
+    sentinel = external / 'sentinel.txt'
+    sentinel.write_text('preserve\n', encoding='utf-8')
+    release_root.parent.mkdir(parents=True, exist_ok=True)
+    release_root.symlink_to(external, target_is_directory=True)
+
+    result = subprocess.run(
+        _release_evidence_command(fixture),
+        cwd=repository,
+        env=os.environ | {'CALL_LOG': str(fixture['call_log'])},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert sentinel.read_text(encoding='utf-8') == 'preserve\n'
+    assert list(external.iterdir()) == [sentinel]
+    assert 'contains a symlink' in result.stderr
+
+
+def test_release_evidence_shell_fails_closed_without_mutating_local_aggregate(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    local_paths = [
+        Path(fixture['local_aggregate']),
+        Path(fixture['local_aggregate']).with_suffix('.SHA256SUMS'),
+        Path(fixture['local_aggregate']).with_suffix('.checksum-validation.txt'),
+    ]
+    local_before = {path: path.read_bytes() for path in local_paths}
+    (Path(fixture['phase4_run']) / 'timeline.jsonl').write_text(
+        'tampered after finalization\n', encoding='utf-8'
+    )
+
+    result = subprocess.run(
+        _release_evidence_command(fixture),
+        cwd=fixture['repository'],
+        env=os.environ | {'CALL_LOG': str(fixture['call_log'])},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert {path: path.read_bytes() for path in local_paths} == local_before
+    release_root = Path(fixture['repository']) / 'artifacts/evidence/phase5/release'
+    release_result = json.loads(
+        (release_root / 'release-evidence.json').read_text(encoding='utf-8')
+    )
+    assert release_result['status'] == 'FAIL'
+    assert release_result['release_eligible'] is False
+    checksum = subprocess.run(
+        ['sha256sum', '-c', '--strict', 'release-evidence.SHA256SUMS'],
+        cwd=release_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert checksum.returncode == 0, checksum.stdout + checksum.stderr
+    assert not Path(fixture['call_log']).exists()
+
+
+def test_release_evidence_rejects_missing_selected_aggregate(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    Path(fixture['aggregate']).unlink()
+    with pytest.raises(EvidenceError, match='missing regular Phase 3 aggregate'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_missing_local_aggregate(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    Path(fixture['local_aggregate']).unlink()
+    with pytest.raises(EvidenceError, match='missing regular local aggregate summary'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_boolean_local_delta_bytes(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    phase0_version = repository / 'artifacts/evidence/phase0/phase0-versions.json'
+    phase0_version.write_bytes(b'x')
+    aggregate_path = Path(fixture['local_aggregate'])
+    aggregate = json.loads(aggregate_path.read_text(encoding='utf-8'))
+    record = aggregate['source']['generated_evidence_delta']['changed_files'][0]
+    record['bytes'] = True
+    record['sha256'] = phase5_module.file_sha256(phase0_version)
+    _canonical_file(aggregate_path, aggregate)
+    aggregate_path.with_suffix('.SHA256SUMS').write_text(
+        f'{phase5_module.file_sha256(aggregate_path)}  {aggregate_path.name}\n',
+        encoding='ascii',
+    )
+    aggregate_path.with_suffix('.checksum-validation.txt').write_text(
+        f'{aggregate_path.name}: OK\n', encoding='utf-8'
+    )
+
+    with pytest.raises(EvidenceError, match='generated Phase 0 evidence changed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_missing_evidence_commit_remote_proof(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    Path(fixture['evidence_remote']).unlink()
+    with pytest.raises(EvidenceError, match='missing regular evidence-commit remote proof'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_wrong_evidence_commit_remote_sha(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    path = Path(fixture['evidence_remote'])
+    proof = json.loads(path.read_text(encoding='utf-8'))
+    proof['run']['head_sha'] = fixture['candidate_sha']
+    _refresh_remote_proof(path, proof)
+    with pytest.raises(EvidenceError, match='verdict or identity is invalid'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_failed_evidence_commit_remote_run(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    path = Path(fixture['evidence_remote'])
+    proof = json.loads(path.read_text(encoding='utf-8'))
+    proof['run']['conclusion'] = 'failure'
+    _refresh_remote_proof(path, proof)
+    with pytest.raises(EvidenceError, match='verdict or identity is invalid'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_reduced_remote_proof_shape(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    path = Path(fixture['evidence_remote'])
+    proof = json.loads(path.read_text(encoding='utf-8'))
+    del proof['provenance']['platform']
+    _refresh_remote_proof(path, proof)
+
+    with pytest.raises(EvidenceError, match='provenance schema changed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_non_distinct_second_ci_run(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    path = Path(fixture['evidence_remote'])
+    proof = json.loads(path.read_text(encoding='utf-8'))
+    proof['run']['run_id'] = 42
+    proof['run']['run_url'] = 'https://github.com/example/robotest/actions/runs/42'
+    _refresh_remote_proof(path, proof)
+
+    with pytest.raises(EvidenceError, match='not a distinct later workflow run'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_boolean_remote_run_id(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    path = Path(fixture['evidence_remote'])
+    proof = json.loads(path.read_text(encoding='utf-8'))
+    proof['run']['run_id'] = True
+    proof['run']['run_url'] = 'https://github.com/example/robotest/actions/runs/True'
+    _refresh_remote_proof(path, proof)
+
+    with pytest.raises(EvidenceError, match='run ID is invalid'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_boolean_remote_schema_version(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    path = Path(fixture['evidence_remote'])
+    proof = json.loads(path.read_text(encoding='utf-8'))
+    proof['schema_version'] = True
+    _refresh_remote_proof(path, proof)
+
+    with pytest.raises(EvidenceError, match='top-level producer contract changed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_second_ci_before_candidate_proof(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    path = Path(fixture['evidence_remote'])
+    proof = json.loads(path.read_text(encoding='utf-8'))
+    proof['run']['created_at'] = '2026-08-26T00:00:30Z'
+    _refresh_remote_proof(path, proof)
+
+    with pytest.raises(EvidenceError, match='not a distinct later workflow run'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_checksum_tampering(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    (Path(fixture['phase4_run']) / 'timeline.jsonl').write_text('tampered\n', encoding='utf-8')
+    with pytest.raises(EvidenceError, match='Phase 4 checksum mismatch'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_requires_an_evidence_only_head_commit(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    (repository / 'unexpected.txt').write_text('not evidence only\n', encoding='utf-8')
+    _commit_all(repository, 'unexpected source change')
+    with pytest.raises(
+        EvidenceError, match='single-parent evidence-only commit directly after the candidate'
+    ):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_tampered_generated_summary(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    summary = (
+        Path(fixture['repository'])
+        / f'docs/results/phase-3/{Path(fixture["candidate_root"]).name}.md'
+    )
+    summary.write_text(summary.read_text(encoding='utf-8') + 'forged\n', encoding='utf-8')
+
+    with pytest.raises(EvidenceError, match='release summary differs'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_extra_generated_summary(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    extra = Path(fixture['repository']) / 'docs/results/phase-3/extra.md'
+    extra.write_text('extra\n', encoding='utf-8')
+
+    with pytest.raises(EvidenceError, match='release summary path set is not exact'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_symlinked_summary_root(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    summary_root = repository / 'docs/results/phase-3'
+    external = tmp_path / 'external-summary'
+    summary_root.rename(external)
+    summary_root.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(EvidenceError, match='release summary root contains a symlink'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_readme_change_outside_markers(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    readme = Path(fixture['repository']) / 'README.md'
+    readme.write_text('forged prefix\n' + readme.read_text(encoding='utf-8'), encoding='utf-8')
+
+    with pytest.raises(EvidenceError, match='README changed outside'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_executable_generated_document(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    document = repository / f'docs/results/phase-3/{Path(fixture["candidate_root"]).name}.md'
+    document.chmod(0o755)
+    subprocess.run(['git', 'update-index', '--chmod=+x', str(document)], cwd=repository, check=True)
+    subprocess.run(
+        [
+            'git',
+            '-c',
+            'user.name=Phase5 Test',
+            '-c',
+            'user.email=phase5@example.invalid',
+            'commit',
+            '-q',
+            '--amend',
+            '--no-edit',
+            '--no-gpg-sign',
+        ],
+        cwd=repository,
+        check=True,
+    )
+
+    with pytest.raises(EvidenceError, match='not a regular 100644 blob'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_symlinked_phase3_evidence_root(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    evidence_root = repository / 'artifacts/evidence/phase3-benchmarks'
+    external = tmp_path / 'external-phase3'
+    evidence_root.rename(external)
+    evidence_root.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(EvidenceError, match='Phase 3 evidence root contains a symlink'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_hidden_index_flags(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    subprocess.run(
+        ['git', 'update-index', '--assume-unchanged', 'README.md'],
+        cwd=repository,
+        check=True,
+    )
+
+    with pytest.raises(EvidenceError, match='release index contains'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_wrong_campaign_verdict(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    aggregate_path = Path(fixture['aggregate'])
+    aggregate = json.loads(aggregate_path.read_text(encoding='utf-8'))
+    aggregate['verdict']['automated_status'] = 'FAIL'
+    _canonical_file(aggregate_path, aggregate)
+    (aggregate_path.parent / 'aggregate-result.csv').write_bytes(
+        release_module._one_row_csv_bytes(aggregate)
+    )
+    with pytest.raises(EvidenceError, match='aggregate verdict is not PASS'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_schema_invalid_phase3_bundle(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    bundle = Path(fixture['candidate_root']) / 'runs/00/result'
+    result_path = bundle / 'run-result.json'
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    del result['events']
+    _canonical_file(result_path, result)
+    _refresh_phase3_bundle(bundle)
+    with pytest.raises(EvidenceError, match='result bundle verification failed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_schema_invalid_phase3_manifest(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    manifest_path = Path(fixture['candidate_root']) / 'runs/00/result/run-artifacts.manifest.json'
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    manifest['producer'] = 'forged/producer'
+    _canonical_file(manifest_path, manifest, sidecar=True)
+
+    with pytest.raises(EvidenceError, match='result bundle verification failed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_incomplete_phase3_pass_vector(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    bundle = Path(fixture['candidate_root']) / 'runs/00/result'
+    result_path = bundle / 'run-result.json'
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    result['verdict']['mission_success'] = False
+    _canonical_file(result_path, result)
+    _refresh_phase3_bundle(bundle)
+
+    with pytest.raises(EvidenceError, match='is not a full canonical PASS'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_phase3_plan_identity_forgery(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    bundle = Path(fixture['candidate_root']) / 'runs/00/result'
+    result_path = bundle / 'run-result.json'
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    result['identity']['ros_domain_id'] = 200
+    _canonical_file(result_path, result)
+    result_sha = _refresh_phase3_bundle(bundle)
+    aggregate_path = Path(fixture['aggregate'])
+    aggregate = json.loads(aggregate_path.read_text(encoding='utf-8'))
+    aggregate['identity']['ordered_source_json_sha256'][0] = result_sha
+    _canonical_file(aggregate_path, aggregate)
+    (aggregate_path.parent / 'aggregate-result.csv').write_bytes(
+        release_module._one_row_csv_bytes(aggregate)
+    )
+    with pytest.raises(EvidenceError, match='identity mismatch for ros_domain_id'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_phase3_target_binding_forgery(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    bundle = Path(fixture['candidate_root']) / 'runs/00/result'
+    result_path = bundle / 'run-result.json'
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    result['targets']['collector_configuration_sha256'] = 'f' * 64
+    result['quality']['candidate_identity']['hashes']['collector_configuration_sha256'] = 'f' * 64
+    _canonical_file(result_path, result)
+    result_sha = _refresh_phase3_bundle(bundle)
+    aggregate_path = Path(fixture['aggregate'])
+    aggregate = json.loads(aggregate_path.read_text(encoding='utf-8'))
+    aggregate['identity']['ordered_source_json_sha256'][0] = result_sha
+    _canonical_file(aggregate_path, aggregate)
+    (aggregate_path.parent / 'aggregate-result.csv').write_bytes(
+        release_module._one_row_csv_bytes(aggregate)
+    )
+
+    with pytest.raises(EvidenceError, match='production analysis replay'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase3_drain_stamp(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_root = Path(fixture['candidate_root']) / 'runs/00'
+    request_path = run_root / 'analysis-request.json'
+    request = json.loads(request_path.read_text(encoding='utf-8'))
+    request['collision']['drain_completed_stamp_ns'] += 1
+    _canonical_file(request_path, request, sidecar=True)
+    analysis = importlib.import_module('robotest_metrics.analysis')
+    result_path = run_root / 'result/run-result.json'
+    _canonical_file(result_path, analysis.analyze_run(request))
+    _refresh_phase3_bundle(result_path.parent)
+
+    with pytest.raises(EvidenceError, match='drain stamp is not derived'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_coordinated_phase3_aggregate_forgery(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    aggregate_path = Path(fixture['aggregate'])
+    aggregate = json.loads(aggregate_path.read_text(encoding='utf-8'))
+    aggregate['scenarios']['1']['metrics']['measurements.completion_time_sim_s']['median'] = 9.0
+    _canonical_file(aggregate_path, aggregate)
+    (aggregate_path.parent / 'aggregate-result.csv').write_bytes(
+        release_module._one_row_csv_bytes(aggregate)
+    )
+
+    with pytest.raises(EvidenceError, match='does not exactly recompute from runs'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_boolean_phase3_aggregate_number(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    aggregate_path = Path(fixture['aggregate'])
+    aggregate = json.loads(aggregate_path.read_text(encoding='utf-8'))
+    aggregate['scenarios']['1']['success_rate'] = True
+    _canonical_file(aggregate_path, aggregate)
+    (aggregate_path.parent / 'aggregate-result.csv').write_bytes(
+        release_module._one_row_csv_bytes(aggregate)
+    )
+
+    with pytest.raises(EvidenceError, match='does not exactly recompute from runs'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_boolean_phase3_plan_schema(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    plan_path = Path(fixture['candidate_root']) / 'suite-plan.json'
+    plan = json.loads(plan_path.read_text(encoding='utf-8'))
+    plan['schema_version'] = True
+    _canonical_file(plan_path, plan, sidecar=True)
+
+    with pytest.raises(EvidenceError, match='suite plan contract changed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_boolean_phase3_manifest_count(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    binding_path = Path(fixture['candidate_root']) / 'build-binding.json'
+    binding = json.loads(binding_path.read_text(encoding='utf-8'))
+    binding['source']['file_count'] = True
+    _canonical_file(binding_path, binding, sidecar=True)
+
+    with pytest.raises(EvidenceError, match='counters or aggregate hash do not reconcile'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_boolean_positive_control_exit_code(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    candidate_root = Path(fixture['candidate_root'])
+    binding_path = candidate_root / 'positive-control/positive-binding.json'
+    marker_path = candidate_root / 'positive-control/PASS.json'
+    binding = json.loads(binding_path.read_text(encoding='utf-8'))
+    binding['positive_control']['verdict']['exit_code'] = False
+    positive_sha = release_module._canonical_sha256(binding['positive_control'])
+    binding['positive_control_json_sha256'] = positive_sha
+    binding['benchmark_binding']['positive_control_json_sha256'] = positive_sha
+    _canonical_file(binding_path, binding, sidecar=True)
+    marker = json.loads(marker_path.read_text(encoding='utf-8'))
+    marker['positive_binding_sha256'] = phase5_module.file_sha256(binding_path)
+    _canonical_file(marker_path, marker, sidecar=True)
+
+    with pytest.raises(EvidenceError, match='positive-control result schema failed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_missing_collision_coverage_sha(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    candidate_root = Path(fixture['candidate_root'])
+    binding_path = candidate_root / 'positive-control/positive-binding.json'
+    binding = json.loads(binding_path.read_text(encoding='utf-8'))
+    del binding['coverage_manifest']['bridge_sha256']
+    for name in ('benchmark_provenance', 'positive_control_provenance'):
+        binding['benchmark_binding'][name]['bridge_sha256'] = None
+    _refresh_phase3_positive_binding(candidate_root, binding, rebind_coverage=True)
+
+    with pytest.raises(EvidenceError, match='collision qualification failed'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize('section', ['configuration', 'control', 'quality'])
+def test_release_evidence_rejects_incomplete_positive_control(tmp_path: Path, section: str) -> None:
+    fixture = _release_fixture(tmp_path)
+    candidate_root = Path(fixture['candidate_root'])
+    binding_path = candidate_root / 'positive-control/positive-binding.json'
+    binding = json.loads(binding_path.read_text(encoding='utf-8'))
+    del binding['positive_control'][section]
+    _refresh_phase3_positive_binding(candidate_root, binding)
+
+    with pytest.raises(EvidenceError, match='positive-control result schema failed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_positive_control_raw_forgery(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    result_path = candidate_root / 'positive-control/contact-control-result.json'
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    record = result['control']['contact']['records'][0]
+    record.update(
+        {
+            'counterpart_collision': None,
+            'counterpart_model': None,
+            'disposition': 'non_robot_pair_ignored',
+            'robot_collision': None,
+        }
+    )
+    _canonical_file(result_path, result, sidecar=True)
+    _rebind_phase3_positive_raw(candidate_root, repository)
+
+    with pytest.raises(EvidenceError, match='collision qualification failed'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize('field', ['source', 'install', 'source_install'])
+def test_release_evidence_rejects_incomplete_phase3_build_binding(
+    tmp_path: Path, field: str
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    binding_path = Path(fixture['candidate_root']) / 'build-binding.json'
+    binding = json.loads(binding_path.read_text(encoding='utf-8'))
+    del binding[field]
+    _canonical_file(binding_path, binding, sidecar=True)
+
+    with pytest.raises(EvidenceError, match='build binding producer or schema changed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_empty_phase3_build_manifest(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    binding_path = Path(fixture['candidate_root']) / 'build-binding.json'
+    binding = json.loads(binding_path.read_text(encoding='utf-8'))
+    binding['source'] = {
+        'aggregate_sha256': release_module._canonical_sha256([]),
+        'file_count': 0,
+        'files': [],
+        'total_bytes': 0,
+    }
+    _canonical_file(binding_path, binding, sidecar=True)
+
+    with pytest.raises(EvidenceError, match='source tree manifest is empty'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_shallow_phase3_positive_binding(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    candidate_root = Path(fixture['candidate_root'])
+    binding_path = candidate_root / 'positive-control/positive-binding.json'
+    binding = json.loads(binding_path.read_text(encoding='utf-8'))
+    del binding['capture_sha256']
+    _canonical_file(binding_path, binding, sidecar=True)
+    marker_path = candidate_root / 'positive-control/PASS.json'
+    marker = json.loads(marker_path.read_text(encoding='utf-8'))
+    marker['positive_binding_sha256'] = phase5_module.file_sha256(binding_path)
+    _canonical_file(marker_path, marker, sidecar=True)
+
+    with pytest.raises(EvidenceError, match='positive-control binding contract changed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_phase3_plan_partition_forgery(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    candidate_root = Path(fixture['candidate_root'])
+    plan_path = candidate_root / 'suite-plan.json'
+    plan = json.loads(plan_path.read_text(encoding='utf-8'))
+    plan['trials'][0]['gz_partition'] = 'robotest_p3_forged_00'
+    _canonical_file(plan_path, plan, sidecar=True)
+    prepared_path = candidate_root / 'prepared.json'
+    prepared = json.loads(prepared_path.read_text(encoding='utf-8'))
+    prepared['suite_plan_sha256'] = phase5_module.file_sha256(plan_path)
+    _canonical_file(prepared_path, prepared, sidecar=True)
+
+    with pytest.raises(EvidenceError, match='trial order changed'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [('schema_version', 2), ('producer', 'forged/acceptance_verifier')],
+)
+def test_release_evidence_rejects_phase4_producer_schema_forgery(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    result_path = Path(fixture['scenario6'])
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    result[field] = value
+    _canonical_file(result_path, result)
+    (run_directory / 'scenario6-result.csv').write_bytes(release_module._phase4_csv_bytes(result))
+    _refresh_phase4_manifest(run_directory)
+
+    with pytest.raises(EvidenceError, match='producer schema changed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_incomplete_phase4_check_set(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    result_path = Path(fixture['scenario6'])
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    del result['quality']['checks']['cleanup_complete_and_owned']
+    _canonical_file(result_path, result)
+    (run_directory / 'scenario6-result.csv').write_bytes(release_module._phase4_csv_bytes(result))
+    _refresh_phase4_manifest(run_directory)
+    with pytest.raises(EvidenceError, match='check set is incomplete or failed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_unexpected_phase4_check(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    result_path = Path(fixture['scenario6'])
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    result['quality']['checks']['forged_check'] = True
+    _canonical_file(result_path, result)
+    (run_directory / 'scenario6-result.csv').write_bytes(release_module._phase4_csv_bytes(result))
+    _refresh_phase4_manifest(run_directory)
+
+    with pytest.raises(EvidenceError, match='check set is incomplete or failed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_incomplete_phase4_raw_hashes(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    result_path = Path(fixture['scenario6'])
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    del result['quality']['raw_evidence_sha256']['timeline.jsonl']
+    _canonical_file(result_path, result)
+    (run_directory / 'scenario6-result.csv').write_bytes(release_module._phase4_csv_bytes(result))
+    _refresh_phase4_manifest(run_directory)
+    with pytest.raises(EvidenceError, match='raw evidence hash coverage is not exact'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_phase4_csv_measurement_forgery(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    csv_path = run_directory / 'scenario6-result.csv'
+    with csv_path.open(encoding='utf-8', newline='') as source:
+        rows = list(csv.DictReader(source))
+        fieldnames = list(rows[0])
+    rows[0]['actual_restart_backoff_wall_s'] = '9.0'
+    with csv_path.open('w', encoding='utf-8', newline='') as target:
+        writer = csv.DictWriter(target, fieldnames=fieldnames, lineterminator='\n')
+        writer.writeheader()
+        writer.writerows(rows)
+    _refresh_phase4_manifest(run_directory)
+    with pytest.raises(EvidenceError, match='Scenario 6 CSV differs from JSON'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_self_consistent_phase4_measurement_forgery(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    result_path = Path(fixture['scenario6'])
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    result['measurements']['ready_503_after_injection_wall_s'] = True
+    _canonical_file(result_path, result)
+    (run_directory / 'scenario6-result.csv').write_bytes(release_module._phase4_csv_bytes(result))
+    _refresh_phase4_manifest(run_directory)
+
+    with pytest.raises(EvidenceError, match='measurements violate frozen bounds'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        ('replacement_child_start_count', True),
+        ('restart_scheduled_count', True),
+        ('interrupted_mission_exit_code', True),
+        ('followup_mission_exit_code', False),
+        ('actual_restart_backoff_wall_s', True),
+    ],
+)
+def test_release_evidence_rejects_boolean_phase4_measurements(
+    tmp_path: Path, field: str, value: bool
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    result_path = Path(fixture['scenario6'])
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    result['measurements'][field] = value
+    _canonical_file(result_path, result)
+    (run_directory / 'scenario6-result.csv').write_bytes(release_module._phase4_csv_bytes(result))
+    _refresh_phase4_manifest(run_directory)
+
+    with pytest.raises(EvidenceError, match='measurements violate frozen bounds'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_boolean_phase4_target(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    result_path = Path(fixture['scenario6'])
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    result['targets']['restart_backoff_wall_s'][0] = True
+    _canonical_file(result_path, result)
+    (run_directory / 'scenario6-result.csv').write_bytes(release_module._phase4_csv_bytes(result))
+    _refresh_phase4_manifest(run_directory)
+
+    with pytest.raises(EvidenceError, match='frozen targets changed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_boolean_phase4_quality_count(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    result_path = Path(fixture['scenario6'])
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    result['quality']['event_trace_dropped'] = False
+    _canonical_file(result_path, result)
+    (run_directory / 'scenario6-result.csv').write_bytes(release_module._phase4_csv_bytes(result))
+    _refresh_phase4_manifest(run_directory)
+
+    with pytest.raises(EvidenceError, match='quality counters are invalid'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_boolean_phase4_event_meta_count(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    meta_path = run_directory / 'supervisor-events.meta.json'
+    meta = json.loads(meta_path.read_text(encoding='utf-8'))
+    meta['dropped_events'] = False
+    _canonical_file(meta_path, meta)
+    _refresh_phase4_result(run_directory)
+
+    with pytest.raises(EvidenceError, match='raw evidence counters do not reconcile'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_boolean_phase4_verdict_count(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    result_path = Path(fixture['scenario6'])
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    result['verdict']['failure_count'] = False
+    _canonical_file(result_path, result)
+    (run_directory / 'scenario6-result.csv').write_bytes(release_module._phase4_csv_bytes(result))
+    _refresh_phase4_manifest(run_directory)
+
+    with pytest.raises(EvidenceError, match='verdict is not canonical PASS'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_self_consistent_phase4_context_forgery(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    context_path = run_directory / 'context.json'
+    context = json.loads(context_path.read_text(encoding='utf-8'))
+    context['isolation']['domain_was_unused'] = False
+    _canonical_file(context_path, context)
+    _refresh_phase4_result(run_directory)
+
+    with pytest.raises(EvidenceError, match='context paths or isolation changed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase4_raw_forgery(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    timeline_path = run_directory / 'timeline.jsonl'
+    timeline = [json.loads(line) for line in timeline_path.read_text(encoding='utf-8').splitlines()]
+    unavailable = next(item for item in timeline if item['kind'] == 'ready_unavailable')
+    unavailable['monotonic_ns'] += 100_000_000
+    timeline_path.write_text(
+        ''.join(
+            json.dumps(item, ensure_ascii=False, separators=(',', ':'), sort_keys=True) + '\n'
+            for item in timeline
+        ),
+        encoding='utf-8',
+    )
+    _refresh_phase4_result(run_directory)
+
+    with pytest.raises(EvidenceError, match='exact production evaluation replay'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_boolean_phase4_context_schema(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    context_path = run_directory / 'context.json'
+    context = json.loads(context_path.read_text(encoding='utf-8'))
+    context['schema_version'] = True
+    _canonical_file(context_path, context)
+    _refresh_phase4_result(run_directory)
+
+    with pytest.raises(EvidenceError, match='clean exact candidate'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_missing_phase4_producer_raw_file(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    (run_directory / 'package-lifecycle.json').unlink()
+    _refresh_phase4_result(run_directory)
+
+    with pytest.raises(EvidenceError, match='raw evidence hash coverage is not exact'):
+        _validate_release_fixture(fixture)

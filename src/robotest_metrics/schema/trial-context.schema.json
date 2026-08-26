@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://robotest-lab.local/schema/metrics-trial-context-v1.json",
+  "title": "RoboTest Phase 3 immutable trial context",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "failure",
+    "identity",
+    "intended_wall_timeout_s",
+    "producer",
+    "schema_version",
+    "targets"
+  ],
+  "properties": {
+    "failure": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "evidence_sha256",
+            "exit_code",
+            "kind",
+            "reason",
+            "stage",
+            "wall_timed_out"
+          ],
+          "properties": {
+            "evidence_sha256": {"$ref": "#/$defs/sha256"},
+            "exit_code": {"type": "integer", "not": {"const": 0}},
+            "kind": {"$ref": "#/$defs/token"},
+            "reason": {"$ref": "#/$defs/boundedString"},
+            "stage": {"$ref": "#/$defs/token"},
+            "wall_timed_out": {"type": "boolean"}
+          }
+        }
+      ]
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_id",
+        "cold_stack",
+        "git_dirty",
+        "git_sha",
+        "gz_partition",
+        "repetition_index",
+        "ros_domain_id",
+        "run_id",
+        "scenario_id",
+        "scenario_index",
+        "scenario_name",
+        "scenario_sha256",
+        "suite_index"
+      ],
+      "properties": {
+        "candidate_id": {"$ref": "#/$defs/boundedString"},
+        "cold_stack": {"const": true},
+        "git_dirty": {"const": false},
+        "git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "gz_partition": {"$ref": "#/$defs/boundedString"},
+        "repetition_index": {"type": "integer", "minimum": 0, "maximum": 2},
+        "ros_domain_id": {"type": "integer", "minimum": 0, "maximum": 232},
+        "run_id": {"$ref": "#/$defs/boundedString"},
+        "scenario_id": {"type": "integer", "minimum": 1, "maximum": 5},
+        "scenario_index": {"type": "integer", "minimum": 1, "maximum": 5},
+        "scenario_name": {"$ref": "#/$defs/boundedString"},
+        "scenario_sha256": {"$ref": "#/$defs/sha256"},
+        "suite_index": {"type": "integer", "minimum": 0, "maximum": 14}
+      }
+    },
+    "intended_wall_timeout_s": {"type": "number", "exclusiveMinimum": 0},
+    "producer": {"const": "robotest_phase3/benchmark_orchestrator"},
+    "schema_version": {"const": 1},
+    "targets": {
+      "type": "object",
+      "required": [
+        "acceptance",
+        "collector_configuration_sha256",
+        "collision_coverage_manifest_sha256",
+        "fault_schedule_sha256",
+        "metrics_contract_sha256",
+        "positive_control_json_sha256",
+        "required_metrics",
+        "scenario_sha256",
+        "source_configuration_sha256",
+        "target_set_sha256",
+        "world_to_map"
+      ],
+      "properties": {
+        "acceptance": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/threshold"}
+        },
+        "collector_configuration_sha256": {"$ref": "#/$defs/sha256"},
+        "collision_coverage_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "fault_schedule_sha256": {"$ref": "#/$defs/sha256"},
+        "metrics_contract_sha256": {"$ref": "#/$defs/sha256"},
+        "positive_control_json_sha256": {"$ref": "#/$defs/sha256"},
+        "required_metrics": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^measurements\\."}
+        },
+        "scenario_sha256": {"$ref": "#/$defs/sha256"},
+        "source_configuration_sha256": {"$ref": "#/$defs/sha256"},
+        "target_set_sha256": {"$ref": "#/$defs/sha256"},
+        "world_to_map": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["x_m", "y_m", "yaw_rad"],
+          "properties": {
+            "x_m": {"const": 0.0},
+            "y_m": {"const": 0.0},
+            "yaw_rad": {"const": 0.0}
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "boundedString": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "threshold": {
+      "type": "object",
+      "minProperties": 1,
+      "properties": {
+        "maximum": {"type": "number"},
+        "minimum": {"type": "number"}
+      },
+      "additionalProperties": false
+    },
+    "token": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    }
+  }
+}

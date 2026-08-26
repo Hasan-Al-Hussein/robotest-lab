@@ -1,0 +1,3 @@
+Tests: installed
+Depends: @, python3, systemd
+Restrictions: isolation-container, superficial

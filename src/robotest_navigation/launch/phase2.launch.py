@@ -20,6 +20,7 @@ from launch.actions import (
     GroupAction,
     IncludeLaunchDescription,
     SetEnvironmentVariable,
+    Shutdown,
     TimerAction,
 )
 from launch.conditions import IfCondition
@@ -64,7 +65,7 @@ SMOOTHER_REMAPS = (
 
 
 def _nav_node(package, executable, namespace, params, log_level, remappings=TF_REMAPS):
-    """Create one non-composed, non-respawning Nav2 lifecycle process."""
+    """Create one non-composed Nav2 process that fails the whole stack closed."""
     return Node(
         package=package,
         executable=executable,
@@ -75,6 +76,7 @@ def _nav_node(package, executable, namespace, params, log_level, remappings=TF_R
         parameters=[params],
         arguments=['--ros-args', '--log-level', log_level],
         remappings=list(remappings),
+        on_exit=Shutdown(reason=f'critical Nav2 process exited: {executable}'),
     )
 
 
@@ -149,6 +151,7 @@ def generate_launch_description():
         parameters=[configured_params, {'yaml_filename': map_yaml}],
         arguments=['--ros-args', '--log-level', log_level],
         remappings=list(TF_REMAPS),
+        on_exit=Shutdown(reason='critical Nav2 process exited: map_server'),
     )
     amcl = _nav_node('nav2_amcl', 'amcl', namespace, configured_params, log_level)
     planner_server = _nav_node(
@@ -188,6 +191,7 @@ def generate_launch_description():
         ],
         arguments=['--ros-args', '--log-level', log_level],
         remappings=list(TF_REMAPS),
+        on_exit=Shutdown(reason='critical Nav2 process exited: bt_navigator'),
     )
     waypoint_follower = _nav_node(
         'nav2_waypoint_follower',
@@ -229,6 +233,7 @@ def generate_launch_description():
             }
         ],
         arguments=['--ros-args', '--log-level', log_level],
+        on_exit=Shutdown(reason='critical Nav2 process exited: lifecycle_manager_navigation'),
     )
     lifecycle_startup_trigger = Node(
         package='robotest_navigation',

@@ -43,6 +43,28 @@ The world must load Gazebo's Sensors, IMU, and Contact systems before spawning
 this model. The simulation package owns those world-level systems and the
 explicit ROS-Gazebo bridge allowlist.
 
+## Collision-coverage provenance
+
+The repository-root `config/collision-coverage.yaml` is generated evidence,
+not a hand-maintained allowlist. From the repository root, verify it with:
+
+    python3 src/robotest_description/tools/generate_collision_coverage.py \
+      --repository-root . --mode check
+
+After an intentional Xacro, contact sensor, bridge, or world change,
+regenerate it atomically with `--mode write` and review the complete diff.
+The generator expands the exact launch arguments, converts the URDF with
+`gz sdf --precision 17 -p`, and proves that every one of the seven rendered
+collision geometries has exactly one 5 Hz contact sensor on the frozen topic.
+
+The manifest binds raw bridge and world bytes, a canonical inventory of every
+Xacro source plus render arguments, the printed rendered SDF bytes, and a
+canonical semantic projection of the seven contact sensors. Its declared
+`manifest_sha256` is SHA-256 over sorted compact UTF-8 JSON plus LF with the
+self-hash field omitted. YAML formatting and comments are not authoritative.
+The four support exclusions are exact wheel/caster-to-ground pairs; no other
+collision can be excluded.
+
 ## Inspect without Gazebo
 
 After building and sourcing the workspace:

@@ -1,0 +1,3 @@
+u robotest-supervisor - "RoboTest Lab supervisor" /var/lib/robotest-supervisor /usr/sbin/nologin
+m robotest-supervisor video
+m robotest-supervisor render

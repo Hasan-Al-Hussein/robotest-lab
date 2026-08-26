@@ -1,6 +1,6 @@
 # ADR 0005: Phase 3 Deterministic Fault Protocol
 
-- Status: Accepted for Phase 3 implementation
+- Status: Accepted and implemented; authoritative Phase 3 benchmark evidence pending
 - Date: 2026-08-26
 - Decision owners: RoboTest Lab fault, mission, metrics, and safety gate
 
@@ -462,3 +462,17 @@ This decision freezes the Phase 3 contract before code changes. At acceptance,
 the legacy Phase 1 load service and `FaultEvent` version 1 still exist; the
 new services, state machine, fault transforms, version 2 events, and runtime
 proof described here are not yet implemented or verified.
+
+### Update — 2026-08-26
+
+The Phase 3 services, deterministic state machine and transforms,
+`FaultEvent` version 2 contract, mission integration, metrics validation, and
+their unit/contract tests are now implemented. The development Phase 3
+verifier at `artifacts/evidence/phase3/20260826T052402Z-3022/` passed its
+static, fresh build, package-test, installed-interface, and dependency gates.
+The package lifecycle evidence at
+`artifacts/evidence/phase4/package-lifecycle-20260826T045138Z.json` also passed.
+
+Those records do not include the authoritative Scenario 4/5 runtime proof or
+the complete Phase 3 candidate. The positive control, runtime smoke, and exact
+15-trial cold-stack campaign remain pending; no benchmark PASS is claimed.

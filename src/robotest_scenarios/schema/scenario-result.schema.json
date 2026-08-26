@@ -1,0 +1,259 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://robotest.local/schema/scenario-result-v1.json",
+  "title": "RoboTest scenario controller component result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "producer", "status", "verdict", "identity",
+    "configuration", "binding", "interaction", "cleanup", "quality"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "producer": {"const": "robotest_scenarios/scenario_controller"},
+    "status": {"enum": ["PASS", "FAIL"]},
+    "verdict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authority", "benchmark_pass", "exit_code", "reason"],
+      "properties": {
+        "authority": {"const": "component_only"},
+        "benchmark_pass": {"type": "null"},
+        "exit_code": {"type": "integer", "minimum": 0, "maximum": 255},
+        "reason": {"type": "string", "maxLength": 4096}
+      }
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "candidate_id", "repetition_index", "suite_index", "scenario_id", "scenario_name", "scenario_sha256"],
+      "properties": {
+        "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "candidate_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"},
+        "repetition_index": {"type": "integer", "minimum": 0, "maximum": 2},
+        "suite_index": {"type": "integer", "minimum": 0, "maximum": 14},
+        "scenario_id": {"type": "integer", "minimum": 1, "maximum": 5},
+        "scenario_name": {"type": "string", "maxLength": 128},
+        "scenario_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "configuration": {"type": "object"},
+    "binding": {"type": "object"},
+    "interaction": {"type": "object"},
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "delete_attempt_count", "delete_success", "actor_absent", "proof"],
+      "properties": {
+        "required": {"type": "boolean"},
+        "delete_attempt_count": {"type": "integer", "minimum": 0, "maximum": 1},
+        "delete_success": {"type": ["boolean", "null"]},
+        "actor_absent": {"type": "boolean"},
+        "proof": {"type": "object"}
+      }
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["all_buffers_bounded", "overflow_free", "single_goal_binding", "immutable_t0", "relative_project_names", "protocol_error_count", "buffers", "clock", "plan_pose_stream"],
+      "properties": {
+        "all_buffers_bounded": {"const": true},
+        "overflow_free": {"type": "boolean"},
+        "single_goal_binding": {"type": "boolean"},
+        "immutable_t0": {"type": "boolean"},
+        "relative_project_names": {"const": true},
+        "protocol_error_count": {"type": "integer", "minimum": 0},
+        "clock": {"$ref": "#/$defs/clock"},
+        "plan_pose_stream": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["accepted_count", "capacity", "first_overflow_sequence", "first_overflow_stamp_ns", "ingress_count", "invalid_count", "overflow", "overflow_count", "retained_count"],
+          "properties": {
+            "accepted_count": {"type": "integer", "minimum": 0},
+            "capacity": {"const": 65536},
+            "first_overflow_sequence": {"type": ["integer", "null"]},
+            "first_overflow_stamp_ns": {"type": ["integer", "null"]},
+            "ingress_count": {"type": "integer", "minimum": 0},
+            "invalid_count": {"type": "integer", "minimum": 0},
+            "overflow": {"type": "boolean"},
+            "overflow_count": {"type": "integer", "minimum": 0},
+            "retained_count": {"type": "integer", "minimum": 0}
+          }
+        },
+        "buffers": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "feedback", "plans", "ground_truth", "actor_state"],
+          "properties": {
+            "status": {"$ref": "#/$defs/buffer"},
+            "feedback": {"$ref": "#/$defs/buffer"},
+            "plans": {"$ref": "#/$defs/buffer"},
+            "ground_truth": {"$ref": "#/$defs/buffer"},
+            "actor_state": {"$ref": "#/$defs/buffer"}
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "PASS"}}},
+      "then": {
+        "properties": {
+          "verdict": {"properties": {"exit_code": {"const": 0}}},
+          "cleanup": {"properties": {"actor_absent": {"const": true}}},
+          "quality": {
+            "properties": {
+              "immutable_t0": {"const": true},
+              "overflow_free": {"const": true},
+              "protocol_error_count": {"const": 0},
+              "single_goal_binding": {"const": true}
+            }
+          }
+        }
+      },
+      "else": {"properties": {"verdict": {"properties": {"exit_code": {"enum": [20, 21, 22, 23, 24]}}}}}
+    },
+    {
+      "if": {"properties": {"identity": {"properties": {"scenario_id": {"enum": [2, 3]}}}}},
+      "then": {
+        "properties": {
+          "interaction": {"properties": {"kind": {"enum": ["static_obstacle", "pose_controlled_obstacle"]}}, "required": ["kind", "criteria"]}
+        }
+      },
+      "else": {
+        "properties": {
+          "cleanup": {"properties": {"required": {"const": false}}},
+          "interaction": {"properties": {"kind": {"const": "none"}}, "required": ["kind", "criteria"]}
+        }
+      }
+    },
+    {
+      "if": {
+        "allOf": [
+          {"properties": {"status": {"const": "PASS"}}},
+          {"properties": {"identity": {"properties": {"scenario_id": {"const": 2}}}}}
+        ]
+      },
+      "then": {"properties": {"interaction": {"$ref": "#/$defs/scenario2Pass"}, "cleanup": {"properties": {"delete_attempt_count": {"const": 1}, "delete_success": {"const": true}}}}}
+    },
+    {
+      "if": {
+        "allOf": [
+          {"properties": {"status": {"const": "PASS"}}},
+          {"properties": {"identity": {"properties": {"scenario_id": {"const": 3}}}}}
+        ]
+      },
+      "then": {"properties": {"interaction": {"$ref": "#/$defs/scenario3Pass"}, "cleanup": {"properties": {"delete_attempt_count": {"const": 1}, "delete_success": {"const": true}}}}}
+    },
+    {
+      "if": {
+        "allOf": [
+          {"properties": {"status": {"const": "PASS"}}},
+          {"properties": {"identity": {"properties": {"scenario_id": {"enum": [1, 4, 5]}}}}}
+        ]
+      },
+      "then": {"properties": {"interaction": {"$ref": "#/$defs/actorlessPass"}}}
+    }
+  ],
+  "$defs": {
+    "actorlessPass": {
+      "type": "object",
+      "required": ["kind", "criteria"],
+      "properties": {
+        "kind": {"const": "none"},
+        "criteria": {
+          "type": "object",
+          "required": ["bound_goal_terminal_succeeded"],
+          "properties": {"bound_goal_terminal_succeeded": {"const": true}}
+        }
+      }
+    },
+    "scenario2Pass": {
+      "type": "object",
+      "required": ["actor", "clearance", "criteria", "initial_plan", "kind", "observed_pose", "replan", "spawn", "trigger"],
+      "properties": {
+        "kind": {"const": "static_obstacle"},
+        "criteria": {
+          "type": "object",
+          "required": ["all_segments_avoid", "clearance_passed", "geometry_hash_changed", "observed_by_deadline", "plan_before_request", "replan_observed_after_request", "replan_stamp_after_request", "spawn_exactly_once"],
+          "properties": {
+            "all_segments_avoid": {"const": true},
+            "clearance_passed": {"const": true},
+            "geometry_hash_changed": {"const": true},
+            "observed_by_deadline": {"const": true},
+            "plan_before_request": {"const": true},
+            "replan_observed_after_request": {"const": true},
+            "replan_stamp_after_request": {"const": true},
+            "spawn_exactly_once": {"const": true}
+          }
+        }
+      }
+    },
+    "scenario3Pass": {
+      "type": "object",
+      "required": ["actor", "criteria", "feedback_anchor", "kind", "metrics_owned", "preload", "spawn", "trajectory"],
+      "properties": {
+        "kind": {"const": "pose_controlled_obstacle"},
+        "criteria": {
+          "type": "object",
+          "required": ["all_targets_observed", "all_transactions_succeeded", "exact_schedule", "exact_single_attempts", "exact_target_count", "final_endpoint", "finished_before_terminal_status_observation", "latency_within_limit", "monotonic_and_dwell", "no_early_motion", "ordered_feedback_anchor", "pose_errors_within_limit", "preloaded_before_goal"],
+          "properties": {
+            "all_targets_observed": {"const": true},
+            "all_transactions_succeeded": {"const": true},
+            "exact_schedule": {"const": true},
+            "exact_single_attempts": {"const": true},
+            "exact_target_count": {"const": true},
+            "final_endpoint": {"const": true},
+            "finished_before_terminal_status_observation": {"const": true},
+            "latency_within_limit": {"const": true},
+            "monotonic_and_dwell": {"const": true},
+            "no_early_motion": {"const": true},
+            "ordered_feedback_anchor": {"const": true},
+            "pose_errors_within_limit": {"const": true},
+            "preloaded_before_goal": {"const": true}
+          }
+        },
+        "trajectory": {
+          "type": "object",
+          "required": ["expected_target_count", "set_attempt_count", "set_success_count", "targets", "terminal_basis"],
+          "properties": {
+            "expected_target_count": {"const": 121},
+            "set_attempt_count": {"const": 121},
+            "set_success_count": {"const": 121},
+            "targets": {"type": "array", "minItems": 121, "maxItems": 121, "items": {"type": "object"}},
+            "terminal_basis": {"const": "follow_waypoints_status_observation"}
+          }
+        }
+      }
+    },
+    "clock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["first_stamp_ns", "latest_stamp_ns", "max_gap_ns", "regression_count", "sample_count"],
+      "properties": {
+        "first_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+        "latest_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+        "max_gap_ns": {"type": "integer", "minimum": 0},
+        "regression_count": {"type": "integer", "minimum": 0},
+        "sample_count": {"type": "integer", "minimum": 0}
+      }
+    },
+    "buffer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accepted_count", "capacity", "first_overflow_sequence", "first_overflow_stamp_ns", "ingress_count", "invalid_count", "overflow", "overflow_count", "retained_count"],
+      "properties": {
+        "accepted_count": {"type": "integer", "minimum": 0},
+        "capacity": {"type": "integer", "minimum": 1},
+        "first_overflow_sequence": {"type": ["integer", "null"]},
+        "first_overflow_stamp_ns": {"type": ["integer", "null"]},
+        "ingress_count": {"type": "integer", "minimum": 0},
+        "invalid_count": {"type": "integer", "minimum": 0},
+        "overflow": {"type": "boolean"},
+        "overflow_count": {"type": "integer", "minimum": 0},
+        "retained_count": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

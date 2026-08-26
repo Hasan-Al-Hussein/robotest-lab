@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "listen_address": "127.0.0.1:9080",
+  "state_directory": "/var/lib/robotest-supervisor",
+  "heartbeat_poll_ms": 500,
+  "heartbeat_stale_ms": 2000,
+  "heartbeat_startup_timeout_ms": 110000,
+  "termination_grace_ms": 5000,
+  "shutdown_timeout_ms": 15000,
+  "maximum_event_entries": 4096,
+  "maximum_event_bytes": 8388608,
+  "restart": {
+    "initial_backoff_ms": 1000,
+    "maximum_backoff_ms": 8000,
+    "maximum_attempts": 4,
+    "window_ms": 60000,
+    "stable_reset_ms": 60000
+  },
+  "children": [
+    {
+      "name": "robotest-stack",
+      "argv": ["/usr/libexec/robotest-supervisor/start-robotest-stack"],
+      "working_directory": "/opt/robotest-lab",
+      "environment": {
+        "GZ_PARTITION": "robotest_supervised",
+        "RCUTILS_LOGGING_BUFFERED_STREAM": "1",
+        "ROBOTEST_CPUSET": "0-5",
+        "ROBOTEST_NAMESPACE": "robotest",
+        "ROS_DOMAIN_ID": "42"
+      },
+      "required": true,
+      "heartbeat_file": "/var/lib/robotest-supervisor/robotest-stack.heartbeat"
+    }
+  ]
+}

@@ -8,8 +8,6 @@
   <maintainer email="200383997+Hasan-Al-Hussein@users.noreply.github.com">Hasan Ahmed</maintainer>
   <license>Apache-2.0</license>
 
-  <buildtool_depend>ament_python</buildtool_depend>
-
   <exec_depend>action_msgs</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>builtin_interfaces</exec_depend>

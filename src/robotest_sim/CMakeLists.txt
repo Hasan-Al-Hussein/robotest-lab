@@ -12,6 +12,11 @@ install(
 )
 
 install(
+  FILES LICENSE README.md
+  DESTINATION share/${PROJECT_NAME}
+)
+
+install(
   PROGRAMS tools/phase1_runtime_probe.py
   DESTINATION lib/${PROJECT_NAME}
 )

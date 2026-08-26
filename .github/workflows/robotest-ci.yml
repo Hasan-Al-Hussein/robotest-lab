@@ -1,0 +1,65 @@
+name: RoboTest CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: robotest-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: '4'
+  MAKEFLAGS: -j4
+  ROBOTEST_CI_MAX_WORKERS: '4'
+  ROS_DISTRO: jazzy
+
+jobs:
+  quality:
+    name: Jazzy static, unit, and build checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out the exact workflow revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Prepare ROS 2 Jazzy
+        uses: ros-tooling/setup-ros@649ef6bcd696da05bc27ceb3fab69d810c0daeab # 0.7.19
+        with:
+          required-ros-distributions: jazzy
+
+      - name: Resolve declared ROS dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rosdep update --rosdistro jazzy
+          rosdep install --from-paths src --ignore-src --rosdistro jazzy -y
+
+      - name: Prepare pinned repository tooling
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 -m venv --system-site-packages .venv
+          .venv/bin/python -m pip install \
+            --disable-pip-version-check \
+            --no-deps \
+            ruff==0.16.4
+
+      - name: Run the non-live Phase 5 CI gate
+        shell: bash
+        run: scripts/verify_phase5.sh --ci
+
+      - name: Preserve bounded Phase 5 evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: phase5-ci-${{ github.sha }}
+          path: artifacts/evidence/phase5/
+          if-no-files-found: error
+          retention-days: 14

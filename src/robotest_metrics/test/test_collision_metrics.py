@@ -1,0 +1,652 @@
+# Copyright 2026 Hasan Ahmed
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import copy
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+import robotest_metrics.collision_metrics as collision_module
+from conftest import collision_fixture
+from jsonschema import Draft202012Validator
+from robotest_metrics.artifacts import canonical_sha256
+from robotest_metrics.collision_metrics import (
+    analyze_collisions,
+    classify_contact_pair,
+    validate_collision_qualification,
+)
+from robotest_metrics.errors import MetricUnavailable
+from robotest_scenarios.provenance import (
+    contact_control_configuration,
+    contact_control_configuration_sha256,
+    file_sha256,
+)
+
+
+def _rebind_positive_control(positive: dict[str, Any], binding: dict[str, Any]) -> None:
+    fixture_sha256 = canonical_sha256(positive['configuration']['fixture'])
+    positive['configuration']['fixture_sha256'] = fixture_sha256
+    positive['identity']['scenario_sha256'] = fixture_sha256
+    binding['positive_control_scenario_sha256'] = fixture_sha256
+    binding['positive_control_json_sha256'] = canonical_sha256(positive)
+
+
+def _contact(counterpart: str, *, depth: float = 0.01, force: float = 2.0) -> dict[str, Any]:
+    return {
+        'collision1': 'robotest::base_link::base_collision',
+        'collision2': counterpart,
+        'depths_m': [depth],
+        'maximum_normal_force_n': force,
+    }
+
+
+def _message(stamp: int, sequence: int, *contacts: dict[str, Any]) -> dict[str, Any]:
+    return {'collector_sequence': sequence, 'contacts': list(contacts), 'stamp_ns': stamp}
+
+
+def test_coverage_requires_exact_complete_collision_union() -> None:
+    manifest, positive, binding = collision_fixture()
+    broken = copy.deepcopy(manifest)
+    broken['covered_collisions'] = []
+    with pytest.raises(MetricUnavailable, match='coverage'):
+        validate_collision_qualification(broken, positive, binding)
+
+
+def test_positive_control_is_hash_bound_and_must_pass() -> None:
+    manifest, positive, binding = collision_fixture()
+    assert validate_collision_qualification(manifest, positive, binding)['status'] == 'PASS'
+    broken = copy.deepcopy(binding)
+    broken['benchmark_provenance']['rendered_sdf_sha256'] = '9' * 64
+    with pytest.raises(MetricUnavailable, match='hash mismatch'):
+        validate_collision_qualification(manifest, positive, broken)
+    failed = copy.deepcopy(positive)
+    failed['status'] = 'FAIL'
+    with pytest.raises(MetricUnavailable, match='not PASS'):
+        validate_collision_qualification(manifest, failed, binding)
+
+
+@pytest.mark.parametrize(
+    'mutation',
+    [
+        lambda positive: positive['control']['command_trace'][0].pop('phase'),
+        lambda positive: positive['control']['contact'].__setitem__('first_qualifying_contact', {}),
+        lambda positive: positive['control'].__setitem__('command_trace', []),
+        lambda positive: positive['control']['contact'].__setitem__('records', []),
+        lambda positive: positive['control']['contact'].__setitem__(
+            'first_qualifying_contact', None
+        ),
+        lambda positive: positive['control']['contact'].__setitem__('exact_pair_raw_count', 0),
+        lambda positive: positive['control'].__setitem__(
+            'command_trace',
+            [
+                command
+                for command in positive['control']['command_trace']
+                if command['phase'] != 'HOLD'
+            ],
+        ),
+        lambda positive: positive['configuration'].__setitem__('control_configuration', {}),
+        lambda positive: positive['configuration']['source_binding'].__setitem__('files', []),
+        lambda positive: positive['configuration'].__setitem__('fixture', {}),
+        lambda positive: positive['control']['setup'].__setitem__('observed_wall', {}),
+        lambda positive: positive['cleanup'].__setitem__('proof', {}),
+        lambda positive: positive['control'].__setitem__('metrics_owned', {}),
+        lambda positive: positive['quality'].__setitem__('forbidden_nodes', ['planner_server']),
+    ],
+)
+def test_positive_control_schema_rejects_incomplete_pass_evidence(mutation: Any) -> None:
+    _, positive, _ = collision_fixture()
+    schema_path = (
+        Path(__file__).resolve().parents[2]
+        / 'robotest_scenarios/schema/contact-control-result.schema.json'
+    )
+    schema = json.loads(schema_path.read_text(encoding='utf-8'))
+    validator = Draft202012Validator(schema)
+    assert not list(validator.iter_errors(positive))
+
+    mutation(positive)
+
+    assert list(validator.iter_errors(positive))
+
+
+@pytest.mark.parametrize(
+    ('section', 'field'),
+    [
+        ('positive_control_external_quality', 'owned_process_group_shutdown'),
+        ('positive_control_external_quality', 'collector_reconciled'),
+        ('positive_control_external_quality', 'checksum_verified'),
+    ],
+)
+def test_positive_control_external_gates_fail_closed(section: str, field: str) -> None:
+    manifest, positive, binding = collision_fixture()
+    binding[section][field] = False
+    with pytest.raises(MetricUnavailable, match='external gate'):
+        validate_collision_qualification(manifest, positive, binding)
+
+
+def test_positive_control_requires_frozen_ground_truth_start_proof() -> None:
+    manifest, positive, binding = collision_fixture()
+    positive['control']['observed_robot_start']['x'] = 0.02
+    binding['positive_control_json_sha256'] = canonical_sha256(positive)
+    with pytest.raises(MetricUnavailable, match='start proof'):
+        validate_collision_qualification(manifest, positive, binding)
+
+
+@pytest.mark.parametrize(
+    ('path', 'value'),
+    [
+        (('control', 'observed_robot_start', 'alignment_error_ns'), -1),
+        (('control', 'observed_robot_start', 'position_error_m'), -0.01),
+        (('quality', 'buffers', 'ground_truth', 'ingress_count'), 2),
+        (('quality', 'buffers', 'ground_truth', 'first_overflow_sequence'), 1),
+    ],
+)
+def test_positive_control_start_and_buffer_proofs_fail_closed(
+    path: tuple[str, ...],
+    value: Any,
+) -> None:
+    manifest, positive, binding = collision_fixture()
+    current = positive
+    for component in path[:-1]:
+        current = current[component]
+    current[path[-1]] = value
+    binding['positive_control_json_sha256'] = canonical_sha256(positive)
+    with pytest.raises(MetricUnavailable, match=r'start proof|buffer ground_truth'):
+        validate_collision_qualification(manifest, positive, binding)
+
+
+@pytest.mark.parametrize(
+    ('path', 'value', 'message'),
+    [
+        (('control', 'criteria', 'release_source_spanned'), False, 'criteria'),
+        (('control', 'setup', 'observed_wall'), None, 'setup'),
+        (('quality', 'source_streams_live'), False, 'source_streams_live'),
+        (
+            ('quality', 'contact_message_heartbeat', 'latest_stamp_ns'),
+            3_000_000_000,
+            'heartbeat',
+        ),
+    ],
+)
+def test_positive_control_source_liveness_proofs_fail_closed(
+    path: tuple[str, ...],
+    value: Any,
+    message: str,
+) -> None:
+    manifest, positive, binding = collision_fixture()
+    current = positive
+    for component in path[:-1]:
+        current = current[component]
+    current[path[-1]] = value
+    binding['positive_control_json_sha256'] = canonical_sha256(positive)
+
+    with pytest.raises(MetricUnavailable, match=message):
+        validate_collision_qualification(manifest, positive, binding)
+
+
+def test_positive_control_coverage_provenance_is_exact() -> None:
+    manifest, positive, binding = collision_fixture()
+    positive['configuration']['coverage_manifest_provenance']['bridge_sha256'] = '9' * 64
+    binding['positive_control_json_sha256'] = canonical_sha256(positive)
+
+    with pytest.raises(MetricUnavailable, match='coverage provenance mismatch'):
+        validate_collision_qualification(manifest, positive, binding)
+
+
+def test_positive_control_actor_state_buffer_allows_genuine_deduplication() -> None:
+    manifest, positive, binding = collision_fixture()
+    actor_state = positive['quality']['buffers']['actor_state']
+    actor_state.update(
+        {
+            'accepted_count': 1_100,
+            'capacity': 1_024,
+            'ingress_count': 1_100,
+            'retained_count': 1,
+        }
+    )
+    binding['positive_control_json_sha256'] = canonical_sha256(positive)
+
+    assert validate_collision_qualification(manifest, positive, binding)['status'] == 'PASS'
+
+
+def test_positive_control_keeps_driver_and_rendered_configuration_hashes_distinct() -> None:
+    manifest, positive, binding = collision_fixture()
+    configuration = positive['configuration']
+    assert configuration['control_configuration'] == contact_control_configuration()
+    assert configuration['control_configuration_sha256'] == contact_control_configuration_sha256()
+    assert configuration['control_configuration_sha256'] != manifest['contact_configuration_sha256']
+    assert validate_collision_qualification(manifest, positive, binding)['status'] == 'PASS'
+
+    swapped = copy.deepcopy(positive)
+    swapped_binding = copy.deepcopy(binding)
+    swapped['configuration']['control_configuration_sha256'] = manifest[
+        'contact_configuration_sha256'
+    ]
+    _rebind_positive_control(swapped, swapped_binding)
+    with pytest.raises(MetricUnavailable, match='driver control configuration'):
+        validate_collision_qualification(manifest, swapped, swapped_binding)
+
+    equalized_binding = copy.deepcopy(binding)
+    for name in ('benchmark_provenance', 'positive_control_provenance'):
+        equalized_binding[name]['contact_configuration_sha256'] = configuration[
+            'control_configuration_sha256'
+        ]
+    with pytest.raises(MetricUnavailable, match='manifest provenance mismatch'):
+        validate_collision_qualification(manifest, positive, equalized_binding)
+
+
+def test_positive_control_default_wall_asset_ignores_evidence_path_redirection(
+    tmp_path: Path,
+) -> None:
+    manifest, positive, binding = collision_fixture()
+    fake_manifest = tmp_path / 'config/collision-coverage.yaml'
+    fake_manifest.parent.mkdir(parents=True)
+    fake_manifest.write_text('attacker-controlled: true\n', encoding='utf-8')
+    fake_asset = tmp_path / 'src/robotest_sim/models/phase3_contact_control_wall.sdf'
+    fake_asset.parent.mkdir(parents=True)
+    fake_asset.write_text('<sdf version="1.10"><model name="forged"/></sdf>\n', encoding='utf-8')
+    fake_asset_sha256 = file_sha256(fake_asset)
+    positive['configuration']['coverage_manifest_path'] = str(fake_manifest)
+    positive['configuration']['wall_asset_sha256'] = fake_asset_sha256
+    positive['configuration']['fixture']['entity']['asset_sha256'] = fake_asset_sha256
+    _rebind_positive_control(positive, binding)
+
+    with pytest.raises(MetricUnavailable, match='wall asset hash'):
+        validate_collision_qualification(manifest, positive, binding)
+
+
+@pytest.mark.parametrize(
+    ('mutation', 'message'),
+    [
+        (
+            lambda positive, _manifest: positive['configuration'].__setitem__(
+                'control_configuration', {}
+            ),
+            'driver control configuration',
+        ),
+        (
+            lambda positive, _manifest: positive['configuration'].__setitem__(
+                'source_binding',
+                {
+                    'aggregate_sha256': canonical_sha256([{'name': 'fake.py', 'sha256': 'a' * 64}]),
+                    'files': [{'name': 'fake.py', 'sha256': 'a' * 64}],
+                },
+            ),
+            'source binding',
+        ),
+        (
+            lambda positive, _manifest: positive['configuration']['fixture']['entity'].__setitem__(
+                'name', 'forged_wall'
+            ),
+            'fixture binding',
+        ),
+        (
+            lambda positive, _manifest: (
+                positive['configuration'].__setitem__('wall_asset_sha256', 'f' * 64),
+                positive['configuration']['fixture']['entity'].__setitem__(
+                    'asset_sha256', 'f' * 64
+                ),
+            ),
+            'wall asset hash',
+        ),
+        (
+            lambda positive, _manifest: positive['control']['setup']['observed_wall'].update(
+                {'position_error_m': 0.1, 'x': 0.8}
+            ),
+            'setup proof',
+        ),
+        (
+            lambda positive, _manifest: positive['control']['setup']['observed_wall'].__setitem__(
+                'stamp_ns', 1_100_000_000
+            ),
+            'timeline',
+        ),
+        (
+            lambda positive, _manifest: positive['control']['observed_robot_start'].__setitem__(
+                'alignment_error_ns', 0
+            ),
+            'setup/control sequence',
+        ),
+        (
+            lambda positive, _manifest: positive['cleanup'].__setitem__('proof', {}),
+            'cleanup proof',
+        ),
+        (
+            lambda positive, _manifest: positive['cleanup']['proof'].__setitem__(
+                'request_stamp_ns', 3_600_000_000
+            ),
+            'cleanup proof',
+        ),
+        (
+            lambda positive, _manifest: positive['control'].__setitem__('metrics_owned', {}),
+            'metrics ownership',
+        ),
+        (
+            lambda positive, _manifest: positive['quality'].__setitem__(
+                'forbidden_nodes', ['planner_server']
+            ),
+            'forbidden navigation nodes',
+        ),
+        (
+            lambda positive, _manifest: positive['control']['command_trace'][1].__setitem__(
+                'collector_sequence',
+                positive['control']['contact']['first_qualifying_contact']['collector_sequence'],
+            ),
+            'command anchors',
+        ),
+        (
+            lambda positive, _manifest: (
+                positive['control']['contact']['first_qualifying_contact'].__setitem__(
+                    'collector_sequence', 6
+                ),
+                positive['control']['contact']['records'][0].__setitem__('collector_sequence', 6),
+                positive['control']['command_trace'][1].__setitem__('collector_sequence', 7),
+            ),
+            'setup/control sequence',
+        ),
+    ],
+)
+def test_positive_control_rejects_rebound_producer_contract_tampering(
+    mutation: Any,
+    message: str,
+) -> None:
+    manifest, positive, binding = collision_fixture()
+    mutation(positive, manifest)
+    setup_start = positive['control']['setup']['observed_robot_start']
+    control_start = positive['control']['observed_robot_start']
+    if setup_start != control_start:
+        positive['control']['setup']['observed_robot_start'] = copy.deepcopy(control_start)
+    _rebind_positive_control(positive, binding)
+
+    with pytest.raises(MetricUnavailable, match=message):
+        validate_collision_qualification(manifest, positive, binding)
+
+
+def test_positive_control_rejects_rebound_command_trace_without_hold() -> None:
+    manifest, positive, binding = collision_fixture()
+    commands = positive['control']['command_trace']
+    positive['control']['command_trace'] = [
+        command for command in commands if command['phase'] != 'HOLD'
+    ]
+    command_buffer = positive['quality']['buffers']['command']
+    for field in ('accepted_count', 'ingress_count', 'retained_count'):
+        command_buffer[field] = len(positive['control']['command_trace'])
+    binding['positive_control_json_sha256'] = canonical_sha256(positive)
+
+    with pytest.raises(MetricUnavailable, match='command anchors'):
+        validate_collision_qualification(manifest, positive, binding)
+
+
+@pytest.mark.parametrize(
+    ('mutation', 'message'),
+    [
+        (
+            lambda positive: positive['control']['contact'].__setitem__('records', []),
+            'retained contact records',
+        ),
+        (
+            lambda positive: positive['quality']['buffers']['command'].update(
+                {'accepted_count': 3, 'ingress_count': 3, 'retained_count': 3}
+            ),
+            'retained buffers',
+        ),
+        (
+            lambda positive: positive['control']['timeline'].__setitem__(
+                'hold_complete_stamp_ns', 2_000_000_000
+            ),
+            'timeline',
+        ),
+        (
+            lambda positive: positive['control']['timeline'].__setitem__(
+                'release_required_through_stamp_ns', 2_250_000_000
+            ),
+            'timeline',
+        ),
+        (
+            lambda positive: positive['control']['timeline'].__setitem__(
+                'release_contact_message_start_count', 0
+            ),
+            'timeline',
+        ),
+        (
+            lambda positive: positive['quality']['contact_message_heartbeat'].__setitem__(
+                'first_stamp_ns', 2_500_000_000
+            ),
+            'heartbeat',
+        ),
+    ],
+)
+def test_positive_control_derived_evidence_relations_fail_closed(
+    mutation: Any,
+    message: str,
+) -> None:
+    manifest, positive, binding = collision_fixture()
+    mutation(positive)
+    binding['positive_control_json_sha256'] = canonical_sha256(positive)
+
+    with pytest.raises(MetricUnavailable, match=message):
+        validate_collision_qualification(manifest, positive, binding)
+
+
+def test_positive_control_contact_records_are_reclassified_from_retained_bytes() -> None:
+    manifest, positive, binding = collision_fixture()
+    record = positive['control']['contact']['records'][0]
+    record.update(
+        {
+            'counterpart_collision': None,
+            'counterpart_model': None,
+            'disposition': 'non_robot_pair_ignored',
+            'normalized_pair': ['box::link::collision', 'wall::link::collision'],
+            'robot_collision': None,
+        }
+    )
+    binding['positive_control_json_sha256'] = canonical_sha256(positive)
+
+    with pytest.raises(MetricUnavailable, match='retained expected contact'):
+        validate_collision_qualification(manifest, positive, binding)
+
+
+def test_pair_classification_has_only_exact_frozen_exclusions() -> None:
+    manifest, _, _ = collision_fixture()
+    wheel = 'robotest::left_wheel::wheel_collision'
+    manifest['robot_collisions'].append(
+        {'name': wheel, 'role': 'left_wheel', 'source': 'all_robot_contacts'}
+    )
+    manifest['covered_collisions'].append(wheel)
+    manifest['rendered_robot_collisions'].append(wheel)
+    ground = 'ground_plane::ground_link::ground_collision'
+    manifest['support_pairs'] = [{'environment_collision': ground, 'robot_collision': wheel}]
+    manifest_body = dict(manifest)
+    manifest_body.pop('manifest_sha256')
+    manifest['manifest_sha256'] = canonical_sha256(manifest_body)
+    assert classify_contact_pair(wheel, ground, manifest)['reason'] == 'allowlisted_support_contact'
+    assert (
+        classify_contact_pair(wheel, manifest['robot_collisions'][0]['name'], manifest)['reason']
+        == 'robot_internal'
+    )
+    assert (
+        classify_contact_pair('box::a::collision', 'wall::b::collision', manifest)['reason']
+        == 'unrelated_environment_contact'
+    )
+    counted = classify_contact_pair(wheel, 'wall::link::collision', manifest)
+    assert counted['counted'] is True
+    assert counted['counterpart_model'] == 'wall'
+
+
+def test_support_allowlist_rejects_chassis_or_non_ground_exclusions() -> None:
+    manifest, _, _ = collision_fixture()
+    chassis = manifest['robot_collisions'][0]['name']
+    for counterpart in (
+        'ground_plane::ground_link::ground_collision',
+        'wall::link::collision',
+    ):
+        broken = copy.deepcopy(manifest)
+        broken['support_pairs'] = [
+            {'environment_collision': counterpart, 'robot_collision': chassis}
+        ]
+        body = dict(broken)
+        body.pop('manifest_sha256')
+        broken['manifest_sha256'] = canonical_sha256(body)
+        with pytest.raises(MetricUnavailable, match='wheel/caster'):
+            classify_contact_pair(chassis, counterpart, broken)
+
+
+def test_contact_episode_dedup_release_and_pre_action_diagnostics() -> None:
+    manifest, positive, binding = collision_fixture()
+    wall = 'wall::link::collision'
+    messages = [
+        _message(50, 1, _contact('prewall::link::collision')),
+        _message(100, 2, _contact(wall, depth=0.01, force=2.0)),
+        _message(200, 3, _contact(wall, depth=0.02, force=3.0)),
+        _message(450, 4, _contact(wall, depth=0.03, force=4.0)),
+        _message(500, 5),
+    ]
+    result = analyze_collisions(
+        messages, 100, 500, 750, manifest, positive, binding, release_gap_ns=250
+    )
+    assert result['collision_count'] == 2
+    assert result['pre_action_contact_record_count'] == 1
+    assert result['events'][0]['sample_count'] == 2
+    assert result['events'][0]['end_stamp_ns'] == 450
+    assert result['events'][0]['maximum_penetration_depth_m'] == pytest.approx(0.02)
+    assert result['events'][1]['start_stamp_ns'] == 450
+
+
+def test_contact_episode_that_began_before_t0_remains_diagnostic() -> None:
+    manifest, positive, binding = collision_fixture()
+    wall = 'wall::link::collision'
+    result = analyze_collisions(
+        [
+            _message(50, 1, _contact(wall)),
+            _message(100, 2, _contact(wall)),
+            _message(200, 3, _contact(wall)),
+        ],
+        100,
+        200,
+        450,
+        manifest,
+        positive,
+        binding,
+        release_gap_ns=250,
+    )
+    assert result['pre_action_contact_record_count'] == 1
+    assert result['collision_count'] == 0
+
+
+def test_simultaneous_counterpart_models_are_distinct_events() -> None:
+    manifest, positive, binding = collision_fixture()
+    messages = [
+        _message(
+            100,
+            1,
+            _contact('wall::link::collision'),
+            _contact('box::link::collision'),
+        ),
+        _message(200, 2),
+    ]
+    result = analyze_collisions(
+        messages, 100, 200, 450, manifest, positive, binding, release_gap_ns=250
+    )
+    assert result['collision_count'] == 2
+    assert {event['counterpart_model'] for event in result['events']} == {'box', 'wall'}
+
+
+def test_post_terminal_contacts_do_not_start_counted_events() -> None:
+    manifest, positive, binding = collision_fixture()
+    messages = [
+        _message(100, 1),
+        _message(201, 2, _contact('wall::link::collision')),
+    ]
+    result = analyze_collisions(
+        messages, 100, 200, 450, manifest, positive, binding, release_gap_ns=250
+    )
+    assert result['collision_count'] == 0
+    assert result['post_terminal_contact_record_count'] == 1
+
+
+def test_post_terminal_continuation_without_full_release_is_censored_at_drain() -> None:
+    manifest, positive, binding = collision_fixture()
+    wall = 'wall::link::collision'
+    result = analyze_collisions(
+        [
+            _message(100, 1),
+            _message(300, 2, _contact(wall)),
+            _message(301, 3, _contact(wall)),
+        ],
+        100,
+        300,
+        550,
+        manifest,
+        positive,
+        binding,
+        release_gap_ns=250,
+    )
+    assert result['collision_count'] == 1
+    assert result['events'][0]['censored_at_drain'] is True
+    assert result['events'][0]['end_stamp_ns'] == 550
+
+
+def test_collision_requires_full_drain_and_non_silent_mission_topic() -> None:
+    manifest, positive, binding = collision_fixture()
+    with pytest.raises(MetricUnavailable, match='drain'):
+        analyze_collisions(
+            [_message(100, 1)],
+            100,
+            200,
+            449,
+            manifest,
+            positive,
+            binding,
+            release_gap_ns=250,
+        )
+    with pytest.raises(MetricUnavailable, match='silent'):
+        analyze_collisions([], 100, 200, 450, manifest, positive, binding, release_gap_ns=250)
+
+
+def test_collision_rejects_negative_depth_and_record_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest, positive, binding = collision_fixture()
+    with pytest.raises(MetricUnavailable, match='negative'):
+        analyze_collisions(
+            [_message(100, 1, _contact('wall::link::collision', depth=-0.1))],
+            100,
+            200,
+            450,
+            manifest,
+            positive,
+            binding,
+            release_gap_ns=250,
+        )
+    monkeypatch.setattr(collision_module, 'CONTACT_RECORD_CAPACITY', 1)
+    with pytest.raises(MetricUnavailable, match='capacity'):
+        analyze_collisions(
+            [
+                _message(
+                    100,
+                    1,
+                    _contact('wall::link::collision'),
+                    _contact('box::link::collision'),
+                )
+            ],
+            100,
+            200,
+            450,
+            manifest,
+            positive,
+            binding,
+            release_gap_ns=250,
+        )

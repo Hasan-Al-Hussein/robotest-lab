@@ -1,6 +1,6 @@
 # ADR 0006: Phase 3 Scenario Mechanics and Trial Independence
 
-- Status: Accepted for Phase 3 design; implementation and benchmark evidence pending
+- Status: Accepted and implemented; authoritative Phase 3 benchmark evidence pending
 - Date: 2026-08-26
 - Decision owners: RoboTest Lab scenario, metrics, safety, and benchmark gate
 
@@ -582,3 +582,19 @@ collision-contact coverage, positive-control fixture, fault protocol, metrics
 collector, 15-trial runner, and canonical benchmark compositor are targets
 awaiting implementation and verification. This ADR records no benchmark
 result.
+
+### Update — 2026-08-26
+
+The scenario-controller and actor interfaces, collision-coverage checks,
+positive-control fixture, metrics collector, bounded staged runner, and
+canonical per-run and aggregate composition paths are now implemented with
+unit/contract tests. The development Phase 3 verifier at
+`artifacts/evidence/phase3/20260826T052402Z-3022/` passed its static, fresh
+build, package-test, installed-CLI, and dependency gates. The package lifecycle
+evidence at `artifacts/evidence/phase4/package-lifecycle-20260826T045138Z.json`
+also passed.
+
+The staged positive control, runtime smoke, and exact 15-trial cold-stack
+candidate have not yet supplied authoritative Phase 3 benchmark evidence.
+This ADR therefore still records no benchmark result and makes no campaign
+PASS claim.

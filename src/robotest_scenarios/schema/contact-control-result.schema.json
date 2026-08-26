@@ -1,0 +1,593 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://robotest.local/schema/contact-control-result-v1.json",
+  "title": "RoboTest collision positive-control component result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "producer", "status", "verdict", "identity",
+    "configuration", "control", "cleanup", "quality"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "producer": {"const": "robotest_scenarios/contact_control_driver"},
+    "status": {"enum": ["PASS", "FAIL"]},
+    "verdict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authority", "benchmark_pass", "exit_code", "reason"],
+      "properties": {
+        "authority": {"const": "component_only"},
+        "benchmark_pass": {"type": "null"},
+        "exit_code": {"type": "integer", "minimum": 0, "maximum": 255},
+        "reason": {"type": "string", "maxLength": 4096}
+      }
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "fixture_id", "scenario_sha256"],
+      "properties": {
+        "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "fixture_id": {"const": "collision_positive_control"},
+        "scenario_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "control_configuration", "control_configuration_sha256",
+        "coverage_manifest_path", "coverage_manifest_provenance", "coverage_manifest_sha256", "expected_pair",
+        "fixture", "fixture_sha256", "service_timeout_s", "source_binding",
+        "wall_asset_sha256", "wall_timeout_s"
+      ],
+      "properties": {
+        "control_configuration": {"type": "object"},
+        "control_configuration_sha256": {"$ref": "#/$defs/sha256"},
+        "coverage_manifest_path": {"type": "string", "maxLength": 4096},
+        "coverage_manifest_provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["bridge_sha256", "contact_configuration_sha256", "coverage_manifest_sha256", "rendered_sdf_sha256", "robot_description_sha256", "world_source_sha256"],
+          "properties": {
+            "bridge_sha256": {"$ref": "#/$defs/sha256"},
+            "contact_configuration_sha256": {"$ref": "#/$defs/sha256"},
+            "coverage_manifest_sha256": {"$ref": "#/$defs/sha256"},
+            "rendered_sdf_sha256": {"$ref": "#/$defs/sha256"},
+            "robot_description_sha256": {"$ref": "#/$defs/sha256"},
+            "world_source_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "coverage_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "expected_pair": {"$ref": "#/$defs/pair"},
+        "fixture": {"type": "object"},
+        "fixture_sha256": {"$ref": "#/$defs/sha256"},
+        "service_timeout_s": {"type": "number", "exclusiveMinimum": 0, "maximum": 30},
+        "source_binding": {"type": "object"},
+        "wall_asset_sha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "wall_timeout_s": {"type": "number", "exclusiveMinimum": 0, "maximum": 30}
+      }
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command_trace", "contact", "criteria", "metrics_owned", "observed_robot_start", "setup", "timeline"],
+      "properties": {
+        "command_trace": {"type": "array", "maxItems": 4096, "items": {"$ref": "#/$defs/command"}},
+        "contact": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "active_counterpart_count", "classified_record_count", "counterpart_tracker_count", "episodes", "exact_pair_raw_count",
+            "expected_pair", "first_qualifying_contact", "raw_contact_record_count", "records"
+          ],
+          "properties": {
+            "active_counterpart_count": {"type": "integer", "minimum": 0},
+            "classified_record_count": {"type": "integer", "minimum": 0},
+            "counterpart_tracker_count": {"type": "integer", "minimum": 1, "maximum": 32768},
+            "episodes": {"type": "array", "maxItems": 32768, "items": {"$ref": "#/$defs/episode"}},
+            "exact_pair_raw_count": {"type": "integer", "minimum": 0},
+            "expected_pair": {"$ref": "#/$defs/pair"},
+            "first_qualifying_contact": {
+              "anyOf": [{"$ref": "#/$defs/firstQualifyingContact"}, {"type": "null"}]
+            },
+            "raw_contact_record_count": {"type": "integer", "minimum": 0},
+            "records": {"type": "array", "maxItems": 32768, "items": {"$ref": "#/$defs/rawContactRecord"}}
+          }
+        },
+        "criteria": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "contact_before_deadline", "episode_reconciled",
+            "exactly_one_counterpart_episode", "final_command_zero",
+            "graph_isolated", "hold_completed", "overflow_free",
+            "raw_expected_contact_observed", "release_completed", "release_source_spanned",
+            "reverse_completed", "robot_start_verified", "sole_cmd_vel_publisher", "stop_within_100ms",
+            "wall_deleted"
+          ],
+          "properties": {
+            "contact_before_deadline": {"type": "boolean"},
+            "episode_reconciled": {"type": "boolean"},
+            "exactly_one_counterpart_episode": {"type": "boolean"},
+            "final_command_zero": {"type": "boolean"},
+            "graph_isolated": {"type": "boolean"},
+            "hold_completed": {"type": "boolean"},
+            "overflow_free": {"type": "boolean"},
+            "raw_expected_contact_observed": {"type": "boolean"},
+            "release_completed": {"type": "boolean"},
+            "release_source_spanned": {"type": "boolean"},
+            "reverse_completed": {"type": "boolean"},
+            "robot_start_verified": {"type": "boolean"},
+            "sole_cmd_vel_publisher": {"type": "boolean"},
+            "stop_within_100ms": {"type": "boolean"},
+            "wall_deleted": {"type": "boolean"}
+          }
+        },
+        "metrics_owned": {"type": "object"},
+        "observed_robot_start": {"type": ["object", "null"]},
+        "setup": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["observed_robot_start", "observed_wall", "spawn"],
+          "properties": {
+            "observed_robot_start": {"type": ["object", "null"]},
+            "observed_wall": {"type": ["object", "null"]},
+            "spawn": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["attempt_count", "error", "request_sequence", "request_stamp_ns", "response_sequence", "response_stamp_ns", "success"],
+              "properties": {
+                "attempt_count": {"type": "integer", "minimum": 0, "maximum": 1},
+                "error": {"type": ["string", "null"], "maxLength": 4096},
+                "request_sequence": {"type": ["integer", "null"], "minimum": 1},
+                "request_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+                "response_sequence": {"type": ["integer", "null"], "minimum": 1},
+                "response_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+                "success": {"type": ["boolean", "null"]}
+              }
+            }
+          }
+        },
+        "timeline": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "control_started_stamp_ns", "final_zero_stamp_ns", "hold_complete_stamp_ns",
+            "release_complete_stamp_ns", "release_contact_message_start_count", "release_contact_message_end_count", "release_required_through_stamp_ns", "reverse_start_stamp_ns",
+            "stop_command_stamp_ns", "stop_latency_ns"
+          ],
+          "properties": {
+            "control_started_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+            "final_zero_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+            "hold_complete_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+            "release_complete_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+            "release_contact_message_start_count": {"type": ["integer", "null"], "minimum": 0},
+            "release_contact_message_end_count": {"type": "integer", "minimum": 0},
+            "release_required_through_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+            "reverse_start_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+            "stop_command_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+            "stop_latency_ns": {"type": ["integer", "null"]}
+          }
+        }
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required", "delete_attempt_count", "delete_success", "actor_absent", "proof"],
+      "properties": {
+        "required": {"type": "boolean"},
+        "delete_attempt_count": {"type": "integer", "minimum": 0, "maximum": 1},
+        "delete_success": {"type": ["boolean", "null"]},
+        "actor_absent": {"type": "boolean"},
+        "proof": {"type": "object"}
+      }
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "all_buffers_bounded", "buffers", "collision_monitor_absent",
+        "forbidden_nodes", "nav2_absent", "overflow_free", "protocol_error_count",
+        "clock", "contact_message_heartbeat", "raw_contact_stream", "relative_project_names", "sole_cmd_vel_publisher", "source_publisher_counts", "source_streams_live", "cmd_vel_publisher_count"
+      ],
+      "properties": {
+        "all_buffers_bounded": {"const": true},
+        "buffers": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["actor_state", "command", "contact_records", "contact_summaries", "ground_truth"],
+          "properties": {
+            "actor_state": {"$ref": "#/$defs/buffer"},
+            "command": {"$ref": "#/$defs/buffer"},
+            "contact_records": {"$ref": "#/$defs/buffer"},
+            "contact_summaries": {"$ref": "#/$defs/buffer"},
+            "ground_truth": {"$ref": "#/$defs/buffer"}
+          }
+        },
+        "collision_monitor_absent": {"type": "boolean"},
+        "clock": {"$ref": "#/$defs/clock"},
+        "contact_message_heartbeat": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["first_stamp_ns", "latest_stamp_ns", "max_gap_ns", "message_count"],
+          "properties": {
+            "first_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+            "latest_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+            "max_gap_ns": {"type": "integer", "minimum": 0},
+            "message_count": {"type": "integer", "minimum": 0}
+          }
+        },
+        "forbidden_nodes": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "nav2_absent": {"type": "boolean"},
+        "overflow_free": {"type": "boolean"},
+        "protocol_error_count": {"type": "integer", "minimum": 0},
+        "raw_contact_stream": {"$ref": "#/$defs/buffer"},
+        "relative_project_names": {"const": true},
+        "sole_cmd_vel_publisher": {"type": "boolean"},
+        "source_publisher_counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["contacts", "entity_pose", "ground_truth"],
+          "properties": {
+            "contacts": {"type": "integer", "minimum": 0},
+            "entity_pose": {"type": "integer", "minimum": 0},
+            "ground_truth": {"type": "integer", "minimum": 0}
+          }
+        },
+        "source_streams_live": {"type": "boolean"},
+        "cmd_vel_publisher_count": {"type": "integer", "minimum": 0}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "PASS"}}},
+      "then": {
+        "properties": {
+          "verdict": {"properties": {"exit_code": {"const": 0}}},
+          "configuration": {
+            "properties": {
+              "control_configuration": {"type": "object", "minProperties": 1},
+              "fixture": {"$ref": "#/$defs/fixture"},
+              "source_binding": {"$ref": "#/$defs/sourceBinding"}
+            }
+          },
+          "cleanup": {
+            "properties": {
+              "actor_absent": {"const": true},
+              "delete_attempt_count": {"const": 1},
+              "delete_success": {"const": true},
+              "proof": {"$ref": "#/$defs/cleanupProof"},
+              "required": {"const": true}
+            }
+          },
+          "control": {
+            "properties": {
+              "command_trace": {
+                "minItems": 5,
+                "contains": {
+                  "required": ["angular_z", "linear_x", "phase"],
+                  "properties": {
+                    "angular_z": {"const": 0.0},
+                    "linear_x": {"const": 0.0},
+                    "phase": {"const": "HOLD"}
+                  }
+                },
+                "minContains": 1
+              },
+              "contact": {
+                "properties": {
+                  "classified_record_count": {"minimum": 1},
+                  "episodes": {"minItems": 1},
+                  "exact_pair_raw_count": {"minimum": 1},
+                  "first_qualifying_contact": {"$ref": "#/$defs/firstQualifyingContact"},
+                  "raw_contact_record_count": {"minimum": 1},
+                  "records": {"minItems": 1}
+                }
+              },
+              "criteria": {"$ref": "#/$defs/passingCriteria"},
+              "metrics_owned": {"$ref": "#/$defs/metricsOwned"},
+              "observed_robot_start": {"$ref": "#/$defs/observedRobotStart"},
+              "setup": {
+                "properties": {
+                  "observed_robot_start": {"$ref": "#/$defs/observedRobotStart"},
+                  "observed_wall": {"$ref": "#/$defs/observedWall"},
+                  "spawn": {
+                    "properties": {
+                      "attempt_count": {"const": 1},
+                      "error": {"type": "null"},
+                      "request_sequence": {"type": "integer", "minimum": 1},
+                      "request_stamp_ns": {"type": "integer", "minimum": 0},
+                      "response_sequence": {"type": "integer", "minimum": 1},
+                      "response_stamp_ns": {"type": "integer", "minimum": 0},
+                      "success": {"const": true}
+                    }
+                  }
+                }
+              },
+              "timeline": {
+                "properties": {
+                  "release_contact_message_end_count": {"minimum": 2},
+                  "release_contact_message_start_count": {"type": "integer", "minimum": 1}
+                }
+              }
+            }
+          },
+          "quality": {
+            "properties": {
+              "collision_monitor_absent": {"const": true},
+              "nav2_absent": {"const": true},
+              "overflow_free": {"const": true},
+              "protocol_error_count": {"const": 0},
+              "forbidden_nodes": {"maxItems": 0},
+              "sole_cmd_vel_publisher": {"const": true},
+              "source_streams_live": {"const": true}
+            }
+          }
+        }
+      },
+      "else": {"properties": {"verdict": {"properties": {"exit_code": {"enum": [20, 21, 22, 23, 24]}}}}}
+    }
+  ],
+  "$defs": {
+    "cleanupProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "pose_source_publishers_after", "pose_source_publishers_before",
+        "post_delete_pose_count", "post_delete_pose_source_heartbeat_count",
+        "post_delete_pose_source_latest_sim_stamp_ns", "quiet_until_sim_stamp_ns",
+        "request_sequence", "request_stamp_ns", "response_sequence", "response_stamp_ns"
+      ],
+      "properties": {
+        "kind": {"const": "successful_delete_response_and_pose_quiet_interval"},
+        "pose_source_publishers_after": {"type": "integer", "minimum": 1},
+        "pose_source_publishers_before": {"type": "integer", "minimum": 1},
+        "post_delete_pose_count": {"const": 0},
+        "post_delete_pose_source_heartbeat_count": {"type": "integer", "minimum": 1},
+        "post_delete_pose_source_latest_sim_stamp_ns": {"type": "integer", "minimum": 1},
+        "quiet_until_sim_stamp_ns": {"type": "integer", "minimum": 1},
+        "request_sequence": {"type": "integer", "minimum": 1},
+        "request_stamp_ns": {"type": "integer", "minimum": 0},
+        "response_sequence": {"type": "integer", "minimum": 1},
+        "response_stamp_ns": {"type": "integer", "minimum": 0}
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["angular_z", "collector_sequence", "linear_x", "phase", "sim_stamp_ns"],
+      "properties": {
+        "angular_z": {"const": 0.0},
+        "collector_sequence": {"type": "integer", "minimum": 1},
+        "linear_x": {"enum": [-0.05, 0.0, 0.05]},
+        "phase": {
+          "enum": [
+            "CONTACT_STOP", "FAIL_SAFE_ZERO", "FINAL_ZERO", "FORWARD", "HOLD",
+            "LATE_CONTACT_FAIL_SAFE_ZERO", "REVERSE"
+          ]
+        },
+        "sim_stamp_ns": {"type": "integer", "minimum": 1}
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "control", "entity", "expected_pair", "fixture_id", "robot_start", "schema_version"
+      ],
+      "properties": {
+        "control": {"type": "object", "minProperties": 1},
+        "entity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["asset_sha256", "name", "pose"],
+          "properties": {
+            "asset_sha256": {"$ref": "#/$defs/sha256"},
+            "name": {"const": "phase3_contact_control_wall"},
+            "pose": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["x", "y", "yaw", "z"],
+              "properties": {
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "yaw": {"type": "number"},
+                "z": {"type": "number"}
+              }
+            }
+          }
+        },
+        "expected_pair": {"$ref": "#/$defs/pair"},
+        "fixture_id": {"const": "collision_positive_control"},
+        "robot_start": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["x", "y", "yaw"],
+          "properties": {
+            "x": {"type": "number"},
+            "y": {"type": "number"},
+            "yaw": {"type": "number"}
+          }
+        },
+        "schema_version": {"const": 1}
+      }
+    },
+    "metricsOwned": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["collector_reconciliation_and_process_group_termination"],
+      "properties": {
+        "collector_reconciliation_and_process_group_termination": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["owner", "required", "scenario_controller_value"],
+          "properties": {
+            "owner": {"const": "robotest_metrics_and_orchestrator"},
+            "required": {"const": true},
+            "scenario_controller_value": {"type": "null"}
+          }
+        }
+      }
+    },
+    "observedRobotStart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "alignment_error_ns", "collector_sequence", "position_error_m", "sim_stamp_ns",
+        "x", "y", "yaw", "yaw_error_rad"
+      ],
+      "properties": {
+        "alignment_error_ns": {"type": "integer", "minimum": 0},
+        "collector_sequence": {"type": "integer", "minimum": 1},
+        "position_error_m": {"type": "number", "minimum": 0},
+        "sim_stamp_ns": {"type": "integer", "minimum": 1},
+        "x": {"type": "number"},
+        "y": {"type": "number"},
+        "yaw": {"type": "number"},
+        "yaw_error_rad": {"type": "number", "minimum": 0}
+      }
+    },
+    "observedWall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "collector_sequence", "position_error_m", "stamp_ns", "x", "y", "yaw",
+        "yaw_error_rad", "z"
+      ],
+      "properties": {
+        "collector_sequence": {"type": "integer", "minimum": 1},
+        "position_error_m": {"type": "number", "minimum": 0},
+        "stamp_ns": {"type": "integer", "minimum": 1},
+        "x": {"type": "number"},
+        "y": {"type": "number"},
+        "yaw": {"type": "number"},
+        "yaw_error_rad": {"type": "number", "minimum": 0},
+        "z": {"type": "number"}
+      }
+    },
+    "episode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["counterpart_model", "end_stamp_ns", "normalized_pairs", "sample_count", "start_stamp_ns"],
+      "properties": {
+        "counterpart_model": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "end_stamp_ns": {"type": "integer", "minimum": 1},
+        "normalized_pairs": {"type": "array", "minItems": 1, "maxItems": 32768, "uniqueItems": true, "items": {"$ref": "#/$defs/pair"}},
+        "sample_count": {"type": "integer", "minimum": 1},
+        "start_stamp_ns": {"type": "integer", "minimum": 1}
+      }
+    },
+    "passingCriteria": {
+      "type": "object",
+      "properties": {
+        "contact_before_deadline": {"const": true},
+        "episode_reconciled": {"const": true},
+        "exactly_one_counterpart_episode": {"const": true},
+        "final_command_zero": {"const": true},
+        "graph_isolated": {"const": true},
+        "hold_completed": {"const": true},
+        "overflow_free": {"const": true},
+        "raw_expected_contact_observed": {"const": true},
+        "release_completed": {"const": true},
+        "release_source_spanned": {"const": true},
+        "reverse_completed": {"const": true},
+        "robot_start_verified": {"const": true},
+        "sole_cmd_vel_publisher": {"const": true},
+        "stop_within_100ms": {"const": true},
+        "wall_deleted": {"const": true}
+      }
+    },
+    "rawContactRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["collector_sequence", "counterpart_collision", "counterpart_model", "disposition", "normalized_pair", "robot_collision", "sim_stamp_ns"],
+      "properties": {
+        "collector_sequence": {"type": "integer", "minimum": 1},
+        "counterpart_collision": {"type": ["string", "null"], "maxLength": 4096},
+        "counterpart_model": {"type": ["string", "null"], "maxLength": 4096},
+        "disposition": {"enum": ["counted", "non_robot_pair_ignored", "robot_internal_excluded", "support_ground_excluded"]},
+        "normalized_pair": {"$ref": "#/$defs/pair"},
+        "robot_collision": {"type": ["string", "null"], "maxLength": 4096},
+        "sim_stamp_ns": {"type": "integer", "minimum": 1}
+      }
+    },
+    "sourceBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["aggregate_sha256", "files"],
+      "properties": {
+        "aggregate_sha256": {"$ref": "#/$defs/sha256"},
+        "files": {
+          "type": "array",
+          "minItems": 11,
+          "maxItems": 11,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "sha256"],
+            "properties": {
+              "name": {"type": "string", "minLength": 1, "maxLength": 4096},
+              "sha256": {"$ref": "#/$defs/sha256"}
+            }
+          }
+        }
+      }
+    },
+    "firstQualifyingContact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clock_delivery_offset_ns", "collector_sequence", "normalized_pair",
+        "observed_sim_stamp_ns", "sim_stamp_ns"
+      ],
+      "properties": {
+        "clock_delivery_offset_ns": {"type": "integer", "minimum": 0},
+        "collector_sequence": {"type": "integer", "minimum": 1},
+        "normalized_pair": {"$ref": "#/$defs/pair"},
+        "observed_sim_stamp_ns": {"type": "integer", "minimum": 1},
+        "sim_stamp_ns": {"type": "integer", "minimum": 1}
+      }
+    },
+    "clock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["first_stamp_ns", "latest_stamp_ns", "max_gap_ns", "regression_count", "sample_count"],
+      "properties": {
+        "first_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+        "latest_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+        "max_gap_ns": {"type": "integer", "minimum": 0},
+        "regression_count": {"type": "integer", "minimum": 0},
+        "sample_count": {"type": "integer", "minimum": 0}
+      }
+    },
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "pair": {
+      "type": "array", "minItems": 2, "maxItems": 2,
+      "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+    },
+    "buffer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accepted_count", "capacity", "first_overflow_sequence", "first_overflow_stamp_ns",
+        "ingress_count", "invalid_count", "overflow", "overflow_count", "retained_count"
+      ],
+      "properties": {
+        "accepted_count": {"type": "integer", "minimum": 0},
+        "capacity": {"type": "integer", "minimum": 1},
+        "first_overflow_sequence": {"type": ["integer", "null"]},
+        "first_overflow_stamp_ns": {"type": ["integer", "null"]},
+        "ingress_count": {"type": "integer", "minimum": 0},
+        "invalid_count": {"type": "integer", "minimum": 0},
+        "overflow": {"type": "boolean"},
+        "overflow_count": {"type": "integer", "minimum": 0},
+        "retained_count": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

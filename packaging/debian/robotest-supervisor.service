@@ -1,0 +1,50 @@
+[Unit]
+Description=RoboTest Lab bounded process supervisor
+Documentation=man:robotest-supervisor(8)
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/opt/robotest-lab/install/setup.bash
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=robotest-supervisor
+Group=robotest-supervisor
+SupplementaryGroups=video render
+WorkingDirectory=/var/lib/robotest-supervisor
+Environment=HOME=/var/lib/robotest-supervisor
+Environment=GZ_HOMEDIR=/var/lib/robotest-supervisor
+ExecStart=/usr/bin/robotest-supervisor --config /etc/robotest-supervisor/config.json
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillMode=mixed
+StateDirectory=robotest-supervisor
+StateDirectoryMode=0750
+LogsDirectory=robotest-supervisor
+LogsDirectoryMode=0750
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+ReadOnlyPaths=/opt/robotest-lab
+ReadWritePaths=/var/lib/robotest-supervisor /var/log/robotest-supervisor
+TasksMax=512
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

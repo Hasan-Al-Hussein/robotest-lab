@@ -1,0 +1,43 @@
+.TH ROBOTEST-SUPERVISOR 8 "August 2026" "robotest-supervisor 0.1.0" "System Administration"
+.SH NAME
+robotest-supervisor \- bounded local process supervisor for RoboTest Lab
+.SH SYNOPSIS
+.B robotest-supervisor
+.RB [ \-config
+.IR path ]
+.RB [ \-check-config ]
+.SH DESCRIPTION
+.B robotest-supervisor
+starts configured child process groups, monitors timestamped heartbeat files,
+and applies a bounded exponential-backoff restart policy. It writes structured
+events and an atomic status snapshot under its configured state directory.
+.PP
+The HTTP interface is read-only and binds exactly to 127.0.0.1. It exposes
+.BR /healthz ,
+.BR /readyz ,
+.BR /v1/status ,
+and
+.BR /metrics .
+There is no remote process-control endpoint.
+.SH OPTIONS
+.TP
+.BI \-config " path"
+Read the strict versioned JSON configuration from
+.IR path .
+The default is
+.IR /etc/robotest-supervisor/config.json .
+.TP
+.B \-check-config
+Validate the configuration and exit without starting a child or HTTP server.
+.SH FILES
+.TP
+.I /etc/robotest-supervisor/config.json
+Administrator configuration managed as a dpkg conffile.
+.TP
+.I /var/lib/robotest-supervisor/events.jsonl
+Prefix-retained structured lifecycle events.
+.TP
+.I /var/lib/robotest-supervisor/status.json
+Atomically replaced current status.
+.SH SEE ALSO
+.BR systemd.service (5)

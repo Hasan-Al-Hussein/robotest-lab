@@ -188,20 +188,24 @@ def test_sensor_contract(robot_xml: ET.Element) -> None:
 
 def test_collision_coverage_manifest_matches_contact_sensors() -> None:
     coverage = yaml.safe_load(COLLISION_COVERAGE.read_text(encoding='utf-8'))
-    entries = coverage['collision_geometries']
+    entries = coverage['robot_collisions']
 
-    assert coverage['schema_version'] == 1
-    assert coverage['model_name'] == 'robotest'
+    assert coverage['schema_version'] == 2
+    assert coverage['robot_model'] == 'robotest'
     assert coverage['contact_topic'] == '/robotest/validation/contacts'
     assert len(entries) == len(CONTACT_SENSORS)
     assert {entry['contact_sensor'] for entry in entries} == set(CONTACT_SENSORS)
     assert {entry['collision'] for entry in entries} == {
         collision_name for _, collision_name in CONTACT_SENSORS.values()
     }
-    assert len({entry['scoped_collision'] for entry in entries}) == len(entries)
+    assert len({entry['name'] for entry in entries}) == len(entries)
+    assert {entry['source'] for entry in entries} == {coverage['contact_topic']}
+    names = {entry['name'] for entry in entries}
+    assert set(coverage['covered_collisions']) == names
+    assert set(coverage['rendered_robot_collisions']) == names
 
     excluded_roles = {
-        entry['robot_collision'].split('::')[1] for entry in coverage['support_ground_exclusions']
+        entry['robot_collision'].split('::')[1] for entry in coverage['support_pairs']
     }
     assert excluded_roles == {
         'left_wheel_link',
@@ -209,7 +213,7 @@ def test_collision_coverage_manifest_matches_contact_sensors() -> None:
         'front_caster_link',
         'rear_caster_link',
     }
-    assert {entry['counterpart_collision'] for entry in coverage['support_ground_exclusions']} == {
+    assert {entry['environment_collision'] for entry in coverage['support_pairs']} == {
         'ground_plane::ground_link::ground_collision'
     }
 

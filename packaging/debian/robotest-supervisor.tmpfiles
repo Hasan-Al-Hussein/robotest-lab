@@ -1,0 +1,2 @@
+d /var/lib/robotest-supervisor 0750 robotest-supervisor robotest-supervisor -
+d /var/log/robotest-supervisor 0750 robotest-supervisor robotest-supervisor -

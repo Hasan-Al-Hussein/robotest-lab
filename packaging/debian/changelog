@@ -1,0 +1,5 @@
+robotest-supervisor (0.1.0) noble; urgency=medium
+
+  * Initial local package for the bounded RoboTest Lab process supervisor.
+
+ -- Hasan Ahmed <200383997+Hasan-Al-Hussein@users.noreply.github.com>  Wed, 26 Aug 2026 07:40:00 +0400

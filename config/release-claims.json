@@ -1,0 +1,90 @@
+{
+  "claims": [
+    {
+      "claim_document": "README.md",
+      "claim_text": "103 tests with zero errors or failures",
+      "evidence_document": "docs/results/phase-1/20260825T200725Z-1333.md",
+      "evidence_text": "103 tests, 0 errors, 0 failures",
+      "id": "phase1-test-count"
+    },
+    {
+      "claim_document": "README.md",
+      "claim_text": "calculated RTF median `0.9999`",
+      "evidence_document": "docs/results/phase-1/20260825T200725Z-1333.md",
+      "evidence_text": "`0.9999416661302953`",
+      "id": "phase1-rtf-median"
+    },
+    {
+      "claim_document": "README.md",
+      "claim_text": "calculated RTF p5 `0.9162`",
+      "evidence_document": "docs/results/phase-1/20260825T200725Z-1333.md",
+      "evidence_text": "`0.9162105536383762`",
+      "id": "phase1-rtf-p5"
+    },
+    {
+      "claim_document": "README.md",
+      "claim_text": "peak launch-group RSS `795,476 KiB`",
+      "evidence_document": "docs/results/phase-1/20260825T200725Z-1333.md",
+      "evidence_text": "`795,476 KiB` (`776.83 MiB`)",
+      "id": "phase1-peak-rss"
+    },
+    {
+      "claim_document": "README.md",
+      "claim_text": "bounded displacement `0.2962 m`",
+      "evidence_document": "docs/results/phase-1/20260825T200725Z-1333.md",
+      "evidence_text": "`0.29619887895167835 m`",
+      "id": "phase1-displacement"
+    },
+    {
+      "claim_document": "README.md",
+      "claim_text": "45-entry run checksum manifest validated completely",
+      "evidence_document": "docs/results/phase-1/20260825T200725Z-1333.md",
+      "evidence_text": "all 45 manifest entries validated",
+      "id": "phase1-checksum-count"
+    },
+    {
+      "claim_document": "README.md",
+      "claim_text": "Nav2 returned `SUCCEEDED` after all three ordered waypoints",
+      "evidence_document": "docs/results/phase-2/20260826T010218Z-466.md",
+      "evidence_text": "Nav2 `SUCCEEDED`; 3/3 completed",
+      "id": "phase2-mission-result"
+    },
+    {
+      "claim_document": "README.md",
+      "claim_text": "213 tests with zero errors and failures",
+      "evidence_document": "docs/results/phase-2/20260826T010218Z-466.md",
+      "evidence_text": "213 tests, 0 errors, 0 failures",
+      "id": "phase2-test-count"
+    },
+    {
+      "claim_document": "README.md",
+      "claim_text": "calculated RTF median `0.9863`",
+      "evidence_document": "docs/results/phase-2/20260826T010218Z-466.md",
+      "evidence_text": "`0.9863029171557808`",
+      "id": "phase2-rtf-median"
+    },
+    {
+      "claim_document": "README.md",
+      "claim_text": "calculated RTF p5 `0.9302`",
+      "evidence_document": "docs/results/phase-2/20260826T010218Z-466.md",
+      "evidence_text": "`0.9302367113894893`",
+      "id": "phase2-rtf-p5"
+    },
+    {
+      "claim_document": "README.md",
+      "claim_text": "peak owned-process-group RSS `1,372,244 KiB`",
+      "evidence_document": "docs/results/phase-2/20260826T010218Z-466.md",
+      "evidence_text": "`1,372,244 KiB`",
+      "id": "phase2-peak-rss"
+    },
+    {
+      "claim_document": "README.md",
+      "claim_text": "All 111 checksum-manifest entries validated",
+      "evidence_document": "docs/results/phase-2/20260826T010218Z-466.md",
+      "evidence_text": "all 111 checksum entries validated",
+      "id": "phase2-checksum-count"
+    }
+  ],
+  "schema_version": 1,
+  "scope": "Quantitative and outcome claims currently published in README.md. No CV document is present in this repository."
+}

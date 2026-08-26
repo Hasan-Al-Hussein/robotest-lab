@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://robotest-lab.local/schema/metrics-run-artifacts-manifest-v1.json",
+  "title": "RoboTest Phase 3 non-circular output manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["artifacts", "identity", "producer", "quality", "schema_version"],
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["bytes", "path", "sha256"],
+        "properties": {
+          "bytes": {"type": "integer", "minimum": 1},
+          "path": {
+            "enum": [
+              "localization-error.png",
+              "measurement-summary.png",
+              "real-time-factor.png",
+              "report.html",
+              "report.md",
+              "run-result.csv",
+              "run-result.json",
+              "trajectory.png"
+            ]
+          },
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "run_result_sha256"],
+      "properties": {
+        "run_id": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "run_result_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "producer": {"const": "robotest_metrics/metrics_analyze"},
+    "quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_bytes_excluding_manifest",
+        "artifact_count",
+        "caps_within_limits",
+        "hashes_verified",
+        "path_set_complete"
+      ],
+      "properties": {
+        "artifact_bytes_excluding_manifest": {"type": "integer", "minimum": 1},
+        "artifact_count": {"type": "integer", "minimum": 4, "maximum": 8},
+        "caps_within_limits": {"const": true},
+        "hashes_verified": {"const": true},
+        "path_set_complete": {"const": true}
+      }
+    },
+    "schema_version": {"const": 1}
+  }
+}

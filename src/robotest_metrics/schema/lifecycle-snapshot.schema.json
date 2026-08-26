@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://robotest-lab.local/schema/lifecycle-snapshot-v1.json",
+  "title": "RoboTest Lifecycle Snapshot Evidence",
+  "type": "object",
+  "required": [
+    "capacity",
+    "clock",
+    "errors",
+    "identity",
+    "lifecycle_snapshot_schema_version",
+    "quality",
+    "records",
+    "samples",
+    "schedule"
+  ],
+  "properties": {
+    "capacity": {
+      "type": "object",
+      "required": [
+        "round_capacity",
+        "sample_capacity",
+        "scheduled_round_count",
+        "scheduled_sample_count"
+      ],
+      "properties": {
+        "round_capacity": {"const": 96},
+        "sample_capacity": {"const": 864},
+        "scheduled_round_count": {"type": "integer", "minimum": 1, "maximum": 96},
+        "scheduled_sample_count": {"type": "integer", "minimum": 9, "maximum": 864}
+      },
+      "additionalProperties": false
+    },
+    "clock": {
+      "type": "object",
+      "required": ["count", "latest_stamp_ns", "regression_count"],
+      "properties": {
+        "count": {"type": "integer", "minimum": 0},
+        "latest_stamp_ns": {"$ref": "#/$defs/nullableStamp"},
+        "regression_count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "errors": {
+      "type": "array",
+      "maxItems": 864,
+      "items": {"$ref": "#/$defs/errorDetail"}
+    },
+    "identity": {
+      "type": "object",
+      "required": ["run_id", "sampler_node", "schedule_sha256"],
+      "properties": {
+        "run_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "sampler_node": {"type": "string", "minLength": 1, "maxLength": 512},
+        "schedule_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "lifecycle_snapshot_schema_version": {"const": 1},
+    "quality": {
+      "type": "object",
+      "required": [
+        "collector_overflow",
+        "complete",
+        "error_count",
+        "error_counts",
+        "finished_steady_wall_ns",
+        "first_overflow_sequence",
+        "first_overflow_stamp_ns",
+        "late_response_count",
+        "missed_count",
+        "overflow_count",
+        "pending_count",
+        "request_count",
+        "response_count",
+        "retained_count",
+        "runtime_error",
+        "started_steady_wall_ns",
+        "stop_reason",
+        "success_count"
+      ],
+      "properties": {
+        "collector_overflow": {"type": "boolean"},
+        "complete": {"type": "boolean"},
+        "error_count": {"type": "integer", "minimum": 0, "maximum": 864},
+        "error_counts": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 1, "maximum": 864}
+        },
+        "finished_steady_wall_ns": {"$ref": "#/$defs/nullableStamp"},
+        "first_overflow_sequence": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "first_overflow_stamp_ns": {"$ref": "#/$defs/nullableStamp"},
+        "late_response_count": {"type": "integer", "minimum": 0},
+        "missed_count": {"type": "integer", "minimum": 0, "maximum": 864},
+        "overflow_count": {"type": "integer", "minimum": 0},
+        "pending_count": {"type": "integer", "minimum": 0, "maximum": 864},
+        "request_count": {"type": "integer", "minimum": 0, "maximum": 864},
+        "response_count": {"type": "integer", "minimum": 0, "maximum": 864},
+        "retained_count": {"type": "integer", "minimum": 0, "maximum": 864},
+        "runtime_error": {"type": ["string", "null"], "maxLength": 512},
+        "started_steady_wall_ns": {"$ref": "#/$defs/nullableStamp"},
+        "stop_reason": {
+          "enum": ["stop_file", "wall_timeout", "runtime_shutdown", "runtime_error", null]
+        },
+        "success_count": {"type": "integer", "minimum": 0, "maximum": 864}
+      },
+      "additionalProperties": false
+    },
+    "records": {
+      "type": "array",
+      "maxItems": 864,
+      "items": {"$ref": "#/$defs/record"}
+    },
+    "samples": {
+      "type": "array",
+      "maxItems": 864,
+      "items": {"$ref": "#/$defs/sample"}
+    },
+    "schedule": {
+      "type": "object",
+      "required": ["nodes", "requested_stamps_ns", "service_names"],
+      "properties": {
+        "nodes": {
+          "type": "array",
+          "prefixItems": [
+            {"const": "map_server"},
+            {"const": "amcl"},
+            {"const": "planner_server"},
+            {"const": "controller_server"},
+            {"const": "behavior_server"},
+            {"const": "bt_navigator"},
+            {"const": "waypoint_follower"},
+            {"const": "velocity_smoother"},
+            {"const": "collision_monitor"}
+          ],
+          "items": false,
+          "minItems": 9,
+          "maxItems": 9
+        },
+        "requested_stamps_ns": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 96,
+          "items": {"$ref": "#/$defs/stamp"}
+        },
+        "service_names": {
+          "type": "array",
+          "prefixItems": [
+            {"const": "map_server/get_state"},
+            {"const": "amcl/get_state"},
+            {"const": "planner_server/get_state"},
+            {"const": "controller_server/get_state"},
+            {"const": "behavior_server/get_state"},
+            {"const": "bt_navigator/get_state"},
+            {"const": "waypoint_follower/get_state"},
+            {"const": "velocity_smoother/get_state"},
+            {"const": "collision_monitor/get_state"}
+          ],
+          "items": false,
+          "minItems": 9,
+          "maxItems": 9
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "stamp": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "nullableStamp": {
+      "anyOf": [
+        {"$ref": "#/$defs/stamp"},
+        {"type": "null"}
+      ]
+    },
+    "node": {
+      "enum": [
+        "map_server",
+        "amcl",
+        "planner_server",
+        "controller_server",
+        "behavior_server",
+        "bt_navigator",
+        "waypoint_follower",
+        "velocity_smoother",
+        "collision_monitor"
+      ]
+    },
+    "record": {
+      "type": "object",
+      "required": [
+        "collector_sequence",
+        "error",
+        "missed",
+        "node",
+        "request_stamp_ns",
+        "requested_stamp_ns",
+        "response_stamp_ns",
+        "round_index",
+        "state_id",
+        "state_label",
+        "success"
+      ],
+      "properties": {
+        "collector_sequence": {"type": "integer", "minimum": 1, "maximum": 864},
+        "error": {"type": ["string", "null"], "maxLength": 512},
+        "missed": {"type": "boolean"},
+        "node": {"$ref": "#/$defs/node"},
+        "request_stamp_ns": {"$ref": "#/$defs/nullableStamp"},
+        "requested_stamp_ns": {"$ref": "#/$defs/stamp"},
+        "response_stamp_ns": {"$ref": "#/$defs/nullableStamp"},
+        "round_index": {"type": "integer", "minimum": 0, "maximum": 95},
+        "state_id": {"type": ["integer", "null"], "minimum": 0, "maximum": 255},
+        "state_label": {"type": ["string", "null"], "maxLength": 256},
+        "success": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "sample": {
+      "type": "object",
+      "required": ["collector_sequence", "node", "stamp_ns", "state"],
+      "properties": {
+        "collector_sequence": {"type": "integer", "minimum": 1, "maximum": 864},
+        "node": {"$ref": "#/$defs/node"},
+        "stamp_ns": {"$ref": "#/$defs/stamp"},
+        "state": {"type": "string", "minLength": 1, "maxLength": 256}
+      },
+      "additionalProperties": false
+    },
+    "errorDetail": {
+      "type": "object",
+      "required": ["collector_sequence", "error", "node", "requested_stamp_ns", "round_index"],
+      "properties": {
+        "collector_sequence": {"type": "integer", "minimum": 1, "maximum": 864},
+        "error": {"type": "string", "minLength": 1, "maxLength": 512},
+        "node": {"$ref": "#/$defs/node"},
+        "requested_stamp_ns": {"$ref": "#/$defs/stamp"},
+        "round_index": {"type": "integer", "minimum": 0, "maximum": 95}
+      },
+      "additionalProperties": false
+    }
+  }
+}

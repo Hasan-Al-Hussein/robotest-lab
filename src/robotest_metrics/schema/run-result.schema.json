@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://robotest-lab.local/schema/metrics-run-result-v1.json",
+  "title": "RoboTest Phase 3 Canonical Run Result",
+  "type": "object",
+  "required": ["events", "identity", "measurements", "quality", "targets", "verdict"],
+  "properties": {
+    "events": {"type": "array", "maxItems": 32768, "items": {"type": "object"}},
+    "identity": {
+      "type": "object",
+      "required": [
+        "candidate_id",
+        "git_sha",
+        "gz_partition",
+        "repetition_index",
+        "ros_domain_id",
+        "run_id",
+        "scenario_id",
+        "scenario_name",
+        "scenario_sha256",
+        "suite_index"
+      ],
+      "properties": {
+        "candidate_id": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "gz_partition": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "repetition_index": {"type": "integer", "minimum": 0, "maximum": 2},
+        "ros_domain_id": {"type": "integer", "minimum": 0, "maximum": 232},
+        "run_id": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "scenario_id": {"type": "integer", "minimum": 1, "maximum": 5},
+        "scenario_name": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "scenario_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "suite_index": {"type": "integer", "minimum": 0, "maximum": 14}
+      },
+      "additionalProperties": true
+    },
+    "measurements": {
+      "type": "object",
+      "required": [
+        "accepted_goal_stamp_ns",
+        "actual_path_length_m",
+        "collision_count",
+        "completed_waypoint_count",
+        "completion_time_sim_s",
+        "initial_planned_path_length_m",
+        "mission_action_status",
+        "path_efficiency",
+        "peak_rss_sum_bytes",
+        "replan_count",
+        "rtf_median",
+        "rtf_p5",
+        "terminal_action_stamp_ns"
+      ],
+      "properties": {
+        "accepted_goal_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+        "actual_path_length_m": {"type": ["number", "null"], "minimum": 0},
+        "collision_count": {"type": ["integer", "null"], "minimum": 0},
+        "completed_waypoint_count": {"type": ["integer", "null"], "minimum": 0},
+        "completion_time_sim_s": {"type": ["number", "null"], "minimum": 0},
+        "initial_planned_path_length_m": {"type": ["number", "null"], "minimum": 0},
+        "mission_action_status": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "path_efficiency": {"type": ["number", "null"]},
+        "peak_rss_sum_bytes": {"type": ["integer", "null"], "minimum": 0},
+        "replan_count": {"type": ["integer", "null"], "minimum": 0},
+        "rtf_median": {"type": ["number", "null"], "minimum": 0},
+        "rtf_p5": {"type": ["number", "null"], "minimum": 0},
+        "terminal_action_stamp_ns": {"type": ["integer", "null"], "minimum": 0}
+      },
+      "additionalProperties": true
+    },
+    "quality": {
+      "type": "object",
+      "required": [
+        "artifact_caps",
+        "artifact_projection_preflight",
+        "candidate_identity",
+        "capture",
+        "collector_overflow",
+        "component_failures",
+        "components",
+        "contract_revision",
+        "infrastructure_failure",
+        "metric_unavailable_reasons"
+      ],
+      "properties": {
+        "artifact_projection_preflight": {"const": "PASS"},
+        "candidate_identity": {"type": "object"},
+        "capture": {
+          "type": "object",
+          "required": ["clock", "failures", "overflowed", "status", "streams"]
+        },
+        "collector_overflow": {"type": ["boolean", "null"]},
+        "component_failures": {
+          "type": "object",
+          "additionalProperties": {"type": "string", "maxLength": 4096}
+        },
+        "components": {
+          "type": "object",
+          "required": [
+            "fault_control",
+            "mission",
+            "mission_artifact_sha256",
+            "orchestrator",
+            "scenario"
+          ]
+        },
+        "contract_revision": {"const": 2},
+        "infrastructure_failure": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "evidence_sha256",
+                "exit_code",
+                "kind",
+                "reason",
+                "stage",
+                "trial_context_sha256",
+                "wall_timed_out"
+              ],
+              "properties": {
+                "evidence_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "exit_code": {"type": "integer"},
+                "kind": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 4096},
+                "stage": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$"},
+                "trial_context_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "wall_timed_out": {"type": "boolean"}
+              }
+            }
+          ]
+        },
+        "metric_unavailable_reasons": {"type": "object", "additionalProperties": {"type": "string"}}
+      },
+      "additionalProperties": true
+    },
+    "targets": {"type": "object"},
+    "verdict": {
+      "type": "object",
+      "required": [
+        "automated_status",
+        "capture_integrity",
+        "components_complete",
+        "exit_code",
+        "mission_success",
+        "required_metric_checks",
+        "scenario_metric_gate",
+        "threshold_checks"
+      ],
+      "properties": {
+        "automated_status": {"enum": ["PASS", "FAIL"]},
+        "capture_integrity": {"type": "boolean"},
+        "components_complete": {"type": "boolean"},
+        "exit_code": {"type": "integer", "minimum": 0},
+        "mission_success": {"type": "boolean"},
+        "required_metric_checks": {"type": "array", "items": {"type": "object"}},
+        "scenario_metric_gate": {"type": "boolean"},
+        "threshold_checks": {"type": "array", "items": {"type": "object"}}
+      },
+      "additionalProperties": true
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "quality": {
+            "required": ["infrastructure_failure"],
+            "properties": {"infrastructure_failure": {"type": "object"}}
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "measurements": {
+            "properties": {
+              "accepted_goal_stamp_ns": {"type": "null"},
+              "completed_waypoint_count": {"type": "null"},
+              "completion_time_sim_s": {"type": "null"},
+              "mission_action_status": {"const": "INFRASTRUCTURE_ERROR"},
+              "terminal_action_stamp_ns": {"type": "null"}
+            }
+          },
+          "quality": {"properties": {"collector_overflow": {"type": "null"}}},
+          "verdict": {
+            "properties": {
+              "automated_status": {"const": "FAIL"},
+              "capture_integrity": {"const": false},
+              "components_complete": {"const": false},
+              "exit_code": {"enum": [31, 32]},
+              "mission_success": {"const": false},
+              "reason": {
+                "enum": ["artifact_finalization_failed", "infrastructure_evidence_invalid"]
+              },
+              "scenario_metric_gate": {"const": false}
+            },
+            "required": ["reason"]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "measurements": {
+            "properties": {
+              "accepted_goal_stamp_ns": {"type": "integer", "minimum": 0},
+              "completed_waypoint_count": {"type": "integer", "minimum": 0},
+              "completion_time_sim_s": {"type": "number", "minimum": 0},
+              "terminal_action_stamp_ns": {"type": "integer", "minimum": 0}
+            }
+          },
+          "quality": {
+            "properties": {
+              "collector_overflow": {"type": "boolean"},
+              "infrastructure_failure": {"type": "null"}
+            }
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,106 @@
+#!/bin/bash
+# Copyright 2026 Hasan Ahmed
+# SPDX-License-Identifier: Apache-2.0
+
+set -Eeuo pipefail
+
+readonly overlay_setup=/opt/robotest-lab/install/setup.bash
+readonly heartbeat=/var/lib/robotest-supervisor/robotest-stack.heartbeat
+readonly startup_result=/var/lib/robotest-supervisor/lifecycle-startup-result.json
+
+if [[ ! -r "${overlay_setup}" ]]; then
+  printf 'missing runtime overlay: %s\n' "${overlay_setup}" >&2
+  exit 66
+fi
+
+cpuset=${ROBOTEST_CPUSET:-0-5}
+namespace=${ROBOTEST_NAMESPACE:-robotest}
+if [[ ! "${cpuset}" =~ ^[0-9]+([,-][0-9]+)*$ ]]; then
+  printf 'invalid ROBOTEST_CPUSET: %s\n' "${cpuset}" >&2
+  exit 64
+fi
+if [[ ! "${namespace}" =~ ^[a-z][a-z0-9_]{0,63}$ ]]; then
+  printf 'invalid ROBOTEST_NAMESPACE: %s\n' "${namespace}" >&2
+  exit 64
+fi
+
+rm -f -- "${heartbeat}" "${startup_result}"
+set +u
+# The target ROS installation owns this absolute setup file.
+# shellcheck disable=SC1091
+source /opt/ros/jazzy/setup.bash
+# overlay_setup is the validated absolute staged-overlay path.
+# shellcheck disable=SC1090
+source "${overlay_setup}"
+set -u
+
+taskset -c "${cpuset}" ros2 launch robotest_navigation phase2.launch.py \
+  namespace:="${namespace}" \
+  seed:=42 \
+  headless:=true \
+  render_sensors:=true \
+  rviz:=false \
+  autostart:=true \
+  use_sim_time:=true \
+  lifecycle_startup_result_path:="${startup_result}" &
+launch_pid=$!
+
+# This function is invoked by the INT/TERM trap below.
+# shellcheck disable=SC2317
+terminate() {
+  trap - INT TERM
+  kill -TERM "${launch_pid}" 2>/dev/null || true
+  wait "${launch_pid}" 2>/dev/null || true
+  exit 143
+}
+trap terminate INT TERM
+
+while [[ ! -f "${startup_result}" ]]; do
+  if ! kill -0 "${launch_pid}" 2>/dev/null; then
+    set +e
+    wait "${launch_pid}"
+    status=$?
+    set -e
+    exit "${status}"
+  fi
+  sleep 0.2
+done
+
+if ! python3 - "${startup_result}" <<'PY'
+import json
+import pathlib
+import sys
+
+expected = {
+    'schema_version', 'verdict', 'accepted', 'exit_code', 'service_name',
+    'command', 'elapsed_wall_sec', 'discovery_grace_sec',
+    'service_timeout_sec', 'response_timeout_sec', 'watch_pid',
+    'failure_kind', 'failure_message', 'started_utc', 'completed_utc',
+}
+path = pathlib.Path(sys.argv[1])
+try:
+    value = json.loads(path.read_text(encoding='utf-8'))
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f'invalid lifecycle result: {error}')
+if not isinstance(value, dict) or set(value) != expected:
+    raise SystemExit('lifecycle result has the wrong schema')
+if value['schema_version'] != 1:
+    raise SystemExit('unsupported lifecycle result schema')
+if value['verdict'] != 'PASS' or value['accepted'] is not True or value['exit_code'] != 0:
+    raise SystemExit('lifecycle startup was not accepted')
+PY
+then
+  kill -TERM "${launch_pid}" 2>/dev/null || true
+  exit 70
+fi
+
+while kill -0 "${launch_pid}" 2>/dev/null; do
+  touch "${heartbeat}"
+  sleep 0.5
+done
+
+set +e
+wait "${launch_pid}"
+status=$?
+set -e
+exit "${status}"

@@ -96,9 +96,10 @@ that separate control plane.
 
 This runner proves only its bounded mission/action/fault-control component result. Collision
 count, actual path length, path efficiency, and the full Scenario 1 acceptance
-verdict remain explicitly `NOT_EVALUATED` in Phase 2. Those independent metrics
-are deferred to Phase 3 and the planned `robotest_metrics` package; the Phase 2
-verifier does not supply them.
+verdict remain explicitly `NOT_EVALUATED` in Phase 2. The implemented
+`robotest_metrics` package owns those independent Phase 3 measurements and the
+sole canonical benchmark verdict; its availability does not itself establish a
+benchmark PASS, and the Phase 2 verifier does not supply those results.
 
 ## Test
 

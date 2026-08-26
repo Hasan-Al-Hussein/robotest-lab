@@ -335,6 +335,10 @@ def test_launch_description_is_fixed_noncomposed_and_discoverable() -> None:
     }
     launch_text = (PACKAGE / 'launch' / 'phase2.launch.py').read_text()
     assert 'respawn=False' in launch_text
+    assert "on_exit=Shutdown(reason=f'critical Nav2 process exited: {executable}')" in launch_text
+    for process_name in ('map_server', 'bt_navigator', 'lifecycle_manager_navigation'):
+        assert f'critical Nav2 process exited: {process_name}' in launch_text
+    assert 'lifecycle_startup_trigger' in launch_text
     assert 'ComposableNode' not in launch_text
     result = subprocess.run(
         ['ros2', 'launch', 'robotest_navigation', 'phase2.launch.py', '--show-args'],

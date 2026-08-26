@@ -1,0 +1,506 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://robotest-lab.local/schema/metrics-analysis-request-v1.json",
+  "title": "RoboTest Phase 3 candidate analysis request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "capture",
+    "collision",
+    "fault",
+    "identity",
+    "mission",
+    "orchestrator",
+    "scenario",
+    "targets"
+  ],
+  "properties": {
+    "capture": {"type": "object"},
+    "collision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "benchmark_binding",
+        "coverage_manifest",
+        "drain_completed_stamp_ns",
+        "positive_control"
+      ],
+      "properties": {
+        "benchmark_binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "benchmark_provenance",
+            "positive_control_external_quality",
+            "positive_control_json_sha256",
+            "positive_control_provenance",
+            "positive_control_run_id",
+            "positive_control_scenario_sha256"
+          ],
+          "properties": {
+            "benchmark_provenance": {"$ref": "#/$defs/collisionProvenance"},
+            "positive_control_external_quality": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "checksum_verified",
+                "collector_capture_sha256",
+                "collector_reconciled",
+                "owned_process_group_shutdown"
+              ],
+              "properties": {
+                "checksum_verified": {"type": "boolean"},
+                "collector_capture_sha256": {"$ref": "#/$defs/sha256"},
+                "collector_reconciled": {"type": "boolean"},
+                "owned_process_group_shutdown": {"type": "boolean"}
+              }
+            },
+            "positive_control_json_sha256": {"$ref": "#/$defs/sha256"},
+            "positive_control_provenance": {"$ref": "#/$defs/collisionProvenance"},
+            "positive_control_run_id": {"$ref": "#/$defs/boundedString"},
+            "positive_control_scenario_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "coverage_manifest": {"type": "object"},
+        "drain_completed_stamp_ns": {"type": "integer", "minimum": 0},
+        "positive_control": {
+          "type": "object",
+          "required": [
+            "cleanup",
+            "configuration",
+            "control",
+            "identity",
+            "producer",
+            "quality",
+            "schema_version",
+            "status",
+            "verdict"
+          ]
+        }
+      }
+    },
+    "fault": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "collision_monitor_source_timeout_s": {"type": "number"},
+        "kind": {"enum": ["none", "lidar_dropout", "odometry_drift"]},
+        "lifecycle_snapshot": {"type": "object"},
+        "required_lifecycle_nodes": {
+          "type": "array",
+          "minItems": 9,
+          "maxItems": 9,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/boundedString"}
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "lidar_dropout"}}},
+          "then": {
+            "required": [
+              "collision_monitor_source_timeout_s",
+              "lifecycle_snapshot",
+              "required_lifecycle_nodes"
+            ]
+          }
+        }
+      ]
+    },
+    "identity": {
+      "type": "object",
+      "required": [
+        "candidate_id",
+        "cold_stack",
+        "git_dirty",
+        "git_sha",
+        "gz_partition",
+        "repetition_index",
+        "ros_domain_id",
+        "run_id",
+        "scenario_id",
+        "scenario_index",
+        "scenario_name",
+        "scenario_sha256",
+        "suite_index"
+      ],
+      "properties": {
+        "candidate_id": {"$ref": "#/$defs/boundedString"},
+        "cold_stack": {"type": "boolean"},
+        "git_dirty": {"type": "boolean"},
+        "git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "gz_partition": {"$ref": "#/$defs/boundedString"},
+        "repetition_index": {"type": "integer", "minimum": 0, "maximum": 2},
+        "ros_domain_id": {"type": "integer", "minimum": 0, "maximum": 232},
+        "run_id": {"$ref": "#/$defs/boundedString"},
+        "scenario_id": {"type": "integer", "minimum": 1, "maximum": 5},
+        "scenario_index": {"type": "integer", "minimum": 1, "maximum": 5},
+        "scenario_name": {"$ref": "#/$defs/boundedString"},
+        "scenario_sha256": {"$ref": "#/$defs/sha256"},
+        "suite_index": {"type": "integer", "minimum": 0, "maximum": 14}
+      },
+      "additionalProperties": true
+    },
+    "mission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_sha256", "result"],
+      "properties": {
+        "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "result": {
+          "type": "object",
+          "required": [
+            "events",
+            "fault",
+            "identity",
+            "measurements",
+            "quality",
+            "targets",
+            "verdict"
+          ]
+        }
+      }
+    },
+    "orchestrator": {"$ref": "#/$defs/orchestrator"},
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_sha256", "result"],
+      "properties": {
+        "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "result": {
+          "type": "object",
+          "required": [
+            "binding",
+            "cleanup",
+            "configuration",
+            "identity",
+            "interaction",
+            "producer",
+            "quality",
+            "schema_version",
+            "status",
+            "verdict"
+          ]
+        }
+      }
+    },
+    "supervisor_events": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": {
+        "type": "object",
+        "required": ["kind", "schema_version", "sequence", "steady_wall_ns"],
+        "properties": {
+          "kind": {"$ref": "#/$defs/boundedString"},
+          "schema_version": {"const": 1},
+          "sequence": {"type": "integer", "minimum": 0},
+          "steady_wall_ns": {"type": "integer", "minimum": 0},
+          "timestamp_utc": {"$ref": "#/$defs/boundedString"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "targets": {
+      "type": "object",
+      "required": [
+        "acceptance",
+        "collector_configuration_sha256",
+        "collision_coverage_manifest_sha256",
+        "fault_schedule_sha256",
+        "metrics_contract_sha256",
+        "positive_control_json_sha256",
+        "required_metrics",
+        "scenario_sha256",
+        "source_configuration_sha256",
+        "target_set_sha256",
+        "world_to_map"
+      ],
+      "properties": {
+        "acceptance": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/threshold"}
+        },
+        "collector_configuration_sha256": {"$ref": "#/$defs/sha256"},
+        "collision_coverage_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "fault_schedule_sha256": {"$ref": "#/$defs/sha256"},
+        "metrics_contract_sha256": {"$ref": "#/$defs/sha256"},
+        "positive_control_json_sha256": {"$ref": "#/$defs/sha256"},
+        "required_metrics": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^measurements\\."}
+        },
+        "scenario_sha256": {"$ref": "#/$defs/sha256"},
+        "source_configuration_sha256": {"$ref": "#/$defs/sha256"},
+        "target_set_sha256": {"$ref": "#/$defs/sha256"},
+        "world_to_map": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["x_m", "y_m", "yaw_rad"],
+          "properties": {
+            "x_m": {"const": 0.0},
+            "y_m": {"const": 0.0},
+            "yaw_rad": {"const": 0.0}
+          }
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "boundedString": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "threshold": {
+      "type": "object",
+      "minProperties": 1,
+      "properties": {
+        "maximum": {"type": "number"},
+        "minimum": {"type": "number"}
+      },
+      "additionalProperties": false
+    },
+    "collisionProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bridge_sha256",
+        "collector_configuration_sha256",
+        "contact_configuration_sha256",
+        "coverage_manifest_sha256",
+        "rendered_sdf_sha256",
+        "robot_description_sha256",
+        "world_source_sha256"
+      ],
+      "properties": {
+        "bridge_sha256": {"$ref": "#/$defs/sha256"},
+        "collector_configuration_sha256": {"$ref": "#/$defs/sha256"},
+        "contact_configuration_sha256": {"$ref": "#/$defs/sha256"},
+        "coverage_manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "rendered_sdf_sha256": {"$ref": "#/$defs/sha256"},
+        "robot_description_sha256": {"$ref": "#/$defs/sha256"},
+        "world_source_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "orchestrator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifacts",
+        "cleanup",
+        "execution",
+        "gates",
+        "git",
+        "identity",
+        "process",
+        "resources",
+        "schema_version",
+        "source_binding"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "identity": {
+          "type": "object",
+          "required": [
+            "candidate_id",
+            "gz_partition",
+            "repetition_index",
+            "ros_domain_id",
+            "run_id",
+            "scenario_id",
+            "scenario_sha256",
+            "suite_index"
+          ],
+          "additionalProperties": true
+        },
+        "git": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["dirty", "end_head", "start_head", "status_porcelain"],
+          "properties": {
+            "dirty": {"type": "boolean"},
+            "end_head": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "start_head": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "status_porcelain": {"type": "string", "maxLength": 8388608}
+          }
+        },
+        "source_binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "collector_configuration_sha256",
+            "install_end_sha256",
+            "install_start_sha256",
+            "install_unchanged",
+            "metrics_contract_sha256",
+            "source_configuration_sha256",
+            "source_end_sha256",
+            "source_install_match",
+            "source_start_sha256",
+            "source_unchanged",
+            "target_set_sha256"
+          ],
+          "properties": {
+            "collector_configuration_sha256": {"$ref": "#/$defs/sha256"},
+            "install_end_sha256": {"$ref": "#/$defs/sha256"},
+            "install_start_sha256": {"$ref": "#/$defs/sha256"},
+            "install_unchanged": {"type": "boolean"},
+            "metrics_contract_sha256": {"$ref": "#/$defs/sha256"},
+            "source_configuration_sha256": {"$ref": "#/$defs/sha256"},
+            "source_end_sha256": {"$ref": "#/$defs/sha256"},
+            "source_install_match": {"type": "boolean"},
+            "source_start_sha256": {"$ref": "#/$defs/sha256"},
+            "source_unchanged": {"type": "boolean"},
+            "target_set_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        "process": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cold_stack",
+            "cpu_affinity",
+            "fresh_fault_generation",
+            "fresh_localization",
+            "new_process_group",
+            "partition_unused_before_start",
+            "previous_trial_gone",
+            "ros_domain_unused_before_start"
+          ],
+          "properties": {
+            "cold_stack": {"type": "boolean"},
+            "cpu_affinity": {
+              "type": "array",
+              "minItems": 6,
+              "maxItems": 6,
+              "prefixItems": [
+                {"const": 0}, {"const": 1}, {"const": 2},
+                {"const": 3}, {"const": 4}, {"const": 5}
+              ]
+            },
+            "fresh_fault_generation": {"type": "boolean"},
+            "fresh_localization": {"type": "boolean"},
+            "new_process_group": {"type": "boolean"},
+            "partition_unused_before_start": {"type": "boolean"},
+            "previous_trial_gone": {"type": "boolean"},
+            "ros_domain_unused_before_start": {"type": "boolean"}
+          }
+        },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cpu_percent_mean",
+            "cpu_percent_p95",
+            "cpu_percent_peak",
+            "missing_sample_count",
+            "oom_kill",
+            "overflow_free",
+            "peak_rss_sum_bytes",
+            "pid_reuse_detected",
+            "sample_count",
+            "sampler_started_before_launch",
+            "sampler_stopped_after_shutdown",
+            "wsl_peak_memory_bytes",
+            "wsl_peak_swap_bytes"
+          ],
+          "properties": {
+            "cpu_percent_mean": {"type": "number", "minimum": 0},
+            "cpu_percent_p95": {"type": "number", "minimum": 0},
+            "cpu_percent_peak": {"type": "number", "minimum": 0},
+            "missing_sample_count": {"type": "integer", "minimum": 0},
+            "oom_kill": {"type": "boolean"},
+            "overflow_free": {"type": "boolean"},
+            "peak_rss_sum_bytes": {"type": "integer", "minimum": 0},
+            "pid_reuse_detected": {"type": "boolean"},
+            "sample_count": {"type": "integer", "minimum": 0},
+            "sampler_started_before_launch": {"type": "boolean"},
+            "sampler_stopped_after_shutdown": {"type": "boolean"},
+            "wsl_peak_memory_bytes": {"type": "integer", "minimum": 0},
+            "wsl_peak_swap_bytes": {"type": "integer", "minimum": 0}
+          }
+        },
+        "execution": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "command",
+            "exit_code",
+            "wall_duration_s",
+            "wall_timed_out",
+            "wall_timeout_s",
+            "working_directory"
+          ],
+          "properties": {
+            "command": {"$ref": "#/$defs/boundedString"},
+            "exit_code": {"type": "integer"},
+            "wall_duration_s": {"type": "number", "minimum": 0},
+            "wall_timed_out": {"type": "boolean"},
+            "wall_timeout_s": {"type": "number", "exclusiveMinimum": 0},
+            "working_directory": {"$ref": "#/$defs/boundedString"}
+          }
+        },
+        "cleanup": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "all_owned_processes_exited",
+            "discovery_endpoints_gone",
+            "no_orphans"
+          ],
+          "properties": {
+            "all_owned_processes_exited": {"type": "boolean"},
+            "discovery_endpoints_gone": {"type": "boolean"},
+            "no_orphans": {"type": "boolean"}
+          }
+        },
+        "artifacts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "prerequisite_artifact_count",
+            "prerequisite_checksums_verified",
+            "prerequisite_manifest_sha256",
+            "prerequisite_maximum_file_bytes",
+            "prerequisite_total_bytes",
+            "prerequisites_finalized",
+            "prerequisites_within_caps",
+            "runtime_stderr_bytes",
+            "runtime_stdout_bytes"
+          ],
+          "properties": {
+            "prerequisite_artifact_count": {"type": "integer", "minimum": 1, "maximum": 256},
+            "prerequisite_checksums_verified": {"type": "boolean"},
+            "prerequisite_manifest_sha256": {"$ref": "#/$defs/sha256"},
+            "prerequisite_maximum_file_bytes": {"type": "integer", "minimum": 0},
+            "prerequisite_total_bytes": {"type": "integer", "minimum": 0},
+            "prerequisites_finalized": {"type": "boolean"},
+            "prerequisites_within_caps": {"type": "boolean"},
+            "runtime_stderr_bytes": {"type": "integer", "minimum": 0},
+            "runtime_stdout_bytes": {"type": "integer", "minimum": 0}
+          }
+        },
+        "gates": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "graph_contract_pass",
+            "namespace_isolation_pass",
+            "qos_contract_pass",
+            "source_install_binding_pass",
+            "validation_autonomy_isolation_pass"
+          ],
+          "properties": {
+            "graph_contract_pass": {"type": "boolean"},
+            "namespace_isolation_pass": {"type": "boolean"},
+            "qos_contract_pass": {"type": "boolean"},
+            "source_install_binding_pass": {"type": "boolean"},
+            "validation_autonomy_isolation_pass": {"type": "boolean"}
+          }
+        }
+      }
+    }
+  }
+}

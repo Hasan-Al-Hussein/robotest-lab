@@ -1,0 +1,29 @@
+#!/usr/bin/make -f
+
+export DH_GOLANG_BUILDPKG := github.com/hasanahmed/robotest-lab/supervisor/cmd/robotest-supervisor
+export GOFLAGS := -trimpath -buildvcs=false
+
+%:
+	dh $@ --builddirectory=_build --buildsystem=golang
+
+override_dh_auto_build:
+	GOFLAGS='$(GOFLAGS) -buildmode=pie' dh_auto_build
+
+override_dh_auto_test:
+
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	CGO_ENABLED=1 GOFLAGS='$(GOFLAGS) -p=4' go test -race ./...
+	GOFLAGS='$(GOFLAGS) -p=4' go vet ./...
+endif
+
+override_dh_auto_install:
+	dh_auto_install -- --no-source
+
+execute_before_dh_installtmpfiles:
+	dh_installsysusers
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start --no-stop-on-upgrade
+
+override_dh_dwz:
+	# Go debug sections are not compatible with dwz rewriting.

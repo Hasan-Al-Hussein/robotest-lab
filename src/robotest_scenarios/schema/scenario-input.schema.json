@@ -1,0 +1,302 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://robotest.local/schema/scenario-input-v1.json",
+  "title": "RoboTest Phase 3 scenario controller input",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "scenario_id",
+    "scenario_name",
+    "mission_seed",
+    "simulator_seed",
+    "scenario_controller_seed",
+    "frame_id",
+    "start_pose",
+    "waypoints",
+    "mission_timeout_sim_s",
+    "wall_escape_timeout_s",
+    "allowed_collision_count",
+    "expected_outcome",
+    "retries",
+    "fault_schedule_sha256",
+    "fault_seed"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "scenario_id": {"type": "integer", "minimum": 1, "maximum": 5},
+    "scenario_name": {
+      "enum": [
+        "baseline_navigation",
+        "deterministic_static_obstacle_replan",
+        "deterministic_dynamic_obstacle",
+        "temporary_lidar_dropout",
+        "deterministic_odometry_drift"
+      ]
+    },
+    "mission_seed": {"const": 42},
+    "simulator_seed": {"const": 42},
+    "scenario_controller_seed": {"const": 42},
+    "frame_id": {"const": "map"},
+    "start_pose": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "yaw"],
+      "properties": {
+        "x": {"const": 0.0},
+        "y": {"const": -3.5},
+        "yaw": {"const": 0.0}
+      }
+    },
+    "waypoints": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        {"$ref": "#/$defs/waypoint0"},
+        {"$ref": "#/$defs/waypoint1"},
+        {"$ref": "#/$defs/waypoint2"}
+      ],
+      "items": false
+    },
+    "mission_timeout_sim_s": {"const": 180.0},
+    "wall_escape_timeout_s": {"const": 300.0},
+    "allowed_collision_count": {"const": 0},
+    "expected_outcome": {"const": "succeeded"},
+    "retries": {"const": 0},
+    "actor": {"type": "null"},
+    "entity": {"oneOf": [{"$ref": "#/$defs/staticEntity"}, {"$ref": "#/$defs/dynamicEntity"}]},
+    "trigger": {"oneOf": [{"$ref": "#/$defs/staticTrigger"}, {"$ref": "#/$defs/dynamicTrigger"}]},
+    "control_rate_hz": {"const": 10.0},
+    "move_1_duration_sim_s": {"const": 4.0},
+    "dwell_duration_sim_s": {"const": 4.0},
+    "move_2_duration_sim_s": {"const": 4.0},
+    "fault_schedule": {"$ref": "#/$defs/emptySchedule"},
+    "fault_schedule_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "fault_seed": {"type": ["integer", "null"]},
+    "fault": {"oneOf": [{"$ref": "#/$defs/scanFault"}, {"$ref": "#/$defs/odomFault"}]}
+  },
+  "oneOf": [
+    {
+      "required": ["actor", "fault_schedule"],
+      "properties": {
+        "scenario_id": {"const": 1},
+        "scenario_name": {"const": "baseline_navigation"},
+        "fault_seed": {"type": "null"},
+        "fault_schedule_sha256": {"const": "26080d7dc8f4108a369962ecad1d2e29941a991af68beb415067eae1dc1de6f8"}
+      },
+      "not": {"anyOf": [
+        {"required": ["entity"]}, {"required": ["fault"]}, {"required": ["trigger"]},
+        {"required": ["control_rate_hz"]}, {"required": ["move_1_duration_sim_s"]},
+        {"required": ["dwell_duration_sim_s"]}, {"required": ["move_2_duration_sim_s"]}
+      ]}
+    },
+    {
+      "required": ["entity", "trigger", "fault_schedule"],
+      "properties": {
+        "scenario_id": {"const": 2},
+        "scenario_name": {"const": "deterministic_static_obstacle_replan"},
+        "fault_seed": {"type": "null"},
+        "fault_schedule_sha256": {"const": "26080d7dc8f4108a369962ecad1d2e29941a991af68beb415067eae1dc1de6f8"},
+        "entity": {"$ref": "#/$defs/staticEntity"},
+        "trigger": {"$ref": "#/$defs/staticTrigger"}
+      },
+      "not": {"anyOf": [
+        {"required": ["actor"]}, {"required": ["fault"]},
+        {"required": ["control_rate_hz"]}, {"required": ["move_1_duration_sim_s"]},
+        {"required": ["dwell_duration_sim_s"]}, {"required": ["move_2_duration_sim_s"]}
+      ]}
+    },
+    {
+      "required": [
+        "entity",
+        "trigger",
+        "control_rate_hz",
+        "move_1_duration_sim_s",
+        "dwell_duration_sim_s",
+        "move_2_duration_sim_s",
+        "fault_schedule"
+      ],
+      "properties": {
+        "scenario_id": {"const": 3},
+        "scenario_name": {"const": "deterministic_dynamic_obstacle"},
+        "fault_seed": {"type": "null"},
+        "fault_schedule_sha256": {"const": "26080d7dc8f4108a369962ecad1d2e29941a991af68beb415067eae1dc1de6f8"},
+        "entity": {"$ref": "#/$defs/dynamicEntity"},
+        "trigger": {"$ref": "#/$defs/dynamicTrigger"}
+      },
+      "not": {"anyOf": [{"required": ["actor"]}, {"required": ["fault"]}]}
+    },
+    {
+      "required": ["actor", "fault"],
+      "properties": {
+        "scenario_id": {"const": 4},
+        "scenario_name": {"const": "temporary_lidar_dropout"},
+        "fault_seed": {"const": 42},
+        "fault_schedule_sha256": {"const": "5f93838ca7c0be214858ffe8f62fa351b82d260f6223f139dfaf6bd3dcd224c8"},
+        "fault": {"$ref": "#/$defs/scanFault"}
+      },
+      "not": {"anyOf": [
+        {"required": ["entity"]}, {"required": ["fault_schedule"]},
+        {"required": ["trigger"]}, {"required": ["control_rate_hz"]},
+        {"required": ["move_1_duration_sim_s"]}, {"required": ["dwell_duration_sim_s"]},
+        {"required": ["move_2_duration_sim_s"]}
+      ]}
+    },
+    {
+      "required": ["actor", "fault"],
+      "properties": {
+        "scenario_id": {"const": 5},
+        "scenario_name": {"const": "deterministic_odometry_drift"},
+        "fault_seed": {"const": 42},
+        "fault_schedule_sha256": {"const": "3c72bc48e05221a52058112e58c94b578550deb2ee1ff4ad0d719675917335eb"},
+        "fault": {"$ref": "#/$defs/odomFault"}
+      },
+      "not": {"anyOf": [
+        {"required": ["entity"]}, {"required": ["fault_schedule"]},
+        {"required": ["trigger"]}, {"required": ["control_rate_hz"]},
+        {"required": ["move_1_duration_sim_s"]}, {"required": ["dwell_duration_sim_s"]},
+        {"required": ["move_2_duration_sim_s"]}
+      ]}
+    }
+  ],
+  "$defs": {
+    "waypoint0": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "yaw"],
+      "properties": {"x": {"const": -2.0}, "y": {"const": -3.5}, "yaw": {"const": 0.0}}
+    },
+    "waypoint1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "yaw"],
+      "properties": {"x": {"const": 0.0}, "y": {"const": 0.0}, "yaw": {"const": 0.0}}
+    },
+    "waypoint2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "yaw"],
+      "properties": {"x": {"const": 0.0}, "y": {"const": 3.5}, "yaw": {"const": 0.0}}
+    },
+    "emptySchedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "faults"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "faults": {"type": "array", "maxItems": 0}
+      }
+    },
+    "staticEntity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "static", "geometry", "world_pose"],
+      "properties": {
+        "name": {"const": "phase3_static_block"},
+        "static": {"const": true},
+        "geometry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "size_x_m", "size_y_m", "size_z_m"],
+          "properties": {
+            "type": {"const": "box"},
+            "size_x_m": {"const": 0.4},
+            "size_y_m": {"const": 0.4},
+            "size_z_m": {"const": 0.8}
+          }
+        },
+        "world_pose": {"$ref": "#/$defs/staticPose"}
+      }
+    },
+    "dynamicEntity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "static", "pose_controlled", "geometry", "initial_world_pose"],
+      "properties": {
+        "name": {"const": "phase3_dynamic_block"},
+        "static": {"const": true},
+        "pose_controlled": {"const": true},
+        "geometry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "size_x_m", "size_y_m", "size_z_m"],
+          "properties": {
+            "type": {"const": "box"},
+            "size_x_m": {"const": 0.35},
+            "size_y_m": {"const": 0.35},
+            "size_z_m": {"const": 0.8}
+          }
+        },
+        "initial_world_pose": {"$ref": "#/$defs/dynamicPose"}
+      }
+    },
+    "staticPose": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x_m", "y_m", "z_m", "yaw_rad"],
+      "properties": {
+        "x_m": {"const": -1.0}, "y_m": {"const": -3.5},
+        "z_m": {"const": 0.4}, "yaw_rad": {"const": 0.0}
+      }
+    },
+    "dynamicPose": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x_m", "y_m", "z_m", "yaw_rad"],
+      "properties": {
+        "x_m": {"const": -0.8}, "y_m": {"const": 1.5},
+        "z_m": {"const": 0.4}, "yaw_rad": {"const": 0.0}
+      }
+    },
+    "staticTrigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["anchor", "target_offset_sim_s", "latest_first_observed_offset_sim_s", "required_leg_index"],
+      "properties": {
+        "anchor": {"const": "accepted_goal_t0"},
+        "target_offset_sim_s": {"const": 2.0},
+        "latest_first_observed_offset_sim_s": {"const": 2.25},
+        "required_leg_index": {"const": 0}
+      }
+    },
+    "dynamicTrigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["anchor"],
+      "properties": {"anchor": {"const": "first_feedback_transition_to_waypoint_index_2"}}
+    },
+    "scanFault": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "fault_id", "target", "mode", "start_offset_ns", "duration_ns", "seed", "parameters"],
+      "properties": {
+        "schema_version": {"const": 1}, "fault_id": {"const": "scan_drop"},
+        "target": {"const": 1}, "mode": {"const": 1},
+        "start_offset_ns": {"const": 10000000000}, "duration_ns": {"const": 2000000000},
+        "seed": {"const": 42},
+        "parameters": {"type": "object", "maxProperties": 0}
+      }
+    },
+    "odomFault": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "fault_id", "target", "mode", "start_offset_ns", "duration_ns", "seed", "parameters"],
+      "properties": {
+        "schema_version": {"const": 1}, "fault_id": {"const": "odom_drift"},
+        "target": {"const": 2}, "mode": {"const": 4},
+        "start_offset_ns": {"const": 10000000000}, "duration_ns": {"const": 20000000000},
+        "seed": {"const": 42},
+        "parameters": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["x_rate_nm_per_s", "yaw_rate_nrad_per_s"],
+          "properties": {
+            "x_rate_nm_per_s": {"const": 10000000},
+            "yaw_rate_nrad_per_s": {"const": 5000000}
+          }
+        }
+      }
+    }
+  }
+}

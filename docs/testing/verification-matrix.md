@@ -90,12 +90,29 @@ obstacle and trial mechanics follow
 commands refuse a dirty worktree; development smoke runs are labeled
 non-candidate and cannot be aggregated with the clean suite.
 
-Canonical commands:
+Static/build verification only; this command never starts Gazebo or a candidate
+trial:
 
 ```powershell
 wsl -d Ubuntu -- bash -lc 'cd /home/hasan/robotest-lab && taskset -c 0-5 scripts/verify_phase3.sh'
-wsl -d Ubuntu -- bash -lc 'cd /home/hasan/robotest-lab && taskset -c 0-5 scripts/run_benchmarks.sh'
 ```
+
+The verifier prints the exact `build-binding.json` path. A binding produced
+from a dirty development tree is static evidence only and is intentionally
+rejected by every runtime stage after a commit changes the Git identity. For
+an authoritative run, first commit the final source, require a clean worktree,
+rerun this verifier on that exact commit, and use its new binding for four
+explicit, non-interchangeable stages with the same candidate ID, domain base,
+output root, and build binding:
+
+```powershell
+wsl -d Ubuntu -- bash -lc 'cd /home/hasan/robotest-lab && CANDIDATE_ID=phase3-candidate-001 && DOMAIN_BASE=100 && OUTPUT_ROOT=artifacts/evidence/phase3-benchmarks && BUILD_BINDING=artifacts/evidence/phase3/VERIFY_RUN_ID/build-binding.json && scripts/run_benchmarks.sh --mode prepare --candidate-id "$CANDIDATE_ID" --domain-base "$DOMAIN_BASE" --output-root "$OUTPUT_ROOT" --build-binding "$BUILD_BINDING" && scripts/run_benchmarks.sh --mode positive-control --candidate-id "$CANDIDATE_ID" --domain-base "$DOMAIN_BASE" --output-root "$OUTPUT_ROOT" --build-binding "$BUILD_BINDING" && scripts/run_benchmarks.sh --mode smoke --candidate-id "$CANDIDATE_ID" --domain-base "$DOMAIN_BASE" --output-root "$OUTPUT_ROOT" --build-binding "$BUILD_BINDING" && scripts/run_benchmarks.sh --mode campaign --candidate-id "$CANDIDATE_ID" --domain-base "$DOMAIN_BASE" --output-root "$OUTPUT_ROOT" --build-binding "$BUILD_BINDING" --authorization I_AUTHORIZE_EXACTLY_15_COLD_STACK_TRIALS_NO_RETRIES'
+```
+
+`prepare` is non-runtime provenance freezing, `positive-control` is the
+separate collision-pipeline prerequisite, and `smoke` is non-candidate. Only
+the authorized `campaign` stage may start the exact ordered 15 cold-stack
+candidate trials; it has no replacement-retry path.
 
 | Criterion | Proof method | Expected result and evidence | Failure signal | Recovery trigger |
 | --- | --- | --- | --- | --- |
@@ -110,11 +127,25 @@ wsl -d Ubuntu -- bash -lc 'cd /home/hasan/robotest-lab && taskset -c 0-5 scripts
 
 ## Phase 4 — supervision, service, and package
 
-Canonical command:
+Non-mutating preflight only (never a Phase 4 release verdict):
 
 ```powershell
 wsl -d Ubuntu -- bash -lc 'cd /home/hasan/robotest-lab && taskset -c 0-5 scripts/verify_phase4.sh'
 ```
+
+Authoritative Phase 4 command, after the Phase 3 source tree and audited
+package/lifecycle evidence are stable:
+
+```powershell
+wsl -d Ubuntu -u root -- bash -lc 'cd /home/hasan/robotest-lab && taskset -c 0-5 scripts/verify_phase4.sh --apply'
+```
+
+The bare command proves only static/unit/package-source readiness and emits no
+canonical Phase 4 verdict. Only the explicit privileged `--apply` run may emit
+`scenario6-result.json` with `verdict.status = PASS` and
+`verdict.accepted = true`; that compositor requires the live staging, package
+lifecycle binding, service, crash/recovery, follow-up mission, manifest, source
+stability, and owned-cleanup gates all to pass.
 
 The verifier includes the literal Go checks:
 
@@ -129,8 +160,8 @@ go vet ./...
 | P4-01 Go unit/concurrency behavior | Fake-clock/process tests, race detector, vet | Backoff/exhaustion, signals, groups, heartbeat, endpoints and parsing pass with no race/vet finding | Race, leaked goroutine/process, nondeterministic timing, ignored signal | Fix supervisor before staging or packaging |
 | P4-02 Runtime staging and systemd | `scripts/stage_runtime_overlay.sh`, package install, `systemd-analyze verify`, controlled service start/stop | Overlay at `/opt/robotest-lab`; unit disabled by default; condition/hardening valid; journal evidence | Service autostarts, missing condition, home dependency, hardening blocks required path | Stop/disable service, preserve logs/config, repair unit/staging |
 | P4-03 HTTP semantics | Loopback HTTP integration tests | Health remains live, readiness tracks children/heartbeat, status JSON and metrics valid; bind is loopback only | False-ready, non-loopback listener, mutation endpoint, unbounded labels | Stop service and repair API/state calculation |
-| P4-04 Scenario 6 | Kill configured managed child during active mission | Scenario 6 meets every frozen detection, orphan, restart, readiness, follow-up mission, and evidence criterion | Orphan, duplicate supervisor, infinite restart, interrupted mission called success, recovery target miss | Disable service, diagnose structured timeline, rerun from clean process tree |
-| P4-05 Debian lifecycle | lintian plus install/upgrade/remove/purge in target distro | Package manifest correct; modified conffile behavior proven; no unrelated path removed | Package overwrite, unsafe maintainer script, lintian project error, data loss | Stop distribution of package; repair lifecycle and repeat in clean fixture |
+| P4-04 Scenario 6 | Exact executable/lineage revalidation and signal of the nested controller during an active mission; exact sequence-bounded event-chain and mission-completion reconciliation | Scenario 6 meets every frozen detection, orphan, restart, readiness, follow-up mission, event-causality, and evidence criterion; every published original/replacement/harness PGID is empty at cleanup | Identity spoof/drift, unrelated or duplicate transition, orphan, duplicate supervisor, infinite restart, missing/mismatched mission completion, interrupted mission called success, recovery target miss | Retain runtime resources unless service inactivity is proven; diagnose structured timeline, then rerun from a clean process tree |
+| P4-05 Debian lifecycle | Exact-schema lifecycle evidence bound to both package bytes, plus direct installed-state re-observation after lintian and install/upgrade/remove/purge in the target distro | Modified conffile is preserved on upgrade/remove and removed on purge; sentinel/state/log survive; final vendor config, version, payload hashes, modes/owners, groups, installed smoke, zero stale dpkg artifacts, disabled/inactive service, and clean dpkg verification all match | Truncated/extra/tampered PASS JSON, package overwrite, unsafe maintainer script, lintian project error, wrong final state, stale artifact, or data loss | Stop distribution of package; repair lifecycle and repeat in clean fixture |
 
 Any package lifecycle command requiring elevated privileges must be surfaced
 before execution. It may not hide a password prompt or weaken system security.
@@ -160,15 +191,41 @@ wsl -d Ubuntu -- bash -lc 'cd /home/hasan/robotest-lab && scripts/verify_phase5.
 
 ## Final gate
 
-Canonical command:
+Canonical local aggregate command (always exits 3/INCOMPLETE after successful
+static/local routing):
 
 ```powershell
 wsl -d Ubuntu -- bash -lc 'cd /home/hasan/robotest-lab && taskset -c 0-5 scripts/verify_all.sh'
 ```
 
-`verify_all.sh` orchestrates the non-manual phase checks and verifies evidence
-integrity. Long benchmarks still run through `scripts/run_benchmarks.sh`;
-public CI and genuine visual inspection retain their own evidence.
+Final read-only evidence command, with every path selected explicitly by the
+reviewer:
+
+```powershell
+wsl -d Ubuntu -- bash -lc 'cd /home/hasan/robotest-lab && scripts/verify_all.sh --release-evidence --local-aggregate <exact-prior-verify-all.json> --phase3-candidate-root <exact-phase3-candidate-root> --phase3-aggregate <exact-phase3-candidate-root>/aggregate/aggregate-result.json --phase4-run-directory <exact-phase4-run-directory> --phase4-scenario6 <exact-phase4-run-directory>/scenario6-result.json --phase5-remote-proof docs/results/phase-5/remote-<candidate-sha>.json --phase5-evidence-commit-remote-proof artifacts/evidence/phase5/remote-evidence-commit/remote-<evidence-commit-sha>.json'
+```
+
+Bare `verify_all.sh` is the only mode that orchestrates phase verifiers, and it
+invokes Phase 5 explicitly as `--local`. `--release-evidence` invokes no phase
+verifier and performs no live, campaign, privileged, remote, or publication
+operation. It does not discover `latest`: it revalidates only the exact prior
+local aggregate, Phase 3 candidate/aggregate, Phase 4 run/Scenario 6, and
+tracked candidate proof plus ignored second-CI proof supplied by the reviewer.
+The prior aggregate records the bounded tracked Phase 0 refresh delta; any
+source/configuration change remains a failure. Before evidence commit E, run
+the deterministic `tests/phase5_release_docs.py` producer on those exact Phase
+3/4 inputs. E must add exactly the six derived Phase 3/4 JSON/CSV/Markdown
+documents, the two bounded README region replacements, the exact
+`config/release-claims.json` extension, the prior local/Phase 0 evidence, and
+the candidate remote-proof trio; every changed path must be a regular `100644`
+blob. Release mode reconstructs README and claims from `git show C`, rejects
+extra or missing E paths, and never discovers a latest run. Only one clean
+candidate SHA, complete canonical PASS evidence, an exact evidence-only child
+commit, and a successful exact-SHA CI run for that child can produce
+`release_eligible=true`.
+Long benchmarks still run through
+`scripts/run_benchmarks.sh`; public CI and genuine visual inspection retain
+their own evidence.
 
 The final reviewer confirms:
 

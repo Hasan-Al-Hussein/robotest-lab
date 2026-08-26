@@ -1,0 +1,28 @@
+Source: robotest-supervisor
+Section: utils
+Priority: optional
+Maintainer: Hasan Ahmed <200383997+Hasan-Al-Hussein@users.noreply.github.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-sequence-golang,
+ golang-any,
+Standards-Version: 4.7.3
+Rules-Requires-Root: no
+XS-Go-Import-Path: github.com/hasanahmed/robotest-lab/supervisor
+
+Package: robotest-supervisor
+Architecture: any
+Built-Using: ${misc:Built-Using}
+Static-Built-Using: ${misc:Static-Built-Using}
+Depends:
+ python3,
+ ros-jazzy-ros2launch,
+ ${misc:Depends},
+ ${shlibs:Depends},
+Description: bounded process supervisor for RoboTest Lab
+ RoboTest Supervisor owns configured Linux process groups, monitors timestamped
+ heartbeat files, performs bounded exponential-backoff recovery, and exposes
+ read-only health, readiness, status, and metrics endpoints on loopback.
+ .
+ The package includes a disabled-by-default systemd unit and a startup wrapper
+ for a separately staged ROS 2 workspace under /opt/robotest-lab.

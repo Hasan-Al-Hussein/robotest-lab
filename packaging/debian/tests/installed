@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+robotest-supervisor -h >/dev/null 2>&1
+robotest-supervisor \
+  -check-config \
+  -config /etc/robotest-supervisor/config.json \
+  | grep -Fx 'configuration valid'
+python3 -m json.tool /etc/robotest-supervisor/config.json >/dev/null
+test -x /usr/libexec/robotest-supervisor/start-robotest-stack
+test -f /usr/lib/systemd/system/robotest-supervisor.service
+grep -Fx 'ConditionPathExists=/opt/robotest-lab/install/setup.bash' \
+  /usr/lib/systemd/system/robotest-supervisor.service
+systemd-analyze verify /usr/lib/systemd/system/robotest-supervisor.service

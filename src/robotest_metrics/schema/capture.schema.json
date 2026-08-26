@@ -1,0 +1,151 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://robotest-lab.local/schema/metrics-capture-v1.json",
+  "title": "RoboTest Metrics Capture",
+  "type": "object",
+  "required": [
+    "capture_schema_version",
+    "clock",
+    "collector_sequence",
+    "finished_steady_wall_ns",
+    "limits",
+    "quality",
+    "started_steady_wall_ns",
+    "stop_reason",
+    "streams"
+  ],
+  "properties": {
+    "capture_schema_version": {"const": 1},
+    "clock": {
+      "type": "object",
+      "required": [
+        "count",
+        "duplicate_count",
+        "first_stamp_ns",
+        "latest_stamp_ns",
+        "maximum_positive_gap_ns",
+        "regression_count"
+      ],
+      "properties": {
+        "count": {"type": "integer", "minimum": 0},
+        "duplicate_count": {"type": "integer", "minimum": 0},
+        "first_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+        "latest_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+        "maximum_positive_gap_ns": {"type": "integer", "minimum": 0},
+        "regression_count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "collector_sequence": {"type": "integer", "minimum": 0},
+    "finished_steady_wall_ns": {"type": "integer", "minimum": 0},
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contact_record_capacity",
+        "plan_message_capacity",
+        "plan_pose_capacity",
+        "stream_capacities",
+        "string_field_max_bytes"
+      ],
+      "properties": {
+        "contact_record_capacity": {"const": 32768},
+        "plan_message_capacity": {"const": 1024},
+        "plan_pose_capacity": {"const": 65536},
+        "stream_capacities": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cmd_vel", "contacts", "fault_events", "ground_truth", "odom",
+            "raw_odom", "raw_scan", "scan", "state_events", "tf_map_odom",
+            "tf_odom_base_footprint", "world_stats"
+          ],
+          "properties": {
+            "cmd_vel": {"const": 4096},
+            "contacts": {"const": 8192},
+            "fault_events": {"const": 512},
+            "ground_truth": {"const": 8192},
+            "odom": {"const": 8192},
+            "raw_odom": {"const": 8192},
+            "raw_scan": {"const": 2048},
+            "scan": {"const": 2048},
+            "state_events": {"const": 1024},
+            "tf_map_odom": {"const": 8192},
+            "tf_odom_base_footprint": {"const": 8192},
+            "world_stats": {"const": 4096}
+          }
+        },
+        "string_field_max_bytes": {"const": 4096}
+      }
+    },
+    "quality": {
+      "type": "object",
+      "required": ["collector_overflow", "contact_record_count", "contact_record_overflow_count"],
+      "properties": {
+        "collector_overflow": {"type": "boolean"},
+        "contact_record_count": {"type": "integer", "minimum": 0},
+        "contact_record_overflow_count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "started_steady_wall_ns": {"type": "integer", "minimum": 0},
+    "stop_reason": {"enum": ["runtime_shutdown", "stop_file", "wall_timeout"]},
+    "streams": {
+      "type": "object",
+      "required": [
+        "cmd_vel",
+        "contacts",
+        "fault_events",
+        "ground_truth",
+        "odom",
+        "plans",
+        "raw_odom",
+        "raw_scan",
+        "scan",
+        "state_events",
+        "tf_map_odom",
+        "tf_odom_base_footprint",
+        "world_stats"
+      ],
+      "properties": {
+        "cmd_vel": {"$ref": "#/$defs/stream"},
+        "contacts": {"$ref": "#/$defs/stream"},
+        "fault_events": {"$ref": "#/$defs/stream"},
+        "ground_truth": {"$ref": "#/$defs/stream"},
+        "odom": {"$ref": "#/$defs/stream"},
+        "plans": {"$ref": "#/$defs/stream"},
+        "raw_odom": {"$ref": "#/$defs/stream"},
+        "raw_scan": {"$ref": "#/$defs/stream"},
+        "scan": {"$ref": "#/$defs/stream"},
+        "state_events": {"$ref": "#/$defs/stream"},
+        "tf_map_odom": {"$ref": "#/$defs/stream"},
+        "tf_odom_base_footprint": {"$ref": "#/$defs/stream"},
+        "world_stats": {"$ref": "#/$defs/stream"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "stream": {
+      "type": "object",
+      "required": ["items", "quality"],
+      "properties": {
+        "items": {"type": "array"},
+        "quality": {
+          "type": "object",
+          "required": ["ingress_count", "invalid_count", "overflow_count", "overflowed", "retained_count"],
+          "properties": {
+            "ingress_count": {"type": "integer", "minimum": 0},
+            "invalid_count": {"type": "integer", "minimum": 0},
+            "overflow_count": {"type": "integer", "minimum": 0},
+            "overflowed": {"type": "boolean"},
+            "retained_count": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

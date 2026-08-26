@@ -1,10 +1,14 @@
 # RoboTest Lab dependency plan
 
-Evidence timestamp: **2026-08-25 22:19:03 UTC+04:00** (Asia/Dubai / Arabian Standard Time)
+Pre-installation snapshot timestamp: **2026-08-25 22:19:03 UTC+04:00**
+(Asia/Dubai / Arabian Standard Time)
 
-## Current status
+## Pre-installation snapshot status
 
-No dependency transaction has been performed. The package manifest is a reviewed **projected desired state**, not proof that the packages are installed.
+At the snapshot timestamp, no dependency transaction had been performed. The
+package manifest was a reviewed **projected desired state**, not proof that the
+packages were installed. This section preserves the original measurements; it
+does not describe the current installed state.
 
 Measured apt state:
 
@@ -13,6 +17,36 @@ Measured apt state:
 - Active components: `main universe restricted multiverse`.
 - Official ROS 2 apt source: **absent**.
 - Newest cached Ubuntu InRelease metadata observed: 2026-08-16. Package versions and size projections must be refreshed before installation.
+
+## Current installed status and evidence
+
+Later evidence recorded on **2026-08-26** supersedes only the installation
+status above; it does not rewrite the dated resource and package projections.
+The [Phase 0 environment audit](environment-audit.md) remains the dated source
+for the host, WSL distribution, and pre-install resource measurements. The
+Phase 2 version record at
+`artifacts/evidence/phase2/20260826T013843Z-324/versions.json` identifies the
+target as Ubuntu 24.04.1 LTS in the `Ubuntu` WSL distribution and records:
+
+- ROS 2 `jazzy` with `ros-jazzy-ros-base`
+  `0.11.0-1noble.20260616.084325`;
+- `ros-jazzy-ros-gz` `1.0.22-1noble.20260616.074726` and Gazebo `gz sim`
+  `8.11.0`;
+- `ros-jazzy-navigation2` `1.3.12-1noble.20260615.181551` and
+  `ros-jazzy-nav2-bringup` `1.3.12-1noble.20260616.082701`;
+- `rmw_fastrtps_cpp` from `ros-jazzy-rmw-fastrtps-cpp`
+  `8.4.4-1noble.20260615.124621`; and
+- colcon-core `0.21.0` and Python `3.12.3`.
+
+The development Phase 3 verifier record at
+`artifacts/evidence/phase3/20260826T052402Z-3022/` reports a successful fresh
+build, package-test result, static checks, installed CLI checks, and `rosdep`
+resolution; its summary also records `runtime_campaign_started=false`. The
+local Phase 5 record at `artifacts/evidence/phase5/20260826T052732Z-636/`
+independently reports successful `rosdep`, build, test, static-analysis, and
+CLI-help gates. These generated evidence directories are intentionally ignored
+by Git. They establish installed development readiness, not an authoritative
+Phase 3 benchmark result.
 
 ## Provenance
 
@@ -29,7 +63,7 @@ Only official upstream sources are approved:
 
 Do not add a third-party ROS mirror, Gazebo PPA, arbitrary keyserver key, or testing repository. The ROS apt-source package embeds and owns the expected source/key material.
 
-## Pinned ROS apt-source bootstrap — projected
+## Pinned ROS apt-source bootstrap — pre-installation projection
 
 The official GitHub release API reported this production asset on the audit date:
 
@@ -106,13 +140,13 @@ The version was verified against PyPI on the evidence date. Do not install Ruff 
 
 No TurtleBot, vendor robot, camera, GPU, ML, Docker, SLAM, or hardware-driver package is included.
 
-## Measured availability
+## Pre-installation measured availability
 
 Already installed during the audit included `ca-certificates`, `curl`, `gnupg`, `git`, `build-essential`, `python3-pip`, `python3-yaml`, `python3-jsonschema`, `dpkg-dev`, and `fakeroot`.
 
 The standard Noble cache contained candidates for all selected non-ROS packages except Ruff. It had no candidates for `ros-dev-tools` or any `ros-jazzy-*` package because the official ROS source had not yet been configured.
 
-## Projected footprint
+## Pre-installation projected footprint
 
 A read-only `apt-get -s` transaction for the selected missing non-ROS quality set, including `clang-tidy` and excluding `devscripts`, projected:
 
@@ -123,9 +157,10 @@ A read-only `apt-get -s` transaction for the selected missing non-ROS quality se
 
 These figures were derived from the cached candidate `Size` and `Installed-Size` fields. They exclude ROS 2, Gazebo, Nav2, RViz, apt/dpkg overhead, build outputs, bags, logs, and upgrade-size deltas. They are **not** an installation promise.
 
-## Installation gate
+## Pre-installation gate (historical)
 
-Before any real transaction:
+The following checklist governed the first real transaction after the snapshot
+and is retained as provenance for future dependency refreshes:
 
 1. Confirm the command targets `Ubuntu`, never `Ubuntu-20.04`.
 2. Verify the pinned apt-source asset checksum and inspect its package metadata.

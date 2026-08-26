@@ -1,0 +1,24 @@
+robotest-supervisor for Ubuntu
+================================
+
+The service is deliberately installed disabled and is not started by package
+installation or upgrade. Before enabling it, stage a tested RoboTest Lab
+overlay at /opt/robotest-lab and review /etc/robotest-supervisor/config.json.
+
+The unit will not start unless /opt/robotest-lab/install/setup.bash exists.
+systemd owns and may restart only the Go supervisor. The Go process owns its
+configured ROS child process groups and their bounded restart policy.
+
+The default service uses ROS_DOMAIN_ID 42, GZ_PARTITION
+robotest_supervised, CPUs 0-5, and a headless seeded Phase 2 stack. Change
+these conffile values when they conflict with another local ROS graph.
+
+Administrative commands, after staging and validation, are:
+
+  systemctl enable --now robotest-supervisor.service
+  curl --fail http://127.0.0.1:9080/healthz
+  curl --fail http://127.0.0.1:9080/readyz
+
+Package removal does not delete /var/lib/robotest-supervisor or
+/var/log/robotest-supervisor. Purging removes dpkg-owned configuration but
+does not recursively remove administrator or evidence data.
