@@ -294,7 +294,6 @@ class MetricsCollectorNode(Node):
         self.contact_progress_path = contact_progress_path
         self.retained_contact_message_count = 0
         self.latest_clock_ns: int | None = None
-        self._subscriptions: list[Any] = []
         self._subscribe(Clock, '/clock', self._on_clock, _qos(1, reliable=False))
         self._subscribe(
             Odometry,
@@ -386,7 +385,7 @@ class MetricsCollectorNode(Node):
         callback: Callable[[Any], None],
         qos: QoSProfile,
     ) -> None:
-        self._subscriptions.append(self.create_subscription(message_type, topic, callback, qos))
+        self.create_subscription(message_type, topic, callback, qos)
 
     def _callback_stamp_ns(self) -> int:
         return int(self.get_clock().now().nanoseconds)

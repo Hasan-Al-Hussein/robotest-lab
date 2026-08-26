@@ -17,6 +17,7 @@ from __future__ import annotations
 import inspect
 
 import pytest
+import rclpy
 import robotest_metrics.collector_node as collector_node
 from geometry_msgs.msg import Transform, Vector3
 from nav_msgs.msg import Odometry, Path
@@ -30,6 +31,18 @@ def test_collector_source_is_observer_only() -> None:
     assert 'create_client' not in source
     assert 'ActionClient' not in source
     assert 'create_subscription' in source
+
+
+def test_collector_node_uses_rclpy_subscription_registry_and_destroys_cleanly() -> None:
+    rclpy.init()
+    node = collector_node.MetricsCollectorNode()
+    try:
+        assert node.get_name() == 'metrics_collector'
+    finally:
+        try:
+            node.destroy_node()
+        finally:
+            rclpy.try_shutdown()
 
 
 def test_scan_normalization_retains_only_bounded_metadata_and_payload_hash() -> None:
