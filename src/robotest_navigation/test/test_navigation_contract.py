@@ -286,6 +286,7 @@ def test_wait_only_behavior_and_command_topics() -> None:
     assert behavior['behavior_plugins'] == ['wait']
     assert behavior['wait']['plugin'] == 'nav2_behaviors::Wait'
     collision = params['collision_monitor']['ros__parameters']
+    assert collision['source_timeout'] == 0.6
     assert collision['cmd_vel_in_topic'] == 'cmd_vel_smoothed'
     assert collision['cmd_vel_out_topic'] == 'cmd_vel'
     smoother = params['velocity_smoother']['ros__parameters']

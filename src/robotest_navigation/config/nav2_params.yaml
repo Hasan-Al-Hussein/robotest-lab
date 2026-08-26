@@ -263,7 +263,7 @@ collision_monitor:
     cmd_vel_out_topic: cmd_vel
     state_topic: collision_monitor_state
     transform_tolerance: 0.2
-    source_timeout: 0.8
+    source_timeout: 0.6
     base_shift_correction: true
     stop_pub_timeout: 1.0
     polygons: [PolygonStop]
