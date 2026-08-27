@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Sequence
+from itertools import islice
+from numbers import Integral
 import os
 from pathlib import Path
 import time
@@ -64,10 +66,22 @@ def _stamp_ns(stamp: Any) -> int:
 
 def _uuid_hex(value: Any) -> str:
     values = getattr(value, 'uuid', None)
-    if not isinstance(values, Sequence) or len(values) != 16:
+    try:
+        items = tuple(islice(values, 17))
+    except TypeError as exc:
+        raise EvidenceError('action-status UUID must contain exactly 16 bytes') from exc
+    if len(items) != 16:
         raise EvidenceError('action-status UUID must contain exactly 16 bytes')
     try:
-        octets = bytes(int(item) for item in values)
+        octet_values = []
+        for item in items:
+            if isinstance(item, bool) or not isinstance(item, Integral):
+                raise TypeError('UUID byte is not an integer')
+            octet = int(item)
+            if not 0 <= octet <= 255:
+                raise ValueError('UUID byte is outside uint8 range')
+            octet_values.append(octet)
+        octets = bytes(octet_values)
     except (TypeError, ValueError, OverflowError) as exc:
         raise EvidenceError('action-status UUID bytes are malformed') from exc
     if not any(octets):

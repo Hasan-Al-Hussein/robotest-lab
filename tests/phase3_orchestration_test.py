@@ -489,6 +489,24 @@ def test_goal_observer_readiness_requires_endpoint_not_idle_status_message() -> 
     assert not runtime_observer._goal_observer_ready(node)
 
 
+def test_goal_observer_accepts_rosidl_numpy_uuid_storage() -> None:
+    import numpy as np
+
+    goal_id = SimpleNamespace(uuid=np.arange(1, 17, dtype=np.uint8))
+
+    assert runtime_observer._uuid_hex(goal_id) == '01020304-0506-0708-090a-0b0c0d0e0f10'
+    with pytest.raises(orchestration.EvidenceError, match='bytes are malformed'):
+        runtime_observer._uuid_hex(SimpleNamespace(uuid=np.arange(16, dtype=float)))
+    with pytest.raises(orchestration.EvidenceError, match='bytes are malformed'):
+        runtime_observer._uuid_hex(SimpleNamespace(uuid=np.ones(16, dtype=np.bool_)))
+    with pytest.raises(orchestration.EvidenceError, match='bytes are malformed'):
+        runtime_observer._uuid_hex(SimpleNamespace(uuid=np.full(16, 256, dtype=np.uint16)))
+    with pytest.raises(orchestration.EvidenceError, match='exactly 16 bytes'):
+        runtime_observer._uuid_hex(SimpleNamespace(uuid=np.arange(17, dtype=np.uint8)))
+    with pytest.raises(orchestration.EvidenceError, match='cannot be all zero'):
+        runtime_observer._uuid_hex(SimpleNamespace(uuid=np.zeros(16, dtype=np.uint8)))
+
+
 def test_goal_observer_binds_first_executing_status_after_empty_prearm_window() -> None:
     observer = runtime_observer.GoalObserver()
 
