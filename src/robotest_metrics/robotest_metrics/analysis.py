@@ -323,10 +323,6 @@ def analyze_run(request: Mapping[str, Any]) -> dict[str, Any]:
     if terminal <= start:
         raise MetricUnavailable('terminal action stamp must be after accepted goal stamp')
     waypoints = list(_sequence(mission_targets.get('waypoints'), 'mission.targets.waypoints'))
-    completed = require_int(
-        mission_measurements.get('completed_waypoint_count'),
-        'mission.measurements.completed_waypoint_count',
-    )
     terminal_status = mission_measurements.get('terminal_status')
     if terminal_status is None:
         terminal_status = mission_measurements.get('goal_status')
@@ -375,6 +371,15 @@ def analyze_run(request: Mapping[str, Any]) -> dict[str, Any]:
     resource_values: dict[str, Any] = {}
     if orchestrator_pair is not None:
         orchestrator_quality, resource_values = orchestrator_pair
+    completed_value = mission_measurements.get('completed_waypoint_count')
+    completed: int | None
+    if completed_value is None and mission_component is None:
+        completed = None
+    else:
+        completed = require_int(
+            completed_value,
+            'mission.measurements.completed_waypoint_count',
+        )
     measurements: dict[str, Any] = {
         'accepted_goal_stamp_ns': start,
         'completed_waypoint_count': completed,

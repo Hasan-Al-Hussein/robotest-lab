@@ -36,6 +36,24 @@ def _set_path(document: dict[str, Any], path: Sequence[str], value: Any) -> None
     current[path[-1]] = value
 
 
+def _mark_canceled_component_failure(request: dict[str, Any]) -> None:
+    """Project a valid canceled mission plus its scenario-controller failure."""
+    mission = request['mission']['result']
+    mission['measurements']['completed_waypoint_count'] = None
+    mission['measurements']['goal_status'] = 'CANCELED'
+    mission['measurements']['goal_status_code'] = 5
+    mission['verdict']['exit_code'] = 23
+    mission['verdict']['expected_outcome_met'] = False
+    mission['verdict']['phase2_action_integration_status'] = 'FAIL'
+    request['mission']['artifact_sha256'] = canonical_sha256(mission)
+
+    scenario = request['scenario']['result']
+    scenario['status'] = 'FAIL'
+    scenario['verdict']['exit_code'] = 20
+    scenario['verdict']['reason'] = 'scenario controller steady-wall escape timeout elapsed'
+    request['scenario']['artifact_sha256'] = canonical_sha256(scenario)
+
+
 def _trial_context(
     request: dict[str, Any],
     *,
@@ -113,6 +131,27 @@ def test_threshold_and_mission_completion_cannot_be_overridden_by_metrics(
     result = analyze_run(failed_threshold)
     assert result['verdict']['automated_status'] == 'FAIL'
     assert result['verdict']['threshold_checks'][1]['passed'] is False
+
+
+def test_claimed_success_with_null_completed_waypoint_count_cannot_pass(
+    analysis_request: dict[str, Any],
+) -> None:
+    mission = analysis_request['mission']['result']
+    mission['measurements']['completed_waypoint_count'] = None
+    analysis_request['mission']['artifact_sha256'] = canonical_sha256(mission)
+
+    result = analyze_run(analysis_request)
+
+    assert result['measurements']['completed_waypoint_count'] is None
+    assert result['quality']['infrastructure_failure'] is None
+    assert (
+        result['quality']['component_failures']['mission']
+        == 'mission waypoint completion evidence is incomplete'
+    )
+    assert result['verdict']['automated_status'] == 'FAIL'
+    assert result['verdict']['exit_code'] == 30
+    assert result['verdict']['mission_success'] is False
+    validate_document(result, 'run-result.schema.json')
 
 
 def test_mission_component_hash_mismatch_is_invalid(
@@ -293,6 +332,48 @@ def test_analysis_cli_writes_matching_bundle_and_refuses_stale_outputs(
     manifest = verify_result_bundle(output)
     assert manifest['identity']['run_result_sha256'] == canonical_sha256(result)
     assert analyze_main(arguments) == 33
+
+
+def test_analysis_cli_preserves_canceled_null_completion_as_functional_failure(
+    tmp_path: Path,
+    analysis_request: dict[str, Any],
+) -> None:
+    _mark_canceled_component_failure(analysis_request)
+    request_path = tmp_path / 'request.json'
+    request_path.write_text(json.dumps(analysis_request), encoding='utf-8')
+    context_path = tmp_path / 'trial-context.json'
+    context_path.write_text(json.dumps(_trial_context(analysis_request)), encoding='utf-8')
+    output = tmp_path / 'result'
+
+    assert (
+        analyze_main(
+            [
+                '--input',
+                str(request_path),
+                '--output-dir',
+                str(output),
+                '--trial-context',
+                str(context_path),
+            ]
+        )
+        == 30
+    )
+
+    result = json.loads((output / 'run-result.json').read_text(encoding='utf-8'))
+    validate_document(result, 'run-result.schema.json')
+    assert result['measurements']['completed_waypoint_count'] is None
+    assert result['measurements']['mission_action_status'] == 'CANCELED'
+    assert result['quality']['infrastructure_failure'] is None
+    assert result['quality']['component_failures']['mission'] == (
+        'mission did not observe a SUCCEEDED action result'
+    )
+    assert result['quality']['component_failures']['scenario'] == (
+        'scenario component status is not PASS'
+    )
+    assert result['verdict']['automated_status'] == 'FAIL'
+    assert result['verdict']['exit_code'] == 30
+    assert result['verdict']['mission_success'] is False
+    verify_result_bundle(output)
 
 
 @pytest.mark.parametrize('invalid_kind', ['missing', 'malformed', 'missing_terminal'])

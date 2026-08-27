@@ -205,7 +205,6 @@
           "measurements": {
             "properties": {
               "accepted_goal_stamp_ns": {"type": "integer", "minimum": 0},
-              "completed_waypoint_count": {"type": "integer", "minimum": 0},
               "completion_time_sim_s": {"type": "number", "minimum": 0},
               "terminal_action_stamp_ns": {"type": "integer", "minimum": 0}
             }
@@ -214,6 +213,25 @@
             "properties": {
               "collector_overflow": {"type": "boolean"},
               "infrastructure_failure": {"type": "null"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "verdict": {
+            "required": ["automated_status"],
+            "properties": {"automated_status": {"const": "PASS"}}
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "measurements": {
+            "properties": {
+              "completed_waypoint_count": {"type": "integer", "minimum": 0}
             }
           }
         }

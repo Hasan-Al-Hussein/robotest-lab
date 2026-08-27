@@ -79,3 +79,13 @@ def test_run_result_has_exactly_six_top_level_objects(
     result['hand_entered_override'] = True
     with pytest.raises(ArtifactError, match='Additional properties'):
         validate_document(result, 'run-result.schema.json')
+
+
+def test_run_result_schema_rejects_pass_with_null_completed_waypoint_count(
+    analysis_request: dict[str, object],
+) -> None:
+    result = analyze_run(analysis_request)
+    result['measurements']['completed_waypoint_count'] = None
+
+    with pytest.raises(ArtifactError, match='completed_waypoint_count'):
+        validate_document(result, 'run-result.schema.json')
