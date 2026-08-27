@@ -981,11 +981,14 @@ def _validated_bounded_process(
     )
     if finished_steady_ns < started_steady_ns:
         raise EvidenceError(f'{label} time regressed')
+    group_confirmed_empty = _require_bool(
+        process.get('group_confirmed_empty'), f'{label}.group_confirmed_empty'
+    )
     if (
         process.get('role') != expected_role
         or (require_zero_returncode and returncode != 0)
         or _require_bool(process.get('timed_out'), f'{label}.timed_out')
-        or not _require_bool(process.get('group_confirmed_empty'), f'{label}.group_confirmed_empty')
+        or not group_confirmed_empty
         or pid != pgid
     ):
         raise EvidenceError(f'{label} did not exit cleanly')
@@ -1329,7 +1332,8 @@ def validate_positive_runtime_gate_artifacts(
     if runtime_gate_path.is_symlink() or not runtime_gate_path.is_file():
         raise EvidenceError('positive-control runtime gate is not a regular file')
     runtime_gate_sha256 = verify_json_sidecar(runtime_gate_path)
-    gate = _require_mapping(load_canonical_json(runtime_gate_path), 'positive_control.runtime_gate')
+    gate_document = load_canonical_json(runtime_gate_path)
+    gate = _require_mapping(gate_document, 'positive_control.runtime_gate')
     if set(gate) != POSITIVE_RUNTIME_GATE_KEYS:
         raise EvidenceError('positive-control runtime gate fields are invalid')
     gate_schema_version = _require_int(

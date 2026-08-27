@@ -2002,7 +2002,8 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         orchestration.atomic_write_json(process_path, frozen_sibling)
 
     stale_clock_ack = copy.deepcopy(armed_ack)
-    stale_clock_ack['armed_clock_sample_count'] = stale_clock_ack['arm_observed_clock_sample_count']
+    observed_clock_count = stale_clock_ack['arm_observed_clock_sample_count']
+    stale_clock_ack['armed_clock_sample_count'] = observed_clock_count
     with pytest.raises(orchestration.EvidenceError, match='fresh /clock'):
         orchestration.validate_contact_control_armed(
             stale_clock_ack,
@@ -2053,7 +2054,8 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     divergent_control_start = copy.deepcopy(result)
     divergent_control_start['control']['timeline']['control_started_steady_ns'] = 69
     orchestration.atomic_write_json(result_path, divergent_control_start, sidecar=True)
-    with pytest.raises(orchestration.EvidenceError, match='control-start steady evidence diverged'):
+    control_start_error = 'control-start steady evidence diverged'
+    with pytest.raises(orchestration.EvidenceError, match=control_start_error):
         orchestration.reconcile_positive_control(
             workspace=Path(__file__).parents[1],
             build_binding=positive_build_binding,

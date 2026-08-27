@@ -92,7 +92,12 @@ def test_positive_control_runtime_gate_finishes_before_motion_arm() -> None:
     driver_wait = positive_source.index('driver_status = driver.wait(50.0)')
 
     assert (
-        driver_ready < runtime_gate < group_empty < owners_alive < arm_write < arm_ack < driver_wait
+        driver_ready < runtime_gate
+        and runtime_gate < group_empty
+        and group_empty < owners_alive
+        and owners_alive < arm_write
+        and arm_write < arm_ack
+        and arm_ack < driver_wait
     )
     assert "'--arm-file'" in positive_source
     assert "'--armed-file'" in positive_source
