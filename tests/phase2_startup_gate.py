@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 # Copyright 2026 Hasan Ahmed
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: I001
 
 """Fail closed on Phase 2 lifecycle startup and final launch-log evidence."""
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, UTC
 import hashlib
 import json
 import math
 import os
+from pathlib import Path
 import re
 import stat
 import tempfile
 import time
-from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
@@ -31,6 +32,7 @@ DEFAULT_WALL_TIMEOUT_SEC = 110.0
 POLL_PERIOD_SEC = 0.05
 MAXIMUM_RESULT_BYTES = 64 * 1024
 MAXIMUM_LAUNCH_LOG_BYTES = 128 * 1024 * 1024
+DEFAULT_MAXIMUM_LAUNCH_STREAM_BYTES = 8 * 1024 * 1024
 
 EXIT_PASS = 0
 EXIT_GATE_FAILURE = 1
@@ -142,6 +144,95 @@ def atomic_write_text(path: Path, content: str) -> None:
         if descriptor >= 0:
             os.close(descriptor)
         pending.unlink(missing_ok=True)
+
+
+def _stable_regular_bytes(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    allow_empty: bool,
+    label: str,
+    activity: str,
+) -> bytes:
+    """Read one bounded regular file while rejecting replacement races."""
+    try:
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise GateError(
+                'launch_log_invalid',
+                f'{label} must be a regular non-symlink file',
+            )
+        minimum_bytes = 0 if allow_empty else 1
+        if metadata.st_size < minimum_bytes or metadata.st_size > maximum_bytes:
+            raise GateError(
+                'launch_log_invalid',
+                f'{label} size {metadata.st_size} is outside '
+                f'{minimum_bytes}..{maximum_bytes}',
+            )
+        payload = path.read_bytes()
+        after = path.lstat()
+        before_identity = (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+        )
+        after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        if (
+            len(payload) != metadata.st_size
+            or before_identity != after_identity
+            or stat.S_ISLNK(after.st_mode)
+        ):
+            raise GateError('launch_log_invalid', f'{label} changed while {activity}')
+        return payload
+    except GateError:
+        raise
+    except OSError as error:
+        raise GateError(
+            'launch_log_invalid',
+            f'cannot read {label}: {type(error).__name__}: {error}',
+        ) from error
+
+
+def combined_launch_log_bytes(
+    stdout_path: Path,
+    stderr_path: Path,
+    *,
+    maximum_stream_bytes: int = DEFAULT_MAXIMUM_LAUNCH_STREAM_BYTES,
+) -> bytes:
+    """Return deterministic bytes for finalized, separately drained launch streams."""
+    if (
+        isinstance(maximum_stream_bytes, bool)
+        or not isinstance(maximum_stream_bytes, int)
+        or maximum_stream_bytes <= 0
+        or maximum_stream_bytes > MAXIMUM_LAUNCH_LOG_BYTES
+    ):
+        raise GateError(
+            'launch_log_invalid',
+            'maximum launch-stream bytes must be a positive bounded integer',
+        )
+    stdout = _stable_regular_bytes(
+        stdout_path,
+        maximum_bytes=maximum_stream_bytes,
+        allow_empty=True,
+        label='full_stack stdout log',
+        activity='being combined',
+    )
+    stderr = _stable_regular_bytes(
+        stderr_path,
+        maximum_bytes=maximum_stream_bytes,
+        allow_empty=True,
+        label='full_stack stderr log',
+        activity='being combined',
+    )
+    separator = b'\n' if stdout and stderr and not stdout.endswith(b'\n') else b''
+    payload = stdout + separator + stderr
+    if len(payload) > MAXIMUM_LAUNCH_LOG_BYTES:
+        raise GateError(
+            'launch_log_invalid',
+            f'combined launch log exceeds {MAXIMUM_LAUNCH_LOG_BYTES} bytes',
+        )
+    return payload
 
 
 def watched_process_alive(pid: int) -> bool:
@@ -306,16 +397,25 @@ def read_startup_result(path: Path) -> tuple[dict[str, Any], str, int]:
     return document, hashlib.sha256(payload).hexdigest(), len(payload)
 
 
-def scan_final_launch_log(path: Path, launch_stopped_utc: str) -> dict[str, Any]:
+def scan_final_launch_log(
+    path: Path,
+    launch_stopped_utc: str,
+    *,
+    scanned_utc: str | None = None,
+) -> dict[str, Any]:
     """Return strict, hash-bound evidence for every prohibited launch-log signature."""
     timestamp_failures: list[str] = []
-    _parse_utc('launch_stopped_utc', launch_stopped_utc, timestamp_failures)
+    stopped_at = _parse_utc('launch_stopped_utc', launch_stopped_utc, timestamp_failures)
+    scan_timestamp = utc_now() if scanned_utc is None else scanned_utc
+    scanned_at = _parse_utc('scanned_utc', scan_timestamp, timestamp_failures)
+    if stopped_at is not None and scanned_at is not None and scanned_at < stopped_at:
+        timestamp_failures.append('scanned_utc must not precede launch_stopped_utc')
     evidence: dict[str, Any] = {
         'schema_version': SCHEMA_VERSION,
         'verdict': 'FAIL',
         'failure_kind': None,
         'failure_message': None,
-        'scanned_utc': utc_now(),
+        'scanned_utc': scan_timestamp,
         'launch_stopped_utc': launch_stopped_utc,
         'launch_log_path': str(path),
         'launch_log_sha256': None,
@@ -339,32 +439,13 @@ def scan_final_launch_log(path: Path, launch_stopped_utc: str) -> dict[str, Any]
         return evidence
 
     try:
-        metadata = path.lstat()
-        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-            raise GateError(
-                'launch_log_invalid',
-                'launch log must be a regular non-symlink file',
-            )
-        if metadata.st_size <= 0 or metadata.st_size > MAXIMUM_LAUNCH_LOG_BYTES:
-            raise GateError(
-                'launch_log_invalid',
-                f'launch log size {metadata.st_size} is outside 1..{MAXIMUM_LAUNCH_LOG_BYTES}',
-            )
-        payload = path.read_bytes()
-        after = path.lstat()
-        before_identity = (
-            metadata.st_dev,
-            metadata.st_ino,
-            metadata.st_size,
-            metadata.st_mtime_ns,
+        payload = _stable_regular_bytes(
+            path,
+            maximum_bytes=MAXIMUM_LAUNCH_LOG_BYTES,
+            allow_empty=False,
+            label='launch log',
+            activity='being scanned',
         )
-        after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-        if (
-            len(payload) != metadata.st_size
-            or before_identity != after_identity
-            or stat.S_ISLNK(after.st_mode)
-        ):
-            raise GateError('launch_log_invalid', 'launch log changed while being scanned')
         text = payload.decode('utf-8')
     except (OSError, UnicodeDecodeError, GateError) as error:
         evidence['failure_kind'] = (
@@ -617,7 +698,9 @@ def run_self_test() -> int:
 
         invalid_verdict = _valid_result()
         invalid_verdict['verdict'] = []
-        assert any('verdict' in item for item in validate_startup_result(invalid_verdict, contract))
+        assert any(
+            'verdict' in item for item in validate_startup_result(invalid_verdict, contract)
+        )
 
         evidence_path = root / 'evidence.json'
         atomic_write_text(evidence_path, serialize_result(success))
@@ -628,7 +711,9 @@ def run_self_test() -> int:
         clean_scan = scan_final_launch_log(clean_log, '2026-08-25T22:40:00Z')
         assert clean_scan['verdict'] == 'PASS'
         assert clean_scan['match_count'] == 0
-        assert clean_scan['launch_log_sha256'] == hashlib.sha256(clean_log.read_bytes()).hexdigest()
+        assert clean_scan['launch_log_sha256'] == hashlib.sha256(
+            clean_log.read_bytes()
+        ).hexdigest()
 
         rejected_log = root / 'rejected-launch.log'
         rejected_log.write_text(
@@ -740,7 +825,12 @@ def main() -> int:
         response_timeout_sec=args.expected_response_timeout_sec,
     )
     try:
-        evidence = wait_for_startup_result(args.result, args.watch_pid, args.wall_timeout, contract)
+        evidence = wait_for_startup_result(
+            args.result,
+            args.watch_pid,
+            args.wall_timeout,
+            contract,
+        )
         exit_code = EXIT_PASS if evidence['verdict'] == 'PASS' else EXIT_GATE_FAILURE
     except Exception as error:  # pragma: no cover - defensive outer boundary
         evidence = initial_gate_evidence(args.result, args.watch_pid, args.wall_timeout, contract)

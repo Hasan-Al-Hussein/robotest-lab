@@ -30,12 +30,39 @@ def _load(name: str, filename: str):
 
 
 orchestration = _load('phase3_orchestration', 'phase3_orchestration.py')
+startup_gate = _load('phase2_startup_gate', 'phase2_startup_gate.py')
 runner = _load('phase3_benchmark_runner', 'phase3_benchmark_runner.py')
 runtime_gate = _load('phase3_runtime_gate', 'phase3_runtime_gate.py')
 metrics_constants = _load(
     'robotest_metrics_source_constants',
     '../src/robotest_metrics/robotest_metrics/constants.py',
 )
+
+
+def _finalized_launch(
+    root: Path,
+    *,
+    stdout: bytes,
+    stderr: bytes,
+    logs_within_cap: bool = True,
+) -> SimpleNamespace:
+    process_dir = root / 'processes'
+    process_dir.mkdir(parents=True, exist_ok=True)
+    stdout_path = process_dir / 'full_stack.stdout.log'
+    stderr_path = process_dir / 'full_stack.stderr.log'
+    metadata_path = process_dir / 'full_stack.process.json'
+    stdout_path.write_bytes(stdout)
+    stderr_path.write_bytes(stderr)
+    metadata_path.write_text('{}\n', encoding='utf-8')
+    return SimpleNamespace(
+        _group_confirmed_empty=True,
+        finished_steady_ns=20,
+        logs_within_cap=logs_within_cap,
+        metadata_path=metadata_path,
+        poll=lambda: -15,
+        stderr_path=stderr_path,
+        stdout_path=stdout_path,
+    )
 
 
 def test_finalized_component_artifact_gets_one_verified_sidecar(tmp_path: Path) -> None:
@@ -53,6 +80,215 @@ def test_finalized_component_artifact_gets_one_verified_sidecar(tmp_path: Path) 
         runner._write_existing_artifact_sidecar(artifact)
     with pytest.raises(runner.EvidenceError, match='missing or non-regular'):
         runner._write_existing_artifact_sidecar(tmp_path / 'missing.json')
+
+
+def test_final_launch_log_gate_combines_closed_streams_and_replays_exactly(
+    tmp_path: Path,
+) -> None:
+    launch = _finalized_launch(
+        tmp_path,
+        stdout=b'full stack healthy',
+        stderr=b'stderr healthy\n',
+    )
+    launch_stopped_utc = '2026-08-27T07:00:00Z'
+    scanned_utc = '2026-08-27T07:00:01Z'
+
+    evidence = runner._finalize_full_stack_log_gate(
+        launch,
+        tmp_path,
+        launch_stopped_utc=launch_stopped_utc,
+        scanned_utc=scanned_utc,
+    )
+
+    combined = tmp_path / runner.FULL_STACK_COMBINED_LOG_NAME
+    gate = tmp_path / runner.FINAL_LAUNCH_LOG_GATE_NAME
+    assert combined.read_bytes() == b'full stack healthy\nstderr healthy\n'
+    assert orchestration.load_canonical_json(gate) == evidence
+    assert orchestration.verify_json_sidecar(gate) == orchestration.file_sha256(gate)
+    assert evidence['verdict'] == 'PASS'
+    assert evidence['launch_stopped_utc'] == launch_stopped_utc
+    assert evidence['scanned_utc'] == scanned_utc
+    assert evidence['launch_log_path'] == str(combined)
+    assert evidence['launch_log_sha256'] == orchestration.file_sha256(combined)
+    assert startup_gate.scan_final_launch_log(
+        combined,
+        evidence['launch_stopped_utc'],
+        scanned_utc=evidence['scanned_utc'],
+    ) == evidence
+
+
+@pytest.mark.parametrize('stream', ('stdout', 'stderr'))
+@pytest.mark.parametrize(
+    ('signature_id', 'line'),
+    (
+        ('lifecycle_startup_rejection', 'Lifecycle STARTUP rejection'),
+        ('nav2_bringup_failure', 'Failed to bring up all requested nodes'),
+        ('lifecycle_async_send_request_failure', 'service client: async_send_request failed'),
+        (
+            'dds_response_timeout',
+            'failed to send response to /robotest/amcl/get_state (timeout)',
+        ),
+        ('fatal_process_signature', 'fatal process condition'),
+    ),
+)
+def test_final_launch_log_gate_rejects_every_signature_from_either_stream(
+    tmp_path: Path,
+    stream: str,
+    signature_id: str,
+    line: str,
+) -> None:
+    stdout = f'{line}\n'.encode() if stream == 'stdout' else b'stdout healthy\n'
+    stderr = f'{line}\n'.encode() if stream == 'stderr' else b'stderr healthy\n'
+    launch = _finalized_launch(tmp_path, stdout=stdout, stderr=stderr)
+
+    with pytest.raises(runner.StageFailure) as captured:
+        runner._finalize_full_stack_log_gate(
+            launch,
+            tmp_path,
+            launch_stopped_utc='2026-08-27T07:00:00Z',
+            scanned_utc='2026-08-27T07:00:01Z',
+        )
+
+    assert captured.value.stage == 'final_launch_log_gate'
+    assert captured.value.kind == 'launch_log_signature_detected'
+    gate = tmp_path / runner.FINAL_LAUNCH_LOG_GATE_NAME
+    evidence = orchestration.load_canonical_json(gate)
+    assert orchestration.verify_json_sidecar(gate) == orchestration.file_sha256(gate)
+    assert evidence['verdict'] == 'FAIL'
+    assert evidence['match_count'] == 1
+    assert evidence['matches'][0]['signature_ids'] == [signature_id]
+
+
+def test_final_launch_log_gate_rejects_empty_or_incomplete_closed_evidence(
+    tmp_path: Path,
+) -> None:
+    empty_root = tmp_path / 'empty'
+    empty_launch = _finalized_launch(empty_root, stdout=b'', stderr=b'')
+    with pytest.raises(runner.StageFailure) as captured:
+        runner._finalize_full_stack_log_gate(
+            empty_launch,
+            empty_root,
+            launch_stopped_utc='2026-08-27T07:00:00Z',
+            scanned_utc='2026-08-27T07:00:01Z',
+        )
+    assert captured.value.kind == 'launch_log_invalid'
+    empty_gate = empty_root / runner.FINAL_LAUNCH_LOG_GATE_NAME
+    assert orchestration.load_canonical_json(empty_gate)['verdict'] == 'FAIL'
+    assert orchestration.verify_json_sidecar(empty_gate) == orchestration.file_sha256(empty_gate)
+
+    overflow_root = tmp_path / 'overflow'
+    overflow_launch = _finalized_launch(
+        overflow_root,
+        stdout=b'retained prefix\n',
+        stderr=b'',
+        logs_within_cap=False,
+    )
+    with pytest.raises(runner.EvidenceError, match='complete finalized process evidence'):
+        runner._finalize_full_stack_log_gate(
+            overflow_launch,
+            overflow_root,
+            launch_stopped_utc='2026-08-27T07:00:00Z',
+            scanned_utc='2026-08-27T07:00:01Z',
+        )
+    assert not (overflow_root / runner.FULL_STACK_COMBINED_LOG_NAME).exists()
+
+
+def test_combined_launch_log_rejects_symlinked_source(tmp_path: Path) -> None:
+    target = tmp_path / 'target.log'
+    target.write_text('healthy\n', encoding='utf-8')
+    stdout = tmp_path / 'stdout.log'
+    stdout.symlink_to(target)
+    stderr = tmp_path / 'stderr.log'
+    stderr.write_bytes(b'')
+
+    with pytest.raises(startup_gate.GateError, match='regular non-symlink'):
+        startup_gate.combined_launch_log_bytes(stdout, stderr)
+
+
+def test_combined_launch_log_rejects_oversized_or_changing_stream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout = tmp_path / 'stdout.log'
+    stderr = tmp_path / 'stderr.log'
+    stdout.write_bytes(b'x' * 17)
+    stderr.write_bytes(b'')
+    with pytest.raises(startup_gate.GateError, match=r'outside 0\.\.16'):
+        startup_gate.combined_launch_log_bytes(
+            stdout,
+            stderr,
+            maximum_stream_bytes=16,
+        )
+
+    stdout.write_bytes(b'stable prefix\n')
+    original_read_bytes = Path.read_bytes
+
+    def mutate_after_read(path: Path) -> bytes:
+        payload = original_read_bytes(path)
+        if path == stdout:
+            path.write_bytes(payload + b'mutated\n')
+        return payload
+
+    monkeypatch.setattr(Path, 'read_bytes', mutate_after_read)
+    with pytest.raises(startup_gate.GateError, match='changed while being combined'):
+        startup_gate.combined_launch_log_bytes(stdout, stderr)
+
+
+def test_final_launch_log_scan_rejects_scan_time_before_shutdown(tmp_path: Path) -> None:
+    launch_log = tmp_path / 'full-stack-combined.log'
+    launch_log.write_text('healthy\n', encoding='utf-8')
+
+    evidence = startup_gate.scan_final_launch_log(
+        launch_log,
+        '2026-08-27T07:00:01Z',
+        scanned_utc='2026-08-27T07:00:00Z',
+    )
+
+    assert evidence['verdict'] == 'FAIL'
+    assert evidence['failure_kind'] == 'launch_log_invalid'
+    assert evidence['failure_message'] == 'scanned_utc must not precede launch_stopped_utc'
+    assert evidence['launch_log_sha256'] is None
+
+
+def test_final_log_failure_is_sticky_without_hiding_a_new_failure() -> None:
+    prior = runner.StageFailure('goal_binding', 'observer_exit', 'observer failed')
+    scan = runner.StageFailure(
+        'final_launch_log_gate',
+        'launch_log_signature_detected',
+        'prohibited signature',
+    )
+
+    assert runner._sticky_final_log_failure(prior, scan) is prior
+    assert runner._sticky_final_log_failure(None, scan) is scan
+    invalid = runner._sticky_final_log_failure(
+        None,
+        startup_gate.GateError('launch_log_invalid', 'missing closed log'),
+    )
+    assert invalid.stage == 'final_launch_log_gate'
+    assert invalid.kind == 'invalid_evidence'
+
+
+def test_final_log_gate_runs_after_stop_and_before_domain_cleanup() -> None:
+    source = (TEST_DIR / 'phase3_benchmark_runner.py').read_text(encoding='utf-8')
+    trial_start = source.index('    def _run_trial(')
+    trial_source = source[trial_start:]
+
+    stop_all = trial_source.index('cleanup_ok = registry.stop_all()')
+    final_gate_try = trial_source.index('try:', stop_all)
+    stopped_timestamp = trial_source.index('launch_stopped_utc = startup_gate_utc_now()', stop_all)
+    final_gate = trial_source.index('_finalize_full_stack_log_gate(', stop_all)
+    final_gate_except = trial_source.index('except (', final_gate)
+    domain_cleanup = trial_source.index("'domain_cleanup',", final_gate)
+
+    assert (
+        stop_all
+        < final_gate_try
+        < stopped_timestamp
+        < final_gate
+        < final_gate_except
+        < domain_cleanup
+    )
+    assert "registry.run_checked(\n                    'final_launch_log_gate'" not in trial_source
 
 
 def test_component_sidecars_are_finalized_before_prerequisite_manifest() -> None:

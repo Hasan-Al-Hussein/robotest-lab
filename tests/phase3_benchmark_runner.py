@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: I001
 
-"""Owned-process Phase 3 positive-control, smoke, and candidate runner.
+"""
+Owned-process Phase 3 positive-control, smoke, and candidate runner.
 
 The CLI is intentionally staged.  ``prepare`` freezes a clean candidate
 ledger, ``positive-control`` qualifies the collision path, ``smoke`` executes
@@ -29,6 +30,12 @@ import threading
 import time
 from typing import Any, BinaryIO
 
+from phase2_startup_gate import (
+    combined_launch_log_bytes,
+    GateError as StartupGateError,
+    scan_final_launch_log,
+    utc_now as startup_gate_utc_now,
+)
 from phase3_orchestration import (
     AGGREGATE_METRICS,
     atomic_write_bytes,
@@ -80,6 +87,9 @@ GROUP_TERM_GRACE_S = 5.0
 PROCESS_KILL_GRACE_S = 10.0
 READY_POLL_S = 0.05
 TOKEN_PATTERN = re.compile(r'^[a-z][a-z0-9_]{0,63}$')
+FULL_STACK_COMBINED_LOG_NAME = 'full-stack-combined.log'
+FINAL_LAUNCH_LOG_GATE_NAME = 'full-stack-final-log-gate.json'
+FULL_STACK_COMBINED_LOG_MAX_BYTES = 2 * LOG_MAX_BYTES + 1
 
 
 def _bounded_reason(value: object) -> str:
@@ -701,6 +711,82 @@ def _write_existing_artifact_sidecar(path: Path) -> str:
     if verify_json_sidecar(path) != digest:
         raise EvidenceError(f'artifact checksum sidecar could not be verified: {sidecar}')
     return digest
+
+
+def _finalize_full_stack_log_gate(
+    launch: BoundedProcess,
+    run_dir: Path,
+    *,
+    launch_stopped_utc: str,
+    scanned_utc: str | None = None,
+) -> Mapping[str, Any]:
+    """Scan immutable combined launch output after owned shutdown and drain completion."""
+    if (
+        launch.poll() is None
+        or launch.finished_steady_ns is None
+        or not launch._group_confirmed_empty
+        or not launch.metadata_path.is_file()
+        or not launch.logs_within_cap
+    ):
+        raise EvidenceError(
+            'full_stack is not fully stopped with complete finalized process evidence'
+        )
+    combined_path = run_dir / FULL_STACK_COMBINED_LOG_NAME
+    gate_path = run_dir / FINAL_LAUNCH_LOG_GATE_NAME
+    gate_sidecar = Path(f'{gate_path}.sha256')
+    for path in (combined_path, gate_path, gate_sidecar):
+        if path.exists() or path.is_symlink():
+            raise EvidenceError(f'final launch-log evidence path already exists: {path}')
+    combined = combined_launch_log_bytes(
+        launch.stdout_path,
+        launch.stderr_path,
+        maximum_stream_bytes=LOG_MAX_BYTES,
+    )
+    atomic_write_bytes(combined_path, combined, FULL_STACK_COMBINED_LOG_MAX_BYTES)
+    evidence = scan_final_launch_log(
+        combined_path,
+        launch_stopped_utc,
+        scanned_utc=scanned_utc,
+    )
+    atomic_write_json(gate_path, evidence, sidecar=True)
+    verify_json_sidecar(gate_path)
+    if evidence.get('verdict') != 'PASS':
+        failure_kind = evidence.get('failure_kind')
+        kind = (
+            failure_kind
+            if isinstance(failure_kind, str) and TOKEN_PATTERN.fullmatch(failure_kind)
+            else 'invalid_evidence'
+        )
+        failure_message = evidence.get('failure_message')
+        reason = (
+            failure_message
+            if isinstance(failure_message, str) and failure_message
+            else 'final launch-log scan did not produce a PASS verdict'
+        )
+        raise StageFailure(
+            'final_launch_log_gate',
+            kind,
+            reason,
+            evidence=evidence,
+        )
+    return evidence
+
+
+def _sticky_final_log_failure(
+    prior_failure: StageFailure | None,
+    final_log_error: Exception,
+) -> StageFailure:
+    """Retain the first causal failure while making a new final-log error fail closed."""
+    if prior_failure is not None:
+        return prior_failure
+    if isinstance(final_log_error, StageFailure):
+        return final_log_error
+    return StageFailure(
+        'final_launch_log_gate',
+        'invalid_evidence',
+        f'{type(final_log_error).__name__}: {final_log_error}',
+        evidence={'exception_type': type(final_log_error).__name__},
+    )
 
 
 def _wait_for_file(
@@ -2053,6 +2139,22 @@ class BenchmarkRunner:
             )
         finally:
             cleanup_ok = registry.stop_all()
+            if cleanup_ok and launch is not None:
+                try:
+                    launch_stopped_utc = startup_gate_utc_now()
+                    _finalize_full_stack_log_gate(
+                        launch,
+                        run_dir,
+                        launch_stopped_utc=launch_stopped_utc,
+                    )
+                except (
+                    EvidenceError,
+                    StartupGateError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                ) as final_log_error:
+                    stage_failure = _sticky_final_log_failure(stage_failure, final_log_error)
             try:
                 registry.run_checked(
                     'domain_cleanup',

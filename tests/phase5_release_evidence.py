@@ -146,6 +146,9 @@ PHASE3_PREREQUISITE_RAW_PATHS = {
     'goal-observer.json',
     'goal-observer.json.sha256',
     'goal-observer.ready.json',
+    'full-stack-combined.log',
+    'full-stack-final-log-gate.json',
+    'full-stack-final-log-gate.json.sha256',
     'lifecycle-ready.json',
     'lifecycle-startup-result.json',
     'metrics.ready.json',
@@ -436,6 +439,21 @@ PHASE3_BOUNDED_STREAM_KEYS = {
     'observed_bytes',
     'overflow',
     'retained_bytes',
+}
+PHASE3_FINAL_LAUNCH_LOG_GATE_KEYS = {
+    'failure_kind',
+    'failure_message',
+    'launch_log_path',
+    'launch_log_sha256',
+    'launch_log_size_bytes',
+    'launch_stopped_utc',
+    'line_count',
+    'match_count',
+    'matches',
+    'scanned_utc',
+    'schema_version',
+    'signature_definitions',
+    'verdict',
 }
 
 
@@ -1106,7 +1124,8 @@ def _validate_positive_component_processes(
                 and maximum_bytes == 8 * 1024 * 1024
                 and _exact_integer(observed_bytes)
                 and _exact_integer(retained_bytes)
-                and 0 <= retained_bytes <= observed_bytes <= maximum_bytes
+                and 0 <= retained_bytes <= maximum_bytes
+                and observed_bytes == retained_bytes
                 and stream.get('overflow') is False
                 and stream.get('error') is None,
                 f'{stream_label} fields are invalid',
@@ -1926,7 +1945,8 @@ def _phase3_bounded_process_record(
             and maximum_bytes == 8 * 1024 * 1024
             and _exact_integer(observed_bytes)
             and _exact_integer(retained_bytes)
-            and 0 <= retained_bytes <= observed_bytes <= maximum_bytes
+            and 0 <= retained_bytes <= maximum_bytes
+            and observed_bytes == retained_bytes
             and stream.get('overflow') is False
             and stream.get('error') is None,
             f'{stream_label} fields are invalid',
@@ -1940,6 +1960,103 @@ def _phase3_bounded_process_record(
             f'{stream_label} retained byte count differs from its log',
         )
     return process
+
+
+def _validate_phase3_final_launch_log_gate(
+    repository: Path,
+    run_root: Path,
+) -> Mapping[str, Any]:
+    """Rebuild and replay the manifest-bound final full-stack launch-log gate."""
+    source = _load_repository_module(
+        repository,
+        'tests/phase2_startup_gate.py',
+        'Phase 3 final launch-log scanner source contract',
+    )
+    stdout_path = run_root / 'processes/full_stack.stdout.log'
+    stderr_path = run_root / 'processes/full_stack.stderr.log'
+    combined_path = _regular_file(
+        run_root / 'full-stack-combined.log',
+        'Phase 3 final combined full-stack launch log',
+    )
+    _require(
+        0 < combined_path.stat().st_size <= 2 * 8 * 1024 * 1024 + 1,
+        'Phase 3 final combined full-stack launch log exceeds its exact size bound',
+    )
+    try:
+        rebuilt = source.combined_launch_log_bytes(
+            stdout_path,
+            stderr_path,
+            maximum_stream_bytes=8 * 1024 * 1024,
+        )
+        observed_combined = combined_path.read_bytes()
+    except Exception as exc:
+        raise EvidenceError(
+            f'Phase 3 final combined launch-log replay failed: {type(exc).__name__}: {exc}'
+        ) from exc
+    _require(
+        observed_combined == rebuilt,
+        'Phase 3 final combined launch log differs from finalized full_stack streams',
+    )
+
+    gate_path = run_root / 'full-stack-final-log-gate.json'
+    gate = _load_canonical_json(
+        gate_path,
+        'Phase 3 final launch-log signature gate',
+        maximum_bytes=PHASE3_RESULT_JSON_MAX_BYTES,
+    )
+    _validate_json_sidecar(gate_path, 'Phase 3 final launch-log signature gate')
+    _require(
+        set(gate) == PHASE3_FINAL_LAUNCH_LOG_GATE_KEYS,
+        'Phase 3 final launch-log signature gate fields are invalid',
+    )
+    launch_stopped_utc = gate.get('launch_stopped_utc')
+    scanned_utc = gate.get('scanned_utc')
+    stopped_at = _utc_timestamp(
+        launch_stopped_utc,
+        'Phase 3 final launch-log signature gate launch_stopped_utc',
+    )
+    scanned_at = _utc_timestamp(
+        scanned_utc,
+        'Phase 3 final launch-log signature gate scanned_utc',
+    )
+    _require(
+        scanned_at >= stopped_at,
+        'Phase 3 final launch-log signature gate was scanned before launch stopped',
+    )
+    resolved_combined = combined_path.resolve(strict=True)
+    try:
+        replayed = source.scan_final_launch_log(
+            resolved_combined,
+            launch_stopped_utc,
+            scanned_utc=scanned_utc,
+        )
+    except Exception as exc:
+        raise EvidenceError(
+            f'Phase 3 final launch-log scanner replay failed: {type(exc).__name__}: {exc}'
+        ) from exc
+    _require(
+        set(replayed) == PHASE3_FINAL_LAUNCH_LOG_GATE_KEYS,
+        'Phase 3 clone-local final launch-log scanner fields are invalid',
+    )
+    _require(
+        _exact_json_equal(gate, replayed),
+        'Phase 3 final launch-log signature gate differs from clone-local scanner replay',
+    )
+    _require(
+        gate.get('schema_version') == 1
+        and gate.get('verdict') == 'PASS'
+        and gate.get('failure_kind') is None
+        and gate.get('failure_message') is None
+        and gate.get('launch_log_path') == str(resolved_combined)
+        and gate.get('launch_log_sha256') == hashlib.sha256(rebuilt).hexdigest()
+        and gate.get('launch_log_size_bytes') == len(rebuilt)
+        and gate.get('line_count') == len(rebuilt.decode('utf-8').splitlines())
+        and gate.get('match_count') == 0
+        and gate.get('matches') == []
+        and gate.get('signature_definitions') == replayed['signature_definitions'],
+        'Phase 3 final launch-log signature gate is not an exact zero-match PASS',
+    )
+    return gate
 
 
 def _phase3_graph_process(
@@ -2112,6 +2229,7 @@ def _validate_phase3_graph_prerequisites(
 
     full_stack_process = process_records['full_stack']
     mission_process = process_records['mission_runner']
+    _validate_phase3_final_launch_log_gate(repository, run_root)
     expected_mission_command = process_contracts['mission_runner'][0]
     _require(
         full_stack_process.get('returncode') in (-15, 0)

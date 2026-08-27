@@ -1430,15 +1430,57 @@ def _bounded_process_fixture(
     }
 
 
-def _write_bounded_process_artifacts(directory: Path, process: dict) -> None:
+def _write_bounded_process_artifacts(
+    directory: Path,
+    process: dict,
+    *,
+    stdout_bytes: bytes = b'',
+    stderr_bytes: bytes = b'',
+) -> None:
     """Write one production-shaped process record and its retained log files."""
     role = process['role']
     process_directory = directory / 'processes'
-    _canonical_file(process_directory / f'{role}.process.json', process)
-    for stream_name in ('stdout', 'stderr'):
+    process_directory.mkdir(parents=True, exist_ok=True)
+    payloads = {'stderr': stderr_bytes, 'stdout': stdout_bytes}
+    for stream_name, payload in payloads.items():
         stream = process[stream_name]
-        assert stream['retained_bytes'] == 0
-        (process_directory / f'{role}.{stream_name}.log').write_bytes(b'')
+        assert isinstance(payload, bytes)
+        assert len(payload) <= stream['maximum_bytes']
+        stream['observed_bytes'] = len(payload)
+        stream['retained_bytes'] = len(payload)
+        (process_directory / f'{role}.{stream_name}.log').write_bytes(payload)
+    _canonical_file(process_directory / f'{role}.process.json', process)
+
+
+def _write_phase3_final_launch_log_gate(
+    repository: Path,
+    run_root: Path,
+    *,
+    launch_stopped_utc: str = '2026-08-26T00:00:00Z',
+    scanned_utc: str = '2026-08-26T00:00:01Z',
+) -> dict:
+    """Write production-shaped combined launch-log bytes and canonical scan evidence."""
+    source = release_module._load_repository_module(
+        repository,
+        'tests/phase2_startup_gate.py',
+        'Phase 3 final launch-log fixture scanner',
+    )
+    combined_path = run_root / 'full-stack-combined.log'
+    combined_path.write_bytes(
+        source.combined_launch_log_bytes(
+            run_root / 'processes/full_stack.stdout.log',
+            run_root / 'processes/full_stack.stderr.log',
+            maximum_stream_bytes=8 * 1024 * 1024,
+        )
+    )
+    gate = source.scan_final_launch_log(
+        combined_path.resolve(strict=True),
+        launch_stopped_utc,
+        scanned_utc=scanned_utc,
+    )
+    assert gate['verdict'] == 'PASS', gate
+    _canonical_file(run_root / 'full-stack-final-log-gate.json', gate, sidecar=True)
+    return gate
 
 
 def _write_phase3_contact_gate_reobservation(
@@ -2573,6 +2615,10 @@ def _write_phase3_graph_prerequisites(
                 wall_timeout_s=wall_timeout_s,
                 returncode=(-15 if role == 'full_stack' else allowed_returncodes[-1]),
             ),
+            stdout_bytes=(
+                b'[robotest] full stack stopped cleanly' if role == 'full_stack' else b''
+            ),
+            stderr_bytes=(b'[robotest] shutdown complete\n' if role == 'full_stack' else b''),
         )
     pre_binding = _write_phase3_graph_evidence(
         run_root,
@@ -3114,6 +3160,7 @@ def _phase3_bundle(
         orchestration=orchestration,
         plan=plan,
     )
+    _write_phase3_final_launch_log_gate(repository, run_root)
     mission_process = json.loads(
         (run_root / 'processes/mission_runner.process.json').read_text(encoding='utf-8')
     )
@@ -4557,6 +4604,15 @@ def _relocate_phase3_evidence(
                 old_root,
                 str(repository),
             )
+        previous_final_log_gate = json.loads(
+            (run_root / 'full-stack-final-log-gate.json').read_text(encoding='utf-8')
+        )
+        _write_phase3_final_launch_log_gate(
+            repository,
+            run_root,
+            launch_stopped_utc=previous_final_log_gate['launch_stopped_utc'],
+            scanned_utc=previous_final_log_gate['scanned_utc'],
+        )
         for gate_name in ('runtime-gate.json', 'contact-stream-final-gate.json'):
             gate_path = run_root / gate_name
             _relocate_json(gate_path, old_root, str(repository), sidecar=True)
@@ -5016,6 +5072,24 @@ def test_release_fixture_clones_are_self_contained_and_reload_producers(
     assert second_scenario_provenance is not first_scenario_provenance
     assert Path(second_analysis.__file__).resolve().is_relative_to(second_repository)
     assert Path(second_scenario_provenance.__file__).resolve().is_relative_to(second_repository)
+    final_log_scanner = release_module._load_repository_module(
+        second_repository,
+        'tests/phase2_startup_gate.py',
+        'relocated Phase 3 final launch-log scanner',
+    )
+    assert Path(final_log_scanner.__file__).resolve().is_relative_to(second_repository)
+    for relative_run_root in ('smoke', 'runs/00'):
+        run_root = Path(second['candidate_root']) / relative_run_root
+        combined_path = run_root / 'full-stack-combined.log'
+        final_gate = json.loads(
+            (run_root / 'full-stack-final-log-gate.json').read_text(encoding='utf-8')
+        )
+        assert final_gate['launch_log_path'] == str(combined_path.resolve(strict=True))
+        assert combined_path.read_bytes() == final_log_scanner.combined_launch_log_bytes(
+            run_root / 'processes/full_stack.stdout.log',
+            run_root / 'processes/full_stack.stderr.log',
+            maximum_stream_bytes=8 * 1024 * 1024,
+        )
 
     candidate_root = Path(second['candidate_root'])
     positive_directory = candidate_root / 'positive-control'
@@ -5566,6 +5640,130 @@ def test_release_evidence_rejects_rebound_phase3_process_contract_forgery(
         _validate_release_fixture(fixture)
 
 
+def test_release_evidence_rejects_rebound_phase3_partial_retained_stream(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    process_path = run_root / 'processes/full_stack.process.json'
+    process = json.loads(process_path.read_text(encoding='utf-8'))
+    process['stdout']['observed_bytes'] = process['stdout']['retained_bytes'] + 128
+    _canonical_file(process_path, process)
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='full_stack process stdout fields are invalid'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase3_combined_launch_log_forgery(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    (run_root / 'full-stack-combined.log').write_bytes(b'forged combined bytes\n')
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='differs from finalized full_stack streams'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ('stream_name', 'payload'),
+    [
+        ('stdout', b'Lifecycle STARTUP was rejected\n'),
+        ('stderr', b'Failed to bring up all requested nodes\n'),
+        ('stdout', b'service client: async_send_request failed\n'),
+        ('stderr', b'failed to send response for request (timeout)\n'),
+        ('stdout', b'process FATAL error\n'),
+    ],
+)
+def test_release_evidence_rejects_coordinated_phase3_launch_signature_forgery(
+    tmp_path: Path,
+    stream_name: str,
+    payload: bytes,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    gate_path = run_root / 'full-stack-final-log-gate.json'
+    recorded_gate = json.loads(gate_path.read_text(encoding='utf-8'))
+
+    stream_path = run_root / f'processes/full_stack.{stream_name}.log'
+    stream_path.write_bytes(payload)
+    process_path = run_root / 'processes/full_stack.process.json'
+    process = json.loads(process_path.read_text(encoding='utf-8'))
+    process[stream_name]['observed_bytes'] = len(payload)
+    process[stream_name]['retained_bytes'] = len(payload)
+    _canonical_file(process_path, process)
+
+    scanner = release_module._load_repository_module(
+        repository,
+        'tests/phase2_startup_gate.py',
+        'coordinated final launch-log forgery scanner',
+    )
+    combined_path = run_root / 'full-stack-combined.log'
+    combined_path.write_bytes(
+        scanner.combined_launch_log_bytes(
+            run_root / 'processes/full_stack.stdout.log',
+            run_root / 'processes/full_stack.stderr.log',
+            maximum_stream_bytes=8 * 1024 * 1024,
+        )
+    )
+    replayed = scanner.scan_final_launch_log(
+        combined_path.resolve(strict=True),
+        recorded_gate['launch_stopped_utc'],
+        scanned_utc=recorded_gate['scanned_utc'],
+    )
+    assert replayed['verdict'] == 'FAIL'
+    assert replayed['match_count'] >= 1
+    replayed.update(
+        {
+            'failure_kind': None,
+            'failure_message': None,
+            'match_count': 0,
+            'matches': [],
+            'verdict': 'PASS',
+        }
+    )
+    _canonical_file(gate_path, replayed, sidecar=True)
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='differs from clone-local scanner replay'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    'case',
+    ['extra_field', 'schema_version', 'hash', 'path', 'signature_order'],
+)
+def test_release_evidence_rejects_rebound_phase3_final_launch_gate_forgery(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    gate_path = run_root / 'full-stack-final-log-gate.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    if case == 'extra_field':
+        gate['forged'] = True
+    elif case == 'schema_version':
+        gate['schema_version'] = 2
+    elif case == 'hash':
+        gate['launch_log_sha256'] = '0' * 64
+    elif case == 'path':
+        gate['launch_log_path'] = str(run_root / 'processes/full_stack.stdout.log')
+    else:
+        gate['signature_definitions'].reverse()
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='final launch-log signature gate'):
+        _validate_release_fixture(fixture)
+
+
 @pytest.mark.parametrize('case', ['mission_before_graph', 'stack_ends_before_final_gate'])
 def test_release_evidence_rejects_rebound_phase3_process_timeline_forgery(
     tmp_path: Path,
@@ -5615,7 +5813,16 @@ def test_release_evidence_rejects_phase3_orchestrator_execution_forgery(
         _validate_release_fixture(fixture)
 
 
-@pytest.mark.parametrize('omitted_path', ['resources.jsonl', 'lifecycle-ready-map_server.txt'])
+@pytest.mark.parametrize(
+    'omitted_path',
+    [
+        'resources.jsonl',
+        'lifecycle-ready-map_server.txt',
+        'full-stack-combined.log',
+        'full-stack-final-log-gate.json',
+        'full-stack-final-log-gate.json.sha256',
+    ],
+)
 def test_release_evidence_rejects_deleted_rebound_phase3_prerequisite(
     tmp_path: Path,
     omitted_path: str,
