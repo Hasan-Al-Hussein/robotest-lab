@@ -794,8 +794,51 @@ def validate_contact_control_ready(document: Any, *, expected_run_id: str) -> di
         or any(not isinstance(item, str) or not item for item in expected_pair)
     ):
         raise EvidenceError('contact-control readiness expected pair is invalid')
-    for field in ('observed_robot_start', 'observed_wall', 'resolved_names', 'spawn'):
+    for field in ('observed_robot_start', 'observed_wall', 'resolved_names'):
         _require_mapping(ready.get(field), f'contact_control.ready.{field}')
+    spawn = _require_mapping(ready.get('spawn'), 'contact_control.ready.spawn')
+    expected_spawn_keys = {
+        'attempt_count',
+        'error',
+        'request_sequence',
+        'request_stamp_ns',
+        'response_sequence',
+        'response_stamp_ns',
+        'success',
+    }
+    if set(spawn) != expected_spawn_keys:
+        raise EvidenceError('contact-control readiness spawn keys are invalid')
+    attempt_count = _require_int(
+        spawn.get('attempt_count'), 'contact_control.ready.spawn.attempt_count', minimum=1
+    )
+    request_sequence = _require_int(
+        spawn.get('request_sequence'),
+        'contact_control.ready.spawn.request_sequence',
+        minimum=1,
+    )
+    response_sequence = _require_int(
+        spawn.get('response_sequence'),
+        'contact_control.ready.spawn.response_sequence',
+        minimum=1,
+    )
+    request_stamp_ns = _require_int(
+        spawn.get('request_stamp_ns'),
+        'contact_control.ready.spawn.request_stamp_ns',
+        minimum=0,
+    )
+    response_stamp_ns = _require_int(
+        spawn.get('response_stamp_ns'),
+        'contact_control.ready.spawn.response_stamp_ns',
+        minimum=0,
+    )
+    if (
+        attempt_count != 1
+        or spawn.get('error') is not None
+        or spawn.get('success') is not True
+        or response_sequence <= request_sequence
+        or response_stamp_ns < request_stamp_ns
+    ):
+        raise EvidenceError('contact-control readiness successful spawn proof is invalid')
     return dict(ready)
 
 

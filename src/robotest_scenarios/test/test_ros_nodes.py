@@ -139,6 +139,65 @@ def test_contact_graph_rejects_invalid_rmw_endpoint_gids(value: str) -> None:
     assert not ContactControlApp._endpoint_gid_is_valid(value)
 
 
+def test_contact_spawn_success_returns_complete_ready_and_result_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = load_coverage_manifest(str(REPOSITORY / 'config' / 'collision-coverage.yaml'))
+    app = ContactControlApp(
+        manifest=manifest,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        arm_path=tmp_path / 'arm.json',
+        armed_path=tmp_path / 'armed.json',
+        run_id='spawn-projection-test',
+        wall_timeout_s=30.0,
+        service_timeout_s=2.0,
+        raw_ros_args=[],
+    )
+    app.wall_asset = tmp_path / 'wall.sdf'
+    app.wall_asset_sha256 = 'a' * 64
+    sequences = iter((41, 42))
+    future = SimpleNamespace(
+        done=lambda: True,
+        result=lambda: SimpleNamespace(success=True),
+    )
+    app.node = SimpleNamespace(
+        _next_sequence=lambda: next(sequences),
+        current_sim_stamp_ns=5_000_000_000,
+        resolve_topic_name=lambda name: name,
+        spawn_client=SimpleNamespace(call_async=lambda _request: future),
+    )
+    monkeypatch.setattr(app, '_wait_service', lambda *_args, **_kwargs: None)
+
+    spawn = app._spawn_wall()
+    expected_keys = {
+        'attempt_count',
+        'error',
+        'request_sequence',
+        'request_stamp_ns',
+        'response_sequence',
+        'response_stamp_ns',
+        'success',
+    }
+    assert set(spawn) == expected_keys
+    assert spawn == app.setup_evidence['spawn']
+    assert spawn is not app.setup_evidence['spawn']
+    assert spawn['error'] is None
+
+    app.observed_start = {'sim_stamp_ns': 4_900_000_000}
+    observed_wall = {'stamp_ns': 5_000_000_000}
+    app.setup_evidence['observed_robot_start'] = app.observed_start
+    app.setup_evidence['observed_wall'] = observed_wall
+    app._write_ready(spawn, observed_wall)
+    ready = json.loads(app.ready_path.read_text(encoding='utf-8'))
+    assert ready['spawn'] == app.setup_evidence['spawn']
+    assert set(ready['spawn']) == expected_keys
+
+    spawn['attempt_count'] = 999
+    assert app.setup_evidence['spawn']['attempt_count'] == 1
+
+
 def test_contact_arm_waits_for_request_and_strictly_newer_positive_clock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1368,7 +1368,7 @@ class ContactControlApp:
             'success': True,
         }
         spawn_evidence.update(result)
-        return result
+        return dict(spawn_evidence)
 
     def _observe_wall(self, spawn: dict[str, Any]) -> dict[str, Any]:
         def candidate() -> WallPoseEvidence | None:

@@ -1015,6 +1015,137 @@ def _positive_topic_fixture(
     }
 
 
+def _contact_control_arm_protocol_fixture() -> dict[str, object]:
+    return {
+        'ack_max_bytes': 4_096,
+        'ack_producer': 'robotest_scenarios/contact_control_driver',
+        'action': 'start_positive_control_motion',
+        'fresh_clock_policy': 'strictly_newer_positive_stamp_after_valid_arm',
+        'request_max_bytes': 4_096,
+        'request_producer': 'robotest_phase3/benchmark_runner',
+        'schema_version': 1,
+        'wait_deadline_policy': 'complete_fixture_steady_wall_deadline_without_reset',
+    }
+
+
+def _successful_contact_control_spawn_fixture() -> dict[str, object]:
+    return {
+        'attempt_count': 1,
+        'error': None,
+        'request_sequence': 10,
+        'request_stamp_ns': 100,
+        'response_sequence': 11,
+        'response_stamp_ns': 101,
+        'success': True,
+    }
+
+
+def _contact_control_ready_fixture() -> dict[str, object]:
+    arm_protocol = _contact_control_arm_protocol_fixture()
+    control_configuration = {'arm_protocol': arm_protocol}
+    return {
+        'arm_protocol': arm_protocol,
+        'arm_protocol_sha256': orchestration.canonical_sha256(arm_protocol),
+        'control_configuration_sha256': orchestration.canonical_sha256(control_configuration),
+        'expected_pair': ['robotest::base::collision', 'wall::link::collision'],
+        'fixture_sha256': '6' * 64,
+        'identity': {
+            'fixture_id': 'collision_positive_control',
+            'run_id': 'positive',
+        },
+        'observed_robot_start': {},
+        'observed_wall': {},
+        'producer': 'robotest_scenarios/contact_control_driver',
+        'ready_steady_ns': 10,
+        'resolved_names': {},
+        'schema_version': 1,
+        'spawn': _successful_contact_control_spawn_fixture(),
+    }
+
+
+def test_validate_contact_control_ready_accepts_exact_successful_spawn() -> None:
+    ready = _contact_control_ready_fixture()
+
+    assert orchestration.validate_contact_control_ready(ready, expected_run_id='positive') == ready
+
+
+@pytest.mark.parametrize('mutation', ('missing', 'extra'))
+def test_validate_contact_control_ready_rejects_inexact_spawn_keys(mutation: str) -> None:
+    ready = _contact_control_ready_fixture()
+    spawn = ready['spawn']
+    assert isinstance(spawn, dict)
+    if mutation == 'missing':
+        del spawn['error']
+    else:
+        spawn['forged'] = None
+
+    with pytest.raises(orchestration.EvidenceError, match='readiness spawn keys are invalid'):
+        orchestration.validate_contact_control_ready(ready, expected_run_id='positive')
+
+
+def test_validate_contact_control_ready_rejects_nonnull_spawn_error() -> None:
+    ready = _contact_control_ready_fixture()
+    spawn = ready['spawn']
+    assert isinstance(spawn, dict)
+    spawn['error'] = 'forged successful response'
+
+    with pytest.raises(
+        orchestration.EvidenceError,
+        match='readiness successful spawn proof is invalid',
+    ):
+        orchestration.validate_contact_control_ready(ready, expected_run_id='positive')
+
+
+@pytest.mark.parametrize(
+    ('field', 'value', 'error'),
+    (
+        ('attempt_count', True, 'attempt_count must be an integer'),
+        ('request_sequence', '10', 'request_sequence must be an integer'),
+        ('request_stamp_ns', False, 'request_stamp_ns must be an integer'),
+        ('response_sequence', 10.0, 'response_sequence must be an integer'),
+        ('response_stamp_ns', '101', 'response_stamp_ns must be an integer'),
+        ('success', 1, 'readiness successful spawn proof is invalid'),
+    ),
+)
+def test_validate_contact_control_ready_rejects_spawn_type_substitution(
+    field: str,
+    value: object,
+    error: str,
+) -> None:
+    ready = _contact_control_ready_fixture()
+    spawn = ready['spawn']
+    assert isinstance(spawn, dict)
+    spawn[field] = value
+
+    with pytest.raises(orchestration.EvidenceError, match=error):
+        orchestration.validate_contact_control_ready(ready, expected_run_id='positive')
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    (
+        ('attempt_count', 2),
+        ('response_sequence', 10),
+        ('response_stamp_ns', 99),
+        ('success', False),
+    ),
+)
+def test_validate_contact_control_ready_rejects_unsuccessful_spawn_semantics(
+    field: str,
+    value: object,
+) -> None:
+    ready = _contact_control_ready_fixture()
+    spawn = ready['spawn']
+    assert isinstance(spawn, dict)
+    spawn[field] = value
+
+    with pytest.raises(
+        orchestration.EvidenceError,
+        match='readiness successful spawn proof is invalid',
+    ):
+        orchestration.validate_contact_control_ready(ready, expected_run_id='positive')
+
+
 def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path) -> None:
     workspace = Path(__file__).parents[1].resolve()
     positive_dir = tmp_path / 'positive-control'
@@ -1077,18 +1208,10 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     }
     manifest_path = tmp_path / 'coverage.yaml'
     manifest_path.write_text(yaml.safe_dump(manifest, sort_keys=True), encoding='utf-8')
-    arm_protocol = {
-        'ack_max_bytes': 4_096,
-        'ack_producer': 'robotest_scenarios/contact_control_driver',
-        'action': 'start_positive_control_motion',
-        'fresh_clock_policy': 'strictly_newer_positive_stamp_after_valid_arm',
-        'request_max_bytes': 4_096,
-        'request_producer': 'robotest_phase3/benchmark_runner',
-        'schema_version': 1,
-        'wait_deadline_policy': 'complete_fixture_steady_wall_deadline_without_reset',
-    }
+    arm_protocol = _contact_control_arm_protocol_fixture()
     control_configuration = {'arm_protocol': arm_protocol}
     control_configuration_sha256 = orchestration.canonical_sha256(control_configuration)
+    spawn_evidence = _successful_contact_control_spawn_fixture()
     driver_ready_path = positive_dir / 'contact-control.ready.json'
     driver_ready = {
         'arm_protocol': arm_protocol,
@@ -1106,7 +1229,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         'ready_steady_ns': 10,
         'resolved_names': {},
         'schema_version': 1,
-        'spawn': {},
+        'spawn': copy.deepcopy(spawn_evidence),
     }
     orchestration.atomic_write_json(driver_ready_path, driver_ready)
     driver_ready_sha256 = orchestration.file_sha256(driver_ready_path)
@@ -1403,7 +1526,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             'setup': {
                 'observed_robot_start': {},
                 'observed_wall': {},
-                'spawn': {},
+                'spawn': copy.deepcopy(spawn_evidence),
             },
             'contact': {
                 'episodes': [
@@ -1618,6 +1741,25 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         'release_qualified_snapshot_stamp_ns': 300_000_000,
         'release_required_through_stamp_ns': 250_000_000,
     }
+
+    missing_spawn_error = copy.deepcopy(result)
+    del missing_spawn_error['control']['setup']['spawn']['error']
+    divergent_spawn_stamp = copy.deepcopy(result)
+    divergent_spawn_stamp['control']['setup']['spawn']['response_stamp_ns'] += 1
+    for divergent_result in (missing_spawn_error, divergent_spawn_stamp):
+        with pytest.raises(
+            orchestration.EvidenceError,
+            match='contact-control readiness setup binding mismatch',
+        ):
+            orchestration._reconcile_contact_control_arm_handshake(
+                workspace=workspace,
+                result=divergent_result,
+                result_path=result_path,
+                driver_ready_path=driver_ready_path,
+                arm_request_path=arm_request_path,
+                armed_ack_path=armed_ack_path,
+                runtime_gate_path=runtime_gate_path,
+            )
 
     frozen_gate = orchestration.load_json(runtime_gate_path)
     frozen_process = orchestration.load_json(runtime_gate_process_path)
