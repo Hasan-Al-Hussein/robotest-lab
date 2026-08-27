@@ -448,6 +448,7 @@ PHASE3_FINAL_LAUNCH_LOG_GATE_KEYS = {
     'launch_log_sha256',
     'launch_log_size_bytes',
     'launch_stopped_utc',
+    'lifecycle_timeout_recovery',
     'line_count',
     'match_count',
     'matches',
@@ -455,6 +456,19 @@ PHASE3_FINAL_LAUNCH_LOG_GATE_KEYS = {
     'schema_version',
     'signature_definitions',
     'verdict',
+}
+PHASE3_LIFECYCLE_TIMEOUT_RECOVERY_KEYS = {
+    'lifecycle_ready_path',
+    'lifecycle_ready_sha256',
+    'lifecycle_ready_size_bytes',
+    'recovered_line_count',
+    'recovered_lines',
+}
+PHASE3_RECOVERED_LIFECYCLE_TIMEOUT_KEYS = {
+    'line_number',
+    'service_name',
+    'text',
+    'timed_out_attempts',
 }
 
 
@@ -1978,6 +1992,9 @@ def _phase3_bounded_process_record(
 def _validate_phase3_final_launch_log_gate(
     repository: Path,
     run_root: Path,
+    *,
+    expected_lifecycle_watch_pid: int,
+    expected_lifecycle_nodes: tuple[str, ...],
 ) -> Mapping[str, Any]:
     """Rebuild and replay the manifest-bound final full-stack launch-log gate."""
     source = _load_repository_module(
@@ -2010,6 +2027,12 @@ def _validate_phase3_final_launch_log_gate(
         observed_combined == rebuilt,
         'Phase 3 final combined launch log differs from finalized full_stack streams',
     )
+    lifecycle_ready_path = _regular_file(
+        run_root / 'lifecycle-ready.json',
+        'Phase 3 lifecycle-ready evidence',
+    )
+    lifecycle_ready_bytes = lifecycle_ready_path.read_bytes()
+    resolved_lifecycle_ready = lifecycle_ready_path.resolve(strict=True)
 
     gate_path = run_root / 'full-stack-final-log-gate.json'
     gate = _load_canonical_json(
@@ -2042,6 +2065,10 @@ def _validate_phase3_final_launch_log_gate(
             resolved_combined,
             launch_stopped_utc,
             scanned_utc=scanned_utc,
+            lifecycle_ready_path=resolved_lifecycle_ready,
+            expected_lifecycle_watch_pid=expected_lifecycle_watch_pid,
+            expected_lifecycle_wall_timeout_s=110.0,
+            expected_lifecycle_nodes=expected_lifecycle_nodes,
         )
     except Exception as exc:
         raise EvidenceError(
@@ -2055,8 +2082,87 @@ def _validate_phase3_final_launch_log_gate(
         _exact_json_equal(gate, replayed),
         'Phase 3 final launch-log signature gate differs from clone-local scanner replay',
     )
+    raw_matches = _list(
+        gate.get('matches'),
+        'Phase 3 final launch-log raw matches',
+    )
+    match_count = gate.get('match_count')
     _require(
-        gate.get('schema_version') == 1
+        _exact_integer(match_count) and match_count >= 0 and match_count == len(raw_matches),
+        'Phase 3 final launch-log raw match count is invalid',
+    )
+    for index, raw_match_value in enumerate(raw_matches):
+        raw_match = _mapping(
+            raw_match_value,
+            f'Phase 3 final launch-log raw match {index}',
+        )
+        signature_ids = _list(
+            raw_match.get('signature_ids'),
+            f'Phase 3 final launch-log raw match {index} signatures',
+        )
+        _require(
+            set(raw_match) == {'line_number', 'signature_ids', 'text'}
+            and _exact_integer(raw_match.get('line_number'))
+            and raw_match['line_number'] > 0
+            and signature_ids
+            and all(isinstance(value, str) and value for value in signature_ids)
+            and isinstance(raw_match.get('text'), str),
+            f'Phase 3 final launch-log raw match {index} fields are invalid',
+        )
+    recovery = _mapping(
+        gate.get('lifecycle_timeout_recovery'),
+        'Phase 3 lifecycle timeout recovery binding',
+    )
+    recovered_lines = _list(
+        recovery.get('recovered_lines'),
+        'Phase 3 recovered lifecycle timeout lines',
+    )
+    recovered_line_count = recovery.get('recovered_line_count')
+    _require(
+        set(recovery) == PHASE3_LIFECYCLE_TIMEOUT_RECOVERY_KEYS
+        and recovery.get('lifecycle_ready_path') == str(resolved_lifecycle_ready)
+        and recovery.get('lifecycle_ready_sha256')
+        == hashlib.sha256(lifecycle_ready_bytes).hexdigest()
+        and recovery.get('lifecycle_ready_size_bytes') == len(lifecycle_ready_bytes)
+        and len(lifecycle_ready_bytes) > 0
+        and _exact_integer(recovered_line_count)
+        and recovered_line_count >= 0
+        and recovered_line_count == len(recovered_lines),
+        'Phase 3 lifecycle timeout recovery binding is invalid',
+    )
+    recovered_pairs: list[tuple[int, str]] = []
+    for index, recovered_value in enumerate(recovered_lines):
+        recovered = _mapping(
+            recovered_value,
+            f'Phase 3 recovered lifecycle timeout line {index}',
+        )
+        line_number = recovered.get('line_number')
+        service_name = recovered.get('service_name')
+        timed_out_attempts = recovered.get('timed_out_attempts')
+        _require(
+            set(recovered) == PHASE3_RECOVERED_LIFECYCLE_TIMEOUT_KEYS
+            and _exact_integer(line_number)
+            and line_number > 0
+            and isinstance(service_name, str)
+            and re.fullmatch(r'/robotest/[A-Za-z0-9_]+/get_state', service_name) is not None
+            and isinstance(recovered.get('text'), str)
+            and _exact_integer(timed_out_attempts)
+            and timed_out_attempts > 0,
+            f'Phase 3 recovered lifecycle timeout line {index} fields are invalid',
+        )
+        recovered_pairs.append((line_number, recovered['text']))
+    raw_pairs = [(value['line_number'], value['text']) for value in raw_matches]
+    _require(
+        recovered_pairs == raw_pairs
+        and len({line_number for line_number, _ in recovered_pairs}) == len(recovered_pairs)
+        and (
+            not raw_matches
+            or all(value['signature_ids'] == ['dds_response_timeout'] for value in raw_matches)
+        ),
+        'Phase 3 recovered lifecycle timeout lines do not exactly audit raw matches',
+    )
+    _require(
+        gate.get('schema_version') == 2
         and gate.get('verdict') == 'PASS'
         and gate.get('failure_kind') is None
         and gate.get('failure_message') is None
@@ -2064,10 +2170,9 @@ def _validate_phase3_final_launch_log_gate(
         and gate.get('launch_log_sha256') == hashlib.sha256(rebuilt).hexdigest()
         and gate.get('launch_log_size_bytes') == len(rebuilt)
         and gate.get('line_count') == len(rebuilt.decode('utf-8').splitlines())
-        and gate.get('match_count') == 0
-        and gate.get('matches') == []
+        and match_count == recovered_line_count
         and gate.get('signature_definitions') == replayed['signature_definitions'],
-        'Phase 3 final launch-log signature gate is not an exact zero-match PASS',
+        'Phase 3 final launch-log signature gate is not an exact recovered-or-zero-match PASS',
     )
     return gate
 
@@ -2242,7 +2347,12 @@ def _validate_phase3_graph_prerequisites(
 
     full_stack_process = process_records['full_stack']
     mission_process = process_records['mission_runner']
-    _validate_phase3_final_launch_log_gate(repository, run_root)
+    _validate_phase3_final_launch_log_gate(
+        repository,
+        run_root,
+        expected_lifecycle_watch_pid=full_stack_process['pid'],
+        expected_lifecycle_nodes=tuple(orchestration.REQUIRED_LIFECYCLE_NODES),
+    )
     expected_mission_command = process_contracts['mission_runner'][0]
     _require(
         full_stack_process.get('returncode') in (-15, 0)

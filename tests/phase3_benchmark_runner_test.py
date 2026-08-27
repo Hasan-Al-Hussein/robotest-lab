@@ -66,6 +66,53 @@ def _finalized_launch(
     )
 
 
+def _write_lifecycle_ready(
+    root: Path,
+    *,
+    node_names: tuple[str, ...] = runner.LIFECYCLE_NODES,
+    timeout_node: str = 'amcl',
+    attempts: int = 2,
+    timed_out_attempts: int = 1,
+    watch_pid: int = 1234,
+    wall_timeout_s: float = runner.LIFECYCLE_READY_WALL_TIMEOUT_S,
+) -> Path:
+    path = root / 'lifecycle-ready.json'
+    document = {
+        'failure': None,
+        'namespace': '/robotest',
+        'required_state': {'id': 3, 'label': 'active'},
+        'states': {
+            node_name: {
+                'attempts': attempts if node_name == timeout_node else 1,
+                'label': 'active',
+                'service': f'/robotest/{node_name}/get_state',
+                'service_seen': True,
+                'state_id': 3,
+                'timed_out_attempts': (timed_out_attempts if node_name == timeout_node else 0),
+            }
+            for node_name in node_names
+        },
+        'verdict': 'PASS',
+        'wall_timeout_s': wall_timeout_s,
+        'watch_pid': watch_pid,
+    }
+    path.write_text(startup_gate.serialize_result(document), encoding='utf-8')
+    return path
+
+
+def _lifecycle_expectations(
+    *,
+    watch_pid: int = 1234,
+    wall_timeout_s: float = runner.LIFECYCLE_READY_WALL_TIMEOUT_S,
+    node_names: tuple[str, ...] = runner.LIFECYCLE_NODES,
+) -> dict[str, object]:
+    return {
+        'expected_lifecycle_watch_pid': watch_pid,
+        'expected_lifecycle_wall_timeout_s': wall_timeout_s,
+        'expected_lifecycle_nodes': node_names,
+    }
+
+
 def test_finalized_component_artifact_gets_one_verified_sidecar(tmp_path: Path) -> None:
     artifact = tmp_path / 'capture.json'
     artifact.write_bytes(b'{"capture_schema_version":1}\n')
@@ -93,12 +140,15 @@ def test_final_launch_log_gate_combines_closed_streams_and_replays_exactly(
     )
     launch_stopped_utc = '2026-08-27T07:00:00Z'
     scanned_utc = '2026-08-27T07:00:01Z'
+    lifecycle_ready = _write_lifecycle_ready(tmp_path)
 
     evidence = runner._finalize_full_stack_log_gate(
         launch,
         tmp_path,
         launch_stopped_utc=launch_stopped_utc,
         scanned_utc=scanned_utc,
+        lifecycle_ready_path=lifecycle_ready,
+        **_lifecycle_expectations(),
     )
 
     combined = tmp_path / runner.FULL_STACK_COMBINED_LOG_NAME
@@ -111,14 +161,278 @@ def test_final_launch_log_gate_combines_closed_streams_and_replays_exactly(
     assert evidence['scanned_utc'] == scanned_utc
     assert evidence['launch_log_path'] == str(combined)
     assert evidence['launch_log_sha256'] == orchestration.file_sha256(combined)
+    assert evidence['schema_version'] == 2
+    assert evidence['lifecycle_timeout_recovery'] == {
+        'lifecycle_ready_path': str(lifecycle_ready.resolve()),
+        'lifecycle_ready_sha256': orchestration.file_sha256(lifecycle_ready),
+        'lifecycle_ready_size_bytes': lifecycle_ready.stat().st_size,
+        'recovered_line_count': 0,
+        'recovered_lines': [],
+    }
     assert (
         startup_gate.scan_final_launch_log(
             combined,
             evidence['launch_stopped_utc'],
             scanned_utc=evidence['scanned_utc'],
+            lifecycle_ready_path=lifecycle_ready,
+            **_lifecycle_expectations(),
         )
         == evidence
     )
+
+
+def test_final_launch_log_gate_recovers_only_counter_witnessed_lifecycle_timeout(
+    tmp_path: Path,
+) -> None:
+    timeout_line = (
+        '[collision_monitor-15] failed to send response to '
+        '/robotest/amcl/get_state (timeout): client will not receive response'
+    )
+    launch = _finalized_launch(
+        tmp_path,
+        stdout=f'{timeout_line}\n'.encode(),
+        stderr=b'',
+    )
+    lifecycle_ready = _write_lifecycle_ready(
+        tmp_path,
+        attempts=3,
+        timed_out_attempts=2,
+    )
+
+    evidence = runner._finalize_full_stack_log_gate(
+        launch,
+        tmp_path,
+        launch_stopped_utc='2026-08-27T07:00:00Z',
+        scanned_utc='2026-08-27T07:00:01Z',
+        lifecycle_ready_path=lifecycle_ready,
+        **_lifecycle_expectations(),
+    )
+
+    assert evidence['verdict'] == 'PASS'
+    assert evidence['match_count'] == 1
+    assert evidence['matches'] == [
+        {
+            'line_number': 1,
+            'signature_ids': ['dds_response_timeout'],
+            'text': timeout_line,
+        }
+    ]
+    recovery = evidence['lifecycle_timeout_recovery']
+    assert recovery['recovered_line_count'] == 1
+    assert recovery['recovered_lines'] == [
+        {
+            'line_number': 1,
+            'service_name': '/robotest/amcl/get_state',
+            'text': timeout_line,
+            'timed_out_attempts': 2,
+        }
+    ]
+    assert recovery['lifecycle_ready_path'] == str(lifecycle_ready.resolve())
+    assert recovery['lifecycle_ready_sha256'] == orchestration.file_sha256(lifecycle_ready)
+    assert recovery['lifecycle_ready_size_bytes'] == lifecycle_ready.stat().st_size
+
+
+def test_final_launch_log_gate_rejects_lifecycle_timeout_comixed_with_generic_timeout(
+    tmp_path: Path,
+) -> None:
+    line = (
+        'failed to send response to /robotest/amcl/get_state (timeout); '
+        'failed to send response for unrelated request (timeout)'
+    )
+    launch = _finalized_launch(tmp_path, stdout=f'{line}\n'.encode(), stderr=b'')
+    lifecycle_ready = _write_lifecycle_ready(tmp_path)
+
+    with pytest.raises(runner.StageFailure) as captured:
+        runner._finalize_full_stack_log_gate(
+            launch,
+            tmp_path,
+            launch_stopped_utc='2026-08-27T07:00:00Z',
+            scanned_utc='2026-08-27T07:00:01Z',
+            lifecycle_ready_path=lifecycle_ready,
+            **_lifecycle_expectations(),
+        )
+
+    assert captured.value.kind == 'launch_log_signature_detected'
+    evidence = orchestration.load_canonical_json(tmp_path / runner.FINAL_LAUNCH_LOG_GATE_NAME)
+    assert evidence['verdict'] == 'FAIL'
+    assert evidence['match_count'] == 1
+    assert evidence['matches'][0]['signature_ids'] == ['dds_response_timeout']
+    assert evidence['lifecycle_timeout_recovery']['recovered_line_count'] == 0
+    assert evidence['lifecycle_timeout_recovery']['recovered_lines'] == []
+
+
+@pytest.mark.parametrize(
+    'line',
+    (
+        'FAILED TO SEND RESPONSE TO /robotest/amcl/get_state (timeout)',
+        'failed to send response to /other/amcl/get_state (timeout)',
+        'failed to send response to /robotest/amcl/set_parameters (timeout)',
+        'failed to send response to /robotest/unlisted_node/get_state (timeout)',
+        (
+            'failed to send response to /robotest/amcl/get_state (timeout); '
+            'failed to send response to /robotest/amcl/get_state (timeout)'
+        ),
+        'failed to send response to /robotest/amcl/get_state (timeout): fatal condition',
+        'Failed to bring up all requested nodes',
+    ),
+)
+def test_final_launch_log_gate_refuses_nonexact_or_comixed_timeout_recovery(
+    tmp_path: Path,
+    line: str,
+) -> None:
+    launch = _finalized_launch(tmp_path, stdout=f'{line}\n'.encode(), stderr=b'')
+    lifecycle_ready = _write_lifecycle_ready(tmp_path)
+
+    with pytest.raises(runner.StageFailure) as captured:
+        runner._finalize_full_stack_log_gate(
+            launch,
+            tmp_path,
+            launch_stopped_utc='2026-08-27T07:00:00Z',
+            scanned_utc='2026-08-27T07:00:01Z',
+            lifecycle_ready_path=lifecycle_ready,
+            **_lifecycle_expectations(),
+        )
+
+    assert captured.value.kind == 'launch_log_signature_detected'
+    evidence = orchestration.load_canonical_json(tmp_path / runner.FINAL_LAUNCH_LOG_GATE_NAME)
+    assert evidence['verdict'] == 'FAIL'
+    assert evidence['match_count'] == 1
+    assert evidence['lifecycle_timeout_recovery']['recovered_line_count'] == 0
+    assert evidence['lifecycle_timeout_recovery']['recovered_lines'] == []
+
+
+def test_final_launch_log_gate_rejects_timeout_lines_in_excess_of_witness(
+    tmp_path: Path,
+) -> None:
+    timeout_line = 'failed to send response to /robotest/amcl/get_state (timeout)'
+    launch = _finalized_launch(
+        tmp_path,
+        stdout=f'{timeout_line}\n{timeout_line}\n'.encode(),
+        stderr=b'',
+    )
+    lifecycle_ready = _write_lifecycle_ready(tmp_path)
+
+    with pytest.raises(runner.StageFailure) as captured:
+        runner._finalize_full_stack_log_gate(
+            launch,
+            tmp_path,
+            launch_stopped_utc='2026-08-27T07:00:00Z',
+            scanned_utc='2026-08-27T07:00:01Z',
+            lifecycle_ready_path=lifecycle_ready,
+            **_lifecycle_expectations(),
+        )
+
+    assert captured.value.kind == 'launch_log_signature_detected'
+    evidence = orchestration.load_canonical_json(tmp_path / runner.FINAL_LAUNCH_LOG_GATE_NAME)
+    assert evidence['match_count'] == 2
+    recovery = evidence['lifecycle_timeout_recovery']
+    assert recovery['recovered_line_count'] == 1
+    assert recovery['recovered_lines'][0]['line_number'] == 1
+
+
+def test_final_launch_log_gate_rejects_exact_timeout_without_counter_witness(
+    tmp_path: Path,
+) -> None:
+    timeout_line = 'failed to send response to /robotest/amcl/get_state (timeout)'
+    launch = _finalized_launch(tmp_path, stdout=f'{timeout_line}\n'.encode(), stderr=b'')
+    lifecycle_ready = _write_lifecycle_ready(
+        tmp_path,
+        attempts=1,
+        timed_out_attempts=0,
+    )
+
+    with pytest.raises(runner.StageFailure) as captured:
+        runner._finalize_full_stack_log_gate(
+            launch,
+            tmp_path,
+            launch_stopped_utc='2026-08-27T07:00:00Z',
+            scanned_utc='2026-08-27T07:00:01Z',
+            lifecycle_ready_path=lifecycle_ready,
+            **_lifecycle_expectations(),
+        )
+
+    assert captured.value.kind == 'launch_log_signature_detected'
+    evidence = orchestration.load_canonical_json(tmp_path / runner.FINAL_LAUNCH_LOG_GATE_NAME)
+    assert evidence['match_count'] == 1
+    assert evidence['lifecycle_timeout_recovery']['recovered_line_count'] == 0
+
+
+@pytest.mark.parametrize(
+    'malformation',
+    (
+        'noncanonical',
+        'invalid_counters',
+        'wrong_service',
+        'failed_verdict',
+        'wrong_pid',
+        'wrong_timeout',
+        'missing_node',
+        'extra_node',
+    ),
+)
+def test_final_launch_log_gate_rejects_malformed_lifecycle_recovery_artifact(
+    tmp_path: Path,
+    malformation: str,
+) -> None:
+    launch = _finalized_launch(tmp_path, stdout=b'healthy\n', stderr=b'')
+    node_names = runner.LIFECYCLE_NODES
+    if malformation == 'missing_node':
+        node_names = runner.LIFECYCLE_NODES[:-1]
+    elif malformation == 'extra_node':
+        node_names = (*runner.LIFECYCLE_NODES, 'unrelated_node')
+    lifecycle_ready = _write_lifecycle_ready(
+        tmp_path,
+        node_names=node_names,
+        attempts=1 if malformation == 'invalid_counters' else 2,
+        timed_out_attempts=1,
+        watch_pid=4321 if malformation == 'wrong_pid' else 1234,
+        wall_timeout_s=(
+            109.0 if malformation == 'wrong_timeout' else runner.LIFECYCLE_READY_WALL_TIMEOUT_S
+        ),
+    )
+    if malformation == 'noncanonical':
+        lifecycle_ready.write_text(
+            lifecycle_ready.read_text(encoding='utf-8') + ' ',
+            encoding='utf-8',
+        )
+    elif malformation == 'wrong_service':
+        lifecycle_ready.write_text(
+            lifecycle_ready.read_text(encoding='utf-8').replace(
+                '/robotest/amcl/get_state',
+                '/robotest/other/get_state',
+            ),
+            encoding='utf-8',
+        )
+    elif malformation == 'failed_verdict':
+        lifecycle_ready.write_text(
+            lifecycle_ready.read_text(encoding='utf-8').replace(
+                '"verdict": "PASS"',
+                '"verdict": "FAIL"',
+            ),
+            encoding='utf-8',
+        )
+
+    with pytest.raises(runner.StageFailure) as captured:
+        runner._finalize_full_stack_log_gate(
+            launch,
+            tmp_path,
+            launch_stopped_utc='2026-08-27T07:00:00Z',
+            scanned_utc='2026-08-27T07:00:01Z',
+            lifecycle_ready_path=lifecycle_ready,
+            **_lifecycle_expectations(),
+        )
+
+    assert captured.value.kind == 'launch_log_recovery_invalid'
+    evidence = orchestration.load_canonical_json(tmp_path / runner.FINAL_LAUNCH_LOG_GATE_NAME)
+    assert evidence['verdict'] == 'FAIL'
+    assert evidence['match_count'] == 0
+    assert evidence['lifecycle_timeout_recovery'] == {
+        'lifecycle_ready_path': None,
+        'lifecycle_ready_sha256': None,
+        'lifecycle_ready_size_bytes': None,
+        'recovered_line_count': 0,
+        'recovered_lines': [],
+    }
 
 
 @pytest.mark.parametrize('stream', ('stdout', 'stderr'))
@@ -293,6 +607,15 @@ def test_final_log_gate_runs_after_stop_and_before_domain_cleanup() -> None:
         < domain_cleanup
     )
     assert "registry.run_checked(\n                    'final_launch_log_gate'" not in trial_source
+    assert "lifecycle_ready_path=run_dir / 'lifecycle-ready.json'" in trial_source
+    assert 'expected_lifecycle_watch_pid=launch.pid' in trial_source
+    assert 'expected_lifecycle_wall_timeout_s=LIFECYCLE_READY_WALL_TIMEOUT_S' in trial_source
+    assert 'expected_lifecycle_nodes=LIFECYCLE_NODES' in trial_source
+    assert format(runner.LIFECYCLE_READY_WALL_TIMEOUT_S, 'g') == '110'
+    assert (
+        "'--wall-timeout',\n                    "
+        "format(LIFECYCLE_READY_WALL_TIMEOUT_S, 'g')" in trial_source
+    )
 
 
 def test_component_sidecars_are_finalized_before_prerequisite_manifest() -> None:

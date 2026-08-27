@@ -1076,22 +1076,32 @@ def _phase3_profile_proc_stat(
     process_group: int,
     start_ticks: int,
     user_ticks: int,
+    comm: str = 'gz sim server',
+    parent_pid: int = 1,
+    session_id: int | None = None,
 ) -> str:
     fields = ['0'] * 50
     fields[0] = 'S'
-    fields[1] = '1'
+    fields[1] = str(parent_pid)
     fields[2] = str(process_group)
-    fields[3] = str(process_group)
+    fields[3] = str(process_group if session_id is None else session_id)
     fields[11] = str(user_ticks)
     fields[12] = '5'
     fields[17] = '1'
     fields[19] = str(start_ticks)
     fields[36] = '2'
-    return f'{pid} (gz sim server) {" ".join(fields)}\n'
+    return f'{pid} ({comm}) {" ".join(fields)}\n'
 
 
-def _write_phase3_profile_proc_host(proc_root: Path) -> None:
+def _write_phase3_profile_proc_host(
+    proc_root: Path,
+    *,
+    repository: Path,
+    candidate_root: Path,
+    domain_base: int,
+) -> None:
     (proc_root / 'pressure').mkdir(parents=True)
+    (proc_root / 'uptime').write_text('0.50 0.25\n', encoding='ascii')
     (proc_root / 'loadavg').write_text('1.00 0.50 0.25 2/100 999\n', encoding='ascii')
     (proc_root / 'stat').write_text(
         'ctxt 100\nprocesses 20\nprocs_running 2\nprocs_blocked 0\n',
@@ -1115,6 +1125,36 @@ def _write_phase3_profile_proc_host(proc_root: Path) -> None:
     (proc_root / 'pressure/cpu').write_text(some, encoding='ascii')
     (proc_root / 'pressure/io').write_text(some + full, encoding='ascii')
     (proc_root / 'pressure/memory').write_text(some + full, encoding='ascii')
+    owner = proc_root / '40'
+    owner.mkdir()
+    owner.joinpath('stat').write_text(
+        _phase3_profile_proc_stat(
+            40,
+            process_group=30,
+            session_id=30,
+            start_ticks=40,
+            user_ticks=10,
+            comm='python3',
+        ),
+        encoding='ascii',
+    )
+    owner.joinpath('cmdline').write_bytes(
+        b'/usr/bin/python3\0'
+        + str(repository / 'tests/phase3_benchmark_runner.py').encode()
+        + b'\0--workspace\0'
+        + str(repository).encode()
+        + b'\0--mode\0smoke\0--candidate-id\0'
+        + candidate_root.name.encode()
+        + b'\0--domain-base\0'
+        + str(domain_base).encode()
+        + b'\0--output-root\0artifacts/evidence/phase3-benchmarks\0'
+        + b'--build-binding\0'
+        + str(candidate_root / 'build-binding.json').encode()
+        + b'\0'
+    )
+    owner_executable = proc_root / 'smoke-runner-python'
+    owner_executable.write_bytes(b'python')
+    owner.joinpath('exe').symlink_to(owner_executable)
 
 
 def _write_phase3_profile_proc_process(
@@ -1131,7 +1171,9 @@ def _write_phase3_profile_proc_process(
     thread_root = process_root / 'task' / str(pid)
     thread_root.mkdir(parents=True, exist_ok=True)
     process_root.joinpath('environ').write_bytes(
-        f'ROS_DOMAIN_ID={domain_id}\0GZ_PARTITION={gz_partition}\0'.encode()
+        (
+            f'ROS_DOMAIN_ID={domain_id}\0GZ_PARTITION={gz_partition}\0ROBOTEST_CONTACT_PROFILE=1\0'
+        ).encode()
     )
     process_root.joinpath('cmdline').write_bytes(b'/usr/bin/gz\0sim\0-s\0')
     stat_text = _phase3_profile_proc_stat(
@@ -1139,6 +1181,7 @@ def _write_phase3_profile_proc_process(
         process_group=pid,
         start_ticks=start_ticks,
         user_ticks=user_ticks,
+        parent_pid=40,
     )
     process_root.joinpath('stat').write_text(stat_text, encoding='ascii')
     thread_root.joinpath('stat').write_text(stat_text, encoding='ascii')
@@ -1212,7 +1255,12 @@ def _write_phase3_smoke_profile_fixture(
         prefix='robotest-profile-proc-', dir=repository.parent
     ) as name:
         proc_root = Path(name)
-        _write_phase3_profile_proc_host(proc_root)
+        _write_phase3_profile_proc_host(
+            proc_root,
+            repository=repository,
+            candidate_root=candidate_root,
+            domain_base=config.ros_domain_id - 16,
+        )
         plugin_path = Path(identity['plugin']['path'])
         process_root = _write_phase3_profile_proc_process(
             proc_root,
@@ -1236,6 +1284,7 @@ def _write_phase3_smoke_profile_fixture(
                 process_group=pid,
                 start_ticks=start_ticks,
                 user_ticks=10 + step * 5,
+                parent_pid=40,
             )
             process_root.joinpath('stat').write_text(stat_text, encoding='ascii')
             process_root.joinpath('task', str(pid), 'stat').write_text(stat_text, encoding='ascii')
@@ -1743,12 +1792,45 @@ def _write_bounded_process_artifacts(
     _canonical_file(process_directory / f'{role}.process.json', process)
 
 
+def _phase3_lifecycle_replay_contract(repository: Path, run_root: Path) -> dict[str, object]:
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 lifecycle replay fixture contract',
+    )
+    full_stack = json.loads(
+        (run_root / 'processes/full_stack.process.json').read_text(encoding='utf-8')
+    )
+    return {
+        'expected_lifecycle_watch_pid': full_stack['pid'],
+        'expected_lifecycle_wall_timeout_s': 110.0,
+        'expected_lifecycle_nodes': tuple(orchestration.REQUIRED_LIFECYCLE_NODES),
+    }
+
+
+def _write_phase3_lifecycle_ready(
+    repository: Path,
+    run_root: Path,
+    document: dict,
+) -> None:
+    source = release_module._load_repository_module(
+        repository,
+        'tests/phase2_startup_gate.py',
+        'Phase 3 lifecycle-ready fixture serializer',
+    )
+    (run_root / 'lifecycle-ready.json').write_text(
+        source.serialize_result(document),
+        encoding='utf-8',
+    )
+
+
 def _write_phase3_final_launch_log_gate(
     repository: Path,
     run_root: Path,
     *,
     launch_stopped_utc: str = '2026-08-26T00:00:00Z',
     scanned_utc: str = '2026-08-26T00:00:01Z',
+    expected_verdict: str = 'PASS',
 ) -> dict:
     """Write production-shaped combined launch-log bytes and canonical scan evidence."""
     source = release_module._load_repository_module(
@@ -1768,10 +1850,55 @@ def _write_phase3_final_launch_log_gate(
         combined_path.resolve(strict=True),
         launch_stopped_utc,
         scanned_utc=scanned_utc,
+        lifecycle_ready_path=(run_root / 'lifecycle-ready.json').resolve(strict=True),
+        **_phase3_lifecycle_replay_contract(repository, run_root),
     )
-    assert gate['verdict'] == 'PASS', gate
+    assert gate['verdict'] == expected_verdict, gate
     _canonical_file(run_root / 'full-stack-final-log-gate.json', gate, sidecar=True)
     return gate
+
+
+def _append_phase3_full_stack_log(
+    run_root: Path,
+    payload: bytes,
+    *,
+    stream_name: str = 'stdout',
+) -> None:
+    """Append retained full-stack bytes and keep its process counters exact."""
+    stream_path = run_root / f'processes/full_stack.{stream_name}.log'
+    retained = stream_path.read_bytes() + payload
+    stream_path.write_bytes(retained)
+    process_path = run_root / 'processes/full_stack.process.json'
+    process = json.loads(process_path.read_text(encoding='utf-8'))
+    process[stream_name]['observed_bytes'] = len(retained)
+    process[stream_name]['retained_bytes'] = len(retained)
+    _canonical_file(process_path, process)
+
+
+def _phase3_recovered_lifecycle_timeout_line(node_name: str) -> bytes:
+    return (
+        f'\n[{node_name}-15] [WARN] [1.000000000] [robotest.{node_name}.rclcpp]: '
+        f'failed to send response to /robotest/{node_name}/get_state (timeout): '
+        'client will not receive response\n'
+    ).encode()
+
+
+def _write_phase3_recovered_lifecycle_timeout_gate(
+    repository: Path,
+    run_root: Path,
+    *,
+    node_name: str = 'collision_monitor',
+) -> dict:
+    """Write one source-valid recovered lifecycle timeout and its v2 gate."""
+    lifecycle_path = run_root / 'lifecycle-ready.json'
+    lifecycle = json.loads(lifecycle_path.read_text(encoding='utf-8'))
+    lifecycle['states'][node_name].update({'attempts': 2, 'timed_out_attempts': 1})
+    _write_phase3_lifecycle_ready(repository, run_root, lifecycle)
+    _append_phase3_full_stack_log(
+        run_root,
+        _phase3_recovered_lifecycle_timeout_line(node_name),
+    )
+    return _write_phase3_final_launch_log_gate(repository, run_root)
 
 
 def _write_phase3_contact_gate_reobservation(
@@ -3355,12 +3482,28 @@ def _phase3_bundle(
     _canonical_file(run_root / 'lifecycle-startup-result.json', {'verdict': 'PASS'})
     _canonical_file(run_root / 'startup-gate.json', {'verdict': 'PASS'})
     lifecycle_states = {
-        node_name: {'label': 'active', 'state_id': 3}
+        node_name: {
+            'attempts': 1,
+            'label': 'active',
+            'service': f'/robotest/{node_name}/get_state',
+            'service_seen': True,
+            'state_id': 3,
+            'timed_out_attempts': 0,
+        }
         for node_name in orchestration.REQUIRED_LIFECYCLE_NODES
     }
-    _canonical_file(
-        run_root / 'lifecycle-ready.json',
-        {'states': lifecycle_states, 'verdict': 'PASS'},
+    _write_phase3_lifecycle_ready(
+        repository,
+        run_root,
+        {
+            'failure': None,
+            'namespace': '/robotest',
+            'required_state': {'id': 3, 'label': 'active'},
+            'states': lifecycle_states,
+            'verdict': 'PASS',
+            'wall_timeout_s': 110.0,
+            'watch_pid': 40_000 + plan['ros_domain_id'],
+        },
     )
     for node_name in orchestration.REQUIRED_LIFECYCLE_NODES:
         (run_root / f'lifecycle-ready-{node_name}.txt').write_text(
@@ -3709,6 +3852,53 @@ def _rebind_phase3_prerequisites(
         }
     )
     _canonical_file(orchestrator_path, orchestrator, sidecar=True)
+
+
+def _recompose_phase3_smoke_result(repository: Path, candidate_root: Path) -> None:
+    """Cascade a rebound smoke prerequisite set through analysis and PASS output."""
+    release_module._activate_repository_packages(repository)
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 smoke analysis rebind fixture',
+    )
+    from robotest_metrics.analysis import analyze_run
+
+    suite_plan = json.loads((candidate_root / 'suite-plan.json').read_text(encoding='utf-8'))
+    first_trial = suite_plan['trials'][0]
+    smoke = suite_plan['smoke']
+    plan = {
+        **first_trial,
+        'candidate_id': f'{suite_plan["candidate_id"]}-smoke',
+        'gz_partition': smoke['gz_partition'],
+        'ros_domain_id': smoke['ros_domain_id'],
+        'run_id': smoke['run_id'],
+    }
+    run_root = candidate_root / 'smoke'
+    request = orchestration.compose_analysis_request(
+        workspace=repository,
+        plan=plan,
+        mission_path=run_root / 'mission-result.json',
+        scenario_path=run_root / 'scenario-result.json',
+        capture_path=run_root / 'capture.json',
+        positive_binding_path=candidate_root / 'positive-control/positive-binding.json',
+        orchestrator_path=run_root / 'orchestrator.json',
+        contact_drain_path=run_root / 'contact-drain.json',
+        contact_progress_path=run_root / 'contact-progress.json',
+        lifecycle_snapshot_path=(
+            run_root / 'lifecycle-snapshot.json' if int(plan['scenario_id']) == 4 else None
+        ),
+    )
+    _canonical_file(run_root / 'analysis-request.json', request, sidecar=True)
+    result = analyze_run(request)
+    assert result['verdict']['automated_status'] == 'PASS', result['verdict']
+    result_directory = run_root / 'result'
+    _canonical_file(result_directory / 'run-result.json', result)
+    result_sha = _refresh_phase3_bundle(result_directory)
+    pass_path = run_root / 'PASS.json'
+    marker = json.loads(pass_path.read_text(encoding='utf-8'))
+    marker['run_result_sha256'] = result_sha
+    _canonical_file(pass_path, marker, sidecar=True)
 
 
 def _rebind_phase3_smoke_runtime_gate(
@@ -6479,6 +6669,136 @@ def test_release_evidence_rejects_rebound_phase3_combined_launch_log_forgery(
         _validate_release_fixture(fixture)
 
 
+def test_release_evidence_accepts_recovered_phase3_lifecycle_timeout(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    run_root = candidate_root / 'smoke'
+
+    gate = _write_phase3_recovered_lifecycle_timeout_gate(repository, run_root)
+    recovery = gate['lifecycle_timeout_recovery']
+    assert gate['schema_version'] == 2
+    assert gate['match_count'] == 1
+    assert gate['matches'][0]['signature_ids'] == ['dds_response_timeout']
+    assert recovery['recovered_line_count'] == 1
+    assert recovery['recovered_lines'][0]['service_name'] == (
+        '/robotest/collision_monitor/get_state'
+    )
+    assert recovery['recovered_lines'][0]['timed_out_attempts'] == 1
+
+    _rebind_phase3_prerequisites(repository, run_root)
+    _recompose_phase3_smoke_result(repository, candidate_root)
+    _rebind_phase3_smoke_profile_outputs(repository, candidate_root)
+
+    _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    'case',
+    (
+        'bad_lifecycle_hash',
+        'bad_lifecycle_path',
+        'timeout_count_deficit',
+        'timeout_count_exceeds_attempts',
+        'inactive_state',
+        'residual_error',
+        'unknown_service',
+        'comixed_dds_timeout',
+        'mixed_fatal_signature',
+        'wrong_watch_pid',
+        'wrong_wall_timeout',
+        'missing_node',
+        'extra_node',
+    ),
+)
+def test_release_evidence_rejects_fully_rebound_lifecycle_timeout_recovery_forgery(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    run_root = candidate_root / 'smoke'
+    gate_path = run_root / 'full-stack-final-log-gate.json'
+    gate = _write_phase3_recovered_lifecycle_timeout_gate(repository, run_root)
+
+    if case == 'bad_lifecycle_hash':
+        gate['lifecycle_timeout_recovery']['lifecycle_ready_sha256'] = '0' * 64
+    elif case == 'bad_lifecycle_path':
+        gate['lifecycle_timeout_recovery']['lifecycle_ready_path'] = str(
+            run_root / 'forged-lifecycle-ready.json'
+        )
+    else:
+        lifecycle_path = run_root / 'lifecycle-ready.json'
+        lifecycle = json.loads(lifecycle_path.read_text(encoding='utf-8'))
+        state = lifecycle['states']['collision_monitor']
+        if case == 'timeout_count_deficit':
+            state['timed_out_attempts'] = 0
+        elif case == 'timeout_count_exceeds_attempts':
+            state.update({'attempts': 2, 'timed_out_attempts': 2})
+        elif case == 'inactive_state':
+            state.update({'label': 'inactive', 'state_id': 2})
+        elif case == 'residual_error':
+            state['error'] = 'lifecycle state response exceeded 2.000s'
+        elif case == 'wrong_watch_pid':
+            lifecycle['watch_pid'] += 1
+        elif case == 'wrong_wall_timeout':
+            lifecycle['wall_timeout_s'] = 109.0
+        elif case == 'missing_node':
+            lifecycle['states'].pop('map_server')
+        elif case == 'extra_node':
+            lifecycle['states']['rogue_node'] = {
+                **lifecycle['states']['map_server'],
+                'service': '/robotest/rogue_node/get_state',
+            }
+        elif case == 'unknown_service':
+            stream_path = run_root / 'processes/full_stack.stdout.log'
+            retained = stream_path.read_bytes().replace(
+                b'/robotest/collision_monitor/get_state',
+                b'/robotest/unknown_service/get_state',
+            )
+            stream_path.write_bytes(retained)
+            process_path = run_root / 'processes/full_stack.process.json'
+            process = json.loads(process_path.read_text(encoding='utf-8'))
+            process['stdout']['observed_bytes'] = len(retained)
+            process['stdout']['retained_bytes'] = len(retained)
+            _canonical_file(process_path, process)
+        elif case == 'comixed_dds_timeout':
+            stream_path = run_root / 'processes/full_stack.stdout.log'
+            retained = stream_path.read_bytes().replace(
+                b'client will not receive response\n',
+                (
+                    b'client will not receive response; failed to send response '
+                    b'for unrelated request (timeout)\n'
+                ),
+            )
+            stream_path.write_bytes(retained)
+            process_path = run_root / 'processes/full_stack.process.json'
+            process = json.loads(process_path.read_text(encoding='utf-8'))
+            process['stdout']['observed_bytes'] = len(retained)
+            process['stdout']['retained_bytes'] = len(retained)
+            _canonical_file(process_path, process)
+        else:
+            _append_phase3_full_stack_log(run_root, b'process FATAL error\n')
+        _write_phase3_lifecycle_ready(repository, run_root, lifecycle)
+        gate = _write_phase3_final_launch_log_gate(
+            repository,
+            run_root,
+            expected_verdict='FAIL',
+        )
+        gate.update({'failure_kind': None, 'failure_message': None, 'verdict': 'PASS'})
+
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_prerequisites(repository, run_root)
+    _recompose_phase3_smoke_result(repository, candidate_root)
+    _rebind_phase3_smoke_profile_outputs(repository, candidate_root)
+
+    with pytest.raises(EvidenceError, match='differs from clone-local scanner replay'):
+        _validate_release_fixture(fixture)
+
+
 @pytest.mark.parametrize(
     ('stream_name', 'payload'),
     [
@@ -6527,6 +6847,8 @@ def test_release_evidence_rejects_coordinated_phase3_launch_signature_forgery(
         combined_path.resolve(strict=True),
         recorded_gate['launch_stopped_utc'],
         scanned_utc=recorded_gate['scanned_utc'],
+        lifecycle_ready_path=(run_root / 'lifecycle-ready.json').resolve(strict=True),
+        **_phase3_lifecycle_replay_contract(repository, run_root),
     )
     assert replayed['verdict'] == 'FAIL'
     assert replayed['match_count'] >= 1
@@ -6568,7 +6890,7 @@ def test_release_evidence_rejects_rebound_phase3_final_launch_gate_forgery(
     if case == 'extra_field':
         gate['forged'] = True
     elif case == 'schema_version':
-        gate['schema_version'] = 2
+        gate['schema_version'] = 1
     elif case == 'hash':
         gate['launch_log_sha256'] = '0' * 64
     elif case == 'path':

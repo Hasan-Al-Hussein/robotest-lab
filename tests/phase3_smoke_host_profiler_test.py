@@ -177,16 +177,17 @@ def _stat_text(
     pid: int,
     *,
     comm: str = 'gz sim server',
+    state: str = 'S',
     start: int = 100,
     utime: int = 10,
     stime: int = 5,
-    ppid: int = 1,
+    ppid: int = 50,
     group: int = 50,
     session: int = 50,
     processor: int = 2,
 ) -> str:
     fields = ['0'] * 50
-    fields[0] = 'S'
+    fields[0] = state
     fields[1] = str(ppid)
     fields[2] = str(group)
     fields[3] = str(session)
@@ -214,6 +215,44 @@ def _host_proc(proc_root: Path) -> None:
     (proc_root / 'pressure/cpu').write_text(some, encoding='ascii')
     (proc_root / 'pressure/io').write_text(some + full, encoding='ascii')
     (proc_root / 'pressure/memory').write_text(some + full, encoding='ascii')
+    owner = proc_root / '40'
+    owner.mkdir()
+    (owner / 'stat').write_text(
+        _stat_text(40, comm='python3', start=40, ppid=1, group=30, session=30),
+        encoding='ascii',
+    )
+    workspace = proc_root.parent / 'workspace'
+    runner = workspace / 'tests/phase3_benchmark_runner.py'
+    binding = workspace / 'artifacts/evidence/phase3-benchmarks/phase3-test-001/build-binding.json'
+    (owner / 'cmdline').write_bytes(
+        b'/usr/bin/python3\0'
+        + str(runner).encode()
+        + b'\0--workspace\0'
+        + str(workspace).encode()
+        + b'\0--mode\0smoke\0--candidate-id\0phase3-test-001\0'
+        + b'--domain-base\0'
+        + b'100\0--output-root\0artifacts/evidence/phase3-benchmarks\0'
+        + b'--build-binding\0'
+        + str(binding).encode()
+        + b'\0'
+    )
+    owner_executable = proc_root.parent / 'smoke-runner-python'
+    owner_executable.write_bytes(b'python')
+    (owner / 'exe').symlink_to(owner_executable)
+    session_leader = proc_root / '50'
+    session_leader.mkdir()
+    (session_leader / 'stat').write_text(
+        _stat_text(50, start=50, ppid=40, group=50, session=50), encoding='ascii'
+    )
+
+
+def _set_smoke_runner_option(proc_root: Path, name: str, value: Path | str) -> None:
+    path = proc_root / '40/cmdline'
+    command = [item for item in path.read_bytes().split(b'\0') if item]
+    encoded_name = name.encode()
+    index = command.index(encoded_name)
+    command[index + 1] = str(value).encode()
+    path.write_bytes(b'\0'.join(command) + b'\0')
 
 
 def _make_process(
@@ -223,20 +262,26 @@ def _make_process(
     *,
     domain: int = 116,
     partition: str = 'robotest_p3_phase3-test-001-smoke_00',
+    profile_value: str | None = '1',
     start: int = 100,
     maps_plugin: bool = True,
     utime: int = 10,
+    ppid: int = 50,
     group: int = 50,
     session: int = 50,
 ) -> Path:
     root = proc_root / str(pid)
     (root / 'task' / str(pid)).mkdir(parents=True)
-    (root / 'environ').write_bytes(f'ROS_DOMAIN_ID={domain}\0GZ_PARTITION={partition}\0'.encode())
+    environment = f'ROS_DOMAIN_ID={domain}\0GZ_PARTITION={partition}\0'
+    if profile_value is not None:
+        environment += f'ROBOTEST_CONTACT_PROFILE={profile_value}\0'
+    (root / 'environ').write_bytes(environment.encode())
     (root / 'cmdline').write_bytes(b'/usr/bin/ruby3.2\0gz\0sim\0')
     process_stat = _stat_text(
         pid,
         start=start,
         utime=utime,
+        ppid=ppid,
         group=group,
         session=session,
     )
@@ -262,8 +307,8 @@ def _make_process(
     return root
 
 
-def _update_cpu(root: Path, pid: int, ticks: int, start: int = 100) -> None:
-    value = _stat_text(pid, start=start, utime=ticks)
+def _update_cpu(root: Path, pid: int, ticks: int, start: int = 100, group: int = 50) -> None:
+    value = _stat_text(pid, start=start, utime=ticks, group=group)
     (root / 'stat').write_text(value, encoding='ascii')
     (root / 'task' / str(pid) / 'stat').write_text(value, encoding='ascii')
 
@@ -478,6 +523,56 @@ def test_discovery_requires_exact_environment_and_one_plugin_host(tmp_path: Path
         profiler.discover_anchor(
             proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
         )
+
+
+@pytest.mark.parametrize('profile_value', (None, '0', '1\0ROBOTEST_CONTACT_PROFILE=1'))
+def test_anchor_requires_exact_contact_profile_environment(
+    tmp_path: Path, profile_value: str | None
+) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    _make_process(proc_root, 101, plugin, profile_value=profile_value)
+
+    with pytest.raises(
+        profiler.ProfileError, match='anchor ROBOTEST_CONTACT_PROFILE must be exactly 1'
+    ):
+        profiler.discover_anchor(
+            proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+        )
+
+
+def test_smoke_runner_owner_rejects_wrong_output_root(tmp_path: Path) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    _make_process(proc_root, 101, plugin)
+    _set_smoke_runner_option(proc_root, '--output-root', config.candidate_root)
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+
+    with pytest.raises(profiler.ProfileError, match='not the exact smoke runner'):
+        profiler.capture_sample(proc_root, config, anchor, profiler.ProfileState())
+
+
+def test_smoke_runner_owner_rejects_wrong_build_binding(tmp_path: Path) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    _make_process(proc_root, 101, plugin)
+    _set_smoke_runner_option(
+        proc_root, '--build-binding', config.candidate_root / 'suite-plan.json'
+    )
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+
+    with pytest.raises(profiler.ProfileError, match='build binding differs from candidate'):
+        profiler.capture_sample(proc_root, config, anchor, profiler.ProfileState())
 
 
 def test_discovery_brackets_environment_read_against_pid_reuse(
@@ -696,7 +791,7 @@ def test_capture_caps_aggregate_retained_command_lines(
         profiler.capture_sample(proc_root, config, anchor, profiler.ProfileState())
 
 
-def test_capture_tracks_the_whole_anchor_process_group_until_empty(tmp_path: Path) -> None:
+def test_capture_tracks_the_whole_runner_owned_process_set_until_empty(tmp_path: Path) -> None:
     config, plugin, producer = _fixture_config(tmp_path)
     identity = _static_identity(config, producer)
     proc_root = tmp_path / 'proc'
@@ -719,7 +814,31 @@ def test_capture_tracks_the_whole_anchor_process_group_until_empty(tmp_path: Pat
     assert all(process.ended_sample is not None for process in state.processes.values())
 
 
-def test_capture_rejects_exact_isolation_outside_anchor_process_group(tmp_path: Path) -> None:
+@pytest.mark.parametrize('terminal_state', ('X', 'Z'))
+def test_capture_stable_terminal_child_as_ended(tmp_path: Path, terminal_state: str) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    _make_process(proc_root, 101, plugin)
+    child = _make_process(proc_root, 102, plugin, maps_plugin=False, start=200)
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    state = profiler.ProfileState()
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    terminal_stat = _stat_text(102, state=terminal_state, start=200)
+    (child / 'stat').write_text(terminal_stat, encoding='ascii')
+    (child / 'task/102/stat').write_text(terminal_stat, encoding='ascii')
+    (child / 'environ').write_bytes(b'')
+
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    assert state.processes[102].ended_sample == 1
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    assert state.processes[102].ended_sample == 1
+
+
+def test_capture_accepts_exact_isolation_in_runner_owned_sibling_group(tmp_path: Path) -> None:
     config, plugin, producer = _fixture_config(tmp_path)
     identity = _static_identity(config, producer)
     proc_root = tmp_path / 'proc'
@@ -731,8 +850,34 @@ def test_capture_rejects_exact_isolation_outside_anchor_process_group(tmp_path: 
         plugin,
         maps_plugin=False,
         start=200,
-        group=99,
-        session=99,
+        ppid=40,
+        group=202,
+        session=202,
+    )
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    state = profiler.ProfileState()
+
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    assert sorted(state.processes) == [101, 202]
+
+
+def test_capture_rejects_foreign_exact_isolation_process_tree(tmp_path: Path) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    _make_process(proc_root, 101, plugin)
+    _make_process(
+        proc_root,
+        303,
+        plugin,
+        maps_plugin=False,
+        start=300,
+        ppid=1,
+        group=303,
+        session=303,
     )
     anchor, _count = profiler.discover_anchor(
         proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
@@ -742,10 +887,45 @@ def test_capture_rejects_exact_isolation_outside_anchor_process_group(tmp_path: 
         profiler.capture_sample(proc_root, config, anchor, profiler.ProfileState())
 
 
+def test_capture_rejects_smoke_runner_disappearance_or_pid_reuse(tmp_path: Path) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    _make_process(proc_root, 101, plugin)
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    state = profiler.ProfileState()
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    owner_root = proc_root / '40'
+    saved = {
+        path.name: path.read_bytes()
+        for path in owner_root.iterdir()
+        if path.is_file() and not path.is_symlink()
+    }
+    executable_target = owner_root.joinpath('exe').resolve()
+    shutil.rmtree(owner_root)
+
+    with pytest.raises(profiler.ProfileError, match=r'smoke runner owner.*disappeared'):
+        profiler.capture_sample(proc_root, config, anchor, state)
+
+    owner_root.mkdir()
+    for name, payload in saved.items():
+        (owner_root / name).write_bytes(payload)
+    (owner_root / 'exe').symlink_to(executable_target)
+    (owner_root / 'stat').write_text(
+        _stat_text(40, comm='python3', start=999, ppid=1, group=30, session=30),
+        encoding='ascii',
+    )
+    with pytest.raises(profiler.ProfileError, match='smoke runner owner PID 40 was reused'):
+        profiler.capture_sample(proc_root, config, anchor, state)
+
+
 def test_full_stack_join_rejects_truncated_stream_or_unrelated_anchor(tmp_path: Path) -> None:
     config, _plugin, _producer = _fixture_config(tmp_path)
     _full_stack_files(config, (_contact_record(),))
-    anchor = {'process_group': 50, 'session': 50}
+    anchor = {'process_group': 60, 'session': 50}
     clock = _Clock()
 
     evidence = profiler.wait_for_full_stack_close(
@@ -757,7 +937,7 @@ def test_full_stack_join_rejects_truncated_stream_or_unrelated_anchor(tmp_path: 
     )
 
     assert evidence['streams']['stdout']['size_bytes'] > 0
-    with pytest.raises(profiler.ProfileError, match='process group'):
+    with pytest.raises(profiler.ProfileError, match='full-stack session'):
         profiler.wait_for_full_stack_close(
             config.candidate_root / 'smoke',
             {'process_group': 51, 'session': 51},
@@ -859,15 +1039,16 @@ def _write_complete_campaign_profile_fixture(tmp_path: Path):
         plugin,
         start=50,
         maps_plugin=False,
+        ppid=40,
     )
-    root = _make_process(proc_root, 101, plugin)
+    root = _make_process(proc_root, 101, plugin, group=60)
     config.renderer_log.write_bytes(b'old renderer history\n')
     steps = {'count': 0}
 
     def on_sleep(clock: _Clock) -> None:
         steps['count'] += 1
         if steps['count'] < 4:
-            _update_cpu(root, 101, 10 + steps['count'] * 5)
+            _update_cpu(root, 101, 10 + steps['count'] * 5, group=60)
         elif root.exists():
             shutil.rmtree(root)
             shutil.rmtree(group_leader)

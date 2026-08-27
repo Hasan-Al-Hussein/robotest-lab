@@ -50,6 +50,7 @@ def probe_states(
             'service': probe._state_clients[name].srv_name,
             'service_seen': False,
             'state_id': None,
+            'timed_out_attempts': 0,
         }
         for name in names
     }
@@ -80,6 +81,7 @@ def probe_states(
                     except Exception as error:  # pragma: no cover - middleware-specific
                         statuses[name]['error'] = f'{type(error).__name__}: {error}'
                     else:
+                        statuses[name].pop('error', None)
                         statuses[name]['label'] = response.current_state.label
                         statuses[name]['state_id'] = int(response.current_state.id)
                     pending.pop(name, None)
@@ -87,14 +89,12 @@ def probe_states(
                 elif future is not None and now >= request_deadline:
                     client.remove_pending_request(future)
                     pending.pop(name, None)
+                    statuses[name]['timed_out_attempts'] += 1
                     statuses[name]['error'] = (
                         f'lifecycle state response exceeded {STATE_REQUEST_TIMEOUT_S:.3f}s'
                     )
-                    failure = (
-                        f'lifecycle state request for {name} exceeded '
-                        f'{STATE_REQUEST_TIMEOUT_S:.3f}s'
-                    )
-                    break
+                    next_request[name] = now + STATE_REQUEST_RETRY_S
+                    continue
                 if statuses[name]['state_id'] == State.PRIMARY_STATE_ACTIVE:
                     continue
                 if name not in pending and now >= next_request[name]:

@@ -65,6 +65,7 @@ from phase3_orchestration import (
     reconcile_contact_gate_reobservation,
     reconcile_goal_binding,
     reconcile_positive_control,
+    REQUIRED_LIFECYCLE_NODES,
     safe_candidate_id,
     suite_document,
     summarize_resources,
@@ -96,6 +97,8 @@ TOKEN_PATTERN = re.compile(r'^[a-z][a-z0-9_]{0,63}$')
 FULL_STACK_COMBINED_LOG_NAME = 'full-stack-combined.log'
 FINAL_LAUNCH_LOG_GATE_NAME = 'full-stack-final-log-gate.json'
 FULL_STACK_COMBINED_LOG_MAX_BYTES = 2 * LOG_MAX_BYTES + 1
+LIFECYCLE_READY_WALL_TIMEOUT_S = 110.0
+LIFECYCLE_NODES = tuple(REQUIRED_LIFECYCLE_NODES)
 
 
 def _bounded_reason(value: object) -> str:
@@ -725,6 +728,10 @@ def _finalize_full_stack_log_gate(
     *,
     launch_stopped_utc: str,
     scanned_utc: str | None = None,
+    lifecycle_ready_path: Path | None = None,
+    expected_lifecycle_watch_pid: int | None = None,
+    expected_lifecycle_wall_timeout_s: float | None = None,
+    expected_lifecycle_nodes: Sequence[str] | None = None,
 ) -> Mapping[str, Any]:
     """Scan immutable combined launch output after owned shutdown and drain completion."""
     if (
@@ -753,6 +760,10 @@ def _finalize_full_stack_log_gate(
         combined_path,
         launch_stopped_utc,
         scanned_utc=scanned_utc,
+        lifecycle_ready_path=lifecycle_ready_path,
+        expected_lifecycle_watch_pid=expected_lifecycle_watch_pid,
+        expected_lifecycle_wall_timeout_s=expected_lifecycle_wall_timeout_s,
+        expected_lifecycle_nodes=expected_lifecycle_nodes,
     )
     atomic_write_json(gate_path, evidence, sidecar=True)
     verify_json_sidecar(gate_path)
@@ -1778,17 +1789,7 @@ class BenchmarkRunner:
                 stage='startup_gate',
             )
             lifecycle_args: list[str] = []
-            for name in (
-                'map_server',
-                'amcl',
-                'planner_server',
-                'controller_server',
-                'behavior_server',
-                'bt_navigator',
-                'waypoint_follower',
-                'velocity_smoother',
-                'collision_monitor',
-            ):
+            for name in LIFECYCLE_NODES:
                 lifecycle_args.extend(['--node', name])
             registry.run_checked(
                 'lifecycle_gate',
@@ -1804,7 +1805,7 @@ class BenchmarkRunner:
                     '--text-prefix',
                     'lifecycle-ready-',
                     '--wall-timeout',
-                    '110',
+                    format(LIFECYCLE_READY_WALL_TIMEOUT_S, 'g'),
                     '--watch-pid',
                     str(launch.pid),
                     *lifecycle_args,
@@ -2274,6 +2275,10 @@ class BenchmarkRunner:
                         launch,
                         run_dir,
                         launch_stopped_utc=launch_stopped_utc,
+                        lifecycle_ready_path=run_dir / 'lifecycle-ready.json',
+                        expected_lifecycle_watch_pid=launch.pid,
+                        expected_lifecycle_wall_timeout_s=LIFECYCLE_READY_WALL_TIMEOUT_S,
+                        expected_lifecycle_nodes=LIFECYCLE_NODES,
                     )
                 except (
                     EvidenceError,

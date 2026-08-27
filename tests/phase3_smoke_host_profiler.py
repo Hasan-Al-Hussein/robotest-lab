@@ -101,6 +101,7 @@ MAX_LINE_BYTES = 65536
 MAX_RENDERER_LINES = 256
 MAX_CONTACT_RECORDS = 128
 MAX_CMDLINE_TOTAL_BYTES = 4 * 1024 * 1024
+MAX_ANCESTRY_DEPTH = 256
 MINIMUM_SAMPLES = 4
 
 CANDIDATE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
@@ -112,6 +113,7 @@ RENDERER_RE = re.compile(
 )
 VMSTAT_KEYS = ('oom_kill', 'pgfault', 'pgmajfault', 'pgpgin', 'pgpgout', 'pswpin', 'pswpout')
 PROC_STAT_KEYS = ('ctxt', 'processes', 'procs_blocked', 'procs_running')
+TERMINAL_PROCESS_STATES = frozenset({'X', 'Z'})
 
 PROFILE_TOP_LEVEL_KEYS = frozenset(
     {
@@ -254,6 +256,20 @@ class LatchedProcess:
     ended_sample: int | None = None
 
 
+@dataclass(frozen=True)
+class SmokeRunnerOwner:
+    """Stable benchmark-runner identity that owns one smoke process forest."""
+
+    pid: int
+    start_ticks: int
+    ppid: int
+    process_group: int
+    session: int
+    comm: str
+    cmdline_sha256: str
+    executable_link: str
+
+
 @dataclass
 class ProfileState:
     """Bounded mutable state retained by the profiler."""
@@ -268,6 +284,7 @@ class ProfileState:
     cmdline_bytes: int = 0
     thread_records: int = 0
     cadence_overruns: int = 0
+    smoke_runner_owner: SmokeRunnerOwner | None = None
 
 
 def canonical_json_bytes(document: Any) -> bytes:
@@ -941,6 +958,8 @@ def discover_matching(
             raise
         if before.pid != pid or not _same_process(before, after):
             raise ProfileError('pid_reuse', f'PID {pid} changed during discovery')
+        if after.state in TERMINAL_PROCESS_STATES:
+            continue
         if not has_exact_environment(environment, domain_id, partition):
             continue
         matches.append((pid, after))
@@ -972,6 +991,234 @@ def _command_identity(proc_root: Path, pid: int) -> dict[str, Any]:
     }
 
 
+def _stat_context(process: ProcStat) -> tuple[int, int, int, int, int]:
+    return (
+        process.pid,
+        process.start_ticks,
+        process.ppid,
+        process.process_group,
+        process.session,
+    )
+
+
+def _read_stable_process_stat(proc_root: Path, pid: int, label: str) -> ProcStat:
+    """Bracket one ancestry read so reparenting and PID reuse fail closed."""
+    try:
+        before = _read_stat(proc_root / str(pid) / 'stat')
+        after = _read_stat(proc_root / str(pid) / 'stat')
+    except FileNotFoundError as exc:
+        raise ProfileError('missing_identity', f'{label} disappeared') from exc
+    if not _same_process(before, after):
+        raise ProfileError('pid_reuse', f'{label} PID {pid} was reused')
+    if _stat_context(before) != _stat_context(after):
+        raise ProfileError('identity_changed', f'{label} ancestry changed')
+    return after
+
+
+def _single_command_option(command: Sequence[str], name: str) -> str:
+    values: list[str] = []
+    for index, item in enumerate(command):
+        if item == name:
+            if index + 1 >= len(command):
+                raise ProfileError('missing_identity', f'smoke runner {name} is incomplete')
+            values.append(command[index + 1])
+        elif item.startswith(f'{name}='):
+            values.append(item.split('=', 1)[1])
+    if len(values) != 1:
+        raise ProfileError('missing_identity', f'smoke runner {name} is not unique')
+    return values[0]
+
+
+def _runner_command_path(workspace: Path, value: str) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else workspace / path
+
+
+def _reject_symlinked_command_path(workspace: Path, path: Path, label: str) -> None:
+    try:
+        relative = path.relative_to(workspace)
+    except ValueError as exc:
+        raise ProfileError('missing_identity', f'{label} escapes workspace') from exc
+    if '..' in relative.parts:
+        raise ProfileError('missing_identity', f'{label} is not canonical')
+    current = workspace
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise ProfileError('missing_identity', f'{label} contains a symlink')
+
+
+def _validate_smoke_runner_command(config: ProfileConfig, command: Sequence[str]) -> None:
+    expected_script = (config.workspace / 'tests/phase3_benchmark_runner.py').resolve()
+    if len(command) < 2:
+        raise ProfileError('missing_identity', 'smoke runner command line is incomplete')
+    try:
+        observed_script = Path(command[1]).resolve()
+        observed_workspace = Path(_single_command_option(command, '--workspace')).resolve()
+        domain_base = int(_single_command_option(command, '--domain-base'))
+        output_root = _runner_command_path(
+            config.workspace, _single_command_option(command, '--output-root')
+        ).resolve(strict=True)
+        build_binding = _runner_command_path(
+            config.workspace, _single_command_option(command, '--build-binding')
+        )
+        resolved_binding = build_binding.resolve(strict=True)
+    except (OSError, ValueError) as exc:
+        raise ProfileError('missing_identity', 'smoke runner command identity is invalid') from exc
+    if (
+        observed_script != expected_script
+        or observed_workspace != config.workspace
+        or _single_command_option(command, '--mode') != 'smoke'
+        or _single_command_option(command, '--candidate-id') != config.candidate_id
+        or domain_base + 16 != config.ros_domain_id
+        or output_root != config.candidate_root.parent
+    ):
+        raise ProfileError('missing_identity', 'anchor owner is not the exact smoke runner')
+    evidence_root = (config.workspace / 'artifacts/evidence').resolve()
+    if not resolved_binding.is_relative_to(evidence_root):
+        raise ProfileError('missing_identity', 'smoke runner build binding escapes evidence root')
+    _reject_symlinked_command_path(config.workspace, build_binding, 'smoke runner build binding')
+    _observed_binding, observed_hash = _load_canonical(build_binding, 'smoke runner build binding')
+    _expected_binding, expected_hash = _load_canonical(
+        config.build_binding, 'candidate build binding'
+    )
+    if observed_hash != expected_hash:
+        raise ProfileError('missing_identity', 'smoke runner build binding differs from candidate')
+
+
+def discover_smoke_runner_owner(
+    proc_root: Path, config: ProfileConfig, anchor: Mapping[str, Any]
+) -> SmokeRunnerOwner:
+    """Latch the runner above the anchor's independently owned session."""
+    anchor_pid = anchor.get('pid')
+    anchor_start = anchor.get('start_ticks')
+    anchor_group = anchor.get('process_group')
+    anchor_session = anchor.get('session')
+    if (
+        type(anchor_pid) is not int
+        or type(anchor_start) is not int
+        or type(anchor_group) is not int
+        or type(anchor_session) is not int
+        or anchor_pid <= 0
+        or anchor_start < 0
+        or anchor_group <= 1
+        or anchor_session <= 1
+    ):
+        raise ProfileError('missing_identity', 'anchor process ancestry is invalid')
+    current = _read_stable_process_stat(proc_root, anchor_pid, 'anchor process')
+    if (
+        current.start_ticks != anchor_start
+        or current.process_group != anchor_group
+        or current.session != anchor_session
+    ):
+        raise ProfileError('identity_changed', 'anchor process ancestry differs')
+    seen: set[tuple[int, int]] = set()
+    for _depth in range(MAX_ANCESTRY_DEPTH):
+        identity = (current.pid, current.start_ticks)
+        if identity in seen:
+            raise ProfileError('incomplete_profile', 'anchor ancestry contains a cycle')
+        seen.add(identity)
+        if current.pid == anchor_session:
+            break
+        if current.session != anchor_session or current.ppid <= 1:
+            raise ProfileError('missing_identity', 'anchor does not reach its session leader')
+        child = current
+        current = _read_stable_process_stat(proc_root, child.ppid, 'anchor ancestor process')
+        child_after = _read_stable_process_stat(proc_root, child.pid, 'anchor process')
+        if _stat_context(child_after) != _stat_context(child):
+            raise ProfileError('identity_changed', 'anchor ancestry changed during discovery')
+    else:
+        raise ProfileError('overflow', 'anchor ancestry exceeds 256 processes')
+    session_leader = current
+    if (
+        session_leader.pid != anchor_session
+        or session_leader.process_group != anchor_session
+        or session_leader.session != anchor_session
+        or session_leader.ppid <= 1
+    ):
+        raise ProfileError('missing_identity', 'anchor session leader identity is invalid')
+    owner_stat = _read_stable_process_stat(proc_root, session_leader.ppid, 'smoke runner owner')
+    session_leader_pid = session_leader.pid
+    leader_label = 'anchor session leader'
+    leader_after = _read_stable_process_stat(proc_root, session_leader_pid, leader_label)
+    if _stat_context(leader_after) != _stat_context(session_leader):
+        raise ProfileError('identity_changed', 'anchor session ownership changed')
+    command = _command_identity(proc_root, owner_stat.pid)
+    owner_after = _read_stable_process_stat(proc_root, owner_stat.pid, 'smoke runner owner')
+    if _stat_context(owner_after) != _stat_context(owner_stat):
+        raise ProfileError('identity_changed', 'smoke runner identity changed while latching')
+    _validate_smoke_runner_command(config, command['cmdline'])
+    owner = SmokeRunnerOwner(
+        pid=owner_after.pid,
+        start_ticks=owner_after.start_ticks,
+        ppid=owner_after.ppid,
+        process_group=owner_after.process_group,
+        session=owner_after.session,
+        comm=owner_after.comm,
+        cmdline_sha256=command['cmdline_sha256'],
+        executable_link=command['executable_link'],
+    )
+    _revalidate_smoke_runner_owner(proc_root, owner)
+    return owner
+
+
+def _revalidate_smoke_runner_owner(proc_root: Path, owner: SmokeRunnerOwner) -> None:
+    current = _read_stable_process_stat(proc_root, owner.pid, 'smoke runner owner')
+    if current.start_ticks != owner.start_ticks:
+        raise ProfileError('pid_reuse', f'smoke runner owner PID {owner.pid} was reused')
+    if (
+        _stat_context(current)
+        != (
+            owner.pid,
+            owner.start_ticks,
+            owner.ppid,
+            owner.process_group,
+            owner.session,
+        )
+        or current.comm != owner.comm
+    ):
+        raise ProfileError('identity_changed', 'smoke runner owner identity changed')
+    command = _command_identity(proc_root, owner.pid)
+    after = _read_stable_process_stat(proc_root, owner.pid, 'smoke runner owner')
+    if _stat_context(after) != _stat_context(current):
+        raise ProfileError('identity_changed', 'smoke runner owner changed during validation')
+    if (
+        command['cmdline_sha256'] != owner.cmdline_sha256
+        or command['executable_link'] != owner.executable_link
+    ):
+        raise ProfileError('identity_changed', 'smoke runner command identity changed')
+
+
+def _process_descends_from_smoke_runner(
+    proc_root: Path, observed: ProcStat, owner: SmokeRunnerOwner
+) -> bool:
+    """Return true only for a stable ancestry chain reaching the latched runner."""
+    current = observed
+    seen: set[tuple[int, int]] = set()
+    for _depth in range(MAX_ANCESTRY_DEPTH):
+        stable = _read_stable_process_stat(proc_root, current.pid, 'matching process')
+        if stable.start_ticks != current.start_ticks:
+            raise ProfileError('pid_reuse', f'matching PID {current.pid} was reused')
+        if _stat_context(stable) != _stat_context(current):
+            raise ProfileError('identity_changed', 'matching process ancestry changed')
+        current = stable
+        identity = (current.pid, current.start_ticks)
+        if identity == (owner.pid, owner.start_ticks):
+            return True
+        if identity in seen:
+            raise ProfileError('incomplete_profile', 'matching process ancestry contains a cycle')
+        seen.add(identity)
+        if current.ppid <= 1:
+            return False
+        child = current
+        parent = _read_stable_process_stat(proc_root, current.ppid, 'matching process ancestor')
+        child_after = _read_stable_process_stat(proc_root, child.pid, 'matching process')
+        if _stat_context(child_after) != _stat_context(child):
+            raise ProfileError('identity_changed', 'matching process ancestry changed')
+        current = parent
+    raise ProfileError('overflow', 'matching process ancestry exceeds 256 processes')
+
+
 def collect_anchor(
     proc_root: Path, pid: int, observed: ProcStat, plugin: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -980,6 +1227,14 @@ def collect_anchor(
     before = _read_stat(root / 'stat')
     if not _same_process(before, observed):
         raise ProfileError('pid_reuse', f'anchor PID {pid} changed before capture')
+    profile_environment = parse_environ(
+        _bounded_proc_read(root / 'environ', ENVIRON_MAX_BYTES, 'anchor proc environ')
+    )
+    if profile_environment.get(b'ROBOTEST_CONTACT_PROFILE') != [b'1']:
+        raise ProfileError(
+            'missing_identity',
+            'anchor ROBOTEST_CONTACT_PROFILE must be exactly 1',
+        )
     mappings = _plugin_maps(proc_root, pid, plugin)
     if (
         not mappings
@@ -1058,6 +1313,9 @@ def _sample_threads(
         return None
     if before.start_ticks != process.start_ticks:
         raise ProfileError('pid_reuse', f'PID {process.pid} was reused')
+    if before.state in TERMINAL_PROCESS_STATES:
+        process.ended_sample = index
+        return None
     try:
         tids = sorted(int(path.name) for path in (root / 'task').iterdir() if path.name.isdigit())
     except FileNotFoundError:
@@ -1121,6 +1379,9 @@ def _sample_threads(
         return None
     if after.start_ticks != process.start_ticks:
         raise ProfileError('pid_reuse', f'PID {process.pid} changed while sampling')
+    if after.state in TERMINAL_PROCESS_STATES:
+        process.ended_sample = index
+        return None
     return {
         'pid': process.pid,
         'start_ticks': process.start_ticks,
@@ -1145,24 +1406,26 @@ def capture_sample(
         raise ProfileError('overflow', 'profile exceeds 2,048 samples')
     index = len(state.samples)
     matching = discover_matching(proc_root, config.ros_domain_id, config.gz_partition)
-    anchor_group = anchor.get('process_group')
-    anchor_session = anchor.get('session')
-    if (
-        type(anchor_group) is not int
-        or type(anchor_session) is not int
-        or anchor_group <= 0
-        or anchor_session <= 0
-    ):
-        raise ProfileError('missing_identity', 'anchor process group identity is invalid')
-    target_matching = [
-        (pid, process_stat)
-        for pid, process_stat in matching
-        if process_stat.process_group == anchor_group and process_stat.session == anchor_session
-    ]
-    if len(target_matching) != len(matching):
+    if matching:
+        if state.smoke_runner_owner is None:
+            state.smoke_runner_owner = discover_smoke_runner_owner(proc_root, config, anchor)
+        else:
+            _revalidate_smoke_runner_owner(proc_root, state.smoke_runner_owner)
+    target_matching: list[tuple[int, ProcStat]] = []
+    foreign_matching: list[int] = []
+    owner = state.smoke_runner_owner
+    if matching and owner is None:
+        raise ProfileError('missing_identity', 'smoke runner owner was not latched')
+    for pid, process_stat in matching:
+        assert owner is not None
+        if _process_descends_from_smoke_runner(proc_root, process_stat, owner):
+            target_matching.append((pid, process_stat))
+        else:
+            foreign_matching.append(pid)
+    if foreign_matching:
         raise ProfileError(
             'missing_identity',
-            'exact candidate isolation is shared outside the anchor process group',
+            'exact candidate isolation is shared outside the smoke runner process tree',
         )
     matching_by_pid = dict(target_matching)
     for pid, process in state.processes.items():
@@ -1172,8 +1435,14 @@ def capture_sample(
             if process.ended_sample is None:
                 process.ended_sample = index
             continue
-        if current.start_ticks != process.start_ticks or process.ended_sample is not None:
+        if current.start_ticks != process.start_ticks:
             raise ProfileError('pid_reuse', f'latched PID {pid} was reused')
+        if current.state in TERMINAL_PROCESS_STATES:
+            if process.ended_sample is None:
+                process.ended_sample = index
+            continue
+        if process.ended_sample is not None:
+            raise ProfileError('identity_changed', f'ended PID {pid} became live')
         if pid not in matching_by_pid:
             raise ProfileError('identity_changed', f'PID {pid} changed isolation identity')
     for pid, process_stat in target_matching:
@@ -1471,10 +1740,9 @@ def wait_for_full_stack_close(
         or type(pgid) is not int
         or pid <= 0
         or pid != pgid
-        or anchor.get('process_group') != pgid
         or anchor.get('session') != pgid
     ):
-        raise ProfileError('missing_identity', 'anchor is not in the full-stack process group')
+        raise ProfileError('missing_identity', 'anchor is not in the full-stack session')
     stream_evidence: dict[str, dict[str, Any]] = {}
     expected_stream_keys = {
         'error',
@@ -1925,8 +2193,8 @@ def _validate_profile_anchor(
     pid = _profile_int(anchor.get('pid'), 'anchor PID', 1)
     start = _profile_int(anchor.get('start_ticks'), 'anchor start ticks')
     _profile_int(anchor.get('ppid'), 'anchor parent PID')
-    group = _profile_int(anchor.get('process_group'), 'anchor process group', 1)
-    session = _profile_int(anchor.get('session'), 'anchor session', 1)
+    _profile_int(anchor.get('process_group'), 'anchor process group', 1)
+    _profile_int(anchor.get('session'), 'anchor session', 1)
     _profile_string(anchor.get('comm'), 'anchor command name', 4096)
     _profile_string(anchor.get('executable_link'), 'anchor executable link', 16 * 1024)
     cmdline = _profile_list(anchor.get('cmdline'), 'anchor command line', 4096)
@@ -1983,8 +2251,6 @@ def _validate_profile_anchor(
     _profile_int(anchor.get('mapping_count'), 'anchor mapping count', 1, 65536)
     if pid != anchor.get('pid') or start != anchor.get('start_ticks'):
         raise ProfileError('invalid_profile', 'anchor process identity is invalid')
-    if group != session:
-        raise ProfileError('identity_changed', 'anchor process group/session differ')
     return anchor
 
 
@@ -2159,7 +2425,6 @@ def _validate_full_stack_profile(
         or metadata.get('timed_out') is not False
         or pid != pgid
         or started < profile_started_monotonic_ns
-        or anchor.get('process_group') != pgid
         or anchor.get('session') != pgid
     ):
         raise ProfileError('identity_changed', 'full-stack process identity does not reconcile')

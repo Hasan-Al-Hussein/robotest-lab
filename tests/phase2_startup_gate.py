@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import datetime, UTC
 import hashlib
@@ -23,6 +23,7 @@ import time
 from typing import Any
 
 SCHEMA_VERSION = 1
+FINAL_LAUNCH_LOG_SCHEMA_VERSION = 2
 EXPECTED_SERVICE_NAME = '/robotest/lifecycle_manager_navigation/manage_nodes'
 EXPECTED_STARTUP_COMMAND = 0
 DEFAULT_DISCOVERY_GRACE_SEC = 4.0
@@ -31,6 +32,7 @@ DEFAULT_RESPONSE_TIMEOUT_SEC = 60.0
 DEFAULT_WALL_TIMEOUT_SEC = 110.0
 POLL_PERIOD_SEC = 0.05
 MAXIMUM_RESULT_BYTES = 64 * 1024
+MAXIMUM_LIFECYCLE_READY_BYTES = 64 * 1024
 MAXIMUM_LAUNCH_LOG_BYTES = 128 * 1024 * 1024
 DEFAULT_MAXIMUM_LAUNCH_STREAM_BYTES = 8 * 1024 * 1024
 
@@ -58,6 +60,36 @@ RESULT_KEYS = frozenset(
     }
 )
 _UTC_PATTERN = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$')
+_LIFECYCLE_NODE_PATTERN = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_]*$')
+_DDS_RESPONSE_TIMEOUT_PATTERN = re.compile(
+    r'failed to send response[^\r\n]*?\(timeout\)', re.IGNORECASE
+)
+_RECOVERABLE_DDS_RESPONSE_TIMEOUT_PATTERN = re.compile(
+    r'failed to send response to '
+    r'(?P<service>/robotest/[A-Za-z0-9_][A-Za-z0-9_]*/get_state) '
+    r'\(timeout\)'
+)
+_LIFECYCLE_READY_KEYS = frozenset(
+    {
+        'failure',
+        'namespace',
+        'required_state',
+        'states',
+        'verdict',
+        'wall_timeout_s',
+        'watch_pid',
+    }
+)
+_LIFECYCLE_STATE_KEYS = frozenset(
+    {
+        'attempts',
+        'label',
+        'service',
+        'service_seen',
+        'state_id',
+        'timed_out_attempts',
+    }
+)
 LAUNCH_LOG_SIGNATURES = (
     (
         'lifecycle_startup_rejection',
@@ -81,7 +113,7 @@ LAUNCH_LOG_SIGNATURES = (
     (
         'dds_response_timeout',
         'DDS failed to send a response before timeout',
-        re.compile(r'failed to send response[^\r\n]*\(timeout\)', re.IGNORECASE),
+        _DDS_RESPONSE_TIMEOUT_PATTERN,
     ),
     (
         'fatal_process_signature',
@@ -166,8 +198,7 @@ def _stable_regular_bytes(
         if metadata.st_size < minimum_bytes or metadata.st_size > maximum_bytes:
             raise GateError(
                 'launch_log_invalid',
-                f'{label} size {metadata.st_size} is outside '
-                f'{minimum_bytes}..{maximum_bytes}',
+                f'{label} size {metadata.st_size} is outside {minimum_bytes}..{maximum_bytes}',
             )
         payload = path.read_bytes()
         after = path.lstat()
@@ -397,11 +428,243 @@ def read_startup_result(path: Path) -> tuple[dict[str, Any], str, int]:
     return document, hashlib.sha256(payload).hexdigest(), len(payload)
 
 
+def _read_lifecycle_ready(
+    path: Path,
+    *,
+    expected_watch_pid: int,
+    expected_wall_timeout_s: float,
+    expected_nodes: Collection[str],
+) -> tuple[dict[str, dict[str, Any]], Path, str, int]:
+    """Read and validate the canonical lifecycle proof used for timeout recovery."""
+    if type(expected_watch_pid) is not int or expected_watch_pid <= 0:
+        raise GateError(
+            'launch_log_recovery_invalid',
+            'expected lifecycle watch PID must be a positive integer',
+        )
+    if (
+        type(expected_wall_timeout_s) is not float
+        or not math.isfinite(expected_wall_timeout_s)
+        or expected_wall_timeout_s <= 0.0
+    ):
+        raise GateError(
+            'launch_log_recovery_invalid',
+            'expected lifecycle wall timeout must be a finite positive float',
+        )
+    if isinstance(expected_nodes, (str, bytes, dict)):
+        raise GateError(
+            'launch_log_recovery_invalid',
+            'expected lifecycle nodes must be a nonempty unique collection',
+        )
+    expected_node_names = tuple(expected_nodes)
+    expected_node_set = set(expected_node_names)
+    if (
+        not expected_node_names
+        or len(expected_node_set) != len(expected_node_names)
+        or any(
+            not isinstance(name, str) or _LIFECYCLE_NODE_PATTERN.fullmatch(name) is None
+            for name in expected_node_names
+        )
+    ):
+        node_collection_error = (
+            'expected lifecycle nodes must be a nonempty unique collection of canonical node names'
+        )
+        raise GateError(
+            'launch_log_recovery_invalid',
+            node_collection_error,
+        )
+    try:
+        resolved_path = path.resolve(strict=True)
+        payload = _stable_regular_bytes(
+            path,
+            maximum_bytes=MAXIMUM_LIFECYCLE_READY_BYTES,
+            allow_empty=False,
+            label='lifecycle-ready artifact',
+            activity='being correlated with the final launch log',
+        )
+        if path.resolve(strict=True) != resolved_path:
+            raise GateError(
+                'launch_log_recovery_invalid',
+                'lifecycle-ready artifact resolved path changed while being read',
+            )
+        document = json.loads(
+            payload.decode('utf-8'),
+            object_pairs_hook=_strict_object,
+            parse_constant=_reject_constant,
+        )
+    except GateError as error:
+        raise GateError('launch_log_recovery_invalid', str(error)) from error
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise GateError(
+            'launch_log_recovery_invalid',
+            f'lifecycle-ready artifact is not canonical strict UTF-8 JSON: {error}',
+        ) from error
+
+    failures: list[str] = []
+    if not isinstance(document, dict):
+        failures.append('lifecycle-ready artifact must be a JSON object')
+    else:
+        observed_keys = set(document)
+        missing = sorted(_LIFECYCLE_READY_KEYS - observed_keys)
+        unexpected = sorted(observed_keys - _LIFECYCLE_READY_KEYS)
+        if missing:
+            failures.append(f'lifecycle-ready artifact missing keys: {missing}')
+        if unexpected:
+            failures.append(f'lifecycle-ready artifact has unexpected keys: {unexpected}')
+
+    if failures:
+        raise GateError('launch_log_recovery_invalid', '; '.join(failures))
+    assert isinstance(document, dict)
+
+    if serialize_result(document).encode('utf-8') != payload:
+        failures.append('lifecycle-ready artifact must use canonical serialization')
+    if document['verdict'] != 'PASS':
+        failures.append("lifecycle-ready verdict must be exactly 'PASS'")
+    if document['failure'] is not None:
+        failures.append('lifecycle-ready PASS requires failure=null')
+    if document['namespace'] != '/robotest':
+        failures.append("lifecycle-ready namespace must be exactly '/robotest'")
+    required_state = document['required_state']
+    if (
+        not isinstance(required_state, dict)
+        or set(required_state) != {'id', 'label'}
+        or type(required_state.get('id')) is not int
+        or required_state.get('id') != 3
+        or required_state.get('label') != 'active'
+    ):
+        failures.append(
+            "lifecycle-ready required_state must be exactly {'id': 3, 'label': 'active'}"
+        )
+    wall_timeout = document['wall_timeout_s']
+    if type(wall_timeout) is not float or not math.isfinite(wall_timeout):
+        failures.append('lifecycle-ready wall_timeout_s must be a finite float')
+    elif wall_timeout != expected_wall_timeout_s:
+        failures.append(
+            'lifecycle-ready wall_timeout_s must equal the correlated launch '
+            f'value {expected_wall_timeout_s}; observed {wall_timeout}'
+        )
+    watch_pid = document['watch_pid']
+    if type(watch_pid) is not int or watch_pid != expected_watch_pid:
+        failures.append(
+            'lifecycle-ready watch_pid must equal the correlated launch PID '
+            f'{expected_watch_pid}; observed {watch_pid!r}'
+        )
+
+    states = document['states']
+    service_states: dict[str, dict[str, Any]] = {}
+    if not isinstance(states, dict) or not states:
+        failures.append('lifecycle-ready states must be a nonempty JSON object')
+    else:
+        if set(states) != expected_node_set:
+            missing_nodes = sorted(expected_node_set - set(states))
+            unexpected_nodes = sorted(set(states) - expected_node_set)
+            failures.append(
+                'lifecycle-ready states must equal the correlated node set; '
+                f'missing={missing_nodes}, unexpected={unexpected_nodes}'
+            )
+        for node_name, state in states.items():
+            if (
+                not isinstance(node_name, str)
+                or _LIFECYCLE_NODE_PATTERN.fullmatch(node_name) is None
+            ):
+                failures.append(
+                    f'lifecycle-ready state name {node_name!r} is not a canonical node name'
+                )
+                continue
+            if not isinstance(state, dict):
+                failures.append(f'lifecycle-ready state {node_name!r} must be an object')
+                continue
+            observed_state_keys = set(state)
+            missing_state = sorted(_LIFECYCLE_STATE_KEYS - observed_state_keys)
+            unexpected_state = sorted(observed_state_keys - _LIFECYCLE_STATE_KEYS)
+            if missing_state:
+                failures.append(
+                    f'lifecycle-ready state {node_name!r} missing keys: {missing_state}'
+                )
+            if unexpected_state:
+                failures.append(
+                    f'lifecycle-ready state {node_name!r} has unexpected keys: {unexpected_state}'
+                )
+            if missing_state:
+                continue
+
+            expected_service = f'/robotest/{node_name}/get_state'
+            if state['service'] != expected_service:
+                failures.append(
+                    f'lifecycle-ready state {node_name!r} service must be {expected_service!r}'
+                )
+            if state['service_seen'] is not True:
+                failures.append(f'lifecycle-ready state {node_name!r} requires service_seen=true')
+            if state['state_id'] != 3 or type(state['state_id']) is not int:
+                failures.append(f'lifecycle-ready state {node_name!r} state_id must be integer 3')
+            if state['label'] != 'active':
+                label_error = f'lifecycle-ready state {node_name!r} label must be exactly active'
+                failures.append(label_error)
+            attempts = state['attempts']
+            timed_out_attempts = state['timed_out_attempts']
+            if type(attempts) is not int or attempts <= 0:
+                failures.append(f'lifecycle-ready state {node_name!r} attempts must be positive')
+            if type(timed_out_attempts) is not int or timed_out_attempts < 0:
+                failures.append(
+                    f'lifecycle-ready state {node_name!r} timed_out_attempts must be nonnegative'
+                )
+            elif type(attempts) is int and timed_out_attempts >= attempts:
+                failures.append(
+                    f'lifecycle-ready state {node_name!r} requires attempts > timed_out_attempts'
+                )
+            service_states[expected_service] = state
+
+    if failures:
+        raise GateError('launch_log_recovery_invalid', '; '.join(failures))
+    return (
+        service_states,
+        resolved_path,
+        hashlib.sha256(payload).hexdigest(),
+        len(payload),
+    )
+
+
+def _recovered_timeout_lines(
+    matches: list[dict[str, Any]],
+    service_states: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return the exact raw timeout lines covered by lifecycle timeout counters."""
+    recovered: list[dict[str, Any]] = []
+    recovered_per_service: dict[str, int] = {}
+    for match in matches:
+        if match['signature_ids'] != ['dds_response_timeout']:
+            continue
+        signature_matches = list(_DDS_RESPONSE_TIMEOUT_PATTERN.finditer(match['text']))
+        phrase_matches = list(_RECOVERABLE_DDS_RESPONSE_TIMEOUT_PATTERN.finditer(match['text']))
+        if len(signature_matches) != 1 or len(phrase_matches) != 1:
+            continue
+        service_name = phrase_matches[0].group('service')
+        state = service_states.get(service_name)
+        if state is None or state['timed_out_attempts'] < 1:
+            continue
+        recovered_count = recovered_per_service.get(service_name, 0)
+        if recovered_count >= state['timed_out_attempts']:
+            continue
+        recovered_per_service[service_name] = recovered_count + 1
+        recovered.append(
+            {
+                'line_number': match['line_number'],
+                'service_name': service_name,
+                'text': match['text'],
+                'timed_out_attempts': state['timed_out_attempts'],
+            }
+        )
+    return recovered
+
+
 def scan_final_launch_log(
     path: Path,
     launch_stopped_utc: str,
     *,
     scanned_utc: str | None = None,
+    lifecycle_ready_path: Path | None = None,
+    expected_lifecycle_watch_pid: int | None = None,
+    expected_lifecycle_wall_timeout_s: float | None = None,
+    expected_lifecycle_nodes: Collection[str] | None = None,
 ) -> dict[str, Any]:
     """Return strict, hash-bound evidence for every prohibited launch-log signature."""
     timestamp_failures: list[str] = []
@@ -411,7 +674,7 @@ def scan_final_launch_log(
     if stopped_at is not None and scanned_at is not None and scanned_at < stopped_at:
         timestamp_failures.append('scanned_utc must not precede launch_stopped_utc')
     evidence: dict[str, Any] = {
-        'schema_version': SCHEMA_VERSION,
+        'schema_version': FINAL_LAUNCH_LOG_SCHEMA_VERSION,
         'verdict': 'FAIL',
         'failure_kind': None,
         'failure_message': None,
@@ -423,6 +686,13 @@ def scan_final_launch_log(
         'line_count': None,
         'match_count': 0,
         'matches': [],
+        'lifecycle_timeout_recovery': {
+            'lifecycle_ready_path': None,
+            'lifecycle_ready_sha256': None,
+            'lifecycle_ready_size_bytes': None,
+            'recovered_line_count': 0,
+            'recovered_lines': [],
+        },
         'signature_definitions': [
             {
                 'signature_id': signature_id,
@@ -479,13 +749,60 @@ def scan_final_launch_log(
             'matches': matches,
         }
     )
-    if matches:
+    recovered_lines: list[dict[str, Any]] = []
+    if lifecycle_ready_path is None and any(
+        value is not None
+        for value in (
+            expected_lifecycle_watch_pid,
+            expected_lifecycle_wall_timeout_s,
+            expected_lifecycle_nodes,
+        )
+    ):
+        evidence['failure_kind'] = 'launch_log_recovery_invalid'
+        evidence['failure_message'] = (
+            'expected lifecycle recovery values require lifecycle_ready_path'
+        )
+        return evidence
+    if lifecycle_ready_path is not None:
+        if (
+            expected_lifecycle_watch_pid is None
+            or expected_lifecycle_wall_timeout_s is None
+            or expected_lifecycle_nodes is None
+        ):
+            evidence['failure_kind'] = 'launch_log_recovery_invalid'
+            evidence['failure_message'] = (
+                'lifecycle timeout recovery requires expected watch PID, wall timeout, '
+                'and exact node set'
+            )
+            return evidence
+        try:
+            service_states, resolved_path, digest, size = _read_lifecycle_ready(
+                lifecycle_ready_path,
+                expected_watch_pid=expected_lifecycle_watch_pid,
+                expected_wall_timeout_s=expected_lifecycle_wall_timeout_s,
+                expected_nodes=expected_lifecycle_nodes,
+            )
+        except GateError as error:
+            evidence['failure_kind'] = error.kind
+            evidence['failure_message'] = str(error)
+            return evidence
+        recovered_lines = _recovered_timeout_lines(matches, service_states)
+        evidence['lifecycle_timeout_recovery'] = {
+            'lifecycle_ready_path': str(resolved_path),
+            'lifecycle_ready_sha256': digest,
+            'lifecycle_ready_size_bytes': size,
+            'recovered_line_count': len(recovered_lines),
+            'recovered_lines': recovered_lines,
+        }
+
+    if matches and len(recovered_lines) != len(matches):
         categories = sorted(
             {signature_id for match in matches for signature_id in match['signature_ids']}
         )
         evidence['failure_kind'] = 'launch_log_signature_detected'
         evidence['failure_message'] = (
-            f'{len(matches)} prohibited launch-log line(s) matched: {categories}'
+            f'{len(matches)} prohibited launch-log line(s) matched, '
+            f'{len(recovered_lines)} recovered: {categories}'
         )
     else:
         evidence['verdict'] = 'PASS'
@@ -698,9 +1015,8 @@ def run_self_test() -> int:
 
         invalid_verdict = _valid_result()
         invalid_verdict['verdict'] = []
-        assert any(
-            'verdict' in item for item in validate_startup_result(invalid_verdict, contract)
-        )
+        verdict_errors = validate_startup_result(invalid_verdict, contract)
+        assert any('verdict' in item for item in verdict_errors)
 
         evidence_path = root / 'evidence.json'
         atomic_write_text(evidence_path, serialize_result(success))
@@ -711,9 +1027,8 @@ def run_self_test() -> int:
         clean_scan = scan_final_launch_log(clean_log, '2026-08-25T22:40:00Z')
         assert clean_scan['verdict'] == 'PASS'
         assert clean_scan['match_count'] == 0
-        assert clean_scan['launch_log_sha256'] == hashlib.sha256(
-            clean_log.read_bytes()
-        ).hexdigest()
+        clean_sha256 = hashlib.sha256(clean_log.read_bytes()).hexdigest()
+        assert clean_scan['launch_log_sha256'] == clean_sha256
 
         rejected_log = root / 'rejected-launch.log'
         rejected_log.write_text(

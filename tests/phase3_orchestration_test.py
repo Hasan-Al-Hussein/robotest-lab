@@ -843,9 +843,12 @@ def test_phase3_graph_validator_rejects_noncanonical_json_and_text_tampering(
         )
 
 
-def test_lifecycle_probe_fails_fast_on_missing_service_response(
+def _probe_lifecycle_responses(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    responses: list[object | None],
+    *,
+    wall_timeout: float,
+) -> tuple[dict[str, Any], object, SimpleNamespace]:
     clock = SimpleNamespace(now=0.0)
 
     class FakeFuture:
@@ -870,8 +873,9 @@ def test_lifecycle_probe_fails_fast_on_missing_service_response(
             return True
 
         def call_async(self, _request: object) -> FakeFuture:
+            response = responses[min(self.call_count, len(responses) - 1)]
             self.call_count += 1
-            return FakeFuture(None)
+            return FakeFuture(response)
 
         def remove_pending_request(self, future: FakeFuture) -> None:
             assert future.response is None
@@ -891,16 +895,57 @@ def test_lifecycle_probe_fails_fast_on_missing_service_response(
         lambda _probe, timeout_sec: setattr(clock, 'now', clock.now + timeout_sec),
     )
 
-    result = lifecycle_probe.probe_states('/robotest', ['amcl'], 1.0, None)
+    result = lifecycle_probe.probe_states('/robotest', ['amcl'], wall_timeout, None)
+
+    return result, client, clock
+
+
+def test_lifecycle_probe_recovers_after_transient_response_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = SimpleNamespace(
+        current_state=SimpleNamespace(
+            id=lifecycle_probe.State.PRIMARY_STATE_ACTIVE,
+            label='active',
+        )
+    )
+
+    result, client, clock = _probe_lifecycle_responses(
+        monkeypatch,
+        [None, active],
+        wall_timeout=1.0,
+    )
+
+    assert result['verdict'] == 'PASS'
+    assert result['failure'] is None
+    assert result['states']['amcl']['attempts'] == 2
+    assert result['states']['amcl']['state_id'] == lifecycle_probe.State.PRIMARY_STATE_ACTIVE
+    assert result['states']['amcl']['label'] == 'active'
+    assert result['states']['amcl']['timed_out_attempts'] == 1
+    assert 'error' not in result['states']['amcl']
+    assert client.call_count == 2
+    assert client.removed_count == 1
+    assert 0.5 <= clock.now < 1.0
+
+
+def test_lifecycle_probe_retries_missing_responses_until_global_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, client, clock = _probe_lifecycle_responses(
+        monkeypatch,
+        [None],
+        wall_timeout=0.65,
+    )
 
     assert result['verdict'] == 'FAIL'
-    assert result['failure'] == 'lifecycle state request for amcl exceeded 0.200s'
-    assert result['states']['amcl']['attempts'] == 1
+    assert result['failure'] == 'lifecycle probe exceeded its 0.650s wall deadline'
+    assert result['states']['amcl']['attempts'] == 2
     assert result['states']['amcl']['state_id'] is None
+    assert result['states']['amcl']['timed_out_attempts'] == 1
     assert result['states']['amcl']['error'] == ('lifecycle state response exceeded 0.200s')
-    assert client.call_count == 1
-    assert client.removed_count == 1
-    assert clock.now < 0.3
+    assert client.call_count == result['states']['amcl']['attempts']
+    assert client.removed_count == client.call_count
+    assert 0.65 <= clock.now < 0.75
 
 
 def test_goal_observer_readiness_requires_endpoint_not_idle_status_message() -> None:
