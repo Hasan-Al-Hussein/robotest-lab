@@ -1083,6 +1083,193 @@ def _phase3_fault_event(
     return event
 
 
+def _positive_runtime_gate_graph_fixture() -> tuple[dict[str, dict], dict[str, dict]]:
+    """Return a compact, production-shaped positive-control topic/QoS graph."""
+    topic_contracts = {
+        '/clock': ('BEST_EFFORT', 'VOLATILE', 1, []),
+        '/robotest/cmd_vel': (
+            'RELIABLE',
+            'VOLATILE',
+            1,
+            [{'depth': 4_096, 'node': '/robotest/metrics_collector', 'side': 'subscriber'}],
+        ),
+        '/robotest/internal/raw_contacts': ('RELIABLE', 'VOLATILE', 64, []),
+        '/robotest/validation/contacts': ('RELIABLE', 'VOLATILE', 10, []),
+        '/robotest/validation/ground_truth': ('RELIABLE', 'VOLATILE', 10, []),
+        '/robotest/validation/scenario_entity_poses': ('RELIABLE', 'VOLATILE', 10, []),
+        '/robotest/validation/world_stats': ('RELIABLE', 'VOLATILE', 10, []),
+    }
+    endpoint_layout = {
+        '/clock': (
+            [('/robotest/parameter_bridge', 'rosgraph_msgs/msg/Clock', 1)],
+            [('/robotest/contact_control_driver', 'rosgraph_msgs/msg/Clock', 1)],
+        ),
+        '/robotest/cmd_vel': (
+            [('/robotest/contact_control_driver', 'geometry_msgs/msg/Twist', 1)],
+            [
+                ('/robotest/metrics_collector', 'geometry_msgs/msg/Twist', 4_096),
+                ('/robotest/parameter_bridge', 'geometry_msgs/msg/Twist', 1),
+            ],
+        ),
+        '/robotest/internal/raw_contacts': (
+            [('/robotest/parameter_bridge', 'ros_gz_interfaces/msg/Contacts', 64)],
+            [('/robotest/contact_stream_gate', 'ros_gz_interfaces/msg/Contacts', 64)],
+        ),
+        '/robotest/validation/contacts': (
+            [('/robotest/contact_stream_gate', 'ros_gz_interfaces/msg/Contacts', 10)],
+            [
+                ('/robotest/contact_control_driver', 'ros_gz_interfaces/msg/Contacts', 10),
+                ('/robotest/metrics_collector', 'ros_gz_interfaces/msg/Contacts', 10),
+            ],
+        ),
+        '/robotest/validation/ground_truth': (
+            [('/robotest/parameter_bridge', 'nav_msgs/msg/Odometry', 10)],
+            [
+                ('/robotest/contact_control_driver', 'nav_msgs/msg/Odometry', 10),
+                ('/robotest/metrics_collector', 'nav_msgs/msg/Odometry', 10),
+            ],
+        ),
+        '/robotest/validation/scenario_entity_poses': (
+            [
+                ('/robotest/parameter_bridge', 'tf2_msgs/msg/TFMessage', 10),
+                ('/robotest/parameter_bridge', 'tf2_msgs/msg/TFMessage', 10),
+                ('/robotest/parameter_bridge', 'tf2_msgs/msg/TFMessage', 10),
+                ('/robotest/parameter_bridge', 'tf2_msgs/msg/TFMessage', 10),
+            ],
+            [('/robotest/contact_control_driver', 'tf2_msgs/msg/TFMessage', 10)],
+        ),
+        '/robotest/validation/world_stats': (
+            [
+                (
+                    '/robotest/parameter_bridge',
+                    'ros_gz_interfaces/msg/WorldStatistics',
+                    10,
+                )
+            ],
+            [
+                (
+                    '/robotest/metrics_collector',
+                    'ros_gz_interfaces/msg/WorldStatistics',
+                    10,
+                )
+            ],
+        ),
+    }
+    gid_counter = 1
+    exact_contract: dict[str, dict] = {}
+    topics: dict[str, dict] = {}
+    for topic, (reliability, durability, depth, overrides) in topic_contracts.items():
+        expected = {
+            'depth': depth,
+            'durability': durability,
+            'endpoint_depth_overrides': copy.deepcopy(overrides),
+            'history': 'KEEP_LAST',
+            'reliability': reliability,
+        }
+        exact_contract[topic] = copy.deepcopy(expected)
+        publishers = []
+        subscribers = []
+        qos_checks = []
+        for side, layout, target in (
+            ('publisher', endpoint_layout[topic][0], publishers),
+            ('subscriber', endpoint_layout[topic][1], subscribers),
+        ):
+            for node, topic_type, endpoint_depth in layout:
+                target.append(
+                    {
+                        'depth': endpoint_depth,
+                        'durability': durability,
+                        'gid': f'{gid_counter:032x}',
+                        'history': 'KEEP_LAST',
+                        'node': node,
+                        'reliability': reliability,
+                        'topic_type': topic_type,
+                    }
+                )
+                gid_counter += 1
+                qos_checks.append(
+                    {
+                        'bounded_depth_live_proven': True,
+                        'exact_depth_live_proven': True,
+                        'expected_depth': endpoint_depth,
+                        'explicit_keep_all': False,
+                        'introspection_complete': True,
+                        'node': node,
+                        'policy_contract_pass': True,
+                        'side': side,
+                    }
+                )
+        topics[topic] = {
+            'bounded_depth_live_proven': True,
+            'exact_depth_live_proven': True,
+            'expected': copy.deepcopy(expected),
+            'publisher_qos_pass': True,
+            'publishers': sorted(publishers, key=lambda item: (item['node'], item['topic_type'])),
+            'qos_checks': sorted(qos_checks, key=lambda item: (item['side'], item['node'])),
+            'qos_introspection_complete': True,
+            'subscriber_qos_pass': True,
+            'subscribers': sorted(
+                subscribers,
+                key=lambda item: (item['node'], item['topic_type']),
+            ),
+        }
+    return exact_contract, topics
+
+
+def _bounded_process_fixture(
+    *,
+    role: str,
+    command: list[str],
+    cwd: Path,
+    pid: int,
+    started_steady_ns: int,
+    finished_steady_ns: int,
+    wall_timeout_s: float,
+    returncode: int = 0,
+) -> dict:
+    timeout_text = f'{wall_timeout_s:.3f}s'
+    stream = {
+        'error': None,
+        'maximum_bytes': 8 * 1024 * 1024,
+        'observed_bytes': 0,
+        'overflow': False,
+        'retained_bytes': 0,
+    }
+    return {
+        'command': list(command),
+        'cwd': str(cwd),
+        'finished_steady_ns': finished_steady_ns,
+        'group_confirmed_empty': True,
+        'pgid': pid,
+        'pid': pid,
+        'returncode': returncode,
+        'role': role,
+        'started_steady_ns': started_steady_ns,
+        'stderr': copy.deepcopy(stream),
+        'stdout': copy.deepcopy(stream),
+        'timed_out': False,
+        'wall_timeout_s': wall_timeout_s,
+        'wrapped_command': [
+            'timeout',
+            '--signal=TERM',
+            '--kill-after=10s',
+            timeout_text,
+            *command,
+        ],
+    }
+
+
+def _write_bounded_process_artifacts(directory: Path, process: dict) -> None:
+    """Write one production-shaped process record and its retained log files."""
+    role = process['role']
+    process_directory = directory / 'processes'
+    _canonical_file(process_directory / f'{role}.process.json', process)
+    for stream_name in ('stdout', 'stderr'):
+        stream = process[stream_name]
+        assert stream['retained_bytes'] == 0
+        (process_directory / f'{role}.{stream_name}.log').write_bytes(b'')
+
+
 def _write_phase3_contact_gate_reobservation(
     repository: Path,
     directory: Path,
@@ -1091,6 +1278,7 @@ def _write_phase3_contact_gate_reobservation(
     build_binding: dict,
     ros_domain_id: int,
     gz_partition: str,
+    mode: str = 'candidate',
 ) -> None:
     frozen = build_binding['contact_gate_binary']
     frozen_aggregator = build_binding['contact_aggregator_binary']
@@ -1220,10 +1408,102 @@ def _write_phase3_contact_gate_reobservation(
         'contact_gate_binary_attestation': attestation,
         'verdict': 'PASS',
     }
+    if mode == 'positive_control':
+        exact_static_qos, topics = _positive_runtime_gate_graph_fixture()
+        gate_document.update(
+            {
+                'attempt_count': 1,
+                'authoritative_publisher_ownership': {
+                    '/clock': True,
+                    '/robotest/validation/ground_truth': True,
+                    '/robotest/validation/scenario_entity_poses': True,
+                    '/robotest/validation/world_stats': True,
+                },
+                'bounded_depth_live_proven_for_all_endpoints': True,
+                'cmd_vel_owner_pass': True,
+                'cmd_vel_subscriber_ownership_pass': True,
+                'contact_publisher_ownership': {
+                    '/robotest/internal/raw_contacts': True,
+                    '/robotest/validation/contacts': True,
+                },
+                'contact_subscriber_ownership': {
+                    '/robotest/internal/raw_contacts': True,
+                },
+                'elapsed_wall_s': 0.5,
+                'exact_static_qos_depth_contract': exact_static_qos,
+                'forbidden_nodes_present': [],
+                'mode': 'positive_control',
+                'namespace_isolation_pass': True,
+                'nodes': [
+                    '/robotest/contact_control_driver',
+                    '/robotest/contact_stream_gate',
+                    '/robotest/evidence/phase3_runtime_gate',
+                    '/robotest/fault_proxy',
+                    '/robotest/metrics_collector',
+                    '/robotest/parameter_bridge',
+                    '/robotest/robot_state_publisher',
+                    '/robotest/scenario_bridge',
+                ],
+                'producer': 'robotest_phase3/runtime_gate',
+                'qos_contract_pass': True,
+                'qos_introspection_complete': True,
+                'required_nodes_missing': [],
+                'scenario_services_missing': [],
+                'schema_version': 1,
+                'topics': topics,
+                'validation_autonomy_isolation_pass': True,
+            }
+        )
     initial_path = directory / 'runtime-gate.json'
     final_path = directory / 'contact-stream-final-gate.json'
     _canonical_file(initial_path, gate_document, sidecar=True)
-    _canonical_file(final_path, gate_document, sidecar=True)
+    final_document = gate_document
+    if mode == 'positive_control':
+        final_topics = {
+            topic: copy.deepcopy(gate_document['topics'][topic])
+            for topic in (
+                '/robotest/internal/raw_contacts',
+                '/robotest/validation/contacts',
+            )
+        }
+        public_contacts = final_topics['/robotest/validation/contacts']
+        public_contacts['subscribers'] = [
+            endpoint
+            for endpoint in public_contacts['subscribers']
+            if endpoint['node'] == '/robotest/metrics_collector'
+        ]
+        public_contacts['qos_checks'] = [
+            check
+            for check in public_contacts['qos_checks']
+            if check['side'] == 'publisher' or check['node'] == '/robotest/metrics_collector'
+        ]
+        final_document = {
+            'attempt_count': 1,
+            'contact_aggregator_binary_attestation': copy.deepcopy(aggregator_attestation),
+            'contact_gate_binary_attestation': copy.deepcopy(attestation),
+            'contact_stream_gate_present': True,
+            'elapsed_wall_s': 0.5,
+            'mode': 'contact_stream',
+            'nodes': [
+                '/robotest/contact_stream_gate',
+                '/robotest/evidence/phase3_runtime_gate',
+                '/robotest/fault_proxy',
+                '/robotest/metrics_collector',
+                '/robotest/parameter_bridge',
+                '/robotest/robot_state_publisher',
+            ],
+            'producer': 'robotest_phase3/runtime_gate',
+            'publisher_ownership': {
+                '/robotest/internal/raw_contacts': True,
+                '/robotest/validation/contacts': True,
+            },
+            'qos_contract_pass': True,
+            'raw_subscriber_ownership': True,
+            'schema_version': 1,
+            'topics': final_topics,
+            'verdict': 'PASS',
+        }
+    _canonical_file(final_path, final_document, sidecar=True)
     _canonical_file(
         directory / 'contact-gate-revalidation.json',
         orchestration.reconcile_contact_gate_reobservation(
@@ -1235,6 +1515,335 @@ def _write_phase3_contact_gate_reobservation(
         ),
         sidecar=True,
     )
+
+
+def _write_phase3_positive_handshake(
+    repository: Path,
+    directory: Path,
+    *,
+    orchestration: object,
+    build_binding: dict,
+    positive_control: dict,
+    ros_domain_id: int,
+    gz_partition: str,
+) -> None:
+    """Create READY, gate/process, ARM, and ACK evidence in causal order."""
+    control_configuration = positive_control['configuration']['control_configuration']
+    protocol = control_configuration['arm_protocol']
+    ready_steady_ns = 1_000_000
+    ready_document = {
+        'arm_protocol': copy.deepcopy(protocol),
+        'arm_protocol_sha256': release_module._canonical_sha256(protocol),
+        'control_configuration_sha256': positive_control['configuration'][
+            'control_configuration_sha256'
+        ],
+        'expected_pair': copy.deepcopy(positive_control['configuration']['expected_pair']),
+        'fixture_sha256': positive_control['configuration']['fixture_sha256'],
+        'identity': {
+            'fixture_id': positive_control['identity']['fixture_id'],
+            'run_id': positive_control['identity']['run_id'],
+        },
+        'observed_robot_start': copy.deepcopy(positive_control['control']['observed_robot_start']),
+        'observed_wall': copy.deepcopy(positive_control['control']['setup']['observed_wall']),
+        'producer': 'robotest_scenarios/contact_control_driver',
+        'ready_steady_ns': ready_steady_ns,
+        'resolved_names': {
+            'clock': '/clock',
+            'cmd_vel': '/robotest/cmd_vel',
+            'contacts': '/robotest/validation/contacts',
+            'entity_pose': '/robotest/validation/scenario_entity_poses',
+            'ground_truth': '/robotest/validation/ground_truth',
+        },
+        'schema_version': 1,
+        'spawn': copy.deepcopy(positive_control['control']['setup']['spawn']),
+    }
+    ready_path = directory / 'contact-control.ready.json'
+    _canonical_file(ready_path, ready_document)
+
+    _write_phase3_contact_gate_reobservation(
+        repository,
+        directory,
+        orchestration=orchestration,
+        build_binding=build_binding,
+        ros_domain_id=ros_domain_id,
+        gz_partition=gz_partition,
+        mode='positive_control',
+    )
+    runtime_gate_path = directory / 'runtime-gate.json'
+    runtime_gate_started_ns = 2_000_000
+    runtime_gate_finished_ns = 3_000_000
+    sim_pid = 40_000 + ros_domain_id
+    driver_pid = 41_000 + ros_domain_id
+    runtime_gate_pid = 51_000 + ros_domain_id
+    runtime_gate_command = [
+        'python3',
+        str(repository / 'tests/phase3_runtime_gate.py'),
+        '--mode',
+        'positive-control',
+        '--output',
+        str(runtime_gate_path),
+        '--workspace',
+        str(repository),
+        '--wall-timeout-s',
+        '20.0',
+        '--watch-pid',
+        str(driver_pid),
+        '--launch-pid',
+        str(sim_pid),
+        '--expected-domain-id',
+        str(ros_domain_id),
+        '--expected-gz-partition',
+        gz_partition,
+    ]
+    _write_bounded_process_artifacts(
+        directory,
+        _bounded_process_fixture(
+            role='runtime_gate',
+            command=runtime_gate_command,
+            cwd=repository,
+            pid=runtime_gate_pid,
+            started_steady_ns=runtime_gate_started_ns,
+            finished_steady_ns=runtime_gate_finished_ns,
+            wall_timeout_s=25.0,
+        ),
+    )
+
+    arm_request = orchestration.build_contact_control_arm_request(
+        ready_document,
+        ready_sha256=phase5_module.file_sha256(ready_path),
+        runtime_gate_sha256=phase5_module.file_sha256(runtime_gate_path),
+        arm_requested_steady_ns=4_000_000,
+    )
+    arm_request_path = directory / 'contact-control.arm.json'
+    _canonical_file(arm_request_path, arm_request)
+    arm_request_sha256 = phase5_module.file_sha256(arm_request_path)
+    acknowledgment = {
+        'arm_observed_clock_sample_count': 10,
+        'arm_observed_sim_stamp_ns': 800_000_000,
+        'arm_observed_steady_ns': 5_000_000,
+        'arm_protocol_sha256': ready_document['arm_protocol_sha256'],
+        'arm_request_sha256': arm_request_sha256,
+        'arm_requested_steady_ns': arm_request['arm_requested_steady_ns'],
+        'armed_clock_sample_count': 11,
+        'armed_sim_stamp_ns': 900_000_000,
+        'armed_steady_ns': 6_000_000,
+        'producer': protocol['ack_producer'],
+        'ready_sha256': arm_request['ready_sha256'],
+        'run_id': arm_request['run_id'],
+        'runtime_gate_sha256': arm_request['runtime_gate_sha256'],
+        'schema_version': protocol['schema_version'],
+    }
+    armed_path = directory / 'contact-control.armed.json'
+    _canonical_file(armed_path, acknowledgment)
+
+    positive_control['control']['arm'] = {
+        'acknowledgment': copy.deepcopy(acknowledgment),
+        'acknowledgment_sha256': phase5_module.file_sha256(armed_path),
+        'first_nonzero_publish_returned_steady_ns': 8_000_000,
+        'first_nonzero_publish_started_steady_ns': 7_000_000,
+        'request': copy.deepcopy(arm_request),
+        'request_sha256': arm_request_sha256,
+    }
+    positive_control['control']['timeline']['control_started_steady_ns'] = 7_000_000
+    _write_bounded_process_artifacts(
+        directory,
+        _bounded_process_fixture(
+            role='sim_launch',
+            command=[
+                'ros2',
+                'launch',
+                'robotest_sim',
+                'sim.launch.py',
+                'namespace:=robotest',
+                'seed:=42',
+                'headless:=true',
+                'render_sensors:=true',
+                'rviz:=false',
+            ],
+            cwd=repository,
+            pid=sim_pid,
+            started_steady_ns=100_000,
+            finished_steady_ns=10_000_000,
+            wall_timeout_s=120.0,
+            returncode=-15,
+        ),
+    )
+    _write_bounded_process_artifacts(
+        directory,
+        _bounded_process_fixture(
+            role='contact_control_driver',
+            command=[
+                'ros2',
+                'run',
+                'robotest_scenarios',
+                'contact_control_driver',
+                '--output',
+                str(directory / 'contact-control-result.json'),
+                '--ready-file',
+                str(ready_path),
+                '--arm-file',
+                str(arm_request_path),
+                '--armed-file',
+                str(armed_path),
+                '--run-id',
+                positive_control['identity']['run_id'],
+                '--coverage-manifest',
+                str(repository / 'config/collision-coverage.yaml'),
+                '--wall-timeout-s',
+                '30.0',
+                '--ros-args',
+                '-r',
+                '__ns:=/robotest',
+            ],
+            cwd=repository,
+            pid=driver_pid,
+            started_steady_ns=500_000,
+            finished_steady_ns=9_000_000,
+            wall_timeout_s=45.0,
+        ),
+    )
+    runtime_gate_script = str(repository / 'tests/phase3_runtime_gate.py')
+    process_fixtures = (
+        _bounded_process_fixture(
+            role='domain_preflight',
+            command=[
+                'python3',
+                runtime_gate_script,
+                '--mode',
+                'empty',
+                '--output',
+                str(directory / 'domain-preflight.json'),
+                '--workspace',
+                str(repository),
+                '--wall-timeout-s',
+                '10.0',
+            ],
+            cwd=repository,
+            pid=42_000 + ros_domain_id,
+            started_steady_ns=10_000,
+            finished_steady_ns=50_000,
+            wall_timeout_s=15.0,
+        ),
+        _bounded_process_fixture(
+            role='partition_preflight',
+            command=['gz', 'topic', '-l'],
+            cwd=repository,
+            pid=43_000 + ros_domain_id,
+            started_steady_ns=60_000,
+            finished_steady_ns=90_000,
+            wall_timeout_s=15.0,
+        ),
+        _bounded_process_fixture(
+            role='metrics_collector',
+            command=[
+                'ros2',
+                'run',
+                'robotest_metrics',
+                'metrics_collector',
+                '--output',
+                str(directory / 'capture.json'),
+                '--ready-file',
+                str(directory / 'metrics.ready.json'),
+                '--stop-file',
+                str(directory / 'metrics.stop'),
+                '--contact-progress-file',
+                str(directory / 'contact-progress.json'),
+                '--wall-timeout-s',
+                '360',
+                '--ros-args',
+                '-r',
+                '__ns:=/robotest',
+            ],
+            cwd=repository,
+            pid=44_000 + ros_domain_id,
+            started_steady_ns=200_000,
+            finished_steady_ns=9_500_000,
+            wall_timeout_s=370.0,
+        ),
+        _bounded_process_fixture(
+            role='contact_stream_final_gate',
+            command=[
+                'python3',
+                runtime_gate_script,
+                '--mode',
+                'contact-stream',
+                '--output',
+                str(directory / 'contact-stream-final-gate.json'),
+                '--workspace',
+                str(repository),
+                '--wall-timeout-s',
+                '10.0',
+                '--watch-pid',
+                str(sim_pid),
+                '--launch-pid',
+                str(sim_pid),
+                '--expected-domain-id',
+                str(ros_domain_id),
+                '--expected-gz-partition',
+                gz_partition,
+            ],
+            cwd=repository,
+            pid=52_000 + ros_domain_id,
+            started_steady_ns=8_200_000,
+            finished_steady_ns=8_400_000,
+            wall_timeout_s=15.0,
+        ),
+        _bounded_process_fixture(
+            role='domain_cleanup',
+            command=[
+                'python3',
+                runtime_gate_script,
+                '--mode',
+                'empty',
+                '--output',
+                str(directory / 'domain-cleanup.json'),
+                '--workspace',
+                str(repository),
+                '--wall-timeout-s',
+                '15.0',
+            ],
+            cwd=repository,
+            pid=53_000 + ros_domain_id,
+            started_steady_ns=10_100_000,
+            finished_steady_ns=10_200_000,
+            wall_timeout_s=20.0,
+        ),
+        _bounded_process_fixture(
+            role='partition_cleanup',
+            command=['gz', 'topic', '-l'],
+            cwd=repository,
+            pid=54_000 + ros_domain_id,
+            started_steady_ns=10_300_000,
+            finished_steady_ns=10_400_000,
+            wall_timeout_s=15.0,
+        ),
+    )
+    for process in process_fixtures:
+        _write_bounded_process_artifacts(directory, process)
+
+    empty_gate = {
+        'attempt_count': 1,
+        'elapsed_wall_s': 0.05,
+        'mode': 'empty',
+        'nodes': ['/robotest/evidence/phase3_runtime_gate'],
+        'producer': 'robotest_phase3/runtime_gate',
+        'remaining_nodes': [],
+        'schema_version': 1,
+        'verdict': 'PASS',
+    }
+    _canonical_file(directory / 'domain-preflight.json', empty_gate, sidecar=True)
+    _canonical_file(directory / 'domain-cleanup.json', empty_gate, sidecar=True)
+    _canonical_file(
+        directory / 'metrics.ready.json',
+        {
+            'initial_contact_stamp_ns': 1,
+            'node_name': '/robotest/metrics_collector',
+            'pre_clock_contact_message_count': 0,
+            'started_steady_wall_ns': 200_000,
+            'status': 'READY',
+        },
+    )
+    (directory / 'metrics.stop').write_text('positive-control-complete\n', encoding='utf-8')
 
 
 def _phase3_capture_fixture(
@@ -2007,13 +2616,10 @@ def _refresh_phase3_positive_binding(
     _canonical_file(marker_path, marker, sidecar=True)
 
 
-def _rebind_phase3_positive_raw(candidate_root: Path, repository: Path) -> None:
-    orchestration = release_module._load_repository_module(
-        repository,
-        'tests/phase3_orchestration.py',
-        'Phase 3 production orchestration test helper',
-    )
-    positive_directory = candidate_root / 'positive-control'
+def _refresh_phase3_positive_component_manifest(
+    positive_directory: Path,
+    orchestration: object,
+) -> None:
     excluded_outputs = {
         'PASS.json',
         'PASS.json.sha256',
@@ -2028,12 +2634,100 @@ def _rebind_phase3_positive_raw(candidate_root: Path, repository: Path) -> None:
         if path.is_file()
         and path.relative_to(positive_directory).as_posix() not in excluded_outputs
     )
-    component_manifest_path = positive_directory / 'component-manifest.json'
     _canonical_file(
-        component_manifest_path,
+        positive_directory / 'component-manifest.json',
         orchestration.component_manifest(component_paths, positive_directory),
         sidecar=True,
     )
+
+
+def _refresh_phase3_positive_component_manifest_from_repository(
+    candidate_root: Path,
+    repository: Path,
+) -> None:
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 production orchestration component-manifest fixture',
+    )
+    _refresh_phase3_positive_component_manifest(
+        candidate_root / 'positive-control',
+        orchestration,
+    )
+
+
+def _rebind_phase3_positive_runtime_gate(
+    candidate_root: Path,
+    repository: Path,
+) -> None:
+    """Cascade a changed runtime-gate hash through ARM, ACK, result, and binding."""
+    positive_directory = candidate_root / 'positive-control'
+    runtime_gate_sha256 = phase5_module.file_sha256(positive_directory / 'runtime-gate.json')
+    request_path = positive_directory / 'contact-control.arm.json'
+    request = json.loads(request_path.read_text(encoding='utf-8'))
+    request['runtime_gate_sha256'] = runtime_gate_sha256
+    _canonical_file(request_path, request)
+    request_sha256 = phase5_module.file_sha256(request_path)
+
+    acknowledgment_path = positive_directory / 'contact-control.armed.json'
+    acknowledgment = json.loads(acknowledgment_path.read_text(encoding='utf-8'))
+    acknowledgment['arm_request_sha256'] = request_sha256
+    acknowledgment['runtime_gate_sha256'] = runtime_gate_sha256
+    _canonical_file(acknowledgment_path, acknowledgment)
+    acknowledgment_sha256 = phase5_module.file_sha256(acknowledgment_path)
+
+    result_path = positive_directory / 'contact-control-result.json'
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    result_arm = result['control']['arm']
+    result_arm.update(
+        {
+            'acknowledgment': acknowledgment,
+            'acknowledgment_sha256': acknowledgment_sha256,
+            'request': request,
+            'request_sha256': request_sha256,
+        }
+    )
+    _canonical_file(result_path, result, sidecar=True)
+
+    binding_path = positive_directory / 'positive-binding.json'
+    binding = json.loads(binding_path.read_text(encoding='utf-8'))
+    binding['positive_control'] = copy.deepcopy(result)
+    _refresh_phase3_positive_binding(candidate_root, binding)
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 production orchestration runtime-gate rebind fixture',
+    )
+    build_binding = json.loads((candidate_root / 'build-binding.json').read_text(encoding='utf-8'))
+    plan = json.loads((candidate_root / 'suite-plan.json').read_text(encoding='utf-8'))
+    positive_plan = plan['positive_control']
+    _canonical_file(
+        positive_directory / 'contact-gate-revalidation.json',
+        orchestration.reconcile_contact_gate_reobservation(
+            positive_directory / 'runtime-gate.json',
+            positive_directory / 'contact-stream-final-gate.json',
+            build_binding=build_binding,
+            expected_domain_id=positive_plan['ros_domain_id'],
+            expected_gz_partition=positive_plan['gz_partition'],
+        ),
+        sidecar=True,
+    )
+    _refresh_phase3_positive_component_manifest(positive_directory, orchestration)
+
+
+def _rewrite_process_command(process: dict, command: list[str]) -> None:
+    process['command'] = command
+    process['wrapped_command'] = [*process['wrapped_command'][:4], *command]
+
+
+def _rebind_phase3_positive_raw(candidate_root: Path, repository: Path) -> None:
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 production orchestration test helper',
+    )
+    positive_directory = candidate_root / 'positive-control'
+    _refresh_phase3_positive_component_manifest(positive_directory, orchestration)
     build_binding = json.loads((candidate_root / 'build-binding.json').read_text(encoding='utf-8'))
     positive_binding_path = positive_directory / 'positive-binding.json'
     binding = orchestration.reconcile_positive_control(
@@ -2042,6 +2736,10 @@ def _rebind_phase3_positive_raw(candidate_root: Path, repository: Path) -> None:
         result_path=positive_directory / 'contact-control-result.json',
         capture_path=positive_directory / 'capture.json',
         contact_progress_path=positive_directory / 'contact-progress.json',
+        driver_ready_path=positive_directory / 'contact-control.ready.json',
+        arm_request_path=positive_directory / 'contact-control.arm.json',
+        armed_ack_path=positive_directory / 'contact-control.armed.json',
+        runtime_gate_path=positive_directory / 'runtime-gate.json',
         manifest_path=repository / 'config/collision-coverage.yaml',
         collector_configuration_sha256=build_binding['collector_configuration_sha256'],
         owned_process_group_shutdown=True,
@@ -2390,9 +3088,6 @@ PY
             'collector_configuration_sha256'
         ]
     positive_control['identity']['run_id'] = f'{candidate_id}-positive-control'
-    positive_sha = release_module._canonical_sha256(positive_control)
-    benchmark_binding['positive_control_json_sha256'] = positive_sha
-    benchmark_binding['positive_control_run_id'] = positive_control['identity']['run_id']
     scenario_names = release_module.PHASE3_SCENARIO_NAMES
     scenario_paths = {
         1: 'scenarios/phase3_s1_baseline.yaml',
@@ -2465,6 +3160,18 @@ PY
     positive_result_path = positive_directory / 'contact-control-result.json'
     positive_capture_path = positive_directory / 'capture.json'
     positive_binding = positive_directory / 'positive-binding.json'
+    _write_phase3_positive_handshake(
+        repository,
+        positive_directory,
+        orchestration=orchestration,
+        build_binding=build_binding,
+        positive_control=positive_control,
+        ros_domain_id=115,
+        gz_partition=f'robotest_p3_{candidate_id}_positive_control',
+    )
+    positive_sha = release_module._canonical_sha256(positive_control)
+    benchmark_binding['positive_control_json_sha256'] = positive_sha
+    benchmark_binding['positive_control_run_id'] = positive_control['identity']['run_id']
     _canonical_file(positive_result_path, positive_control, sidecar=True)
     metrics_fixture = release_module._load_repository_module(
         repository,
@@ -2523,7 +3230,7 @@ PY
             'stop_reason': 'stop_file',
         }
     )
-    _canonical_file(positive_capture_path, positive_capture, sidecar=True)
+    _canonical_file(positive_capture_path, positive_capture)
     positive_contact_items = positive_capture['streams']['contacts']['items']
     _canonical_file(
         positive_directory / 'contact-progress.json',
@@ -2534,14 +3241,6 @@ PY
             'retained_message_count': len(positive_contact_items),
             'schema_version': 1,
         },
-    )
-    _write_phase3_contact_gate_reobservation(
-        repository,
-        positive_directory,
-        orchestration=orchestration,
-        build_binding=build_binding,
-        ros_domain_id=115,
-        gz_partition=f'robotest_p3_{candidate_id}_positive_control',
     )
     resource_path = positive_directory / 'resources.jsonl'
     resource_samples = [
@@ -2596,6 +3295,10 @@ PY
         result_path=positive_result_path,
         capture_path=positive_capture_path,
         contact_progress_path=positive_directory / 'contact-progress.json',
+        driver_ready_path=positive_directory / 'contact-control.ready.json',
+        arm_request_path=positive_directory / 'contact-control.arm.json',
+        armed_ack_path=positive_directory / 'contact-control.armed.json',
+        runtime_gate_path=positive_directory / 'runtime-gate.json',
         manifest_path=repository / 'config/collision-coverage.yaml',
         collector_configuration_sha256=build_binding['collector_configuration_sha256'],
         owned_process_group_shutdown=True,
@@ -2908,6 +3611,68 @@ def _relocate_json(
     return relocated
 
 
+def _rebind_phase3_gate_attestation_workspace(
+    path: Path,
+    *,
+    repository: Path,
+    build_binding: dict,
+    orchestration: object,
+) -> None:
+    """Refresh clone-local live binary identities in one runtime-gate document."""
+    gate = json.loads(path.read_text(encoding='utf-8'))
+    gate_binding = build_binding['contact_gate_binary']
+    gate_path = (repository / gate_binding['installed_path']).resolve(strict=True)
+    gate_stat = gate_path.stat()
+    gate_attestation = gate['contact_gate_binary_attestation']
+    gate_attestation.update(
+        {
+            'installed_device': gate_stat.st_dev,
+            'installed_inode': gate_stat.st_ino,
+            'live_cmdline_sha256': hashlib.sha256(
+                f'{gate_path}\0--ros-args\0'.encode()
+            ).hexdigest(),
+            'live_device': gate_stat.st_dev,
+            'live_executable_link': str(gate_path),
+            'live_executable_path': str(gate_path),
+            'live_inode': gate_stat.st_ino,
+            'live_size_bytes': gate_stat.st_size,
+        }
+    )
+
+    aggregator_binding = build_binding['contact_aggregator_binary']
+    aggregator_path = (repository / aggregator_binding['installed_path']).resolve(strict=True)
+    aggregator_stat = aggregator_path.stat()
+    mapping_paths = [str(aggregator_path)]
+    mapping_fingerprint = hashlib.sha256(
+        (
+            f'{aggregator_stat.st_dev}:{aggregator_stat.st_ino}:'
+            f'{aggregator_stat.st_size}:{aggregator_path}'
+        ).encode()
+    ).hexdigest()
+    aggregator_attestation = gate['contact_aggregator_binary_attestation']
+    aggregator_attestation.update(
+        {
+            'installed_device': aggregator_stat.st_dev,
+            'installed_inode': aggregator_stat.st_ino,
+            'installed_size_bytes': aggregator_stat.st_size,
+            'live_mapping_count': 1,
+            'live_mapping_device': aggregator_stat.st_dev,
+            'live_mapping_fingerprint_sha256': mapping_fingerprint,
+            'live_mapping_inode': aggregator_stat.st_ino,
+            'live_mapping_paths': mapping_paths,
+        }
+    )
+    stable_identity = {
+        field: aggregator_attestation[field]
+        for field in orchestration.CONTACT_AGGREGATOR_STABLE_IDENTITY_FIELDS
+    }
+    aggregator_attestation['stable_identity'] = stable_identity
+    aggregator_attestation['stable_identity_sha256'] = orchestration.canonical_sha256(
+        stable_identity
+    )
+    _canonical_file(path, gate, sidecar=True)
+
+
 def _relocate_phase3_evidence(
     repository: Path,
     candidate_root: Path,
@@ -2925,6 +3690,22 @@ def _relocate_phase3_evidence(
     positive_directory = candidate_root / 'positive-control'
     positive_result_path = positive_directory / 'contact-control-result.json'
     _relocate_json(positive_result_path, old_root, str(repository), sidecar=True)
+    for role in release_module.PHASE3_POSITIVE_PROCESS_ROLES:
+        _relocate_json(
+            positive_directory / f'processes/{role}.process.json',
+            old_root,
+            str(repository),
+        )
+    for gate_name in ('runtime-gate.json', 'contact-stream-final-gate.json'):
+        gate_path = positive_directory / gate_name
+        _relocate_json(gate_path, old_root, str(repository), sidecar=True)
+        _rebind_phase3_gate_attestation_workspace(
+            gate_path,
+            repository=repository,
+            build_binding=build_binding,
+            orchestration=orchestration,
+        )
+    _rebind_phase3_positive_runtime_gate(candidate_root, repository)
     excluded_outputs = {
         'PASS.json',
         'PASS.json.sha256',
@@ -2952,6 +3733,10 @@ def _relocate_phase3_evidence(
         result_path=positive_result_path,
         capture_path=positive_directory / 'capture.json',
         contact_progress_path=positive_directory / 'contact-progress.json',
+        driver_ready_path=positive_directory / 'contact-control.ready.json',
+        arm_request_path=positive_directory / 'contact-control.arm.json',
+        armed_ack_path=positive_directory / 'contact-control.armed.json',
+        runtime_gate_path=positive_directory / 'runtime-gate.json',
         manifest_path=repository / 'config/collision-coverage.yaml',
         collector_configuration_sha256=build_binding['collector_configuration_sha256'],
         owned_process_group_shutdown=True,
@@ -4109,6 +4894,399 @@ def test_release_evidence_rejects_rebound_positive_control_raw_forgery(
     _rebind_phase3_positive_raw(candidate_root, repository)
 
     with pytest.raises(EvidenceError, match='positive-control result schema failed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_deleted_positive_control_arm_request(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    candidate_root = Path(fixture['candidate_root'])
+    (candidate_root / 'positive-control/contact-control.arm.json').unlink()
+
+    with pytest.raises(EvidenceError, match='positive-control arm request'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize('case', ['gate_tamper', 'boolean', 'order', 'hash'])
+def test_release_evidence_rejects_positive_control_arm_forgeries(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    positive_directory = Path(fixture['candidate_root']) / 'positive-control'
+    if case == 'gate_tamper':
+        path = positive_directory / 'runtime-gate.json'
+        document = json.loads(path.read_text(encoding='utf-8'))
+        document['qos_contract_pass'] = False
+        _canonical_file(path, document, sidecar=True)
+    elif case == 'boolean':
+        path = positive_directory / 'contact-control.armed.json'
+        document = json.loads(path.read_text(encoding='utf-8'))
+        document['schema_version'] = True
+        _canonical_file(path, document)
+    elif case == 'order':
+        path = positive_directory / 'contact-control.armed.json'
+        document = json.loads(path.read_text(encoding='utf-8'))
+        document['arm_observed_steady_ns'] = 3_999_999
+        _canonical_file(path, document)
+    else:
+        path = positive_directory / 'contact-control.arm.json'
+        document = json.loads(path.read_text(encoding='utf-8'))
+        document['arm_protocol_sha256'] = '0' * 64
+        _canonical_file(path, document)
+
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 production orchestration arm-forgery fixture',
+    )
+    _refresh_phase3_positive_component_manifest(positive_directory, orchestration)
+
+    with pytest.raises(EvidenceError, match='positive-control recomposition failed'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        'publisher_missing',
+        'publisher_extra',
+        'publisher_non_boolean',
+        'subscriber_missing',
+        'subscriber_wrong',
+        'subscriber_non_boolean',
+    ],
+)
+def test_release_evidence_rejects_rebound_runtime_gate_ownership_keys(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    gate_path = candidate_root / 'positive-control/runtime-gate.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    if case == 'publisher_missing':
+        del gate['contact_publisher_ownership']['/robotest/internal/raw_contacts']
+    elif case == 'publisher_extra':
+        gate['contact_publisher_ownership']['/robotest/forged_contacts'] = True
+    elif case == 'publisher_non_boolean':
+        gate['contact_publisher_ownership']['/robotest/internal/raw_contacts'] = 1
+    elif case == 'subscriber_missing':
+        gate['contact_subscriber_ownership'] = {}
+    elif case == 'subscriber_non_boolean':
+        gate['contact_subscriber_ownership']['/robotest/internal/raw_contacts'] = 1
+    else:
+        gate['contact_subscriber_ownership'] = {'/robotest/validation/contacts': True}
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_positive_runtime_gate(candidate_root, repository)
+
+    with pytest.raises(EvidenceError, match='positive-control recomposition failed'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize('case', ['missing', 'false', 'extra'])
+def test_release_evidence_rejects_cascaded_authoritative_projection_forgery(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    gate_path = candidate_root / 'positive-control/runtime-gate.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    projection = gate['authoritative_publisher_ownership']
+    topic = '/robotest/validation/ground_truth'
+    if case == 'missing':
+        del projection[topic]
+    elif case == 'false':
+        projection[topic] = False
+    else:
+        projection['/robotest/validation/forged_source'] = True
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_positive_runtime_gate(candidate_root, repository)
+
+    with pytest.raises(EvidenceError, match='positive-control recomposition failed'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    'case',
+    ['extra', 'missing', 'wrong_type', 'duplicate_gid', 'cross_topic_duplicate_gid'],
+)
+def test_release_evidence_rejects_cascaded_authoritative_source_forgery(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    gate_path = candidate_root / 'positive-control/runtime-gate.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    if case == 'cross_topic_duplicate_gid':
+        gate['topics']['/robotest/validation/ground_truth']['publishers'][0]['gid'] = gate[
+            'topics'
+        ]['/clock']['publishers'][0]['gid']
+    else:
+        topic = gate['topics']['/robotest/validation/scenario_entity_poses']
+        publishers = topic['publishers']
+        publisher_checks = [check for check in topic['qos_checks'] if check['side'] == 'publisher']
+        subscriber_checks = [
+            check for check in topic['qos_checks'] if check['side'] == 'subscriber'
+        ]
+        if case == 'extra':
+            forged_endpoint = copy.deepcopy(publishers[-1])
+            forged_endpoint['gid'] = 'e' * 32
+            publishers.append(forged_endpoint)
+            publisher_checks.append(copy.deepcopy(publisher_checks[-1]))
+        elif case == 'missing':
+            publishers.pop()
+            publisher_checks.pop()
+        elif case == 'wrong_type':
+            publishers[0]['topic_type'] = 'std_msgs/msg/String'
+        else:
+            publishers[1]['gid'] = publishers[0]['gid']
+        publishers.sort(key=lambda item: (item['node'], item['topic_type']))
+        topic['qos_checks'] = sorted(
+            [*publisher_checks, *subscriber_checks],
+            key=lambda item: (item['side'], item['node']),
+        )
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_positive_runtime_gate(candidate_root, repository)
+
+    with pytest.raises(EvidenceError, match='positive-control recomposition failed'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        'rebound_cmd_vel_override',
+        'duplicate_endpoint_gid',
+        'wrong_contact_type',
+        'extra_contact_owner',
+    ],
+)
+def test_release_evidence_rejects_cascaded_nested_runtime_gate_qos_forgery(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    gate_path = candidate_root / 'positive-control/runtime-gate.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    if case == 'rebound_cmd_vel_override':
+        topic = gate['topics']['/robotest/cmd_vel']
+        topic['expected']['endpoint_depth_overrides'][0]['depth'] = 2_048
+        gate['exact_static_qos_depth_contract']['/robotest/cmd_vel'] = copy.deepcopy(
+            topic['expected']
+        )
+        endpoint = next(
+            item for item in topic['subscribers'] if item['node'] == '/robotest/metrics_collector'
+        )
+        endpoint['depth'] = 2_048
+        check = next(
+            item
+            for item in topic['qos_checks']
+            if item['side'] == 'subscriber' and item['node'] == '/robotest/metrics_collector'
+        )
+        check['expected_depth'] = 2_048
+    elif case == 'duplicate_endpoint_gid':
+        topic = gate['topics']['/robotest/cmd_vel']
+        topic['subscribers'][0]['gid'] = topic['publishers'][0]['gid']
+    elif case == 'wrong_contact_type':
+        topic = gate['topics']['/robotest/internal/raw_contacts']
+        topic['publishers'][0]['topic_type'] = 'std_msgs/msg/String'
+    else:
+        topic = gate['topics']['/robotest/internal/raw_contacts']
+        forged_endpoint = copy.deepcopy(topic['publishers'][0])
+        forged_endpoint.update(
+            {
+                'gid': 'f' * 32,
+                'node': '/robotest/forged_parameter_bridge',
+            }
+        )
+        topic['publishers'].append(forged_endpoint)
+        topic['publishers'].sort(key=lambda item: (item['node'], item['topic_type']))
+        forged_check = copy.deepcopy(
+            next(item for item in topic['qos_checks'] if item['side'] == 'publisher')
+        )
+        forged_check['node'] = '/robotest/forged_parameter_bridge'
+        topic['qos_checks'].append(forged_check)
+        topic['qos_checks'].sort(key=lambda item: (item['side'], item['node']))
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_positive_runtime_gate(candidate_root, repository)
+
+    with pytest.raises(EvidenceError, match='positive-control recomposition failed'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        'wrong_executable',
+        'wrong_script',
+        'wrong_mode',
+        'wrong_workspace',
+        'wrong_inner_timeout',
+        'wrong_outer_timeout',
+        'wrong_watch_pid',
+        'wrong_launch_pid',
+        'wrong_domain',
+        'wrong_partition',
+        'missing_runtime_cwd',
+        'extra_runtime_field',
+        'missing_runtime_stream_field',
+        'extra_runtime_stream_field',
+        'missing_driver_cwd',
+        'missing_sim_stream_field',
+    ],
+)
+def test_release_evidence_rejects_rebound_runtime_gate_process_forgery(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    process_directory = candidate_root / 'positive-control/processes'
+    process_path = process_directory / 'runtime_gate.process.json'
+    if case == 'missing_driver_cwd':
+        process_path = process_directory / 'contact_control_driver.process.json'
+    elif case == 'missing_sim_stream_field':
+        process_path = process_directory / 'sim_launch.process.json'
+    process = json.loads(process_path.read_text(encoding='utf-8'))
+    command = list(process['command'])
+    if case == 'wrong_executable':
+        command[0] = 'python'
+        _rewrite_process_command(process, command)
+    elif case == 'wrong_script':
+        command[1] = str(repository / 'tests/forged_runtime_gate.py')
+        _rewrite_process_command(process, command)
+    elif case == 'wrong_mode':
+        command[command.index('--mode') + 1] = 'candidate'
+        _rewrite_process_command(process, command)
+    elif case == 'wrong_workspace':
+        forged_workspace = repository.parent.resolve()
+        process['cwd'] = str(forged_workspace)
+        command[1] = str(forged_workspace / 'tests/phase3_runtime_gate.py')
+        command[command.index('--workspace') + 1] = str(forged_workspace)
+        _rewrite_process_command(process, command)
+    elif case == 'wrong_inner_timeout':
+        command[command.index('--wall-timeout-s') + 1] = '19.0'
+        _rewrite_process_command(process, command)
+    elif case == 'wrong_outer_timeout':
+        process['wall_timeout_s'] = 24.0
+        process['wrapped_command'][3] = '24.000s'
+    elif case == 'wrong_watch_pid':
+        command[command.index('--watch-pid') + 1] = str(
+            int(command[command.index('--watch-pid') + 1]) + 1
+        )
+        _rewrite_process_command(process, command)
+    elif case == 'wrong_launch_pid':
+        command[command.index('--launch-pid') + 1] = str(
+            int(command[command.index('--launch-pid') + 1]) + 1
+        )
+        _rewrite_process_command(process, command)
+    elif case == 'wrong_domain':
+        command[command.index('--expected-domain-id') + 1] = str(
+            int(command[command.index('--expected-domain-id') + 1]) + 1
+        )
+        _rewrite_process_command(process, command)
+    elif case == 'wrong_partition':
+        partition_index = command.index('--expected-gz-partition') + 1
+        command[partition_index] = f'{command[partition_index]}-forged'
+        _rewrite_process_command(process, command)
+    elif case in {'missing_runtime_cwd', 'missing_driver_cwd'}:
+        del process['cwd']
+    elif case == 'extra_runtime_field':
+        process['unexpected'] = 'forged'
+    elif case == 'missing_runtime_stream_field':
+        del process['stdout']['maximum_bytes']
+    elif case == 'extra_runtime_stream_field':
+        process['stdout']['unexpected'] = 0
+    else:
+        del process['stderr']['retained_bytes']
+    _canonical_file(process_path, process)
+    _refresh_phase3_positive_component_manifest_from_repository(candidate_root, repository)
+
+    with pytest.raises(EvidenceError, match=r'positive-control .* process'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize('case', ['missing_log', 'missing_process', 'extra_artifact'])
+def test_release_evidence_requires_exact_positive_component_artifact_set(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    positive_directory = candidate_root / 'positive-control'
+    if case == 'missing_log':
+        (positive_directory / 'processes/partition_cleanup.stdout.log').unlink()
+    elif case == 'missing_process':
+        (positive_directory / 'processes/partition_cleanup.process.json').unlink()
+    else:
+        (positive_directory / 'forged-extra.log').write_text('forged\n', encoding='utf-8')
+    _refresh_phase3_positive_component_manifest_from_repository(candidate_root, repository)
+
+    with pytest.raises(EvidenceError, match='component artifact path set is not exact'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize('attestation_kind', ['contact_gate', 'contact_aggregator'])
+def test_release_evidence_rejects_rebound_foreign_runtime_gate_workspace_paths(
+    tmp_path: Path,
+    attestation_kind: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    positive_directory = candidate_root / 'positive-control'
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 foreign runtime-gate path forgery fixture',
+    )
+    for gate_name in ('runtime-gate.json', 'contact-stream-final-gate.json'):
+        gate_path = positive_directory / gate_name
+        gate = json.loads(gate_path.read_text(encoding='utf-8'))
+        if attestation_kind == 'contact_gate':
+            attestation = gate['contact_gate_binary_attestation']
+            foreign_path = repository.parent / 'foreign/build/robotest_sim/contact_stream_gate'
+            attestation['live_executable_link'] = str(foreign_path)
+            attestation['live_executable_path'] = str(foreign_path)
+            attestation['live_cmdline_sha256'] = hashlib.sha256(
+                f'{foreign_path}\0--ros-args\0'.encode()
+            ).hexdigest()
+        else:
+            attestation = gate['contact_aggregator_binary_attestation']
+            foreign_path = (
+                repository.parent
+                / 'foreign/build/robotest_sim/librobotest_contact_aggregator_system.so'
+            )
+            attestation['live_mapping_paths'] = [str(foreign_path)]
+            attestation['live_mapping_fingerprint_sha256'] = hashlib.sha256(
+                (
+                    f'{attestation["live_mapping_device"]}:'
+                    f'{attestation["live_mapping_inode"]}:'
+                    f'{attestation["installed_size_bytes"]}:{foreign_path}'
+                ).encode()
+            ).hexdigest()
+            stable_identity = {
+                field: attestation[field]
+                for field in orchestration.CONTACT_AGGREGATOR_STABLE_IDENTITY_FIELDS
+            }
+            attestation['stable_identity'] = stable_identity
+            attestation['stable_identity_sha256'] = orchestration.canonical_sha256(stable_identity)
+        _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_positive_runtime_gate(candidate_root, repository)
+
+    with pytest.raises(EvidenceError, match='attestation is not bound to this workspace'):
         _validate_release_fixture(fixture)
 
 

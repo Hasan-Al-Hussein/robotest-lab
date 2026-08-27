@@ -72,8 +72,9 @@
     "control": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["command_trace", "contact", "criteria", "metrics_owned", "observed_robot_start", "setup", "timeline"],
+      "required": ["arm", "command_trace", "contact", "criteria", "metrics_owned", "observed_robot_start", "setup", "timeline"],
       "properties": {
+        "arm": {"$ref": "#/$defs/armEvidence"},
         "command_trace": {"type": "array", "maxItems": 4096, "items": {"$ref": "#/$defs/command"}},
         "contact": {
           "type": "object",
@@ -159,7 +160,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "control_started_stamp_ns", "final_zero_stamp_ns", "hold_complete_stamp_ns",
+            "control_started_stamp_ns", "control_started_steady_ns", "final_zero_stamp_ns", "hold_complete_stamp_ns",
             "release_complete_stamp_ns", "release_contact_snapshot_start_count", "release_contact_snapshot_end_count",
             "release_observed_clock_stamp_ns", "release_qualified_snapshot_stamp_ns",
             "release_required_through_stamp_ns", "reverse_start_stamp_ns",
@@ -167,6 +168,7 @@
           ],
           "properties": {
             "control_started_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+            "control_started_steady_ns": {"type": ["integer", "null"], "minimum": 1},
             "final_zero_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
             "hold_complete_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
             "release_complete_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
@@ -286,6 +288,7 @@
           },
           "control": {
             "properties": {
+              "arm": {"$ref": "#/$defs/passingArmEvidence"},
               "command_trace": {
                 "minItems": 5,
                 "contains": {
@@ -333,6 +336,7 @@
               },
               "timeline": {
                 "properties": {
+                  "control_started_steady_ns": {"type": "integer", "minimum": 1},
                   "release_contact_snapshot_end_count": {"minimum": 2},
                   "release_contact_snapshot_start_count": {"type": "integer", "minimum": 1},
                   "release_observed_clock_stamp_ns": {"type": "integer", "minimum": 1},
@@ -367,6 +371,85 @@
     }
   ],
   "$defs": {
+    "armRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action", "arm_protocol_sha256", "arm_requested_steady_ns", "producer",
+        "ready_sha256", "run_id", "runtime_gate_sha256", "schema_version"
+      ],
+      "properties": {
+        "action": {"const": "start_positive_control_motion"},
+        "arm_protocol_sha256": {"$ref": "#/$defs/sha256"},
+        "arm_requested_steady_ns": {"type": "integer", "minimum": 1},
+        "producer": {"const": "robotest_phase3/benchmark_runner"},
+        "ready_sha256": {"$ref": "#/$defs/sha256"},
+        "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "runtime_gate_sha256": {"$ref": "#/$defs/sha256"},
+        "schema_version": {"const": 1}
+      }
+    },
+    "armedAcknowledgment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "arm_observed_clock_sample_count", "arm_observed_sim_stamp_ns",
+        "arm_observed_steady_ns", "arm_protocol_sha256", "arm_request_sha256",
+        "arm_requested_steady_ns", "armed_clock_sample_count", "armed_sim_stamp_ns",
+        "armed_steady_ns", "producer", "ready_sha256", "run_id",
+        "runtime_gate_sha256", "schema_version"
+      ],
+      "properties": {
+        "arm_observed_clock_sample_count": {"type": "integer", "minimum": 1},
+        "arm_observed_sim_stamp_ns": {"type": "integer", "minimum": 1},
+        "arm_observed_steady_ns": {"type": "integer", "minimum": 1},
+        "arm_protocol_sha256": {"$ref": "#/$defs/sha256"},
+        "arm_request_sha256": {"$ref": "#/$defs/sha256"},
+        "arm_requested_steady_ns": {"type": "integer", "minimum": 1},
+        "armed_clock_sample_count": {"type": "integer", "minimum": 1},
+        "armed_sim_stamp_ns": {"type": "integer", "minimum": 1},
+        "armed_steady_ns": {"type": "integer", "minimum": 1},
+        "producer": {"const": "robotest_scenarios/contact_control_driver"},
+        "ready_sha256": {"$ref": "#/$defs/sha256"},
+        "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "runtime_gate_sha256": {"$ref": "#/$defs/sha256"},
+        "schema_version": {"const": 1}
+      }
+    },
+    "armEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "acknowledgment", "acknowledgment_sha256",
+        "first_nonzero_publish_returned_steady_ns",
+        "first_nonzero_publish_started_steady_ns", "request", "request_sha256"
+      ],
+      "properties": {
+        "acknowledgment": {"anyOf": [{"$ref": "#/$defs/armedAcknowledgment"}, {"type": "null"}]},
+        "acknowledgment_sha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "first_nonzero_publish_returned_steady_ns": {"type": ["integer", "null"], "minimum": 1},
+        "first_nonzero_publish_started_steady_ns": {"type": ["integer", "null"], "minimum": 1},
+        "request": {"anyOf": [{"$ref": "#/$defs/armRequest"}, {"type": "null"}]},
+        "request_sha256": {"anyOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]}
+      }
+    },
+    "passingArmEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "acknowledgment", "acknowledgment_sha256",
+        "first_nonzero_publish_returned_steady_ns",
+        "first_nonzero_publish_started_steady_ns", "request", "request_sha256"
+      ],
+      "properties": {
+        "acknowledgment": {"$ref": "#/$defs/armedAcknowledgment"},
+        "acknowledgment_sha256": {"$ref": "#/$defs/sha256"},
+        "first_nonzero_publish_returned_steady_ns": {"type": "integer", "minimum": 1},
+        "first_nonzero_publish_started_steady_ns": {"type": "integer", "minimum": 1},
+        "request": {"$ref": "#/$defs/armRequest"},
+        "request_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
     "cleanupProof": {
       "type": "object",
       "additionalProperties": false,

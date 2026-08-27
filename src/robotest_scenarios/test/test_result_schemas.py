@@ -65,6 +65,55 @@ def test_contact_graph_endpoint_schema_pins_jazzy_gid_width() -> None:
         validate_against_schema(_contact_graph_endpoint('ab' * 24), endpoint_schema)
 
 
+def test_contact_arm_evidence_schema_requires_complete_passing_proof() -> None:
+    schema = load_schema(SCHEMA_DIR / 'contact-control-result.schema.json')
+    passing_schema = {
+        '$schema': schema['$schema'],
+        '$defs': schema['$defs'],
+        '$ref': '#/$defs/passingArmEvidence',
+    }
+    sha = 'a' * 64
+    request = {
+        'action': 'start_positive_control_motion',
+        'arm_protocol_sha256': sha,
+        'arm_requested_steady_ns': 20,
+        'producer': 'robotest_phase3/benchmark_runner',
+        'ready_sha256': sha,
+        'run_id': 'control-1',
+        'runtime_gate_sha256': sha,
+        'schema_version': 1,
+    }
+    acknowledgment = {
+        'arm_observed_clock_sample_count': 3,
+        'arm_observed_sim_stamp_ns': 100,
+        'arm_observed_steady_ns': 30,
+        'arm_protocol_sha256': sha,
+        'arm_request_sha256': sha,
+        'arm_requested_steady_ns': 20,
+        'armed_clock_sample_count': 4,
+        'armed_sim_stamp_ns': 101,
+        'armed_steady_ns': 40,
+        'producer': 'robotest_scenarios/contact_control_driver',
+        'ready_sha256': sha,
+        'run_id': 'control-1',
+        'runtime_gate_sha256': sha,
+        'schema_version': 1,
+    }
+    evidence = {
+        'acknowledgment': acknowledgment,
+        'acknowledgment_sha256': sha,
+        'first_nonzero_publish_returned_steady_ns': 51,
+        'first_nonzero_publish_started_steady_ns': 50,
+        'request': request,
+        'request_sha256': sha,
+    }
+    validate_against_schema(evidence, passing_schema)
+
+    evidence['acknowledgment'] = None
+    with pytest.raises(ArtifactError, match='schema violation'):
+        validate_against_schema(evidence, passing_schema)
+
+
 def test_contact_failure_artifact_shape_is_valid() -> None:
     sha = 'a' * 64
     criteria_names = {
@@ -115,6 +164,14 @@ def test_contact_failure_artifact_shape_is_valid() -> None:
             'wall_timeout_s': 30.0,
         },
         'control': {
+            'arm': {
+                'acknowledgment': None,
+                'acknowledgment_sha256': None,
+                'first_nonzero_publish_returned_steady_ns': None,
+                'first_nonzero_publish_started_steady_ns': None,
+                'request': None,
+                'request_sha256': None,
+            },
             'command_trace': [],
             'contact': {
                 'active_counterpart_count': 0,
@@ -147,6 +204,7 @@ def test_contact_failure_artifact_shape_is_valid() -> None:
                 },
             },
             'timeline': {
+                'control_started_steady_ns': None,
                 'control_started_stamp_ns': None,
                 'final_zero_stamp_ns': None,
                 'hold_complete_stamp_ns': None,

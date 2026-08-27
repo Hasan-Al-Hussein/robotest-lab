@@ -216,6 +216,69 @@ CONTACT_AGGREGATOR_BUILD_PATH = 'build/robotest_sim/librobotest_contact_aggregat
 CONTACT_AGGREGATOR_INSTALL_PATH = (
     'install/robotest_sim/lib/robotest_sim/librobotest_contact_aggregator_system.so'
 )
+PHASE3_POSITIVE_PROCESS_ROLES = (
+    'domain_preflight',
+    'partition_preflight',
+    'sim_launch',
+    'metrics_collector',
+    'contact_control_driver',
+    'runtime_gate',
+    'contact_stream_final_gate',
+    'domain_cleanup',
+    'partition_cleanup',
+)
+PHASE3_POSITIVE_TOP_LEVEL_COMPONENT_PATHS = frozenset(
+    {
+        'capture.json',
+        'contact-control-result.json',
+        'contact-control-result.json.sha256',
+        'contact-control.ready.json',
+        'contact-control.arm.json',
+        'contact-control.armed.json',
+        'contact-gate-revalidation.json',
+        'contact-gate-revalidation.json.sha256',
+        'contact-progress.json',
+        'contact-stream-final-gate.json',
+        'contact-stream-final-gate.json.sha256',
+        'domain-cleanup.json',
+        'domain-cleanup.json.sha256',
+        'domain-preflight.json',
+        'domain-preflight.json.sha256',
+        'metrics.ready.json',
+        'metrics.stop',
+        'resources.jsonl',
+        'runtime-gate.json',
+        'runtime-gate.json.sha256',
+    }
+)
+PHASE3_POSITIVE_COMPONENT_PATHS = PHASE3_POSITIVE_TOP_LEVEL_COMPONENT_PATHS | frozenset(
+    f'processes/{role}.{suffix}'
+    for role in PHASE3_POSITIVE_PROCESS_ROLES
+    for suffix in ('process.json', 'stdout.log', 'stderr.log')
+)
+PHASE3_BOUNDED_PROCESS_KEYS = {
+    'command',
+    'cwd',
+    'finished_steady_ns',
+    'group_confirmed_empty',
+    'pgid',
+    'pid',
+    'returncode',
+    'role',
+    'started_steady_ns',
+    'stderr',
+    'stdout',
+    'timed_out',
+    'wall_timeout_s',
+    'wrapped_command',
+}
+PHASE3_BOUNDED_STREAM_KEYS = {
+    'error',
+    'maximum_bytes',
+    'observed_bytes',
+    'overflow',
+    'retained_bytes',
+}
 
 
 def _require(condition: bool, message: str) -> None:
@@ -762,6 +825,305 @@ def _validate_contact_aggregator_binary_binding(value: object) -> None:
     )
 
 
+def _validate_positive_gate_workspace_paths(
+    gate: Mapping[str, Any],
+    *,
+    repository: Path,
+    build_binding: Mapping[str, Any],
+    label: str,
+) -> None:
+    """Bind both live binary attestations to this exact release workspace."""
+    gate_binding = _mapping(
+        build_binding.get('contact_gate_binary'),
+        'Phase 3 contact gate build binding',
+    )
+    gate_path = (repository / gate_binding['installed_path']).resolve(strict=True)
+    gate_stat = gate_path.stat()
+    gate_attestation = _mapping(
+        gate.get('contact_gate_binary_attestation'),
+        f'{label} contact gate attestation',
+    )
+    _require(
+        gate_attestation.get('live_executable_path') == str(gate_path)
+        and gate_attestation.get('live_executable_link') == str(gate_path)
+        and gate_attestation.get('live_device') == gate_stat.st_dev
+        and gate_attestation.get('live_inode') == gate_stat.st_ino
+        and gate_attestation.get('live_size_bytes') == gate_stat.st_size
+        and gate_attestation.get('installed_device') == gate_stat.st_dev
+        and gate_attestation.get('installed_inode') == gate_stat.st_ino
+        and gate_attestation.get('live_cmdline_sha256')
+        == hashlib.sha256(f'{gate_path}\0--ros-args\0'.encode()).hexdigest(),
+        f'{label} contact gate attestation is not bound to this workspace',
+    )
+
+    aggregator_binding = _mapping(
+        build_binding.get('contact_aggregator_binary'),
+        'Phase 3 contact aggregator build binding',
+    )
+    aggregator_path = (repository / aggregator_binding['installed_path']).resolve(strict=True)
+    aggregator_stat = aggregator_path.stat()
+    aggregator_attestation = _mapping(
+        gate.get('contact_aggregator_binary_attestation'),
+        f'{label} contact aggregator attestation',
+    )
+    expected_mapping_paths = [str(aggregator_path)]
+    expected_fingerprint = hashlib.sha256(
+        (
+            f'{aggregator_stat.st_dev}:{aggregator_stat.st_ino}:'
+            f'{aggregator_stat.st_size}:{aggregator_path}'
+        ).encode()
+    ).hexdigest()
+    stable_identity = _mapping(
+        aggregator_attestation.get('stable_identity'),
+        f'{label} contact aggregator stable identity',
+    )
+    _require(
+        aggregator_attestation.get('installed_device') == aggregator_stat.st_dev
+        and aggregator_attestation.get('installed_inode') == aggregator_stat.st_ino
+        and aggregator_attestation.get('installed_size_bytes') == aggregator_stat.st_size
+        and aggregator_attestation.get('live_mapping_count') == 1
+        and aggregator_attestation.get('live_mapping_device') == aggregator_stat.st_dev
+        and aggregator_attestation.get('live_mapping_inode') == aggregator_stat.st_ino
+        and aggregator_attestation.get('live_mapping_paths') == expected_mapping_paths
+        and aggregator_attestation.get('live_mapping_fingerprint_sha256') == expected_fingerprint
+        and stable_identity.get('installed_device') == aggregator_stat.st_dev
+        and stable_identity.get('installed_inode') == aggregator_stat.st_ino
+        and stable_identity.get('live_mapping_device') == aggregator_stat.st_dev
+        and stable_identity.get('live_mapping_inode') == aggregator_stat.st_ino
+        and stable_identity.get('live_mapping_paths') == expected_mapping_paths
+        and stable_identity.get('live_mapping_fingerprint_sha256') == expected_fingerprint,
+        f'{label} contact aggregator attestation is not bound to this workspace',
+    )
+
+
+def _validate_positive_component_processes(
+    positive_directory: Path,
+    *,
+    repository: Path,
+    positive_plan: Mapping[str, Any],
+) -> None:
+    """Validate every positive-control process record, retained log, and command."""
+    workspace = repository.resolve()
+    process_directory = positive_directory / 'processes'
+    processes: dict[str, dict[str, Any]] = {}
+    pids: set[int] = set()
+    for role in PHASE3_POSITIVE_PROCESS_ROLES:
+        label = f'Phase 3 positive-control {role} process'
+        process = _load_canonical_json(
+            process_directory / f'{role}.process.json',
+            label,
+            maximum_bytes=64 * 1024,
+        )
+        _require(set(process) == PHASE3_BOUNDED_PROCESS_KEYS, f'{label} fields are invalid')
+        pid = process.get('pid')
+        started = process.get('started_steady_ns')
+        finished = process.get('finished_steady_ns')
+        returncode = process.get('returncode')
+        _require(
+            process.get('role') == role
+            and process.get('cwd') == str(workspace)
+            and _exact_integer(pid)
+            and pid > 0
+            and process.get('pgid') == pid
+            and pid not in pids
+            and _exact_integer(started)
+            and started > 0
+            and _exact_integer(finished)
+            and finished >= started
+            and _exact_integer(returncode)
+            and (role == 'sim_launch' or returncode == 0)
+            and process.get('timed_out') is False
+            and process.get('group_confirmed_empty') is True,
+            f'{label} identity, lifetime, or exit state is invalid',
+        )
+        pids.add(pid)
+        for stream_name in ('stdout', 'stderr'):
+            stream_label = f'{label} {stream_name}'
+            stream = _mapping(process.get(stream_name), stream_label)
+            maximum_bytes = stream.get('maximum_bytes')
+            observed_bytes = stream.get('observed_bytes')
+            retained_bytes = stream.get('retained_bytes')
+            _require(
+                set(stream) == PHASE3_BOUNDED_STREAM_KEYS
+                and maximum_bytes == 8 * 1024 * 1024
+                and _exact_integer(observed_bytes)
+                and _exact_integer(retained_bytes)
+                and 0 <= retained_bytes <= observed_bytes <= maximum_bytes
+                and stream.get('overflow') is False
+                and stream.get('error') is None,
+                f'{stream_label} fields are invalid',
+            )
+            log_path = _regular_file(
+                process_directory / f'{role}.{stream_name}.log',
+                f'{stream_label} retained log',
+            )
+            _require(
+                log_path.stat().st_size == retained_bytes,
+                f'{stream_label} retained byte count differs from its log',
+            )
+        processes[role] = process
+
+    domain_id = positive_plan['ros_domain_id']
+    partition = positive_plan['gz_partition']
+    run_id = positive_plan['run_id']
+    sim_pid = processes['sim_launch']['pid']
+    driver_pid = processes['contact_control_driver']['pid']
+    script = str(workspace / 'tests/phase3_runtime_gate.py')
+    result_path = str((positive_directory / 'contact-control-result.json').resolve())
+    ready_path = str((positive_directory / 'contact-control.ready.json').resolve())
+    arm_path = str((positive_directory / 'contact-control.arm.json').resolve())
+    armed_path = str((positive_directory / 'contact-control.armed.json').resolve())
+    expected_commands = {
+        'domain_preflight': [
+            'python3',
+            script,
+            '--mode',
+            'empty',
+            '--output',
+            str((positive_directory / 'domain-preflight.json').resolve()),
+            '--workspace',
+            str(workspace),
+            '--wall-timeout-s',
+            '10.0',
+        ],
+        'partition_preflight': ['gz', 'topic', '-l'],
+        'sim_launch': [
+            'ros2',
+            'launch',
+            'robotest_sim',
+            'sim.launch.py',
+            'namespace:=robotest',
+            'seed:=42',
+            'headless:=true',
+            'render_sensors:=true',
+            'rviz:=false',
+        ],
+        'metrics_collector': [
+            'ros2',
+            'run',
+            'robotest_metrics',
+            'metrics_collector',
+            '--output',
+            str((positive_directory / 'capture.json').resolve()),
+            '--ready-file',
+            str((positive_directory / 'metrics.ready.json').resolve()),
+            '--stop-file',
+            str((positive_directory / 'metrics.stop').resolve()),
+            '--contact-progress-file',
+            str((positive_directory / 'contact-progress.json').resolve()),
+            '--wall-timeout-s',
+            '360',
+            '--ros-args',
+            '-r',
+            '__ns:=/robotest',
+        ],
+        'contact_control_driver': [
+            'ros2',
+            'run',
+            'robotest_scenarios',
+            'contact_control_driver',
+            '--output',
+            result_path,
+            '--ready-file',
+            ready_path,
+            '--arm-file',
+            arm_path,
+            '--armed-file',
+            armed_path,
+            '--run-id',
+            run_id,
+            '--coverage-manifest',
+            str(workspace / 'config/collision-coverage.yaml'),
+            '--wall-timeout-s',
+            '30.0',
+            '--ros-args',
+            '-r',
+            '__ns:=/robotest',
+        ],
+        'runtime_gate': [
+            'python3',
+            script,
+            '--mode',
+            'positive-control',
+            '--output',
+            str((positive_directory / 'runtime-gate.json').resolve()),
+            '--workspace',
+            str(workspace),
+            '--wall-timeout-s',
+            '20.0',
+            '--watch-pid',
+            str(driver_pid),
+            '--launch-pid',
+            str(sim_pid),
+            '--expected-domain-id',
+            str(domain_id),
+            '--expected-gz-partition',
+            partition,
+        ],
+        'contact_stream_final_gate': [
+            'python3',
+            script,
+            '--mode',
+            'contact-stream',
+            '--output',
+            str((positive_directory / 'contact-stream-final-gate.json').resolve()),
+            '--workspace',
+            str(workspace),
+            '--wall-timeout-s',
+            '10.0',
+            '--watch-pid',
+            str(sim_pid),
+            '--launch-pid',
+            str(sim_pid),
+            '--expected-domain-id',
+            str(domain_id),
+            '--expected-gz-partition',
+            partition,
+        ],
+        'domain_cleanup': [
+            'python3',
+            script,
+            '--mode',
+            'empty',
+            '--output',
+            str((positive_directory / 'domain-cleanup.json').resolve()),
+            '--workspace',
+            str(workspace),
+            '--wall-timeout-s',
+            '15.0',
+        ],
+        'partition_cleanup': ['gz', 'topic', '-l'],
+    }
+    expected_timeouts = {
+        'domain_preflight': 15.0,
+        'partition_preflight': 15.0,
+        'sim_launch': 120.0,
+        'metrics_collector': 370.0,
+        'contact_control_driver': 45.0,
+        'runtime_gate': 25.0,
+        'contact_stream_final_gate': 15.0,
+        'domain_cleanup': 20.0,
+        'partition_cleanup': 15.0,
+    }
+    for role in PHASE3_POSITIVE_PROCESS_ROLES:
+        process = processes[role]
+        command = expected_commands[role]
+        timeout = expected_timeouts[role]
+        _require(
+            process.get('command') == command
+            and process.get('wall_timeout_s') == timeout
+            and process.get('wrapped_command')
+            == [
+                'timeout',
+                '--signal=TERM',
+                '--kill-after=10s',
+                f'{timeout:.3f}s',
+                *command,
+            ],
+            f'Phase 3 positive-control {role} process command binding is invalid',
+        )
+
+
 def _validate_phase3_bundle(
     repository: Path,
     result_directory: Path,
@@ -1224,6 +1586,16 @@ def _phase3_evidence(
         and 0 <= domain_base <= 216,
         'Phase 3 domain base is invalid',
     )
+    positive_plan = _mapping(plan.get('positive_control'), 'Phase 3 positive-control plan')
+    _require(
+        positive_plan
+        == {
+            'gz_partition': f'robotest_p3_{candidate_id}_positive_control',
+            'ros_domain_id': domain_base + 15,
+            'run_id': f'{candidate_id}-positive-control',
+        },
+        'Phase 3 positive-control plan changed',
+    )
 
     positive_directory = candidate_root / 'positive-control'
     positive_binding_path = positive_directory / 'positive-binding.json'
@@ -1231,6 +1603,9 @@ def _phase3_evidence(
     positive_result_path = positive_directory / 'contact-control-result.json'
     positive_capture_path = positive_directory / 'capture.json'
     positive_contact_progress_path = positive_directory / 'contact-progress.json'
+    positive_driver_ready_path = positive_directory / 'contact-control.ready.json'
+    positive_arm_request_path = positive_directory / 'contact-control.arm.json'
+    positive_armed_ack_path = positive_directory / 'contact-control.armed.json'
     positive_initial_contact_gate_path = positive_directory / 'runtime-gate.json'
     positive_final_contact_gate_path = positive_directory / 'contact-stream-final-gate.json'
     positive_contact_gate_revalidation_path = positive_directory / 'contact-gate-revalidation.json'
@@ -1255,13 +1630,35 @@ def _phase3_evidence(
         positive_contact_progress_path,
         'Phase 3 positive-control contact progress',
     )
+    _load_canonical_json(
+        positive_driver_ready_path,
+        'Phase 3 positive-control driver readiness',
+        maximum_bytes=64 * 1024,
+    )
+    _load_canonical_json(
+        positive_arm_request_path,
+        'Phase 3 positive-control arm request',
+        maximum_bytes=4_096,
+    )
+    _load_canonical_json(
+        positive_armed_ack_path,
+        'Phase 3 positive-control armed acknowledgment',
+        maximum_bytes=4_096,
+    )
+    positive_initial_contact_gate = _load_canonical_json(
+        positive_initial_contact_gate_path,
+        'Phase 3 positive-control runtime gate',
+    )
+    positive_final_contact_gate = _load_canonical_json(
+        positive_final_contact_gate_path,
+        'Phase 3 positive-control final contact gate',
+    )
     positive_component_manifest = _load_canonical_json(
         positive_component_manifest_path,
         'Phase 3 positive-control component manifest',
     )
     for path, label in (
         (positive_result_path, 'Phase 3 positive-control component result'),
-        (positive_capture_path, 'Phase 3 positive-control capture'),
         (positive_initial_contact_gate_path, 'Phase 3 positive initial contact gate'),
         (positive_final_contact_gate_path, 'Phase 3 positive final contact gate'),
         (
@@ -1292,21 +1689,45 @@ def _phase3_evidence(
         'positive-binding.json',
         'positive-binding.json.sha256',
     }
-    expected_component_paths = {
+    actual_component_paths = {
         path.relative_to(positive_directory).as_posix()
         for path in positive_directory.rglob('*')
         if path.is_file()
         and path.relative_to(positive_directory).as_posix() not in excluded_component_outputs
     }
+    _require(
+        actual_component_paths == PHASE3_POSITIVE_COMPONENT_PATHS,
+        'Phase 3 positive-control component artifact path set is not exact',
+    )
+    for relative_path in PHASE3_POSITIVE_COMPONENT_PATHS:
+        _regular_file(
+            positive_directory / relative_path,
+            f'Phase 3 positive-control component artifact {relative_path}',
+        )
     manifest_artifacts = _list(
         positive_component_manifest.get('artifacts'),
         'Phase 3 positive-control component artifacts',
     )
     _require(
         {item.get('path') for item in manifest_artifacts if isinstance(item, dict)}
-        == expected_component_paths,
-        'Phase 3 positive-control component manifest path set is incomplete',
+        == PHASE3_POSITIVE_COMPONENT_PATHS,
+        'Phase 3 positive-control component manifest path set is not exact',
     )
+    _validate_positive_component_processes(
+        positive_directory,
+        repository=repository,
+        positive_plan=positive_plan,
+    )
+    for gate, label in (
+        (positive_initial_contact_gate, 'Phase 3 positive initial contact gate'),
+        (positive_final_contact_gate, 'Phase 3 positive final contact gate'),
+    ):
+        _validate_positive_gate_workspace_paths(
+            gate,
+            repository=repository,
+            build_binding=binding,
+            label=label,
+        )
     positive_resources_path = _regular_file(
         candidate_root / 'positive-control/resources.jsonl',
         'Phase 3 positive-control resource trace',
@@ -1325,16 +1746,6 @@ def _phase3_evidence(
         and positive_marker.get('status') == 'PASS'
         and positive_marker.get('positive_binding_sha256') == file_sha256(positive_binding_path),
         'Phase 3 positive control is not PASS',
-    )
-    positive_plan = _mapping(plan.get('positive_control'), 'Phase 3 positive-control plan')
-    _require(
-        positive_plan
-        == {
-            'gz_partition': f'robotest_p3_{candidate_id}_positive_control',
-            'ros_domain_id': domain_base + 15,
-            'run_id': f'{candidate_id}-positive-control',
-        },
-        'Phase 3 positive-control plan changed',
     )
     benchmark_binding = _mapping(
         positive_binding.get('benchmark_binding'), 'Phase 3 positive benchmark binding'
@@ -1563,6 +1974,10 @@ def _phase3_evidence(
             result_path=positive_result_path,
             capture_path=positive_capture_path,
             contact_progress_path=positive_contact_progress_path,
+            driver_ready_path=positive_driver_ready_path,
+            arm_request_path=positive_arm_request_path,
+            armed_ack_path=positive_armed_ack_path,
+            runtime_gate_path=positive_initial_contact_gate_path,
             manifest_path=repository / 'config/collision-coverage.yaml',
             collector_configuration_sha256=binding['collector_configuration_sha256'],
             owned_process_group_shutdown=True,

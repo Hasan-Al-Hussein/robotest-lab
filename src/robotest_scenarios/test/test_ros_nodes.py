@@ -14,6 +14,9 @@
 
 """Focused in-process ROS graph adapter tests."""
 
+import hashlib
+import json
+import time
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,11 +27,28 @@ from action_msgs.msg import GoalStatus, GoalStatusArray
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, ReliabilityPolicy
-from robotest_scenarios.constants import ACTION_STATUS_TOPIC
-from robotest_scenarios.contact_control_driver import ContactControlApp, ContactControlNode
+from robotest_scenarios.artifacts import canonical_json_bytes, write_canonical_json
+from robotest_scenarios.constants import (
+    ACTION_STATUS_TOPIC,
+    CONTROL_ARM_REQUEST_MAX_BYTES,
+    CONTROL_COMMAND_PERIOD_NS,
+    CONTROL_REVERSE_MPS,
+)
+from robotest_scenarios.contact_control_driver import (
+    ContactControlApp,
+    ContactControlNode,
+    _decode_arm_request,
+    _read_regular_nonsymlink,
+)
 from robotest_scenarios.contact_evidence import load_coverage_manifest
-from robotest_scenarios.errors import InfrastructureError, ProtocolError, ScenarioFailureError
+from robotest_scenarios.errors import (
+    InfrastructureError,
+    ProtocolError,
+    ScenarioFailureError,
+    WallTimeoutError,
+)
 from robotest_scenarios.models import load_scenario
+from robotest_scenarios.provenance import contact_control_arm_protocol_sha256
 from robotest_scenarios.scenario_controller import ScenarioControllerApp, ScenarioControllerNode
 from ros_gz_interfaces.msg import Contact, Contacts
 from rosgraph_msgs.msg import Clock
@@ -57,6 +77,59 @@ def _init_ros() -> None:
     rclpy.init(args=['--ros-args', '-r', '__ns:=/robotest'])
 
 
+class _ArmTestNode:
+    def __init__(self, acknowledgment_path: Path) -> None:
+        self.acknowledgment_path = acknowledgment_path
+        self.clock_sample_count = 8
+        self.clock_seen = True
+        self.control_started_stamp_ns = None
+        self.current_sim_stamp_ns = 2_000_000_000
+        self.fatal_error = None
+        self.first_qualifying_contact = None
+        self.motion_armed = False
+
+    def arm_motion(self) -> None:
+        assert self.acknowledgment_path.is_file()
+        assert not self.acknowledgment_path.is_symlink()
+        self.motion_armed = True
+
+    def start_forward(self) -> None:
+        assert self.motion_armed
+        self.control_started_stamp_ns = self.current_sim_stamp_ns
+
+
+def _arm_test_app(tmp_path: Path) -> ContactControlApp:
+    manifest = load_coverage_manifest(str(REPOSITORY / 'config' / 'collision-coverage.yaml'))
+    app = ContactControlApp(
+        manifest=manifest,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        arm_path=tmp_path / 'arm.json',
+        armed_path=tmp_path / 'armed.json',
+        run_id='arm-test',
+        wall_timeout_s=30.0,
+        service_timeout_s=2.0,
+        raw_ros_args=[],
+    )
+    app.node = _ArmTestNode(app.armed_path)
+    app.ready_steady_ns = time.monotonic_ns()
+    app.ready_sha256 = 'a' * 64
+    return app
+
+
+def _arm_request(app: ContactControlApp, *, ready_sha256: str | None = None) -> dict[str, object]:
+    return {
+        'action': 'start_positive_control_motion',
+        'arm_protocol_sha256': contact_control_arm_protocol_sha256(),
+        'arm_requested_steady_ns': time.monotonic_ns(),
+        'producer': 'robotest_phase3/benchmark_runner',
+        'ready_sha256': app.ready_sha256 if ready_sha256 is None else ready_sha256,
+        'run_id': app.run_id,
+        'runtime_gate_sha256': 'b' * 64,
+        'schema_version': 1,
+    }
+
+
 def test_contact_graph_accepts_pinned_jazzy_rmw_endpoint_gid_size() -> None:
     assert ContactControlApp._endpoint_gid_is_valid('ab' * 16)
 
@@ -64,6 +137,305 @@ def test_contact_graph_accepts_pinned_jazzy_rmw_endpoint_gid_size() -> None:
 @pytest.mark.parametrize('value', ['', 'ab' * 15, 'ab' * 17, 'ab' * 24, 'gg' * 16])
 def test_contact_graph_rejects_invalid_rmw_endpoint_gids(value: str) -> None:
     assert not ContactControlApp._endpoint_gid_is_valid(value)
+
+
+def test_contact_arm_waits_for_request_and_strictly_newer_positive_clock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _arm_test_app(tmp_path)
+    node = app._node
+    spin_count = 0
+
+    def spin_once() -> None:
+        nonlocal spin_count
+        spin_count += 1
+        if spin_count == 1:
+            write_canonical_json(app.arm_path, _arm_request(app), write_sidecar=False)
+        elif spin_count == 2:
+            node.clock_sample_count += 1
+        elif spin_count == 3:
+            node.clock_sample_count += 1
+            node.current_sim_stamp_ns += 1
+
+    monkeypatch.setattr(app, '_spin_once', spin_once)
+    app._wait_for_arm()
+
+    assert spin_count == 3
+    assert node.motion_armed
+    acknowledgment_bytes = app.armed_path.read_bytes()
+    acknowledgment = json.loads(acknowledgment_bytes)
+    assert acknowledgment_bytes == canonical_json_bytes(acknowledgment)
+    assert acknowledgment['arm_observed_clock_sample_count'] == 8
+    assert acknowledgment['armed_clock_sample_count'] == 10
+    assert acknowledgment['arm_observed_sim_stamp_ns'] == 2_000_000_000
+    assert acknowledgment['armed_sim_stamp_ns'] == 2_000_000_001
+    assert acknowledgment['arm_request_sha256'] == app.arm_request_sha256
+    assert app.armed_acknowledgment_sha256 == hashlib.sha256(acknowledgment_bytes).hexdigest()
+
+    node.first_qualifying_contact = {'sim_stamp_ns': node.current_sim_stamp_ns}
+    app._drive_until_contact()
+    assert (
+        acknowledgment['armed_steady_ns']
+        <= app.first_nonzero_publish_started_steady_ns
+        <= app.first_nonzero_publish_returned_steady_ns
+    )
+
+
+def test_contact_arm_timeout_cannot_arm_or_publish(tmp_path: Path) -> None:
+    app = _arm_test_app(tmp_path)
+
+    def timeout() -> None:
+        raise WallTimeoutError('deadline elapsed')
+
+    app._spin_once = timeout
+    with pytest.raises(WallTimeoutError, match='deadline elapsed'):
+        app._wait_for_arm()
+    assert not app._node.motion_armed
+    assert app.arm_request is None
+    assert not app.armed_path.exists()
+
+
+def test_contact_arm_fresh_clock_callback_cannot_cross_wall_deadline(tmp_path: Path) -> None:
+    app = _arm_test_app(tmp_path)
+    node = app._node
+    write_canonical_json(app.arm_path, _arm_request(app), write_sidecar=False)
+
+    class CrossingExecutor:
+        @staticmethod
+        def spin_once(*, timeout_sec: float) -> None:
+            assert timeout_sec > 0.0
+            node.clock_sample_count += 1
+            node.current_sim_stamp_ns += 1
+            app.wall_deadline = time.monotonic()
+
+    app.executor = CrossingExecutor()
+
+    with pytest.raises(WallTimeoutError, match='30 s steady-wall escape'):
+        app._wait_for_arm()
+
+    assert app.arm_request is not None
+    assert app.armed_acknowledgment is None
+    assert not app.armed_path.exists()
+    assert not node.motion_armed
+    assert app.first_nonzero_publish_started_steady_ns is None
+
+
+def test_contact_arm_ack_commit_crossing_deadline_is_retained_without_arming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _arm_test_app(tmp_path)
+    node = app._node
+    write_canonical_json(app.arm_path, _arm_request(app), write_sidecar=False)
+
+    def spin_once() -> None:
+        node.clock_sample_count += 1
+        node.current_sim_stamp_ns += 1
+
+    def crossing_write(path: Path, value: object, **kwargs: object) -> str:
+        digest = write_canonical_json(path, value, **kwargs)
+        if path == app.armed_path:
+            app.wall_deadline = time.monotonic()
+        return digest
+
+    monkeypatch.setattr(app, '_spin_once', spin_once)
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.write_canonical_json',
+        crossing_write,
+    )
+
+    with pytest.raises(WallTimeoutError, match='30 s steady-wall escape'):
+        app._wait_for_arm()
+
+    assert app.armed_path.is_file()
+    assert app.armed_acknowledgment is not None
+    assert (
+        app.armed_acknowledgment_sha256 == hashlib.sha256(app.armed_path.read_bytes()).hexdigest()
+    )
+    assert not node.motion_armed
+    assert app.first_nonzero_publish_started_steady_ns is None
+
+
+def test_contact_first_nonzero_rechecks_wall_deadline_after_ack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _arm_test_app(tmp_path)
+    node = app._node
+    write_canonical_json(app.arm_path, _arm_request(app), write_sidecar=False)
+
+    def spin_once() -> None:
+        node.clock_sample_count += 1
+        node.current_sim_stamp_ns += 1
+
+    monkeypatch.setattr(app, '_spin_once', spin_once)
+    app._wait_for_arm()
+    assert app.armed_path.is_file()
+    assert node.motion_armed
+
+    app.wall_deadline = time.monotonic()
+    with pytest.raises(WallTimeoutError, match='30 s steady-wall escape'):
+        app._drive_until_contact()
+
+    assert node.control_started_stamp_ns is None
+    assert app.first_nonzero_publish_started_steady_ns is None
+    assert app.first_nonzero_publish_returned_steady_ns is None
+
+
+def test_contact_wait_predicate_cannot_cross_wall_deadline(tmp_path: Path) -> None:
+    app = _arm_test_app(tmp_path)
+    predicate_calls = 0
+
+    def crossing_predicate() -> bool:
+        nonlocal predicate_calls
+        predicate_calls += 1
+        app.wall_deadline = time.monotonic()
+        return True
+
+    with pytest.raises(WallTimeoutError, match='30 s steady-wall escape'):
+        app._wait_for(crossing_predicate, reason='predicate crossed deadline')
+
+    assert predicate_calls == 1
+
+
+def test_contact_reverse_rechecks_wall_deadline_before_nonzero(tmp_path: Path) -> None:
+    app = _arm_test_app(tmp_path)
+    published_commands: list[tuple[float, str]] = []
+
+    def publish_command(linear_x: float, *, phase: str) -> dict[str, int]:
+        published_commands.append((linear_x, phase))
+        return {'sim_stamp_ns': app._node.current_sim_stamp_ns}
+
+    app._node.publish_command = publish_command
+    app.wall_deadline = time.monotonic()
+
+    with pytest.raises(WallTimeoutError, match='30 s steady-wall escape'):
+        app._reverse_and_release()
+
+    assert published_commands == []
+
+
+def test_contact_repeated_forward_rechecks_deadline_after_spin_postcheck(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _arm_test_app(tmp_path)
+    node = app._node
+    node.motion_armed = True
+    app.armed_acknowledgment = {}
+    app.armed_acknowledgment_sha256 = 'a' * 64
+    app.wall_deadline = 10.0
+    monotonic_values = iter((9.0, 9.0, 9.0, 10.0))
+    published_commands: list[tuple[float, str]] = []
+
+    def publish_command(linear_x: float, *, phase: str) -> dict[str, int]:
+        published_commands.append((linear_x, phase))
+        return {'sim_stamp_ns': node.current_sim_stamp_ns}
+
+    def spin_once() -> None:
+        node.current_sim_stamp_ns += CONTROL_COMMAND_PERIOD_NS
+        app._require_wall_budget()
+
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.time.monotonic',
+        lambda: next(monotonic_values),
+    )
+    monkeypatch.setattr(node, 'publish_command', publish_command, raising=False)
+    monkeypatch.setattr(app, '_spin_once', spin_once)
+
+    with pytest.raises(WallTimeoutError, match='30 s steady-wall escape'):
+        app._drive_until_contact()
+
+    assert node.control_started_stamp_ns == 2_000_000_000
+    assert published_commands == []
+
+
+def test_contact_repeated_reverse_rechecks_deadline_after_spin_postcheck(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _arm_test_app(tmp_path)
+    node = app._node
+    app.wall_deadline = 10.0
+    monotonic_values = iter((9.0, 9.0, 9.0, 10.0))
+    published_commands: list[tuple[float, str]] = []
+
+    def publish_command(linear_x: float, *, phase: str) -> dict[str, int]:
+        published_commands.append((linear_x, phase))
+        return {'sim_stamp_ns': node.current_sim_stamp_ns}
+
+    def spin_once() -> None:
+        node.current_sim_stamp_ns += CONTROL_COMMAND_PERIOD_NS
+        app._require_wall_budget()
+
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.time.monotonic',
+        lambda: next(monotonic_values),
+    )
+    monkeypatch.setattr(node, 'publish_command', publish_command, raising=False)
+    monkeypatch.setattr(app, '_spin_once', spin_once)
+
+    with pytest.raises(WallTimeoutError, match='30 s steady-wall escape'):
+        app._reverse_and_release()
+
+    assert published_commands == [(CONTROL_REVERSE_MPS, 'REVERSE')]
+
+
+def test_contact_arm_rejects_canonical_request_with_wrong_ready_binding(tmp_path: Path) -> None:
+    app = _arm_test_app(tmp_path)
+    write_canonical_json(
+        app.arm_path,
+        _arm_request(app, ready_sha256='c' * 64),
+        write_sidecar=False,
+    )
+    with pytest.raises(ProtocolError, match='ready artifact'):
+        app._wait_for_arm()
+    assert not app._node.motion_armed
+    assert not app.armed_path.exists()
+
+
+def test_contact_arm_rejects_noncanonical_oversized_and_symlink_payloads(
+    tmp_path: Path,
+) -> None:
+    app = _arm_test_app(tmp_path)
+    request = _arm_request(app)
+    app.arm_path.write_text(json.dumps(request), encoding='utf-8')
+    with pytest.raises(ProtocolError, match='exact canonical'):
+        app._wait_for_arm()
+
+    with pytest.raises(ProtocolError, match='byte bound'):
+        _decode_arm_request(b' ' * (CONTROL_ARM_REQUEST_MAX_BYTES + 1))
+
+    app.arm_path.unlink()
+    target = tmp_path / 'arm-target.json'
+    write_canonical_json(target, request, write_sidecar=False)
+    app.arm_path.symlink_to(target)
+    with pytest.raises(ProtocolError, match='regular non-symlink'):
+        _read_regular_nonsymlink(
+            app.arm_path,
+            maximum_bytes=CONTROL_ARM_REQUEST_MAX_BYTES,
+        )
+
+
+def test_contact_node_blocks_nonzero_prearm_but_allows_fail_safe_zero() -> None:
+    _init_ros()
+    manifest = load_coverage_manifest(str(REPOSITORY / 'config' / 'collision-coverage.yaml'))
+    node = ContactControlNode(manifest)
+    try:
+        node._on_clock(_clock(1_000_000_000))
+        zero = node.publish_command(0.0, phase='FAIL_SAFE_ZERO')
+        assert zero['linear_x'] == 0.0
+        with pytest.raises(ProtocolError, match='preceded the armed acknowledgment'):
+            node.publish_command(0.05, phase='FORWARD')
+        node.arm_motion()
+        forward = node.publish_command(0.05, phase='FORWARD')
+        assert forward['linear_x'] == 0.05
+        with pytest.raises(ProtocolError, match='exactly once'):
+            node.arm_motion()
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
 
 
 def test_scenario_controller_binds_only_one_post_ready_uuid() -> None:
@@ -164,6 +536,7 @@ def test_contact_node_stops_on_exact_manifest_pair() -> None:
         ground_truth.pose.pose.orientation.w = 1.0
         node._on_ground_truth(ground_truth)
         assert node.latest_ground_truth is not None
+        node.arm_motion()
         node.start_forward()
         node._on_clock(_clock(1_050_000_000))
         contact = Contact()
@@ -382,6 +755,7 @@ def test_contact_node_validates_whole_snapshot_before_stop_and_rejects_nonrobot(
     node = ContactControlNode(manifest)
     try:
         node._on_clock(_clock(1_000_000_000))
+        node.arm_motion()
         node.start_forward()
         exact = Contact()
         exact.collision1.name, exact.collision2.name = manifest.expected_control_pair
@@ -407,6 +781,7 @@ def test_contact_node_stops_immediately_then_settles_future_snapshot_latency() -
     node = ContactControlNode(manifest)
     try:
         node._on_clock(_clock(1_000_000_000))
+        node.arm_motion()
         node.start_forward()
         contact = Contact()
         contact.collision1.name, contact.collision2.name = manifest.expected_control_pair
@@ -440,6 +815,7 @@ def test_contact_node_stop_latency_100ms_boundary(
     node = ContactControlNode(manifest)
     try:
         node._on_clock(_clock(1_000_000_000))
+        node.arm_motion()
         node.start_forward()
         node._on_clock(_clock(1_000_000_000 + stop_latency_ns))
         contact = Contact()
@@ -661,6 +1037,8 @@ def test_contact_cleanup_retains_successful_response_when_quiet_wait_fails(
         manifest=manifest,
         output_path=tmp_path / 'result.json',
         ready_path=tmp_path / 'ready.json',
+        arm_path=tmp_path / 'arm.json',
+        armed_path=tmp_path / 'armed.json',
         run_id='cleanup-proof-test',
         wall_timeout_s=1.0,
         service_timeout_s=1.0,
@@ -739,6 +1117,7 @@ def test_contact_control_phase_boundaries_publish_only_the_new_phase(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     app = object.__new__(ContactControlApp)
+    app.wall_deadline = time.monotonic() + 30.0
     commands: list[dict[str, object]] = []
 
     def publish_command(linear_x: float, *, phase: str) -> dict[str, object]:

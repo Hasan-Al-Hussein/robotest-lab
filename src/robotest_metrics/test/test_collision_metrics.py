@@ -95,6 +95,57 @@ def test_positive_control_is_hash_bound_and_must_pass() -> None:
         validate_collision_qualification(manifest, failed, binding)
 
 
+def _rehash_arm_acknowledgment(positive: dict[str, Any]) -> None:
+    arm = positive['control']['arm']
+    arm['acknowledgment_sha256'] = canonical_sha256(arm['acknowledgment'])
+
+
+@pytest.mark.parametrize(
+    ('mutation', 'message'),
+    [
+        (lambda positive: positive['control'].pop('arm'), 'arm proof'),
+        (
+            lambda positive: positive['control']['arm']['request'].__setitem__(
+                'schema_version', True
+            ),
+            'must be an integer',
+        ),
+        (
+            lambda positive: positive['control']['arm'].__setitem__('request_sha256', '0' * 64),
+            'request hash mismatch',
+        ),
+        (
+            lambda positive: (
+                positive['control']['arm']['acknowledgment'].__setitem__(
+                    'arm_observed_steady_ns', 3_999_999
+                ),
+                _rehash_arm_acknowledgment(positive),
+            ),
+            'steady-time ordering',
+        ),
+        (
+            lambda positive: (
+                positive['control']['arm']['acknowledgment'].__setitem__(
+                    'armed_clock_sample_count', 10
+                ),
+                _rehash_arm_acknowledgment(positive),
+            ),
+            'fresh clock sample',
+        ),
+    ],
+)
+def test_positive_control_arm_handshake_fails_closed(
+    mutation: Any,
+    message: str,
+) -> None:
+    manifest, positive, binding = collision_fixture()
+    mutation(positive)
+    _rebind_positive_control(positive, binding)
+
+    with pytest.raises(MetricUnavailable, match=message):
+        validate_collision_qualification(manifest, positive, binding)
+
+
 def test_positive_control_graph_pins_jazzy_endpoint_gid_width() -> None:
     _manifest, positive, _binding = collision_fixture()
     snapshot = positive['quality']['contact_graph_topology']['first_snapshot']

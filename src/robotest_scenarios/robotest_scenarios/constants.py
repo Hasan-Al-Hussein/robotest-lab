@@ -88,6 +88,14 @@ CONTROL_WALL_POSE = (0.70, -3.50, 0.40, 0.0)
 CONTROL_ROBOT_START = (0.0, -3.5, 0.0)
 CONTROL_WALL_COLLISION = 'phase3_contact_control_wall::link::collision'
 CONTROL_SOURCE_GRAPH_MISSING_CONFIRM_NS = 100_000_000
+CONTROL_ARM_ACTION = 'start_positive_control_motion'
+CONTROL_ARM_ACK_MAX_BYTES = 4_096
+CONTROL_ARM_ACK_PRODUCER = 'robotest_scenarios/contact_control_driver'
+CONTROL_ARM_FRESH_CLOCK_POLICY = 'strictly_newer_positive_stamp_after_valid_arm'
+CONTROL_ARM_REQUEST_MAX_BYTES = 4_096
+CONTROL_ARM_REQUEST_PRODUCER = 'robotest_phase3/benchmark_runner'
+CONTROL_ARM_SCHEMA_VERSION = 1
+CONTROL_ARM_WAIT_DEADLINE_POLICY = 'complete_fixture_steady_wall_deadline_without_reset'
 
 DEFAULT_SERVICE_TIMEOUT_S = 2.0
 DEFAULT_CONTROL_WALL_TIMEOUT_S = 30.0

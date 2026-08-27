@@ -33,6 +33,7 @@ from phase3_orchestration import (
     AGGREGATE_METRICS,
     atomic_write_bytes,
     atomic_write_json,
+    build_contact_control_arm_request,
     build_binding,
     canonical_json_bytes,
     component_manifest,
@@ -43,6 +44,7 @@ from phase3_orchestration import (
     EvidenceError,
     failure_evidence,
     file_sha256,
+    load_canonical_json,
     load_json,
     LOG_MAX_BYTES,
     make_orchestrator_evidence,
@@ -56,8 +58,11 @@ from phase3_orchestration import (
     suite_document,
     summarize_resources,
     validate_build_binding,
+    validate_contact_control_armed,
+    validate_contact_control_ready,
     validate_contact_drain_evidence,
     validate_contact_progress,
+    validate_positive_runtime_gate_artifacts,
     verify_component_manifest,
     verify_json_sidecar,
 )
@@ -700,6 +705,36 @@ def _wait_for_file(
     )
 
 
+def _require_fresh_distinct_paths(paths: Sequence[Path], *, label: str) -> None:
+    """Reserve distinct absent paths before handing them to independent processes."""
+    resolved = [path.resolve() for path in paths]
+    if len(set(resolved)) != len(resolved):
+        raise EvidenceError(f'{label} paths must be distinct')
+    for path in paths:
+        if path.exists() or path.is_symlink():
+            raise EvidenceError(f'{label} path already exists: {path}')
+
+
+def _require_processes_alive(
+    processes: Sequence[BoundedProcess],
+    *,
+    stage: str,
+) -> None:
+    """Fail before authorization when any required positive-control owner exited."""
+    for process in processes:
+        status = process.poll()
+        if status is None:
+            continue
+        process.wait(1.0)
+        raise StageFailure(
+            stage,
+            'process_exit_before_arm',
+            f'{process.role} exited with status {status} before motion authorization',
+            exit_code=status,
+            evidence=load_json(process.metadata_path),
+        )
+
+
 def _validate_goal_observer_armed(
     document: object,
     ready_document: Mapping[str, Any],
@@ -1095,6 +1130,11 @@ class BenchmarkRunner:
             )
             result_path = run_dir / 'contact-control-result.json'
             driver_ready = run_dir / 'contact-control.ready.json'
+            driver_arm = run_dir / 'contact-control.arm.json'
+            driver_armed = run_dir / 'contact-control.armed.json'
+            _require_fresh_distinct_paths(
+                (driver_arm, driver_armed), label='contact-control arm handshake'
+            )
             driver = registry.start(
                 'contact_control_driver',
                 [
@@ -1106,6 +1146,10 @@ class BenchmarkRunner:
                     str(result_path),
                     '--ready-file',
                     str(driver_ready),
+                    '--arm-file',
+                    str(driver_arm),
+                    '--armed-file',
+                    str(driver_armed),
                     '--run-id',
                     stage['run_id'],
                     '--coverage-manifest',
@@ -1124,12 +1168,20 @@ class BenchmarkRunner:
                 watched=(launch, collector, driver),
                 stage='positive_driver_ready',
             )
-            registry.run_checked(
+            if driver_ready.is_symlink():
+                raise EvidenceError('contact-control readiness cannot be a symlink')
+            driver_ready_document = validate_contact_control_ready(
+                load_canonical_json(driver_ready, maximum_bytes=64 * 1024),
+                expected_run_id=stage['run_id'],
+            )
+            driver_ready_sha256 = file_sha256(driver_ready)
+            runtime_gate_path = run_dir / 'runtime-gate.json'
+            runtime_gate_process = registry.run_checked(
                 'runtime_gate',
                 _runtime_gate_command(
                     self.workspace,
                     'positive-control',
-                    run_dir / 'runtime-gate.json',
+                    runtime_gate_path,
                     watch_pid=driver.pid,
                     launch_pid=launch.pid,
                     expected_domain_id=stage['ros_domain_id'],
@@ -1139,6 +1191,58 @@ class BenchmarkRunner:
                 wall_timeout_s=25.0,
                 stage='positive_runtime_gate',
             )
+            if _group_alive(runtime_gate_process.pgid):
+                raise StageFailure(
+                    'positive_runtime_gate',
+                    'process_group_not_empty',
+                    'runtime gate process group remained live before motion authorization',
+                    evidence=load_json(runtime_gate_process.metadata_path),
+                )
+            runtime_gate_binding = validate_positive_runtime_gate_artifacts(
+                runtime_gate_path,
+                runtime_gate_process.metadata_path,
+            )
+            _require_processes_alive((launch, collector, driver), stage='positive_runtime_gate')
+            _require_fresh_distinct_paths(
+                (driver_arm, driver_armed), label='contact-control arm handshake'
+            )
+            arm_request = build_contact_control_arm_request(
+                driver_ready_document,
+                ready_sha256=driver_ready_sha256,
+                runtime_gate_sha256=runtime_gate_binding['runtime_gate_sha256'],
+                arm_requested_steady_ns=time.monotonic_ns(),
+            )
+            if not (
+                driver_ready_document['ready_steady_ns']
+                <= runtime_gate_binding['started_steady_ns']
+                <= runtime_gate_binding['finished_steady_ns']
+                <= arm_request['arm_requested_steady_ns']
+            ):
+                raise EvidenceError('runtime-gate completion does not precede arm request')
+            arm_protocol = driver_ready_document['arm_protocol']
+            arm_request_sha256 = atomic_write_json(
+                driver_arm,
+                arm_request,
+                maximum_bytes=arm_protocol['request_max_bytes'],
+            )
+            _wait_for_file(
+                driver_armed,
+                timeout_s=CONTACT_CONTROL_WALL_TIMEOUT_S,
+                watched=(launch, collector, driver),
+                stage='positive_driver_armed',
+            )
+            if driver_armed.is_symlink():
+                raise EvidenceError('contact-control arm acknowledgment cannot be a symlink')
+            validate_contact_control_armed(
+                load_canonical_json(
+                    driver_armed,
+                    maximum_bytes=arm_protocol['ack_max_bytes'],
+                ),
+                ready=driver_ready_document,
+                request=arm_request,
+                request_sha256=arm_request_sha256,
+            )
+            _require_processes_alive((launch, collector, driver), stage='positive_driver_armed')
             driver_status = driver.wait(50.0)
             if driver_status != 0:
                 raise StageFailure(
@@ -1257,6 +1361,10 @@ class BenchmarkRunner:
                 result_path=result_path,
                 capture_path=capture_path,
                 contact_progress_path=contact_progress_path,
+                driver_ready_path=driver_ready,
+                arm_request_path=driver_arm,
+                armed_ack_path=driver_armed,
+                runtime_gate_path=runtime_gate_path,
                 manifest_path=self.workspace / 'config/collision-coverage.yaml',
                 collector_configuration_sha256=binding['collector_configuration_sha256'],
                 owned_process_group_shutdown=cleanup_ok,

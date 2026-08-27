@@ -325,13 +325,38 @@ does not match, or any source/rendered/configuration hash differs between the
 control and benchmark candidates. In those cases `collision_count` is null and
 the benchmark fails; a silent mission contact topic cannot be reported as zero.
 
+Positive-control motion is authorized by a stationary, artifact-bound
+handshake. The driver completes preparation, atomically writes READY, and keeps
+spinning with graph/source checks active but no nonzero motion. The runner must
+finish the positive runtime gate, validate its canonical semantic PASS, confirm
+that its process group is empty, and recheck that the launch, collector, and
+driver are alive. It then atomically writes the exact canonical run-bound ARM
+artifact, bound by hash to both READY and runtime-gate evidence. The driver
+rejects a missing, stale, oversized, symlinked, malformed, noncanonical,
+wrong-run, wrong-producer, or hash-mismatched artifact.
+
+After accepting ARM, the driver records its clock baseline and continues
+spinning until it observes a strictly newer positive `/clock` sample. It then
+atomically writes a driver-owned ARMED acknowledgement bound to ARM, READY, and
+runtime-gate evidence. Only that completed acknowledgement authorizes the first
+nonzero publication. A fail-safe zero may be published during pre-arm failure
+cleanup, but never authorizes motion. Canonical evidence must prove the order
+runtime-gate completion, ARM authorization, driver observation, fresh-clock
+arming, and first nonzero publication. Missing evidence or an order/hash
+violation fails closed.
+
+The complete positive-control fixture, including preparation, runtime gate,
+ARM wait, fresh-clock wait, motion, release, and cleanup, shares one 30 s
+steady-wall deadline. READY, ARM, and ARMED never start or reset a deadline.
+
 Actuator-facing `cmd_vel` endpoints remain RELIABLE, VOLATILE, and
 KEEP_LAST(1). The independent metrics observer alone uses a bounded
 KEEP_LAST(4096) reader history equal to its retained command capacity, so a
 short single-thread callback backlog cannot overwrite admissible evidence or
 queue stale commands to the actuator. Qualification still requires a distinct
 collector observation for every component publication within 100 ms; this
-history exception does not relax that latency or completeness rule.
+history exception does not relax that latency or completeness rule. The active
+stop command must likewise be issued within 100 ms of the qualifying contact.
 
 The component and metrics collector are independent observers of the public
 snapshot stream. Their retained traces are reconciled bijectively from the

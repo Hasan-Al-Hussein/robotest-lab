@@ -397,7 +397,34 @@ then provides a seeded, strictly increasing authoritative delivered active-pair
 snapshot stream before motion. The control starts the robot at
 `(0.0, -3.5, 0.0)` with Nav2 and the collision monitor absent. A dedicated
 `contact_control_driver` is the sole publisher of the final Gazebo command
-topic for this isolated fixture. It spawns:
+topic for this isolated fixture.
+
+Motion uses this frozen fail-closed authorization sequence:
+
+1. The driver completes preparation, observes its required positive `/clock`
+   and later authoritative contact state, proves its stable graph, atomically
+   writes READY, and remains stationary while continuing to spin and audit the
+   graph and sources.
+2. The runner completes the positive runtime gate while the driver is
+   stationary. It requires gate exit zero, an empty gate process group, a
+   canonical semantic PASS with the frozen ownership, subscriber, and QoS
+   booleans true, and the launch, collector, and driver still alive.
+3. The runner atomically writes the exact canonical run-bound ARM artifact,
+   bound by SHA-256 to READY and the runtime-gate artifact. The driver rejects
+   missing, stale, oversized, symlinked, malformed, noncanonical, wrong-run,
+   wrong-producer, or hash-mismatched ARM evidence.
+4. After accepting ARM, the driver records its current clock sample and keeps
+   spinning until a strictly newer positive `/clock` sample arrives. It then
+   atomically writes the driver-owned ARMED acknowledgement bound to ARM, READY,
+   and runtime-gate evidence.
+5. Only a valid ARMED acknowledgement permits the first nonzero command. The
+   retained timing evidence must prove runtime-gate completion before ARM
+   authorization, driver observation before fresh-clock arming, and arming
+   before the first nonzero publication. Any missing artifact, hash mismatch,
+   or ordering violation fails closed. A best-effort zero remains allowed
+   before arm solely for fail-safe cleanup.
+
+During preparation, before READY, the driver spawns:
 
 ```yaml
 entity:
@@ -416,7 +443,9 @@ within `0.10 s`, holds for `0.25 s`, reverses at `-0.05 m/s` for
 retained authoritative snapshot `q` with the wall absent and
 `q > final_zero_stamp + 0.25 s`; equality and a clock-only target do not close
 the episode. The collector acknowledges and retains that exact `q`. A `30 s`
-steady-wall escape bounds the complete fixture.
+steady-wall escape bounds the complete fixture, including preparation, the
+stationary runtime gate, ARM and fresh-clock waits, motion, release, and
+cleanup. READY, ARM, and ARMED do not start or reset that deadline.
 
 The expected non-excluded pair is the coverage manifest's exact rendered
 chassis collision and
@@ -429,7 +458,9 @@ Passive collector callback offsets are retained as noncausal diagnostics; the
 active driver's own callback-time bound remains fail-closed. Exact graph
 endpoint cardinality/GID continuity, the final command being zero, false
 collector overflows, actor deletion, and termination of both owned process
-groups are also required.
+groups are also required. Every component command publication must have a
+distinct collector observation within `0.10 s`; the active contact stop retains
+the same `0.10 s` maximum response bound.
 
 The coverage manifest, not this one chassis contact alone, must enumerate and
 bind every rendered robot collision geometry. A chassis-only production

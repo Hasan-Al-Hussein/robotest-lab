@@ -901,7 +901,148 @@ def test_resource_summary_rejects_a_bounded_child_affinity_escape(tmp_path: Path
         orchestration.summarize_resources(trace)
 
 
+def _bounded_process_fixture(
+    *,
+    command: list[str],
+    finished_steady_ns: int,
+    pid: int,
+    role: str,
+    started_steady_ns: int,
+    wall_timeout_s: float,
+    workspace: Path,
+    returncode: int = 0,
+) -> dict:
+    return {
+        'command': command,
+        'cwd': str(workspace),
+        'finished_steady_ns': finished_steady_ns,
+        'group_confirmed_empty': True,
+        'pgid': pid,
+        'pid': pid,
+        'returncode': returncode,
+        'role': role,
+        'started_steady_ns': started_steady_ns,
+        'stderr': {
+            'error': None,
+            'maximum_bytes': orchestration.LOG_MAX_BYTES,
+            'observed_bytes': 0,
+            'overflow': False,
+            'retained_bytes': 0,
+        },
+        'stdout': {
+            'error': None,
+            'maximum_bytes': orchestration.LOG_MAX_BYTES,
+            'observed_bytes': 0,
+            'overflow': False,
+            'retained_bytes': 0,
+        },
+        'timed_out': False,
+        'wall_timeout_s': wall_timeout_s,
+        'wrapped_command': [
+            'timeout',
+            '--signal=TERM',
+            '--kill-after=10s',
+            f'{wall_timeout_s:.3f}s',
+            *command,
+        ],
+    }
+
+
+def _positive_topic_fixture(
+    topic: str,
+    *,
+    publishers: list[tuple[str, str]],
+    subscribers: list[tuple[str, str]],
+    gid_seed: int,
+) -> dict:
+    static = copy.deepcopy(orchestration.POSITIVE_RUNTIME_GATE_QOS_CONTRACTS[topic])
+
+    def endpoint(side: str, node: str, topic_type: str, gid: int) -> dict:
+        expected = orchestration._positive_endpoint_expected_qos(static, side=side, node=node)
+        return {
+            'depth': 0,
+            'durability': expected['durability'],
+            'gid': f'{gid:032x}',
+            'history': 'UNKNOWN',
+            'node': node,
+            'reliability': expected['reliability'],
+            'topic_type': topic_type,
+        }
+
+    publisher_records = sorted(
+        (
+            endpoint('publisher', node, topic_type, gid_seed + index)
+            for index, (node, topic_type) in enumerate(publishers)
+        ),
+        key=lambda item: (item['node'], item['topic_type']),
+    )
+    subscriber_records = sorted(
+        (
+            endpoint(
+                'subscriber',
+                node,
+                topic_type,
+                gid_seed + len(publishers) + index,
+            )
+            for index, (node, topic_type) in enumerate(subscribers)
+        ),
+        key=lambda item: (item['node'], item['topic_type']),
+    )
+    checks = []
+    for side, records in (('publisher', publisher_records), ('subscriber', subscriber_records)):
+        for record in records:
+            expected = orchestration._positive_endpoint_expected_qos(
+                static, side=side, node=record['node']
+            )
+            checks.append(
+                {
+                    **orchestration._positive_endpoint_qos_status(record, expected),
+                    'node': record['node'],
+                    'side': side,
+                }
+            )
+    checks.sort(key=lambda item: (item['side'], item['node']))
+    return {
+        'bounded_depth_live_proven': False,
+        'exact_depth_live_proven': False,
+        'expected': static,
+        'publishers': publisher_records,
+        'publisher_qos_pass': bool(publisher_records),
+        'qos_checks': checks,
+        'qos_introspection_complete': False,
+        'subscribers': subscriber_records,
+        'subscriber_qos_pass': True,
+    }
+
+
 def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path) -> None:
+    workspace = Path(__file__).parents[1].resolve()
+    positive_dir = tmp_path / 'positive-control'
+    positive_dir.mkdir()
+    partition = 'robotest_p3_candidate_positive_control'
+    domain_id = 16
+    launch_pid = 44
+    driver_pid = 43
+    runtime_gate_pid = 42
+    orchestration.atomic_write_json(
+        tmp_path / 'suite-plan.json',
+        {
+            'aggregate_metrics': [],
+            'candidate_id': 'candidate',
+            'cpu_affinity': orchestration.CPU_AFFINITY,
+            'domain_base': 1,
+            'positive_control': {
+                'gz_partition': partition,
+                'ros_domain_id': domain_id,
+                'run_id': 'positive',
+            },
+            'producer': orchestration.PRODUCER,
+            'schema_version': orchestration.SCHEMA_VERSION,
+            'smoke': {},
+            'trials': [],
+        },
+        sidecar=True,
+    )
     unsigned = {
         'bridge_sha256': '1' * 64,
         'contact_stream': _contact_stream_contract(),
@@ -936,9 +1077,288 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     }
     manifest_path = tmp_path / 'coverage.yaml'
     manifest_path.write_text(yaml.safe_dump(manifest, sort_keys=True), encoding='utf-8')
+    arm_protocol = {
+        'ack_max_bytes': 4_096,
+        'ack_producer': 'robotest_scenarios/contact_control_driver',
+        'action': 'start_positive_control_motion',
+        'fresh_clock_policy': 'strictly_newer_positive_stamp_after_valid_arm',
+        'request_max_bytes': 4_096,
+        'request_producer': 'robotest_phase3/benchmark_runner',
+        'schema_version': 1,
+        'wait_deadline_policy': 'complete_fixture_steady_wall_deadline_without_reset',
+    }
+    control_configuration = {'arm_protocol': arm_protocol}
+    control_configuration_sha256 = orchestration.canonical_sha256(control_configuration)
+    driver_ready_path = positive_dir / 'contact-control.ready.json'
+    driver_ready = {
+        'arm_protocol': arm_protocol,
+        'arm_protocol_sha256': orchestration.canonical_sha256(arm_protocol),
+        'control_configuration_sha256': control_configuration_sha256,
+        'expected_pair': ['robotest::base::collision', 'wall::link::collision'],
+        'fixture_sha256': '6' * 64,
+        'identity': {
+            'fixture_id': 'collision_positive_control',
+            'run_id': 'positive',
+        },
+        'observed_robot_start': {},
+        'observed_wall': {},
+        'producer': 'robotest_scenarios/contact_control_driver',
+        'ready_steady_ns': 10,
+        'resolved_names': {},
+        'schema_version': 1,
+        'spawn': {},
+    }
+    orchestration.atomic_write_json(driver_ready_path, driver_ready)
+    driver_ready_sha256 = orchestration.file_sha256(driver_ready_path)
+    runtime_gate_path = positive_dir / 'runtime-gate.json'
+    positive_topics = {
+        '/clock': _positive_topic_fixture(
+            '/clock',
+            publishers=[('/robotest/parameter_bridge', 'rosgraph_msgs/msg/Clock')],
+            subscribers=[],
+            gid_seed=1,
+        ),
+        '/robotest/cmd_vel': _positive_topic_fixture(
+            '/robotest/cmd_vel',
+            publishers=[
+                (
+                    '/robotest/contact_control_driver',
+                    orchestration.POSITIVE_RUNTIME_GATE_COMMAND_TYPE,
+                )
+            ],
+            subscribers=[
+                ('/robotest/metrics_collector', orchestration.POSITIVE_RUNTIME_GATE_COMMAND_TYPE),
+                ('/robotest/parameter_bridge', orchestration.POSITIVE_RUNTIME_GATE_COMMAND_TYPE),
+            ],
+            gid_seed=10,
+        ),
+        '/robotest/internal/raw_contacts': _positive_topic_fixture(
+            '/robotest/internal/raw_contacts',
+            publishers=[
+                ('/robotest/parameter_bridge', orchestration.POSITIVE_RUNTIME_GATE_CONTACT_TYPE)
+            ],
+            subscribers=[
+                (
+                    '/robotest/contact_stream_gate',
+                    orchestration.POSITIVE_RUNTIME_GATE_CONTACT_TYPE,
+                )
+            ],
+            gid_seed=20,
+        ),
+        '/robotest/validation/contacts': _positive_topic_fixture(
+            '/robotest/validation/contacts',
+            publishers=[
+                (
+                    '/robotest/contact_stream_gate',
+                    orchestration.POSITIVE_RUNTIME_GATE_CONTACT_TYPE,
+                )
+            ],
+            subscribers=[],
+            gid_seed=30,
+        ),
+        '/robotest/validation/ground_truth': _positive_topic_fixture(
+            '/robotest/validation/ground_truth',
+            publishers=[('/robotest/parameter_bridge', 'nav_msgs/msg/Odometry')],
+            subscribers=[],
+            gid_seed=40,
+        ),
+        '/robotest/validation/scenario_entity_poses': _positive_topic_fixture(
+            '/robotest/validation/scenario_entity_poses',
+            publishers=[('/robotest/parameter_bridge', 'tf2_msgs/msg/TFMessage')] * 4,
+            subscribers=[],
+            gid_seed=50,
+        ),
+        '/robotest/validation/world_stats': _positive_topic_fixture(
+            '/robotest/validation/world_stats',
+            publishers=[('/robotest/parameter_bridge', 'ros_gz_interfaces/msg/WorldStatistics')],
+            subscribers=[],
+            gid_seed=60,
+        ),
+    }
+    orchestration.atomic_write_json(
+        runtime_gate_path,
+        {
+            'attempt_count': 2,
+            'authoritative_publisher_ownership': {
+                topic: True for topic in orchestration.POSITIVE_AUTHORITATIVE_PUBLISHER_CONTRACTS
+            },
+            'bounded_depth_live_proven_for_all_endpoints': False,
+            'cmd_vel_owner_pass': True,
+            'cmd_vel_subscriber_ownership_pass': True,
+            'contact_aggregator_binary_attestation': {
+                'launch_root_pid': launch_pid,
+                'observed_gz_partition': partition,
+                'observed_ros_domain_id': str(domain_id),
+                'verdict': 'PASS',
+            },
+            'contact_gate_binary_attestation': {
+                'launch_root_pid': launch_pid,
+                'observed_gz_partition': partition,
+                'observed_ros_domain_id': str(domain_id),
+                'verdict': 'PASS',
+            },
+            'contact_publisher_ownership': {
+                '/robotest/internal/raw_contacts': True,
+                '/robotest/validation/contacts': True,
+            },
+            'contact_subscriber_ownership': {
+                '/robotest/internal/raw_contacts': True,
+            },
+            'elapsed_wall_s': 0.5,
+            'exact_static_qos_depth_contract': {
+                topic: copy.deepcopy(evidence['expected'])
+                for topic, evidence in positive_topics.items()
+            },
+            'forbidden_nodes_present': [],
+            'mode': 'positive_control',
+            'namespace_isolation_pass': True,
+            'nodes': sorted(
+                f'/robotest/{name}'
+                for name in orchestration.POSITIVE_RUNTIME_GATE_REQUIRED_NODE_NAMES
+            ),
+            'producer': 'robotest_phase3/runtime_gate',
+            'qos_contract_pass': True,
+            'qos_introspection_complete': False,
+            'required_nodes_missing': [],
+            'scenario_services_missing': [],
+            'schema_version': 1,
+            'topics': positive_topics,
+            'validation_autonomy_isolation_pass': True,
+            'verdict': 'PASS',
+        },
+        sidecar=True,
+    )
+    runtime_gate_process_path = positive_dir / 'processes/runtime_gate.process.json'
+    runtime_gate_command = [
+        'python3',
+        str(workspace / 'tests/phase3_runtime_gate.py'),
+        '--mode',
+        'positive-control',
+        '--output',
+        str(runtime_gate_path),
+        '--workspace',
+        str(workspace),
+        '--wall-timeout-s',
+        '20.0',
+        '--watch-pid',
+        str(driver_pid),
+        '--launch-pid',
+        str(launch_pid),
+        '--expected-domain-id',
+        str(domain_id),
+        '--expected-gz-partition',
+        partition,
+    ]
+    runtime_gate_process = _bounded_process_fixture(
+        command=runtime_gate_command,
+        finished_steady_ns=30,
+        pid=runtime_gate_pid,
+        role='runtime_gate',
+        started_steady_ns=20,
+        wall_timeout_s=25.0,
+        workspace=workspace,
+    )
+    orchestration.atomic_write_json(
+        runtime_gate_process_path,
+        runtime_gate_process,
+    )
+    processes_dir = runtime_gate_process_path.parent
+    result_path = positive_dir / 'contact-control-result.json'
+    driver_command = [
+        'ros2',
+        'run',
+        'robotest_scenarios',
+        'contact_control_driver',
+        '--output',
+        str(result_path),
+        '--ready-file',
+        str(driver_ready_path),
+        '--arm-file',
+        str(positive_dir / 'contact-control.arm.json'),
+        '--armed-file',
+        str(positive_dir / 'contact-control.armed.json'),
+        '--run-id',
+        'positive',
+        '--coverage-manifest',
+        str(workspace / 'config/collision-coverage.yaml'),
+        '--wall-timeout-s',
+        '30.0',
+        '--ros-args',
+        '-r',
+        '__ns:=/robotest',
+    ]
+    orchestration.atomic_write_json(
+        processes_dir / 'contact_control_driver.process.json',
+        _bounded_process_fixture(
+            command=driver_command,
+            finished_steady_ns=90,
+            pid=driver_pid,
+            role='contact_control_driver',
+            started_steady_ns=5,
+            wall_timeout_s=45.0,
+            workspace=workspace,
+        ),
+    )
+    orchestration.atomic_write_json(
+        processes_dir / 'sim_launch.process.json',
+        _bounded_process_fixture(
+            command=[
+                'ros2',
+                'launch',
+                'robotest_sim',
+                'sim.launch.py',
+                'namespace:=robotest',
+                'seed:=42',
+                'headless:=true',
+                'render_sensors:=true',
+                'rviz:=false',
+            ],
+            finished_steady_ns=100,
+            pid=launch_pid,
+            role='sim_launch',
+            started_steady_ns=1,
+            wall_timeout_s=120.0,
+            workspace=workspace,
+            returncode=-15,
+        ),
+    )
+    arm_request_path = positive_dir / 'contact-control.arm.json'
+    arm_request = orchestration.build_contact_control_arm_request(
+        driver_ready,
+        ready_sha256=driver_ready_sha256,
+        runtime_gate_sha256=orchestration.file_sha256(runtime_gate_path),
+        arm_requested_steady_ns=40,
+    )
+    arm_request_sha256 = orchestration.atomic_write_json(arm_request_path, arm_request)
+    armed_ack_path = positive_dir / 'contact-control.armed.json'
+    armed_ack = {
+        'arm_observed_clock_sample_count': 5,
+        'arm_observed_sim_stamp_ns': 100,
+        'arm_observed_steady_ns': 50,
+        'arm_protocol_sha256': driver_ready['arm_protocol_sha256'],
+        'arm_request_sha256': arm_request_sha256,
+        'arm_requested_steady_ns': 40,
+        'armed_clock_sample_count': 6,
+        'armed_sim_stamp_ns': 101,
+        'armed_steady_ns': 60,
+        'producer': arm_protocol['ack_producer'],
+        'ready_sha256': driver_ready_sha256,
+        'run_id': 'positive',
+        'runtime_gate_sha256': arm_request['runtime_gate_sha256'],
+        'schema_version': 1,
+    }
+    armed_ack_sha256 = orchestration.atomic_write_json(armed_ack_path, armed_ack)
+    handshake_paths = {
+        'arm_request_path': arm_request_path,
+        'armed_ack_path': armed_ack_path,
+        'driver_ready_path': driver_ready_path,
+        'runtime_gate_path': runtime_gate_path,
+    }
     result = {
         'cleanup': {},
         'configuration': {
+            'control_configuration': control_configuration,
+            'control_configuration_sha256': control_configuration_sha256,
             'coverage_manifest_provenance': {
                 key: manifest[key]
                 for key in (
@@ -951,8 +1371,18 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             }
             | {'coverage_manifest_sha256': manifest['manifest_sha256']},
             'coverage_manifest_sha256': manifest['manifest_sha256'],
+            'expected_pair': ['robotest::base::collision', 'wall::link::collision'],
+            'fixture_sha256': '6' * 64,
         },
         'control': {
+            'arm': {
+                'acknowledgment': armed_ack,
+                'acknowledgment_sha256': armed_ack_sha256,
+                'first_nonzero_publish_returned_steady_ns': 71,
+                'first_nonzero_publish_started_steady_ns': 70,
+                'request': arm_request,
+                'request_sha256': arm_request_sha256,
+            },
             'command_trace': [
                 {
                     'angular_z': 0.0,
@@ -969,6 +1399,12 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                     'sim_stamp_ns': 20,
                 },
             ],
+            'observed_robot_start': {},
+            'setup': {
+                'observed_robot_start': {},
+                'observed_wall': {},
+                'spawn': {},
+            },
             'contact': {
                 'episodes': [
                     {
@@ -1049,11 +1485,16 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                 ],
             },
             'timeline': {
+                'control_started_steady_ns': 70,
                 'release_qualified_snapshot_stamp_ns': 300_000_000,
                 'release_required_through_stamp_ns': 250_000_000,
             },
         },
-        'identity': {'run_id': 'positive', 'scenario_sha256': '6' * 64},
+        'identity': {
+            'fixture_id': 'collision_positive_control',
+            'run_id': 'positive',
+            'scenario_sha256': '6' * 64,
+        },
         'producer': 'robotest_scenarios/contact_control_driver',
         'quality': {'overflow_free': True},
         'schema_version': 1,
@@ -1065,7 +1506,6 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             'reason': 'complete',
         },
     }
-    result_path = tmp_path / 'contact-control-result.json'
     orchestration.atomic_write_json(result_path, result, sidecar=True)
     capture = {
         'clock': {'latest_stamp_ns': 600_000_000, 'regression_count': 0},
@@ -1133,6 +1573,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         result_path=result_path,
         capture_path=capture_path,
         contact_progress_path=contact_progress_path,
+        **handshake_paths,
         manifest_path=manifest_path,
         collector_configuration_sha256='7' * 64,
         owned_process_group_shutdown=True,
@@ -1178,6 +1619,455 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         'release_required_through_stamp_ns': 250_000_000,
     }
 
+    frozen_gate = orchestration.load_json(runtime_gate_path)
+    frozen_process = orchestration.load_json(runtime_gate_process_path)
+    ownership_mutations = []
+    for field, key in (
+        ('contact_publisher_ownership', '/robotest/internal/raw_contacts'),
+        ('contact_subscriber_ownership', '/robotest/internal/raw_contacts'),
+    ):
+        missing = copy.deepcopy(frozen_gate)
+        del missing[field][key]
+        ownership_mutations.append(missing)
+        extra = copy.deepcopy(frozen_gate)
+        extra[field]['/robotest/forged_contacts'] = True
+        ownership_mutations.append(extra)
+        wrong = copy.deepcopy(frozen_gate)
+        wrong[field][key] = False
+        ownership_mutations.append(wrong)
+        wrong_type = copy.deepcopy(frozen_gate)
+        wrong_type[field][key] = 1
+        ownership_mutations.append(wrong_type)
+    for forged_gate in ownership_mutations:
+        orchestration.atomic_write_json(runtime_gate_path, forged_gate, sidecar=True)
+        with pytest.raises(orchestration.EvidenceError, match='ownership is not exact'):
+            orchestration.validate_positive_runtime_gate_artifacts(
+                runtime_gate_path, runtime_gate_process_path
+            )
+    orchestration.atomic_write_json(runtime_gate_path, frozen_gate, sidecar=True)
+
+    source_topic = '/robotest/validation/ground_truth'
+    authoritative_shape_mutations = []
+    missing = copy.deepcopy(frozen_gate)
+    del missing['authoritative_publisher_ownership'][source_topic]
+    authoritative_shape_mutations.append(missing)
+    extra = copy.deepcopy(frozen_gate)
+    extra['authoritative_publisher_ownership']['/robotest/validation/forged'] = True
+    authoritative_shape_mutations.append(extra)
+    wrong = copy.deepcopy(frozen_gate)
+    wrong['authoritative_publisher_ownership'][source_topic] = False
+    authoritative_shape_mutations.append(wrong)
+    wrong_type = copy.deepcopy(frozen_gate)
+    wrong_type['authoritative_publisher_ownership'][source_topic] = 1
+    authoritative_shape_mutations.append(wrong_type)
+    for forged_gate in authoritative_shape_mutations:
+        orchestration.atomic_write_json(runtime_gate_path, forged_gate, sidecar=True)
+        with pytest.raises(
+            orchestration.EvidenceError,
+            match='authoritative publisher ownership is not exact',
+        ):
+            orchestration.validate_positive_runtime_gate_artifacts(
+                runtime_gate_path, runtime_gate_process_path
+            )
+
+    forged_gate = copy.deepcopy(frozen_gate)
+    forged_gate['topics']['/clock'] = _positive_topic_fixture(
+        '/clock',
+        publishers=[
+            ('/robotest/parameter_bridge', 'rosgraph_msgs/msg/Clock'),
+            ('/robotest/rogue_clock', 'rosgraph_msgs/msg/Clock'),
+        ],
+        subscribers=[],
+        gid_seed=700,
+    )
+    orchestration.atomic_write_json(runtime_gate_path, forged_gate, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='ownership projection'):
+        orchestration.validate_positive_runtime_gate_artifacts(
+            runtime_gate_path, runtime_gate_process_path
+        )
+
+    forged_gate = copy.deepcopy(frozen_gate)
+    forged_gate['topics']['/robotest/validation/ground_truth'] = _positive_topic_fixture(
+        '/robotest/validation/ground_truth',
+        publishers=[],
+        subscribers=[],
+        gid_seed=710,
+    )
+    orchestration.atomic_write_json(runtime_gate_path, forged_gate, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='ownership projection'):
+        orchestration.validate_positive_runtime_gate_artifacts(
+            runtime_gate_path, runtime_gate_process_path
+        )
+
+    forged_gate = copy.deepcopy(frozen_gate)
+    entity_poses = forged_gate['topics']['/robotest/validation/scenario_entity_poses']
+    entity_poses['publishers'][0]['topic_type'] = 'ros_gz_interfaces/msg/EntityPose_V'
+    orchestration.atomic_write_json(runtime_gate_path, forged_gate, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='ownership projection'):
+        orchestration.validate_positive_runtime_gate_artifacts(
+            runtime_gate_path, runtime_gate_process_path
+        )
+
+    forged_gate = copy.deepcopy(frozen_gate)
+    entity_publishers = forged_gate['topics']['/robotest/validation/scenario_entity_poses'][
+        'publishers'
+    ]
+    entity_publishers[1]['gid'] = entity_publishers[0]['gid']
+    orchestration.atomic_write_json(runtime_gate_path, forged_gate, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='GIDs/cardinality'):
+        orchestration.validate_positive_runtime_gate_artifacts(
+            runtime_gate_path, runtime_gate_process_path
+        )
+
+    forged_gate = copy.deepcopy(frozen_gate)
+    forged_gate['topics']['/robotest/validation/ground_truth']['publishers'][0]['gid'] = (
+        forged_gate['topics']['/clock']['publishers'][0]['gid']
+    )
+    orchestration.atomic_write_json(runtime_gate_path, forged_gate, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='ownership projection'):
+        orchestration.validate_positive_runtime_gate_artifacts(
+            runtime_gate_path, runtime_gate_process_path
+        )
+
+    for field_mutation in ('missing', 'extra'):
+        forged_gate = copy.deepcopy(frozen_gate)
+        clock_publisher = forged_gate['topics']['/clock']['publishers'][0]
+        if field_mutation == 'missing':
+            del clock_publisher['gid']
+        else:
+            clock_publisher['forged'] = True
+        orchestration.atomic_write_json(runtime_gate_path, forged_gate, sidecar=True)
+        with pytest.raises(orchestration.EvidenceError, match='fields are invalid'):
+            orchestration.validate_positive_runtime_gate_artifacts(
+                runtime_gate_path, runtime_gate_process_path
+            )
+
+    forged_gate = copy.deepcopy(frozen_gate)
+    public_contacts = forged_gate['topics']['/robotest/validation/contacts']
+    public_contacts['publishers'][0]['node'] = '/robotest/forged_contact_gate'
+    public_contacts['qos_checks'][0]['node'] = '/robotest/forged_contact_gate'
+    orchestration.atomic_write_json(runtime_gate_path, forged_gate, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='ownership projection'):
+        orchestration.validate_positive_runtime_gate_artifacts(
+            runtime_gate_path, runtime_gate_process_path
+        )
+
+    forged_gate = copy.deepcopy(frozen_gate)
+    raw_contacts = forged_gate['topics']['/robotest/internal/raw_contacts']
+    raw_contacts['publishers'][0]['topic_type'] = 'std_msgs/msg/String'
+    orchestration.atomic_write_json(runtime_gate_path, forged_gate, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='ownership projection'):
+        orchestration.validate_positive_runtime_gate_artifacts(
+            runtime_gate_path, runtime_gate_process_path
+        )
+
+    forged_gate = copy.deepcopy(frozen_gate)
+    raw_contacts = forged_gate['topics']['/robotest/internal/raw_contacts']
+    raw_contacts['subscribers'][0]['gid'] = raw_contacts['publishers'][0]['gid']
+    orchestration.atomic_write_json(runtime_gate_path, forged_gate, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='GIDs/cardinality'):
+        orchestration.validate_positive_runtime_gate_artifacts(
+            runtime_gate_path, runtime_gate_process_path
+        )
+
+    forged_gate = copy.deepcopy(frozen_gate)
+    cmd_vel = forged_gate['topics']['/robotest/cmd_vel']
+    metrics_endpoint = next(
+        endpoint
+        for endpoint in cmd_vel['subscribers']
+        if endpoint['node'] == '/robotest/metrics_collector'
+    )
+    metrics_endpoint['depth'] = 1
+    metrics_endpoint['history'] = 'KEEP_LAST'
+    metrics_check = next(
+        check
+        for check in cmd_vel['qos_checks']
+        if check['side'] == 'subscriber' and check['node'] == '/robotest/metrics_collector'
+    )
+    metrics_check.update(
+        orchestration._positive_endpoint_qos_status(
+            metrics_endpoint,
+            {'depth': 4_096, 'durability': 'VOLATILE', 'reliability': 'RELIABLE'},
+        )
+    )
+    cmd_vel['subscriber_qos_pass'] = False
+    orchestration.atomic_write_json(runtime_gate_path, forged_gate, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='top-level graph projection'):
+        orchestration.validate_positive_runtime_gate_artifacts(
+            runtime_gate_path, runtime_gate_process_path
+        )
+
+    for static_mutation in ('default_depth', 'metrics_override'):
+        forged_gate = copy.deepcopy(frozen_gate)
+        topic_expected = forged_gate['topics']['/robotest/cmd_vel']['expected']
+        projected_expected = forged_gate['exact_static_qos_depth_contract']['/robotest/cmd_vel']
+        if static_mutation == 'default_depth':
+            topic_expected['depth'] = 2
+            projected_expected['depth'] = 2
+        else:
+            topic_expected['endpoint_depth_overrides'][0]['depth'] = 1
+            projected_expected['endpoint_depth_overrides'][0]['depth'] = 1
+        orchestration.atomic_write_json(runtime_gate_path, forged_gate, sidecar=True)
+        with pytest.raises(orchestration.EvidenceError, match='frozen positive-control QoS'):
+            orchestration.validate_positive_runtime_gate_artifacts(
+                runtime_gate_path, runtime_gate_process_path
+            )
+
+    for factual_field in (
+        'bounded_depth_live_proven_for_all_endpoints',
+        'qos_introspection_complete',
+    ):
+        forged_gate = copy.deepcopy(frozen_gate)
+        forged_gate[factual_field] = True
+        orchestration.atomic_write_json(runtime_gate_path, forged_gate, sidecar=True)
+        with pytest.raises(orchestration.EvidenceError, match='top-level graph projection'):
+            orchestration.validate_positive_runtime_gate_artifacts(
+                runtime_gate_path, runtime_gate_process_path
+            )
+    orchestration.atomic_write_json(runtime_gate_path, frozen_gate, sidecar=True)
+
+    for field_mutation in ('missing', 'extra'):
+        forged_process = copy.deepcopy(frozen_process)
+        if field_mutation == 'missing':
+            del forged_process['cwd']
+        else:
+            forged_process['forged'] = True
+        orchestration.atomic_write_json(runtime_gate_process_path, forged_process)
+        with pytest.raises(orchestration.EvidenceError, match='fields are invalid'):
+            orchestration.validate_positive_runtime_gate_artifacts(
+                runtime_gate_path, runtime_gate_process_path
+            )
+
+    for command_index, forged_value in ((0, 'python'), (3, 'candidate')):
+        forged_process = copy.deepcopy(frozen_process)
+        forged_process['command'][command_index] = forged_value
+        forged_process['wrapped_command'] = [
+            *frozen_process['wrapped_command'][:4],
+            *forged_process['command'],
+        ]
+        orchestration.atomic_write_json(runtime_gate_process_path, forged_process)
+        with pytest.raises(orchestration.EvidenceError, match='command binding mismatch'):
+            orchestration.validate_positive_runtime_gate_artifacts(
+                runtime_gate_path, runtime_gate_process_path
+            )
+
+    cross_binding_mutations = (
+        (11, '45', None, None, 'sibling PID binding mismatch'),
+        (13, '46', 'launch_root_pid', 46, 'sibling PID binding mismatch'),
+        (15, '17', 'observed_ros_domain_id', '17', 'identity binding mismatch'),
+        (
+            17,
+            'robotest_p3_forged_partition',
+            'observed_gz_partition',
+            'robotest_p3_forged_partition',
+            'identity binding mismatch',
+        ),
+    )
+    for (
+        command_index,
+        forged_value,
+        attestation_field,
+        attestation_value,
+        error,
+    ) in cross_binding_mutations:
+        forged_process = copy.deepcopy(frozen_process)
+        forged_process['command'][command_index] = forged_value
+        forged_process['wrapped_command'] = [
+            *frozen_process['wrapped_command'][:4],
+            *forged_process['command'],
+        ]
+        forged_gate = copy.deepcopy(frozen_gate)
+        if attestation_field is not None:
+            for field in (
+                'contact_aggregator_binary_attestation',
+                'contact_gate_binary_attestation',
+            ):
+                forged_gate[field][attestation_field] = attestation_value
+        orchestration.atomic_write_json(runtime_gate_process_path, forged_process)
+        orchestration.atomic_write_json(runtime_gate_path, forged_gate, sidecar=True)
+        runtime_binding = orchestration.validate_positive_runtime_gate_artifacts(
+            runtime_gate_path, runtime_gate_process_path
+        )
+        with pytest.raises(orchestration.EvidenceError, match=error):
+            orchestration._validate_positive_runtime_gate_reconciliation_bindings(
+                workspace=workspace,
+                result_run_id='positive',
+                result_path=result_path,
+                driver_ready_path=driver_ready_path,
+                arm_request_path=arm_request_path,
+                armed_ack_path=armed_ack_path,
+                runtime_gate_path=runtime_gate_path,
+                runtime_gate=runtime_binding,
+            )
+
+    forged_workspace = tmp_path / 'forged-workspace'
+    forged_process = copy.deepcopy(frozen_process)
+    forged_process['cwd'] = str(forged_workspace)
+    forged_process['command'][1] = str(forged_workspace / 'tests/phase3_runtime_gate.py')
+    forged_process['command'][7] = str(forged_workspace)
+    forged_process['wrapped_command'] = [
+        *frozen_process['wrapped_command'][:4],
+        *forged_process['command'],
+    ]
+    orchestration.atomic_write_json(runtime_gate_process_path, forged_process)
+    orchestration.atomic_write_json(runtime_gate_path, frozen_gate, sidecar=True)
+    runtime_binding = orchestration.validate_positive_runtime_gate_artifacts(
+        runtime_gate_path, runtime_gate_process_path
+    )
+    with pytest.raises(orchestration.EvidenceError, match='workspace differs'):
+        orchestration._validate_positive_runtime_gate_reconciliation_bindings(
+            workspace=workspace,
+            result_run_id='positive',
+            result_path=result_path,
+            driver_ready_path=driver_ready_path,
+            arm_request_path=arm_request_path,
+            armed_ack_path=armed_ack_path,
+            runtime_gate_path=runtime_gate_path,
+            runtime_gate=runtime_binding,
+        )
+    orchestration.atomic_write_json(runtime_gate_process_path, frozen_process)
+    orchestration.atomic_write_json(runtime_gate_path, frozen_gate, sidecar=True)
+
+    driver_process_path = processes_dir / 'contact_control_driver.process.json'
+    launch_process_path = processes_dir / 'sim_launch.process.json'
+    frozen_driver_process = orchestration.load_json(driver_process_path)
+    frozen_launch_process = orchestration.load_json(launch_process_path)
+    runtime_binding = orchestration.validate_positive_runtime_gate_artifacts(
+        runtime_gate_path, runtime_gate_process_path
+    )
+    sibling_command_mutations = (
+        (driver_process_path, frozen_driver_process, 0, 'python3', 'driver'),
+        (launch_process_path, frozen_launch_process, 0, 'python3', 'launch'),
+    )
+    for (
+        process_path,
+        frozen_sibling,
+        command_index,
+        forged_value,
+        role,
+    ) in sibling_command_mutations:
+        forged_sibling = copy.deepcopy(frozen_sibling)
+        forged_sibling['command'][command_index] = forged_value
+        forged_sibling['wrapped_command'] = [
+            *frozen_sibling['wrapped_command'][:4],
+            *forged_sibling['command'],
+        ]
+        orchestration.atomic_write_json(process_path, forged_sibling)
+        with pytest.raises(orchestration.EvidenceError, match=f'{role} process command'):
+            orchestration._validate_positive_runtime_gate_reconciliation_bindings(
+                workspace=workspace,
+                result_run_id='positive',
+                result_path=result_path,
+                driver_ready_path=driver_ready_path,
+                arm_request_path=arm_request_path,
+                armed_ack_path=armed_ack_path,
+                runtime_gate_path=runtime_gate_path,
+                runtime_gate=runtime_binding,
+            )
+        orchestration.atomic_write_json(process_path, frozen_sibling)
+
+    forged_driver_wrapper = copy.deepcopy(frozen_driver_process)
+    forged_driver_wrapper['wrapped_command'][2] = '--kill-after=9s'
+    orchestration.atomic_write_json(driver_process_path, forged_driver_wrapper)
+    with pytest.raises(orchestration.EvidenceError, match='driver process command'):
+        orchestration._validate_positive_runtime_gate_reconciliation_bindings(
+            workspace=workspace,
+            result_run_id='positive',
+            result_path=result_path,
+            driver_ready_path=driver_ready_path,
+            arm_request_path=arm_request_path,
+            armed_ack_path=armed_ack_path,
+            runtime_gate_path=runtime_gate_path,
+            runtime_gate=runtime_binding,
+        )
+    orchestration.atomic_write_json(driver_process_path, frozen_driver_process)
+
+    for role, process_path, frozen_sibling in (
+        ('driver', driver_process_path, frozen_driver_process),
+        ('launch', launch_process_path, frozen_launch_process),
+    ):
+        early_exit = copy.deepcopy(frozen_sibling)
+        early_exit['finished_steady_ns'] = 55
+        orchestration.atomic_write_json(process_path, early_exit)
+        with pytest.raises(orchestration.EvidenceError, match=f'{role} process did not span'):
+            orchestration._reconcile_contact_control_arm_handshake(
+                workspace=workspace,
+                result=result,
+                result_path=result_path,
+                driver_ready_path=driver_ready_path,
+                arm_request_path=arm_request_path,
+                armed_ack_path=armed_ack_path,
+                runtime_gate_path=runtime_gate_path,
+            )
+        orchestration.atomic_write_json(process_path, frozen_sibling)
+
+    stale_clock_ack = copy.deepcopy(armed_ack)
+    stale_clock_ack['armed_clock_sample_count'] = stale_clock_ack['arm_observed_clock_sample_count']
+    with pytest.raises(orchestration.EvidenceError, match='fresh /clock'):
+        orchestration.validate_contact_control_armed(
+            stale_clock_ack,
+            ready=driver_ready,
+            request=arm_request,
+            request_sha256=arm_request_sha256,
+        )
+
+    incomplete_gate_process = orchestration.load_json(runtime_gate_process_path)
+    incomplete_gate_process['group_confirmed_empty'] = False
+    orchestration.atomic_write_json(runtime_gate_process_path, incomplete_gate_process)
+    with pytest.raises(orchestration.EvidenceError, match='did not exit cleanly'):
+        orchestration.validate_positive_runtime_gate_artifacts(
+            runtime_gate_path, runtime_gate_process_path
+        )
+    incomplete_gate_process['group_confirmed_empty'] = True
+    orchestration.atomic_write_json(runtime_gate_process_path, incomplete_gate_process)
+
+    runtime_gate_document = orchestration.load_json(runtime_gate_path)
+    runtime_gate_document['schema_version'] = True
+    orchestration.atomic_write_json(runtime_gate_path, runtime_gate_document, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='schema_version must be an integer'):
+        orchestration.validate_positive_runtime_gate_artifacts(
+            runtime_gate_path, runtime_gate_process_path
+        )
+    runtime_gate_document['schema_version'] = 1
+    orchestration.atomic_write_json(runtime_gate_path, runtime_gate_document, sidecar=True)
+
+    prearm_motion = copy.deepcopy(result)
+    prearm_motion['control']['arm']['first_nonzero_publish_started_steady_ns'] = 59
+    prearm_motion['control']['timeline']['control_started_steady_ns'] = 59
+    orchestration.atomic_write_json(result_path, prearm_motion, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='gate/arm/motion steady-time ordering'):
+        orchestration.reconcile_positive_control(
+            workspace=Path(__file__).parents[1],
+            build_binding=positive_build_binding,
+            result_path=result_path,
+            capture_path=capture_path,
+            contact_progress_path=contact_progress_path,
+            **handshake_paths,
+            manifest_path=manifest_path,
+            collector_configuration_sha256='7' * 64,
+            owned_process_group_shutdown=True,
+            checksum_verified=True,
+        )
+    orchestration.atomic_write_json(result_path, result, sidecar=True)
+
+    divergent_control_start = copy.deepcopy(result)
+    divergent_control_start['control']['timeline']['control_started_steady_ns'] = 69
+    orchestration.atomic_write_json(result_path, divergent_control_start, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='control-start steady evidence diverged'):
+        orchestration.reconcile_positive_control(
+            workspace=Path(__file__).parents[1],
+            build_binding=positive_build_binding,
+            result_path=result_path,
+            capture_path=capture_path,
+            contact_progress_path=contact_progress_path,
+            **handshake_paths,
+            manifest_path=manifest_path,
+            collector_configuration_sha256='7' * 64,
+            owned_process_group_shutdown=True,
+            checksum_verified=True,
+        )
+    orchestration.atomic_write_json(result_path, result, sidecar=True)
+
     missing_repeated_command = copy.deepcopy(result)
     missing_repeated_command['control']['command_trace'][1]['collector_sequence'] = 3
     missing_repeated_command['control']['command_trace'].insert(
@@ -1198,6 +2088,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             result_path=result_path,
             capture_path=capture_path,
             contact_progress_path=contact_progress_path,
+            **handshake_paths,
             manifest_path=manifest_path,
             collector_configuration_sha256='7' * 64,
             owned_process_group_shutdown=True,
@@ -1261,6 +2152,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         result_path=result_path,
         capture_path=capture_path,
         contact_progress_path=contact_progress_path,
+        **handshake_paths,
         manifest_path=manifest_path,
         collector_configuration_sha256='7' * 64,
         owned_process_group_shutdown=True,
@@ -1292,6 +2184,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             result_path=result_path,
             capture_path=capture_path,
             contact_progress_path=contact_progress_path,
+            **handshake_paths,
             manifest_path=manifest_path,
             collector_configuration_sha256='7' * 64,
             owned_process_group_shutdown=True,
@@ -1312,6 +2205,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             result_path=result_path,
             capture_path=capture_path,
             contact_progress_path=contact_progress_path,
+            **handshake_paths,
             manifest_path=manifest_path,
             collector_configuration_sha256='7' * 64,
             owned_process_group_shutdown=True,
@@ -1340,6 +2234,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             result_path=result_path,
             capture_path=capture_path,
             contact_progress_path=contact_progress_path,
+            **handshake_paths,
             manifest_path=manifest_path,
             collector_configuration_sha256='7' * 64,
             owned_process_group_shutdown=True,
@@ -1360,6 +2255,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         result_path=result_path,
         capture_path=capture_path,
         contact_progress_path=contact_progress_path,
+        **handshake_paths,
         manifest_path=manifest_path,
         collector_configuration_sha256='7' * 64,
         owned_process_group_shutdown=True,
@@ -1381,6 +2277,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             result_path=result_path,
             capture_path=capture_path,
             contact_progress_path=contact_progress_path,
+            **handshake_paths,
             manifest_path=manifest_path,
             collector_configuration_sha256='7' * 64,
             owned_process_group_shutdown=True,
@@ -1415,6 +2312,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                 result_path=result_path,
                 capture_path=capture_path,
                 contact_progress_path=contact_progress_path,
+                **handshake_paths,
                 manifest_path=manifest_path,
                 collector_configuration_sha256='7' * 64,
                 owned_process_group_shutdown=True,
@@ -1431,6 +2329,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             result_path=result_path,
             capture_path=capture_path,
             contact_progress_path=contact_progress_path,
+            **handshake_paths,
             manifest_path=manifest_path,
             collector_configuration_sha256='7' * 64,
             owned_process_group_shutdown=True,
@@ -1445,6 +2344,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             result_path=result_path,
             capture_path=capture_path,
             contact_progress_path=contact_progress_path,
+            **handshake_paths,
             manifest_path=manifest_path,
             collector_configuration_sha256='7' * 64,
             owned_process_group_shutdown=True,
@@ -1462,6 +2362,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             result_path=result_path,
             capture_path=capture_path,
             contact_progress_path=contact_progress_path,
+            **handshake_paths,
             manifest_path=manifest_path,
             collector_configuration_sha256='7' * 64,
             owned_process_group_shutdown=True,

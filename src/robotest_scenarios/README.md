@@ -25,19 +25,37 @@ fixture and must run without Nav2 or the collision monitor:
 ros2 run robotest_scenarios contact_control_driver \
   --output artifacts/control/contact-control-result.json \
   --ready-file artifacts/control/contact-control-ready.json \
+  --arm-file artifacts/control/contact-control-arm.json \
+  --armed-file artifacts/control/contact-control-armed.json \
   --run-id CONTROL \
   --coverage-manifest config/collision-coverage.yaml
 ```
 
-The driver emits READY only after a positive `/clock` sample and a later
-authoritative contact snapshot have both been observed. Contact callbacks that
-arrive before the first positive `/clock` are counted as a discarded
-pre-evidence prefix; post-clock snapshots retain the full active safety checks.
-READY also requires graph prerequisites to pass for 100 ms. One missing
-observation-source publisher query is treated as a graph discovery diagnostic;
-the driver fails when the same source is missing in another observation at
-least 100 ms later. Command ownership, forbidden nodes, and contact endpoint
-identity or QoS changes remain immediately fatal.
+The driver completes preparation and emits READY only after a positive `/clock`
+sample and a later authoritative contact snapshot have both been observed.
+Contact callbacks that arrive before the first positive `/clock` are counted as
+a discarded pre-evidence prefix; post-clock snapshots retain the full active
+safety checks. READY also requires graph prerequisites to pass for 100 ms. One
+missing observation-source publisher query is treated as a graph discovery
+diagnostic; the driver fails when the same source is missing in another
+observation at least 100 ms later. Command ownership, forbidden nodes, and
+contact endpoint identity or QoS changes remain immediately fatal.
+
+READY means prepared and stationary, not permission to move. The driver keeps
+spinning and checking its graph while the runner completes the positive
+runtime gate, verifies its canonical PASS artifact, and confirms that the gate
+process group is empty. Only then may the runner atomically write the exact
+run-bound ARM artifact. The driver validates its canonical encoding, exact
+schema and types, run ID, producer, READY hash, and runtime-gate hash; records a
+pre-arm clock baseline; and waits for a strictly newer positive `/clock`
+sample. It then atomically writes the driver-owned ARMED acknowledgement. No
+nonzero command may be published before that acknowledgement. A best-effort
+zero remains permitted for fail-safe cleanup before arm.
+
+Missing, stale, oversized, symlinked, malformed, noncanonical, wrongly bound,
+or hash-mismatched handshake artifacts fail closed, as does any ordering
+violation. The existing 30 s steady-wall deadline bounds the complete fixture,
+including the pre-arm wait, and is never reset by READY, ARM, or ARMED.
 
 Both executables use relative RoboTest names under their launch namespace.
 The standardized Gazebo `/clock` topic is the single global-name exception.

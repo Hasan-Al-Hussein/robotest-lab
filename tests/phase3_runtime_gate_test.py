@@ -103,6 +103,118 @@ def _unrelated_maps(path: str = '/fake/launch') -> bytes:
     return f'00400000-00401000 r--p 00000000 00:00 0 {path}\n'.encode()
 
 
+class _Policy:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _GraphQos:
+    def __init__(self, topic: str) -> None:
+        reliability, durability, _depth = runtime_gate.QOS_CONTRACTS[topic]
+        self.depth = 0
+        self.durability = _Policy(durability)
+        self.history = _Policy('UNKNOWN')
+        self.reliability = _Policy(reliability)
+
+
+class _GraphEndpoint:
+    def __init__(self, topic: str, node: str, topic_type: str, gid: int) -> None:
+        namespace, name = node.rsplit('/', 1)
+        self.endpoint_gid = bytes.fromhex(f'{gid:032x}')
+        self.node_name = name
+        self.node_namespace = namespace
+        self.qos_profile = _GraphQos(topic)
+        self.topic_type = topic_type
+
+
+class _PositiveGraph:
+    def __init__(self) -> None:
+        source_contracts = runtime_gate.POSITIVE_AUTHORITATIVE_PUBLISHER_CONTRACTS
+        layouts = {
+            '/clock': (
+                [('/robotest/parameter_bridge', source_contracts['/clock'][1])],
+                [],
+            ),
+            '/robotest/cmd_vel': (
+                [('/robotest/contact_control_driver', runtime_gate.COMMAND_MESSAGE_TYPE)],
+                [
+                    ('/robotest/metrics_collector', runtime_gate.COMMAND_MESSAGE_TYPE),
+                    ('/robotest/parameter_bridge', runtime_gate.COMMAND_MESSAGE_TYPE),
+                ],
+            ),
+            '/robotest/internal/raw_contacts': (
+                [('/robotest/parameter_bridge', runtime_gate.CONTACT_MESSAGE_TYPE)],
+                [('/robotest/contact_stream_gate', runtime_gate.CONTACT_MESSAGE_TYPE)],
+            ),
+            '/robotest/validation/contacts': (
+                [('/robotest/contact_stream_gate', runtime_gate.CONTACT_MESSAGE_TYPE)],
+                [],
+            ),
+            '/robotest/validation/ground_truth': (
+                [
+                    (
+                        '/robotest/parameter_bridge',
+                        source_contracts['/robotest/validation/ground_truth'][1],
+                    )
+                ],
+                [],
+            ),
+            '/robotest/validation/scenario_entity_poses': (
+                [
+                    (
+                        '/robotest/parameter_bridge',
+                        source_contracts['/robotest/validation/scenario_entity_poses'][1],
+                    )
+                ]
+                * 4,
+                [],
+            ),
+            '/robotest/validation/world_stats': (
+                [
+                    (
+                        '/robotest/parameter_bridge',
+                        source_contracts['/robotest/validation/world_stats'][1],
+                    )
+                ],
+                [],
+            ),
+        }
+        self.publishers: dict[str, list[_GraphEndpoint]] = {}
+        self.subscribers: dict[str, list[_GraphEndpoint]] = {}
+        gid = 1
+        for topic, (publishers, subscribers) in layouts.items():
+            self.publishers[topic] = []
+            self.subscribers[topic] = []
+            for node, topic_type in publishers:
+                self.publishers[topic].append(_GraphEndpoint(topic, node, topic_type, gid))
+                gid += 1
+            for node, topic_type in subscribers:
+                self.subscribers[topic].append(_GraphEndpoint(topic, node, topic_type, gid))
+                gid += 1
+
+    def get_node_names_and_namespaces(self) -> list[tuple[str, str]]:
+        names = {f'/robotest/{name}' for name in runtime_gate.POSITIVE_REQUIRED_NODE_NAMES}
+        for endpoints in (*self.publishers.values(), *self.subscribers.values()):
+            for endpoint in endpoints:
+                names.add(f'{endpoint.node_namespace}/{endpoint.node_name}')
+        return [
+            (fully_qualified.rsplit('/', 1)[1], fully_qualified.rsplit('/', 1)[0])
+            for fully_qualified in sorted(names)
+        ]
+
+    def get_service_names_and_types(self) -> list[tuple[str, list[str]]]:
+        return [
+            ('/robotest/scenario/delete_entity', ['ros_gz_interfaces/srv/DeleteEntity']),
+            ('/robotest/scenario/spawn_entity', ['ros_gz_interfaces/srv/SpawnEntity']),
+        ]
+
+    def get_publishers_info_by_topic(self, topic: str) -> list[_GraphEndpoint]:
+        return self.publishers[topic]
+
+    def get_subscriptions_info_by_topic(self, topic: str) -> list[_GraphEndpoint]:
+        return self.subscribers[topic]
+
+
 def _write_process(
     proc_root: Path,
     pid: int,
@@ -157,6 +269,84 @@ def _fake_proc_tree(
         environment=b'ROS_DOMAIN_ID=77\0GZ_PARTITION=robotest-test\0',
     )
     return proc_root, launch_pid, live_pid
+
+
+def test_positive_graph_requires_the_configured_authoritative_publishers() -> None:
+    graph = _PositiveGraph()
+
+    passed, evidence = runtime_gate._positive_evaluation(graph)
+
+    assert passed
+    assert evidence['authoritative_publisher_ownership'] == {
+        topic: True for topic in runtime_gate.POSITIVE_AUTHORITATIVE_PUBLISHER_CONTRACTS
+    }
+    entity_publishers = evidence['topics']['/robotest/validation/scenario_entity_poses'][
+        'publishers'
+    ]
+    assert len(entity_publishers) == 4
+    assert {publisher['node'] for publisher in entity_publishers} == {'/robotest/parameter_bridge'}
+    assert {publisher['topic_type'] for publisher in entity_publishers} == {
+        'tf2_msgs/msg/TFMessage'
+    }
+    assert len({publisher['gid'] for publisher in entity_publishers}) == 4
+    assert evidence['qos_contract_pass']
+    assert not evidence['qos_introspection_complete']
+
+
+@pytest.mark.parametrize('topic', tuple(runtime_gate.POSITIVE_AUTHORITATIVE_PUBLISHER_CONTRACTS))
+@pytest.mark.parametrize('mutation', ('extra', 'missing', 'wrong_type'))
+def test_positive_graph_rejects_authoritative_publisher_drift(
+    topic: str,
+    mutation: str,
+) -> None:
+    graph = _PositiveGraph()
+    _expected_nodes, expected_type, _expected_cardinality = (
+        runtime_gate.POSITIVE_AUTHORITATIVE_PUBLISHER_CONTRACTS[topic]
+    )
+    if mutation == 'extra':
+        graph.publishers[topic].append(
+            _GraphEndpoint(topic, '/robotest/rogue_source', expected_type, 10_000)
+        )
+    elif mutation == 'missing':
+        graph.publishers[topic].pop()
+    else:
+        graph.publishers[topic][0].topic_type = 'std_msgs/msg/String'
+
+    passed, evidence = runtime_gate._positive_evaluation(graph)
+
+    assert not passed
+    assert evidence['authoritative_publisher_ownership'][topic] is False
+    assert all(
+        accepted
+        for other_topic, accepted in evidence['authoritative_publisher_ownership'].items()
+        if other_topic != topic
+    )
+
+
+def test_positive_graph_rejects_duplicate_authoritative_publisher_gid() -> None:
+    graph = _PositiveGraph()
+    topic = '/robotest/validation/scenario_entity_poses'
+    graph.publishers[topic][1].endpoint_gid = graph.publishers[topic][0].endpoint_gid
+
+    passed, evidence = runtime_gate._positive_evaluation(graph)
+
+    assert not passed
+    assert evidence['authoritative_publisher_ownership'][topic] is False
+
+
+def test_positive_graph_rejects_cross_topic_authoritative_publisher_gid() -> None:
+    graph = _PositiveGraph()
+    graph.publishers['/robotest/validation/ground_truth'][0].endpoint_gid = graph.publishers[
+        '/clock'
+    ][0].endpoint_gid
+
+    passed, evidence = runtime_gate._positive_evaluation(graph)
+
+    assert not passed
+    assert evidence['authoritative_publisher_ownership']['/clock'] is False
+    assert (
+        evidence['authoritative_publisher_ownership']['/robotest/validation/ground_truth'] is False
+    )
 
 
 def test_contact_pipeline_source_inventory_is_the_canonical_eleven_files() -> None:

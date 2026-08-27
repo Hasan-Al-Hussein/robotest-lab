@@ -128,6 +128,23 @@ coverage manifest, rendered SDF, robot description, world, and collector
 hashes. External checksum, collector reconciliation, and owned-process-group
 shutdown gates are mandatory.
 
+The positive-control command trace begins only after a fail-closed stationary
+handshake. The driver prepares, writes READY, and keeps spinning without
+nonzero motion while the runner completes and semantically verifies the
+runtime gate and confirms its process group is empty. The runner then
+atomically writes the exact run-bound ARM artifact. The driver validates its
+canonical bytes, identity, hashes, and ordering, observes a strictly newer
+positive `/clock` sample, and atomically writes its ARMED acknowledgement before
+the first nonzero command. A fail-safe zero is the only command allowed before
+arm. The complete pre-arm wait remains inside the original, never-reset 30 s
+steady-wall fixture deadline.
+
+Reconciliation requires a distinct retained collector observation for every
+component command publication within 0.10 simulation seconds. This includes
+the active stop command, which must be published within 0.10 simulation
+seconds of the qualifying contact. Missing, tampered, stale, wrongly bound, or
+out-of-order READY, runtime-gate, ARM, or ARMED evidence fails the control.
+
 Scenario 4 lifecycle freshness is collected by a dedicated bounded sampler.
 The schedule contains one to 96 strictly increasing simulation stamps and the
 sampler queries the exact nine Nav2 `GetState` services using relative names:

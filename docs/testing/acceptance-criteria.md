@@ -87,6 +87,25 @@ confirmed reset fault state. A failed index remains failed and cannot be
 replaced by an unrecorded retry. The canonical Phase 3 run result, rather than
 the mission process exit alone, owns the benchmark verdict.
 
+The separate positive-control fixture uses a frozen stationary authorization
+sequence. The driver prepares, writes READY, and continues spinning and
+auditing without nonzero motion. The runner must complete and semantically
+verify the runtime gate, prove its process group empty, and recheck the owned
+fixture processes before atomically writing the exact run-bound ARM artifact.
+The driver must validate the canonical artifact and its identity/hash bindings,
+observe a strictly newer positive `/clock` sample than its pre-arm baseline,
+and atomically write the driver-owned ARMED acknowledgement before publishing
+any nonzero command. A fail-safe zero is allowed before arm only for cleanup.
+
+READY, runtime-gate, ARM, ARMED, and first-command evidence must be complete,
+hash-bound, and correctly ordered. Missing, stale, oversized, symlinked,
+malformed, noncanonical, wrongly bound, tampered, or out-of-order artifacts fail
+closed. One never-reset **30 steady-wall-second** deadline includes preparation,
+the stationary runtime gate, all pre-arm waits, motion, release, and cleanup.
+Every component command publication requires a distinct collector observation
+within **0.10 simulation seconds**, and the active stop remains bounded by
+**0.10 simulation seconds** from the qualifying contact.
+
 All trials, including failures and timeouts, remain in the denominator.
 
 ## Scenario 1 — Baseline navigation
@@ -303,6 +322,11 @@ second systemd-owned ROS process is failure.
 - Every collector buffer and artifact writer respects the capacities and byte
   limits in the metrics contract; any overflow, truncation, or missing
   terminal contact drain fails closed.
+- Positive-control READY, runtime-gate, ARM, and ARMED evidence proves the
+  stationary authorization order, exact run/hash bindings, fresh post-arm
+  clock, and absence of nonzero motion before acknowledgement.
+- Positive-control command traces reconcile every component publication to one
+  distinct collector observation within 0.10 simulation seconds.
 - Reports derive all displayed numbers from canonical run JSON.
 - Null/unavailable values never become zero.
 

@@ -18,7 +18,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import math
+import os
+import re
+import stat
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -66,6 +70,12 @@ from robotest_scenarios.constants import (
     CONTACT_RELEASE_GAP_NS,
     CONTACT_SUMMARY_CAPACITY,
     CONTACT_TOPIC,
+    CONTROL_ARM_ACK_MAX_BYTES,
+    CONTROL_ARM_ACK_PRODUCER,
+    CONTROL_ARM_ACTION,
+    CONTROL_ARM_REQUEST_MAX_BYTES,
+    CONTROL_ARM_REQUEST_PRODUCER,
+    CONTROL_ARM_SCHEMA_VERSION,
     CONTROL_COMMAND_PERIOD_NS,
     CONTROL_CONTACT_DEADLINE_NS,
     CONTROL_FORWARD_MPS,
@@ -106,6 +116,8 @@ from robotest_scenarios.errors import (
 from robotest_scenarios.geometry import quaternion_yaw, shortest_yaw_error, stamp_to_ns
 from robotest_scenarios.models import package_schema_path
 from robotest_scenarios.provenance import (
+    contact_control_arm_protocol,
+    contact_control_arm_protocol_sha256,
     contact_control_configuration,
     contact_control_configuration_sha256,
     contact_source_binding,
@@ -116,6 +128,19 @@ WALL_NAME = 'phase3_contact_control_wall'
 FIXTURE_ID = 'collision_positive_control'
 # ROS 2 Jazzy's pinned rmw ABI stores 16 endpoint-GID bytes, rendered as hex here.
 ENDPOINT_GID_HEX_LENGTH = 32
+_SHA256_PATTERN = re.compile(r'^[0-9a-f]{64}$')
+_ARM_REQUEST_KEYS = frozenset(
+    {
+        'action',
+        'arm_protocol_sha256',
+        'arm_requested_steady_ns',
+        'producer',
+        'ready_sha256',
+        'run_id',
+        'runtime_gate_sha256',
+        'schema_version',
+    }
+)
 FORBIDDEN_NAVIGATION_NODES = frozenset(
     {
         'amcl',
@@ -168,6 +193,94 @@ def _wall_pose_message() -> Pose:
     pose.orientation.z = math.sin(yaw_value / 2.0)
     pose.orientation.w = math.cos(yaw_value / 2.0)
     return pose
+
+
+def _positive_integer(value: object, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ProtocolError(f'{label} must be a positive integer')
+    return value
+
+
+def _sha256_value(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None:
+        raise ProtocolError(f'{label} must be a lowercase SHA-256 digest')
+    return value
+
+
+def _decode_arm_request(payload: bytes) -> dict[str, Any]:
+    """Decode one exact canonical, bounded arm-request document."""
+    if not payload:
+        raise ProtocolError('contact-control arm request is empty')
+    if len(payload) > CONTROL_ARM_REQUEST_MAX_BYTES:
+        raise ProtocolError('contact-control arm request exceeds its frozen byte bound')
+    try:
+        value = json.loads(payload.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProtocolError(f'contact-control arm request is invalid JSON: {exc}') from exc
+    if not isinstance(value, dict) or set(value) != _ARM_REQUEST_KEYS:
+        raise ProtocolError('contact-control arm request fields do not match the frozen contract')
+    try:
+        encoded = canonical_json_bytes(value)
+    except ArtifactError as exc:
+        raise ProtocolError(f'contact-control arm request is not canonical JSON: {exc}') from exc
+    if encoded != payload:
+        raise ProtocolError('contact-control arm request bytes are not exact canonical JSON')
+    return value
+
+
+def _read_regular_nonsymlink(path: Path, *, maximum_bytes: int) -> bytes | None:
+    """Read one stable regular file without accepting a final-component symlink."""
+    try:
+        path_before = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ProtocolError(f'contact-control arm request cannot be inspected: {exc}') from exc
+    if stat.S_ISLNK(path_before.st_mode) or not stat.S_ISREG(path_before.st_mode):
+        raise ProtocolError('contact-control arm request must be a regular non-symlink file')
+    if path_before.st_size > maximum_bytes:
+        raise ProtocolError('contact-control arm request exceeds its frozen byte bound')
+    flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NONBLOCK', 0)
+    flags |= getattr(os, 'O_NOFOLLOW', 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ProtocolError(f'contact-control arm request cannot be opened safely: {exc}') from exc
+    try:
+        opened_before = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_before.st_mode) or (
+            opened_before.st_dev,
+            opened_before.st_ino,
+        ) != (path_before.st_dev, path_before.st_ino):
+            raise ProtocolError('contact-control arm request changed during safe open')
+        with os.fdopen(descriptor, 'rb', closefd=True) as stream:
+            descriptor = -1
+            payload = stream.read(maximum_bytes + 1)
+            opened_after = os.fstat(stream.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(payload) > maximum_bytes:
+        raise ProtocolError('contact-control arm request exceeds its frozen byte bound')
+    try:
+        path_after = path.lstat()
+    except OSError as exc:
+        raise ProtocolError(f'contact-control arm request changed during read: {exc}') from exc
+    stable_identity = (
+        (opened_before.st_dev, opened_before.st_ino)
+        == (
+            opened_after.st_dev,
+            opened_after.st_ino,
+        )
+        == (path_after.st_dev, path_after.st_ino)
+    )
+    stable_content = (
+        opened_before.st_size == opened_after.st_size == path_after.st_size == len(payload)
+        and opened_before.st_mtime_ns == opened_after.st_mtime_ns == path_after.st_mtime_ns
+    )
+    if not stable_identity or not stable_content or not stat.S_ISREG(path_after.st_mode):
+        raise ProtocolError('contact-control arm request changed during bounded read')
+    return payload
 
 
 class ContactControlNode(Node):
@@ -226,6 +339,7 @@ class ContactControlNode(Node):
         self.snapshot_contact_first_overflow_stamp_ns: int | None = None
         self.classified_contact_record_count = 0
         self.latest_ground_truth: dict[str, Any] | None = None
+        self.motion_armed = False
         self.motion_active = False
         self.phase = 'PREPARE'
         self.counterpart_trackers = {WALL_NAME: ContactEpisodeTracker(WALL_NAME)}
@@ -653,6 +767,8 @@ class ContactControlNode(Node):
         """Publish and retain one command from the frozen three-value alphabet."""
         if linear_x not in {CONTROL_FORWARD_MPS, 0.0, CONTROL_REVERSE_MPS}:
             raise ProtocolError('contact-control command is outside the frozen value set')
+        if linear_x != 0.0 and not self.motion_armed:
+            raise ProtocolError('contact-control nonzero command preceded the armed acknowledgment')
         if not self.clock_seen or self.current_sim_stamp_ns <= 0:
             raise InfrastructureError('cannot publish contact-control command before /clock')
         message = Twist()
@@ -669,6 +785,12 @@ class ContactControlNode(Node):
         }
         self.commands.add(record, sequence=sequence, stamp_ns=self.current_sim_stamp_ns)
         return record
+
+    def arm_motion(self) -> None:
+        """Permit nonzero motion exactly once after the driver commits its acknowledgment."""
+        if self.motion_armed:
+            raise ProtocolError('contact-control motion may be armed exactly once')
+        self.motion_armed = True
 
     def start_forward(self) -> None:
         """Start the sole controlled motion exactly once."""
@@ -757,6 +879,8 @@ class ContactControlApp:
         manifest: CoverageManifest,
         output_path: Path,
         ready_path: Path,
+        arm_path: Path,
+        armed_path: Path,
         run_id: str,
         wall_timeout_s: float,
         service_timeout_s: float,
@@ -765,6 +889,8 @@ class ContactControlApp:
         self.manifest = manifest
         self.output_path = output_path
         self.ready_path = ready_path
+        self.arm_path = arm_path
+        self.armed_path = armed_path
         self.run_id = run_id
         self.wall_timeout_s = wall_timeout_s
         self.service_timeout_s = service_timeout_s
@@ -799,6 +925,14 @@ class ContactControlApp:
         self.contact_graph_first_sha256: str | None = None
         self.contact_graph_last_sha256: str | None = None
         self.forbidden_nodes: list[str] = []
+        self.ready_steady_ns: int | None = None
+        self.ready_sha256: str | None = None
+        self.arm_request: dict[str, Any] | None = None
+        self.arm_request_sha256: str | None = None
+        self.armed_acknowledgment: dict[str, Any] | None = None
+        self.armed_acknowledgment_sha256: str | None = None
+        self.first_nonzero_publish_started_steady_ns: int | None = None
+        self.first_nonzero_publish_returned_steady_ns: int | None = None
         self.hold_complete_stamp_ns: int | None = None
         self.reverse_start_stamp_ns: int | None = None
         self.final_zero_stamp_ns: int | None = None
@@ -1059,9 +1193,18 @@ class ContactControlApp:
             return False
         return now_ns - self.source_graph_stable_since_ns >= CONTROL_SOURCE_GRAPH_MISSING_CONFIRM_NS
 
-    def _spin_once(self, timeout_s: float = 0.02, *, check_fatal: bool = True) -> None:
+    def _require_wall_budget(self) -> None:
+        """Reject work at or beyond the complete-fixture steady-wall deadline."""
         if time.monotonic() >= self.wall_deadline:
             raise WallTimeoutError('contact-control 30 s steady-wall escape elapsed')
+
+    def _publish_nonzero_command(self, publish: Callable[[], Any]) -> Any:
+        """Recheck the complete-fixture deadline immediately before motion."""
+        self._require_wall_budget()
+        return publish()
+
+    def _spin_once(self, timeout_s: float = 0.02, *, check_fatal: bool = True) -> None:
+        self._require_wall_budget()
         remaining_s = max(0.0, self.wall_deadline - time.monotonic())
         self._executor.spin_once(timeout_sec=min(timeout_s, remaining_s))
         if check_fatal and self._node.fatal_error is not None:
@@ -1074,6 +1217,7 @@ class ContactControlApp:
         ):
             self._enforce_graph_isolation()
             self.last_graph_check_ns = now_ns
+        self._require_wall_budget()
 
     def _wait_for(
         self,
@@ -1083,7 +1227,12 @@ class ContactControlApp:
         sim_deadline_ns: int | None = None,
         check_fatal: bool = True,
     ) -> None:
-        while not predicate():
+        while True:
+            self._require_wall_budget()
+            satisfied = predicate()
+            self._require_wall_budget()
+            if satisfied:
+                return
             self._spin_once(check_fatal=check_fatal)
             if (
                 sim_deadline_ns is not None
@@ -1314,7 +1463,11 @@ class ContactControlApp:
 
     def _write_ready(self, spawn: dict[str, Any], observed_wall: dict[str, Any]) -> None:
         node = self._node
+        self.ready_steady_ns = time.monotonic_ns()
         ready = {
+            'arm_protocol': contact_control_arm_protocol(),
+            'arm_protocol_sha256': contact_control_arm_protocol_sha256(),
+            'control_configuration_sha256': contact_control_configuration_sha256(),
             'expected_pair': list(self.manifest.expected_control_pair),
             'fixture_sha256': self._fixture_sha256(),
             'identity': {'fixture_id': FIXTURE_ID, 'run_id': self.run_id},
@@ -1328,10 +1481,146 @@ class ContactControlApp:
                 'entity_pose': node.resolve_topic_name(ENTITY_POSE_TOPIC),
                 'ground_truth': node.resolve_topic_name(GROUND_TRUTH_TOPIC),
             },
+            'ready_steady_ns': self.ready_steady_ns,
             'schema_version': 1,
             'spawn': spawn,
         }
-        write_canonical_json(self.ready_path, ready, write_sidecar=False)
+        self.ready_sha256 = write_canonical_json(
+            self.ready_path,
+            ready,
+            write_sidecar=False,
+        )
+
+    def _validate_arm_request(
+        self,
+        request: Mapping[str, Any],
+        *,
+        observed_ceiling_steady_ns: int,
+    ) -> None:
+        if request['action'] != CONTROL_ARM_ACTION:
+            raise ProtocolError('contact-control arm request action is not frozen')
+        if request['producer'] != CONTROL_ARM_REQUEST_PRODUCER:
+            raise ProtocolError('contact-control arm request producer is not authoritative')
+        schema_version = _positive_integer(
+            request['schema_version'],
+            label='contact-control arm request schema_version',
+        )
+        if schema_version != CONTROL_ARM_SCHEMA_VERSION:
+            raise ProtocolError('contact-control arm request schema version is not frozen')
+        if request['run_id'] != self.run_id:
+            raise ProtocolError('contact-control arm request belongs to another run')
+        if self.ready_sha256 is None or self.ready_steady_ns is None:
+            raise ProtocolError('contact-control ready identity is unavailable before arm')
+        ready_sha256 = _sha256_value(
+            request['ready_sha256'],
+            label='contact-control arm request ready_sha256',
+        )
+        if ready_sha256 != self.ready_sha256:
+            raise ProtocolError('contact-control arm request does not bind the ready artifact')
+        protocol_sha256 = _sha256_value(
+            request['arm_protocol_sha256'],
+            label='contact-control arm request arm_protocol_sha256',
+        )
+        if protocol_sha256 != contact_control_arm_protocol_sha256():
+            raise ProtocolError('contact-control arm request does not bind the frozen protocol')
+        _sha256_value(
+            request['runtime_gate_sha256'],
+            label='contact-control arm request runtime_gate_sha256',
+        )
+        requested_steady_ns = _positive_integer(
+            request['arm_requested_steady_ns'],
+            label='contact-control arm request arm_requested_steady_ns',
+        )
+        if not self.ready_steady_ns <= requested_steady_ns <= observed_ceiling_steady_ns:
+            raise ProtocolError('contact-control arm request steady timestamp is out of order')
+
+    @staticmethod
+    def _require_fresh_ack_path(path: Path) -> None:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise ProtocolError(
+                f'contact-control armed acknowledgment path cannot be inspected: {exc}'
+            ) from exc
+        raise ProtocolError('contact-control armed acknowledgment path is not fresh')
+
+    def _wait_for_arm(self) -> None:
+        """Spin all guards until an exact request and a strictly newer clock sample exist."""
+        while True:
+            payload = _read_regular_nonsymlink(
+                self.arm_path,
+                maximum_bytes=CONTROL_ARM_REQUEST_MAX_BYTES,
+            )
+            if payload is None:
+                self._spin_once()
+                continue
+            request = _decode_arm_request(payload)
+            read_complete_steady_ns = time.monotonic_ns()
+            self._validate_arm_request(
+                request,
+                observed_ceiling_steady_ns=read_complete_steady_ns,
+            )
+            arm_observed_steady_ns = time.monotonic_ns()
+            break
+
+        node = self._node
+        arm_observed_clock_sample_count = node.clock_sample_count
+        arm_observed_sim_stamp_ns = node.current_sim_stamp_ns
+        if not node.clock_seen or arm_observed_sim_stamp_ns <= 0:
+            raise InfrastructureError('contact-control arm was observed without a positive /clock')
+        self.arm_request = dict(request)
+        self.arm_request_sha256 = hashlib.sha256(payload).hexdigest()
+
+        while not (
+            node.clock_sample_count > arm_observed_clock_sample_count
+            and node.current_sim_stamp_ns > arm_observed_sim_stamp_ns
+            and node.current_sim_stamp_ns > 0
+        ):
+            self._spin_once()
+
+        self._require_wall_budget()
+        armed_steady_ns = time.monotonic_ns()
+        acknowledgment = {
+            'arm_observed_clock_sample_count': arm_observed_clock_sample_count,
+            'arm_observed_sim_stamp_ns': arm_observed_sim_stamp_ns,
+            'arm_observed_steady_ns': arm_observed_steady_ns,
+            'arm_protocol_sha256': contact_control_arm_protocol_sha256(),
+            'arm_request_sha256': self.arm_request_sha256,
+            'arm_requested_steady_ns': request['arm_requested_steady_ns'],
+            'armed_clock_sample_count': node.clock_sample_count,
+            'armed_sim_stamp_ns': node.current_sim_stamp_ns,
+            'armed_steady_ns': armed_steady_ns,
+            'producer': CONTROL_ARM_ACK_PRODUCER,
+            'ready_sha256': self.ready_sha256,
+            'run_id': self.run_id,
+            'runtime_gate_sha256': request['runtime_gate_sha256'],
+            'schema_version': CONTROL_ARM_SCHEMA_VERSION,
+        }
+        if len(canonical_json_bytes(acknowledgment)) > CONTROL_ARM_ACK_MAX_BYTES:
+            raise ProtocolError(
+                'contact-control armed acknowledgment exceeds its frozen byte bound'
+            )
+        self._require_wall_budget()
+        self._require_fresh_ack_path(self.armed_path)
+        acknowledgment_sha256 = write_canonical_json(
+            self.armed_path,
+            acknowledgment,
+            write_sidecar=False,
+        )
+        try:
+            acknowledgment_stat = self.armed_path.lstat()
+        except OSError as exc:
+            raise ArtifactError(
+                f'contact-control armed acknowledgment cannot be inspected: {exc}'
+            ) from exc
+        if not stat.S_ISREG(acknowledgment_stat.st_mode):
+            raise ArtifactError('contact-control armed acknowledgment is not a regular file')
+        self.armed_acknowledgment = acknowledgment
+        self.armed_acknowledgment_sha256 = acknowledgment_sha256
+        self._require_wall_budget()
+        node.arm_motion()
 
     def _prepare(self) -> None:
         self._resolve_wall_asset()
@@ -1359,7 +1648,14 @@ class ContactControlApp:
 
     def _drive_until_contact(self) -> None:
         node = self._node
-        node.start_forward()
+        if self.armed_acknowledgment is None or self.armed_acknowledgment_sha256 is None:
+            raise ProtocolError(
+                'contact-control motion cannot start without an armed acknowledgment'
+            )
+        self._require_wall_budget()
+        self.first_nonzero_publish_started_steady_ns = time.monotonic_ns()
+        self._publish_nonzero_command(node.start_forward)
+        self.first_nonzero_publish_returned_steady_ns = time.monotonic_ns()
         assert node.control_started_stamp_ns is not None
         deadline_ns = node.control_started_stamp_ns + CONTROL_CONTACT_DEADLINE_NS
         next_publish_ns = node.control_started_stamp_ns + CONTROL_COMMAND_PERIOD_NS
@@ -1375,7 +1671,9 @@ class ContactControlApp:
                     raise ScenarioFailureError('no qualifying contact by the 12.0 s deadline')
                 continue
             if node.current_sim_stamp_ns >= next_publish_ns:
-                node.publish_command(CONTROL_FORWARD_MPS, phase='FORWARD')
+                self._publish_nonzero_command(
+                    lambda: node.publish_command(CONTROL_FORWARD_MPS, phase='FORWARD')
+                )
                 next_publish_ns = self._advance_schedule(next_publish_ns, node.current_sim_stamp_ns)
 
     def _hold_zero(self) -> None:
@@ -1410,7 +1708,10 @@ class ContactControlApp:
 
     def _reverse_and_release(self) -> None:
         node = self._node
-        record = node.publish_command(CONTROL_REVERSE_MPS, phase='REVERSE')
+        self._require_wall_budget()
+        record = self._publish_nonzero_command(
+            lambda: node.publish_command(CONTROL_REVERSE_MPS, phase='REVERSE')
+        )
         self.reverse_start_stamp_ns = int(record['sim_stamp_ns'])
         node.phase = 'REVERSE'
         reverse_until_ns = self.reverse_start_stamp_ns + CONTROL_REVERSE_NS
@@ -1420,7 +1721,9 @@ class ContactControlApp:
             if node.current_sim_stamp_ns >= reverse_until_ns:
                 break
             if node.current_sim_stamp_ns >= next_publish_ns:
-                node.publish_command(CONTROL_REVERSE_MPS, phase='REVERSE')
+                self._publish_nonzero_command(
+                    lambda: node.publish_command(CONTROL_REVERSE_MPS, phase='REVERSE')
+                )
                 next_publish_ns = self._advance_schedule(next_publish_ns, node.current_sim_stamp_ns)
         final = node.publish_command(0.0, phase='FINAL_ZERO')
         self.final_zero_stamp_ns = int(final['sim_stamp_ns'])
@@ -1697,6 +2000,18 @@ class ContactControlApp:
     def _control_evidence(self) -> dict[str, Any]:
         node = self._node
         return {
+            'arm': {
+                'acknowledgment': self.armed_acknowledgment,
+                'acknowledgment_sha256': self.armed_acknowledgment_sha256,
+                'first_nonzero_publish_returned_steady_ns': (
+                    self.first_nonzero_publish_returned_steady_ns
+                ),
+                'first_nonzero_publish_started_steady_ns': (
+                    self.first_nonzero_publish_started_steady_ns
+                ),
+                'request': self.arm_request,
+                'request_sha256': self.arm_request_sha256,
+            },
             'command_trace': list(node.commands.items),
             'observed_robot_start': self.observed_start,
             'setup': self.setup_evidence,
@@ -1723,6 +2038,7 @@ class ContactControlApp:
                 }
             },
             'timeline': {
+                'control_started_steady_ns': self.first_nonzero_publish_started_steady_ns,
                 'control_started_stamp_ns': node.control_started_stamp_ns,
                 'final_zero_stamp_ns': self.final_zero_stamp_ns,
                 'hold_complete_stamp_ns': self.hold_complete_stamp_ns,
@@ -1818,6 +2134,7 @@ class ContactControlApp:
             self.executor = SingleThreadedExecutor()
             self.executor.add_node(self.node)
             self._prepare()
+            self._wait_for_arm()
             self._run_control()
         except RobotestScenarioError as exc:
             error = exc
@@ -1906,6 +2223,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument('--output', required=True, help='new positive-control JSON path')
     parser.add_argument('--ready-file', required=True, help='new atomic readiness JSON path')
+    parser.add_argument('--arm-file', required=True, help='fresh runner-owned arm request path')
+    parser.add_argument('--armed-file', required=True, help='fresh driver-owned armed ack path')
     parser.add_argument('--run-id', required=True)
     parser.add_argument('--coverage-manifest', required=True)
     parser.add_argument('--wall-timeout-s', type=float, default=DEFAULT_CONTROL_WALL_TIMEOUT_S)
@@ -1919,19 +2238,59 @@ def _positive_bounded(value: float, *, label: str, maximum: float) -> float:
     return value
 
 
+def _validate_new_handshake_path(path_value: str, *, label: str) -> Path:
+    """Reserve a fresh final component while retaining it for O_NOFOLLOW reads."""
+    candidate = Path(path_value).expanduser()
+    if candidate.name in {'', '.', '..'}:
+        raise ValidationError(f'{label} must name a file')
+    try:
+        parent = candidate.parent.resolve(strict=True)
+    except OSError as exc:
+        raise ValidationError(
+            f'{label} parent directory does not exist: {candidate.parent}'
+        ) from exc
+    if not parent.is_dir():
+        raise ValidationError(f'{label} parent is not a directory: {parent}')
+    path = parent / candidate.name
+    for reserved in (path, sha256_sidecar(path)):
+        try:
+            reserved.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ValidationError(f'{label} cannot be inspected: {reserved}: {exc}') from exc
+        raise ValidationError(f'{label} already exists: {reserved}')
+    return path
+
+
 def _inputs(
     raw_args: Sequence[str],
-) -> tuple[CoverageManifest, Path, Path, str, float, float]:
+) -> tuple[CoverageManifest, Path, Path, Path, Path, str, float, float]:
     cli = _parser().parse_args(remove_ros_args(args=list(raw_args))[1:])
     manifest = load_coverage_manifest(cli.coverage_manifest)
     run_id = validate_run_id(cli.run_id)
     output = validate_new_output(cli.output, label='contact-control output')
     ready = validate_new_output(cli.ready_file, label='contact-control ready file')
-    reserved_paths = {output, sha256_sidecar(output), ready}
-    if len(reserved_paths) != 3:
+    arm = _validate_new_handshake_path(cli.arm_file, label='contact-control arm request')
+    armed = _validate_new_handshake_path(
+        cli.armed_file,
+        label='contact-control armed acknowledgment',
+    )
+    reserved_paths = {
+        output,
+        sha256_sidecar(output),
+        ready,
+        arm,
+        sha256_sidecar(arm),
+        armed,
+        sha256_sidecar(armed),
+    }
+    if len(reserved_paths) != 7:
         raise ValidationError(
-            'contact-control output, checksum sidecar, and ready file must be distinct'
+            'contact-control output, checksum sidecar, ready, arm, and armed paths must be distinct'
         )
+    if {output.parent, ready.parent, arm.parent, armed.parent} != {output.parent}:
+        raise ValidationError('contact-control handshake artifacts must share the result directory')
     wall_timeout = float(cli.wall_timeout_s)
     if wall_timeout != DEFAULT_CONTROL_WALL_TIMEOUT_S:
         raise ValidationError(
@@ -1943,14 +2302,16 @@ def _inputs(
         label='service timeout',
         maximum=30.0,
     )
-    return manifest, output, ready, run_id, wall_timeout, service_timeout
+    return manifest, output, ready, arm, armed, run_id, wall_timeout, service_timeout
 
 
 def main(args: Sequence[str] | None = None) -> int:
     """Run the installed contact-control driver and return its stable exit code."""
     raw_args = list(sys.argv if args is None else ['contact_control_driver', *args])
     try:
-        manifest, output, ready, run_id, wall_timeout, service_timeout = _inputs(raw_args)
+        manifest, output, ready, arm, armed, run_id, wall_timeout, service_timeout = _inputs(
+            raw_args
+        )
     except (OSError, RuntimeError, ValidationError) as exc:
         print(f'contact_control_driver: validation error: {exc}', file=sys.stderr)
         return int(ExitCode.VALIDATION_ERROR)
@@ -1958,6 +2319,8 @@ def main(args: Sequence[str] | None = None) -> int:
         manifest=manifest,
         output_path=output,
         ready_path=ready,
+        arm_path=arm,
+        armed_path=armed,
         run_id=run_id,
         wall_timeout_s=wall_timeout,
         service_timeout_s=service_timeout,

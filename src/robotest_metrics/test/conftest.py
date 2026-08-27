@@ -507,6 +507,35 @@ def collision_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
     }
     graph_snapshot_sha256 = canonical_sha256(graph_snapshot)
 
+    arm_protocol = control_configuration['arm_protocol']
+    arm_request = {
+        'action': arm_protocol['action'],
+        'arm_protocol_sha256': canonical_sha256(arm_protocol),
+        'arm_requested_steady_ns': 4_000_000,
+        'producer': arm_protocol['request_producer'],
+        'ready_sha256': 'd' * 64,
+        'run_id': 'positive-control-1',
+        'runtime_gate_sha256': 'e' * 64,
+        'schema_version': arm_protocol['schema_version'],
+    }
+    arm_request_sha256 = canonical_sha256(arm_request)
+    armed_acknowledgment = {
+        'arm_observed_clock_sample_count': 10,
+        'arm_observed_sim_stamp_ns': 800_000_000,
+        'arm_observed_steady_ns': 5_000_000,
+        'arm_protocol_sha256': canonical_sha256(arm_protocol),
+        'arm_request_sha256': arm_request_sha256,
+        'arm_requested_steady_ns': arm_request['arm_requested_steady_ns'],
+        'armed_clock_sample_count': 11,
+        'armed_sim_stamp_ns': 900_000_000,
+        'armed_steady_ns': 6_000_000,
+        'producer': arm_protocol['ack_producer'],
+        'ready_sha256': arm_request['ready_sha256'],
+        'run_id': arm_request['run_id'],
+        'runtime_gate_sha256': arm_request['runtime_gate_sha256'],
+        'schema_version': arm_protocol['schema_version'],
+    }
+
     positive = {
         'cleanup': {
             'actor_absent': True,
@@ -549,6 +578,14 @@ def collision_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
             'wall_timeout_s': 30.0,
         },
         'control': {
+            'arm': {
+                'acknowledgment': armed_acknowledgment,
+                'acknowledgment_sha256': canonical_sha256(armed_acknowledgment),
+                'first_nonzero_publish_returned_steady_ns': 8_000_000,
+                'first_nonzero_publish_started_steady_ns': 7_000_000,
+                'request': arm_request,
+                'request_sha256': arm_request_sha256,
+            },
             'command_trace': [
                 {
                     'angular_z': 0.0,
@@ -693,6 +730,7 @@ def collision_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
                 },
             },
             'timeline': {
+                'control_started_steady_ns': 7_000_000,
                 'control_started_stamp_ns': 1_000_000_000,
                 'final_zero_stamp_ns': 2_350_000_000,
                 'hold_complete_stamp_ns': 1_350_000_000,

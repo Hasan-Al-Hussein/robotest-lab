@@ -75,6 +75,47 @@ def test_goal_observer_arm_ack_is_validated_before_mission_launch() -> None:
     assert arm_request < arm_ack < mission_launch
 
 
+def test_positive_control_runtime_gate_finishes_before_motion_arm() -> None:
+    source = (TEST_DIR / 'phase3_benchmark_runner.py').read_text(encoding='utf-8')
+    positive_start = source.index('    def positive_control(')
+    positive_end = source.index('    def smoke(', positive_start)
+    positive_source = source[positive_start:positive_end]
+
+    driver_ready = positive_source.index("stage='positive_driver_ready'")
+    runtime_gate = positive_source.index('runtime_gate_process = registry.run_checked(')
+    group_empty = positive_source.index('if _group_alive(runtime_gate_process.pgid):')
+    owners_alive = positive_source.index(
+        "(launch, collector, driver), stage='positive_runtime_gate'"
+    )
+    arm_write = positive_source.index('arm_request_sha256 = atomic_write_json(')
+    arm_ack = positive_source.index("stage='positive_driver_armed'")
+    driver_wait = positive_source.index('driver_status = driver.wait(50.0)')
+
+    assert (
+        driver_ready < runtime_gate < group_empty < owners_alive < arm_write < arm_ack < driver_wait
+    )
+    assert "'--arm-file'" in positive_source
+    assert "'--armed-file'" in positive_source
+
+
+def test_contact_control_arm_paths_must_be_fresh_and_distinct(tmp_path: Path) -> None:
+    arm_path = tmp_path / 'arm.json'
+    armed_path = tmp_path / 'armed.json'
+    runner._require_fresh_distinct_paths(
+        (arm_path, armed_path), label='contact-control arm handshake'
+    )
+
+    with pytest.raises(runner.EvidenceError, match='distinct'):
+        runner._require_fresh_distinct_paths(
+            (arm_path, arm_path), label='contact-control arm handshake'
+        )
+    arm_path.write_text('{}\n', encoding='utf-8')
+    with pytest.raises(runner.EvidenceError, match='already exists'):
+        runner._require_fresh_distinct_paths(
+            (arm_path, armed_path), label='contact-control arm handshake'
+        )
+
+
 def test_bounded_process_is_group_leader_and_records_exact_command(tmp_path: Path) -> None:
     process = runner.BoundedProcess(
         role='probe',

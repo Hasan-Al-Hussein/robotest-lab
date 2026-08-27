@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
@@ -127,6 +128,34 @@ CANDIDATE_REQUIRED_NODES = AUTONOMY_NODE_NAMES - {'mission_runner'} | {
 }
 
 POSITIVE_FORBIDDEN_NODES = AUTONOMY_NODE_NAMES - {'fault_proxy'}
+POSITIVE_REQUIRED_NODE_NAMES = {
+    'contact_control_driver',
+    'contact_stream_gate',
+    'fault_proxy',
+    'metrics_collector',
+    'parameter_bridge',
+    'robot_state_publisher',
+    'scenario_bridge',
+}
+
+POSITIVE_AUTHORITATIVE_PUBLISHER_CONTRACTS: dict[str, tuple[set[str], str, int]] = {
+    '/clock': ({'/robotest/parameter_bridge'}, 'rosgraph_msgs/msg/Clock', 1),
+    '/robotest/validation/ground_truth': (
+        {'/robotest/parameter_bridge'},
+        'nav_msgs/msg/Odometry',
+        1,
+    ),
+    '/robotest/validation/scenario_entity_poses': (
+        {'/robotest/parameter_bridge'},
+        'tf2_msgs/msg/TFMessage',
+        4,
+    ),
+    '/robotest/validation/world_stats': (
+        {'/robotest/parameter_bridge'},
+        'ros_gz_interfaces/msg/WorldStatistics',
+        1,
+    ),
+}
 
 CANDIDATE_EXPECTED_PUBLISHERS: dict[str, set[str]] = {
     '/clock': {'/robotest/parameter_bridge'},
@@ -1033,12 +1062,14 @@ def _exact_endpoint_owners(
     expected_nodes: set[str],
     *,
     expected_type: str | None = None,
+    expected_cardinality: int | None = None,
 ) -> bool:
     """Require exact endpoint cardinality, identity, type, and distinct GIDs."""
     nodes = [item['node'] for item in endpoints]
     gids = [item['gid'] for item in endpoints]
+    cardinality = len(expected_nodes) if expected_cardinality is None else expected_cardinality
     return (
-        len(endpoints) == len(expected_nodes)
+        len(endpoints) == cardinality
         and set(nodes) == expected_nodes
         and len(set(gids)) == len(gids)
         and all(gids)
@@ -1290,6 +1321,35 @@ def _positive_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
         )
     }
     cmd_ownership = _positive_command_ownership(relevant['/robotest/cmd_vel'])
+    authoritative_publisher_ownership = {
+        topic: _exact_endpoint_owners(
+            relevant[topic]['publishers'],
+            expected_nodes,
+            expected_type=expected_type,
+            expected_cardinality=expected_cardinality,
+        )
+        for topic, (
+            expected_nodes,
+            expected_type,
+            expected_cardinality,
+        ) in POSITIVE_AUTHORITATIVE_PUBLISHER_CONTRACTS.items()
+    }
+    authoritative_gids = [
+        endpoint['gid']
+        for topic in POSITIVE_AUTHORITATIVE_PUBLISHER_CONTRACTS
+        for endpoint in relevant[topic]['publishers']
+    ]
+    duplicate_authoritative_gids = {
+        gid for gid, count in Counter(authoritative_gids).items() if count > 1
+    }
+    authoritative_publisher_ownership = {
+        topic: accepted
+        and all(
+            endpoint['gid'] not in duplicate_authoritative_gids
+            for endpoint in relevant[topic]['publishers']
+        )
+        for topic, accepted in authoritative_publisher_ownership.items()
+    }
     contact_publisher_ownership = {
         topic: _exact_endpoint_owners(
             relevant[topic]['publishers'],
@@ -1305,16 +1365,7 @@ def _positive_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
             expected_type=CONTACT_MESSAGE_TYPE,
         )
     }
-    required_nodes = {
-        'contact_control_driver',
-        'contact_stream_gate',
-        'fault_proxy',
-        'metrics_collector',
-        'parameter_bridge',
-        'robot_state_publisher',
-        'scenario_bridge',
-    }
-    required_nodes_missing = sorted(required_nodes - short_names)
+    required_nodes_missing = sorted(POSITIVE_REQUIRED_NODE_NAMES - short_names)
     forbidden_present = sorted(POSITIVE_FORBIDDEN_NODES & short_names)
     services_missing = sorted(
         {
@@ -1342,6 +1393,7 @@ def _positive_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
     passed = (
         cmd_ownership['publisher']
         and cmd_ownership['subscribers']
+        and all(authoritative_publisher_ownership.values())
         and all(contact_publisher_ownership.values())
         and all(contact_subscriber_ownership.values())
         and not forbidden_present
@@ -1351,6 +1403,7 @@ def _positive_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
         and qos_pass
     )
     return passed, {
+        'authoritative_publisher_ownership': authoritative_publisher_ownership,
         'bounded_depth_live_proven_for_all_endpoints': bounded_depth_live_proven,
         'cmd_vel_owner_pass': cmd_ownership['publisher'],
         'cmd_vel_subscriber_ownership_pass': cmd_ownership['subscribers'],

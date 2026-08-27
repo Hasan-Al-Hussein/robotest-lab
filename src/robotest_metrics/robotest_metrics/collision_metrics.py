@@ -126,12 +126,176 @@ _CONTACT_DISPOSITIONS = {
     'robot_internal': 'robot_internal_excluded',
 }
 _MAX_CONTACT_SNAPSHOT_GAP_NS = 220_000_000
+_ARM_REQUEST_FIELDS = {
+    'action',
+    'arm_protocol_sha256',
+    'arm_requested_steady_ns',
+    'producer',
+    'ready_sha256',
+    'run_id',
+    'runtime_gate_sha256',
+    'schema_version',
+}
+_ARM_ACKNOWLEDGMENT_FIELDS = {
+    'arm_observed_clock_sample_count',
+    'arm_observed_sim_stamp_ns',
+    'arm_observed_steady_ns',
+    'arm_protocol_sha256',
+    'arm_request_sha256',
+    'arm_requested_steady_ns',
+    'armed_clock_sample_count',
+    'armed_sim_stamp_ns',
+    'armed_steady_ns',
+    'producer',
+    'ready_sha256',
+    'run_id',
+    'runtime_gate_sha256',
+    'schema_version',
+}
+_ARM_RESULT_FIELDS = {
+    'acknowledgment',
+    'acknowledgment_sha256',
+    'first_nonzero_publish_returned_steady_ns',
+    'first_nonzero_publish_started_steady_ns',
+    'request',
+    'request_sha256',
+}
 
 
 def _sha256(value: Any, name: str) -> str:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         raise MetricUnavailable(f'{name} must be a lowercase SHA-256')
     return value
+
+
+def _positive_int(value: Any, name: str) -> int:
+    parsed = require_int(value, name)
+    if parsed <= 0:
+        raise MetricUnavailable(f'{name} must be positive')
+    return parsed
+
+
+def _validate_contact_control_arm(
+    control: Mapping[str, Any],
+    *,
+    expected_run_id: str,
+    control_configuration: Mapping[str, Any],
+) -> None:
+    """Validate the component-owned motion authorization and fresh-clock barrier."""
+    arm = control.get('arm')
+    if not isinstance(arm, Mapping) or set(arm) != _ARM_RESULT_FIELDS:
+        raise MetricUnavailable('positive-control arm proof fields are incomplete')
+    protocol = control_configuration.get('arm_protocol')
+    if not isinstance(protocol, Mapping):
+        raise MetricUnavailable('positive-control arm protocol is missing')
+    protocol_sha256 = canonical_sha256(protocol)
+
+    request = arm.get('request')
+    if not isinstance(request, Mapping) or set(request) != _ARM_REQUEST_FIELDS:
+        raise MetricUnavailable('positive-control arm request fields are incomplete')
+    request_schema_version = require_int(
+        request.get('schema_version'), 'positive_control.control.arm.request.schema_version'
+    )
+    requested_steady_ns = _positive_int(
+        request.get('arm_requested_steady_ns'),
+        'positive_control.control.arm.request.arm_requested_steady_ns',
+    )
+    request_ready_sha256 = _sha256(
+        request.get('ready_sha256'), 'positive_control.control.arm.request.ready_sha256'
+    )
+    request_runtime_gate_sha256 = _sha256(
+        request.get('runtime_gate_sha256'),
+        'positive_control.control.arm.request.runtime_gate_sha256',
+    )
+    if (
+        request.get('action') != protocol.get('action')
+        or request.get('producer') != protocol.get('request_producer')
+        or request_schema_version != protocol.get('schema_version')
+        or request.get('run_id') != expected_run_id
+        or request.get('arm_protocol_sha256') != protocol_sha256
+    ):
+        raise MetricUnavailable('positive-control arm request binding changed')
+    request_sha256 = _sha256(
+        arm.get('request_sha256'), 'positive_control.control.arm.request_sha256'
+    )
+    if canonical_sha256(request) != request_sha256:
+        raise MetricUnavailable('positive-control arm request hash mismatch')
+
+    acknowledgment = arm.get('acknowledgment')
+    if not isinstance(acknowledgment, Mapping) or set(acknowledgment) != _ARM_ACKNOWLEDGMENT_FIELDS:
+        raise MetricUnavailable('positive-control arm acknowledgment fields are incomplete')
+    acknowledgment_schema_version = require_int(
+        acknowledgment.get('schema_version'),
+        'positive_control.control.arm.acknowledgment.schema_version',
+    )
+    observed_steady_ns = _positive_int(
+        acknowledgment.get('arm_observed_steady_ns'),
+        'positive_control.control.arm.acknowledgment.arm_observed_steady_ns',
+    )
+    armed_steady_ns = _positive_int(
+        acknowledgment.get('armed_steady_ns'),
+        'positive_control.control.arm.acknowledgment.armed_steady_ns',
+    )
+    observed_clock_count = _positive_int(
+        acknowledgment.get('arm_observed_clock_sample_count'),
+        'positive_control.control.arm.acknowledgment.arm_observed_clock_sample_count',
+    )
+    armed_clock_count = _positive_int(
+        acknowledgment.get('armed_clock_sample_count'),
+        'positive_control.control.arm.acknowledgment.armed_clock_sample_count',
+    )
+    observed_sim_stamp_ns = _positive_int(
+        acknowledgment.get('arm_observed_sim_stamp_ns'),
+        'positive_control.control.arm.acknowledgment.arm_observed_sim_stamp_ns',
+    )
+    armed_sim_stamp_ns = _positive_int(
+        acknowledgment.get('armed_sim_stamp_ns'),
+        'positive_control.control.arm.acknowledgment.armed_sim_stamp_ns',
+    )
+    if (
+        acknowledgment.get('arm_protocol_sha256') != protocol_sha256
+        or acknowledgment.get('arm_request_sha256') != request_sha256
+        or acknowledgment.get('arm_requested_steady_ns') != requested_steady_ns
+        or acknowledgment.get('producer') != protocol.get('ack_producer')
+        or acknowledgment.get('ready_sha256') != request_ready_sha256
+        or acknowledgment.get('run_id') != expected_run_id
+        or acknowledgment.get('runtime_gate_sha256') != request_runtime_gate_sha256
+        or acknowledgment_schema_version != protocol.get('schema_version')
+    ):
+        raise MetricUnavailable('positive-control arm acknowledgment binding changed')
+    acknowledgment_sha256 = _sha256(
+        arm.get('acknowledgment_sha256'),
+        'positive_control.control.arm.acknowledgment_sha256',
+    )
+    if canonical_sha256(acknowledgment) != acknowledgment_sha256:
+        raise MetricUnavailable('positive-control arm acknowledgment hash mismatch')
+    if armed_clock_count <= observed_clock_count or armed_sim_stamp_ns <= observed_sim_stamp_ns:
+        raise MetricUnavailable('positive-control arm acknowledgment lacks a fresh clock sample')
+
+    first_publish_started_ns = _positive_int(
+        arm.get('first_nonzero_publish_started_steady_ns'),
+        'positive_control.control.arm.first_nonzero_publish_started_steady_ns',
+    )
+    first_publish_returned_ns = _positive_int(
+        arm.get('first_nonzero_publish_returned_steady_ns'),
+        'positive_control.control.arm.first_nonzero_publish_returned_steady_ns',
+    )
+    timeline = control.get('timeline')
+    if not isinstance(timeline, Mapping):
+        raise MetricUnavailable('positive-control timeline is missing')
+    control_started_steady_ns = _positive_int(
+        timeline.get('control_started_steady_ns'),
+        'positive_control.timeline.control_started_steady_ns',
+    )
+    if not (
+        requested_steady_ns
+        <= observed_steady_ns
+        <= armed_steady_ns
+        <= control_started_steady_ns
+        == first_publish_started_ns
+        <= first_publish_returned_ns
+    ):
+        raise MetricUnavailable('positive-control arm steady-time ordering is invalid')
 
 
 def _require_bounded_buffer(
@@ -777,6 +941,11 @@ def _positive_control_evidence(
     control = positive_control.get('control')
     if not isinstance(control, Mapping):
         raise MetricUnavailable('positive-control control evidence is missing')
+    _validate_contact_control_arm(
+        control,
+        expected_run_id=identity['run_id'],
+        control_configuration=expected_control_configuration,
+    )
     criteria = control.get('criteria')
     if not isinstance(criteria, Mapping) or set(criteria) != set(_POSITIVE_CONTROL_CRITERIA):
         raise MetricUnavailable('positive-control criteria fields are incomplete')

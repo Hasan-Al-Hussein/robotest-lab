@@ -16,6 +16,7 @@ starting a graph or simulator.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 import hashlib
@@ -49,10 +50,260 @@ STRING_MAX_BYTES = 4096
 COLLECTOR_WALL_TIMEOUT_S = 360.0
 TRIAL_WALL_TIMEOUT_S = 300.0
 CONTACT_CONTROL_WALL_TIMEOUT_S = 30.0
+CONTACT_CONTROL_PROCESS_WALL_TIMEOUT_S = 45.0
+POSITIVE_SIM_LAUNCH_PROCESS_WALL_TIMEOUT_S = 120.0
 CONTACT_DRAIN_NS = 250_000_000
 CONTACT_HEARTBEAT_NS = 200_000_000
 CONTACT_MAX_PUBLIC_GAP_NS = 220_000_000
 CONTACT_MAX_CLOCK_LAG_NS = 220_000_000
+CONTACT_CONTROL_ARM_PROTOCOL_KEYS = {
+    'ack_max_bytes',
+    'ack_producer',
+    'action',
+    'fresh_clock_policy',
+    'request_max_bytes',
+    'request_producer',
+    'schema_version',
+    'wait_deadline_policy',
+}
+CONTACT_CONTROL_ARM_REQUEST_KEYS = {
+    'action',
+    'arm_protocol_sha256',
+    'arm_requested_steady_ns',
+    'producer',
+    'ready_sha256',
+    'run_id',
+    'runtime_gate_sha256',
+    'schema_version',
+}
+CONTACT_CONTROL_ARM_ACK_KEYS = {
+    'arm_observed_clock_sample_count',
+    'arm_observed_sim_stamp_ns',
+    'arm_observed_steady_ns',
+    'arm_protocol_sha256',
+    'arm_request_sha256',
+    'arm_requested_steady_ns',
+    'armed_clock_sample_count',
+    'armed_sim_stamp_ns',
+    'armed_steady_ns',
+    'producer',
+    'ready_sha256',
+    'run_id',
+    'runtime_gate_sha256',
+    'schema_version',
+}
+POSITIVE_RUNTIME_GATE_KEYS = {
+    'attempt_count',
+    'authoritative_publisher_ownership',
+    'bounded_depth_live_proven_for_all_endpoints',
+    'cmd_vel_owner_pass',
+    'cmd_vel_subscriber_ownership_pass',
+    'contact_aggregator_binary_attestation',
+    'contact_gate_binary_attestation',
+    'contact_publisher_ownership',
+    'contact_subscriber_ownership',
+    'elapsed_wall_s',
+    'exact_static_qos_depth_contract',
+    'forbidden_nodes_present',
+    'mode',
+    'namespace_isolation_pass',
+    'nodes',
+    'producer',
+    'qos_contract_pass',
+    'qos_introspection_complete',
+    'required_nodes_missing',
+    'scenario_services_missing',
+    'schema_version',
+    'topics',
+    'validation_autonomy_isolation_pass',
+    'verdict',
+}
+POSITIVE_RUNTIME_GATE_TOPIC_KEYS = {
+    '/clock',
+    '/robotest/cmd_vel',
+    '/robotest/internal/raw_contacts',
+    '/robotest/validation/contacts',
+    '/robotest/validation/ground_truth',
+    '/robotest/validation/scenario_entity_poses',
+    '/robotest/validation/world_stats',
+}
+POSITIVE_AUTHORITATIVE_PUBLISHER_CONTRACTS: dict[str, tuple[set[str], str, int]] = {
+    '/clock': ({'/robotest/parameter_bridge'}, 'rosgraph_msgs/msg/Clock', 1),
+    '/robotest/validation/ground_truth': (
+        {'/robotest/parameter_bridge'},
+        'nav_msgs/msg/Odometry',
+        1,
+    ),
+    '/robotest/validation/scenario_entity_poses': (
+        {'/robotest/parameter_bridge'},
+        'tf2_msgs/msg/TFMessage',
+        4,
+    ),
+    '/robotest/validation/world_stats': (
+        {'/robotest/parameter_bridge'},
+        'ros_gz_interfaces/msg/WorldStatistics',
+        1,
+    ),
+}
+POSITIVE_CONTACT_PUBLISHER_OWNERSHIP = {
+    '/robotest/internal/raw_contacts': True,
+    '/robotest/validation/contacts': True,
+}
+POSITIVE_CONTACT_SUBSCRIBER_OWNERSHIP = {
+    '/robotest/internal/raw_contacts': True,
+}
+POSITIVE_RUNTIME_GATE_TOPIC_KEYS_NESTED = {
+    'bounded_depth_live_proven',
+    'exact_depth_live_proven',
+    'expected',
+    'publishers',
+    'publisher_qos_pass',
+    'qos_checks',
+    'qos_introspection_complete',
+    'subscribers',
+    'subscriber_qos_pass',
+}
+POSITIVE_RUNTIME_GATE_ENDPOINT_KEYS = {
+    'depth',
+    'durability',
+    'gid',
+    'history',
+    'node',
+    'reliability',
+    'topic_type',
+}
+POSITIVE_RUNTIME_GATE_QOS_CHECK_KEYS = {
+    'bounded_depth_live_proven',
+    'exact_depth_live_proven',
+    'expected_depth',
+    'explicit_keep_all',
+    'introspection_complete',
+    'node',
+    'policy_contract_pass',
+    'side',
+}
+POSITIVE_RUNTIME_GATE_STATIC_QOS_KEYS = {
+    'depth',
+    'durability',
+    'endpoint_depth_overrides',
+    'history',
+    'reliability',
+}
+POSITIVE_RUNTIME_GATE_QOS_OVERRIDE_KEYS = {'depth', 'node', 'side'}
+POSITIVE_RUNTIME_GATE_COMMAND_TYPE = 'geometry_msgs/msg/Twist'
+POSITIVE_RUNTIME_GATE_CONTACT_TYPE = 'ros_gz_interfaces/msg/Contacts'
+POSITIVE_RUNTIME_GATE_QOS_CONTRACTS = {
+    '/clock': {
+        'depth': 1,
+        'durability': 'VOLATILE',
+        'endpoint_depth_overrides': [],
+        'history': 'KEEP_LAST',
+        'reliability': 'BEST_EFFORT',
+    },
+    '/robotest/cmd_vel': {
+        'depth': 1,
+        'durability': 'VOLATILE',
+        'endpoint_depth_overrides': [
+            {'depth': 4_096, 'node': '/robotest/metrics_collector', 'side': 'subscriber'}
+        ],
+        'history': 'KEEP_LAST',
+        'reliability': 'RELIABLE',
+    },
+    '/robotest/internal/raw_contacts': {
+        'depth': 64,
+        'durability': 'VOLATILE',
+        'endpoint_depth_overrides': [],
+        'history': 'KEEP_LAST',
+        'reliability': 'RELIABLE',
+    },
+    '/robotest/validation/contacts': {
+        'depth': 10,
+        'durability': 'VOLATILE',
+        'endpoint_depth_overrides': [],
+        'history': 'KEEP_LAST',
+        'reliability': 'RELIABLE',
+    },
+    '/robotest/validation/ground_truth': {
+        'depth': 10,
+        'durability': 'VOLATILE',
+        'endpoint_depth_overrides': [],
+        'history': 'KEEP_LAST',
+        'reliability': 'RELIABLE',
+    },
+    '/robotest/validation/scenario_entity_poses': {
+        'depth': 10,
+        'durability': 'VOLATILE',
+        'endpoint_depth_overrides': [],
+        'history': 'KEEP_LAST',
+        'reliability': 'RELIABLE',
+    },
+    '/robotest/validation/world_stats': {
+        'depth': 10,
+        'durability': 'VOLATILE',
+        'endpoint_depth_overrides': [],
+        'history': 'KEEP_LAST',
+        'reliability': 'RELIABLE',
+    },
+}
+POSITIVE_RUNTIME_GATE_REQUIRED_NODE_NAMES = {
+    'contact_control_driver',
+    'contact_stream_gate',
+    'fault_proxy',
+    'metrics_collector',
+    'parameter_bridge',
+    'robot_state_publisher',
+    'scenario_bridge',
+}
+POSITIVE_RUNTIME_GATE_FORBIDDEN_NODE_NAMES = {
+    'amcl',
+    'behavior_server',
+    'bt_navigator',
+    'collision_monitor',
+    'controller_server',
+    'lifecycle_manager_navigation',
+    'map_server',
+    'mission_runner',
+    'planner_server',
+    'velocity_smoother',
+    'waypoint_follower',
+}
+BOUNDED_PROCESS_KEYS = {
+    'command',
+    'cwd',
+    'finished_steady_ns',
+    'group_confirmed_empty',
+    'pgid',
+    'pid',
+    'returncode',
+    'role',
+    'started_steady_ns',
+    'stderr',
+    'stdout',
+    'timed_out',
+    'wall_timeout_s',
+    'wrapped_command',
+}
+BOUNDED_PROCESS_STREAM_KEYS = {
+    'error',
+    'maximum_bytes',
+    'observed_bytes',
+    'overflow',
+    'retained_bytes',
+}
+POSITIVE_RUNTIME_GATE_INNER_TIMEOUT_S = 20.0
+POSITIVE_RUNTIME_GATE_OUTER_TIMEOUT_S = 25.0
+POSITIVE_RUNTIME_GATE_MAX_ATTEMPTS = 4_096
+SUITE_DOCUMENT_KEYS = {
+    'aggregate_metrics',
+    'candidate_id',
+    'cpu_affinity',
+    'domain_base',
+    'positive_control',
+    'producer',
+    'schema_version',
+    'smoke',
+    'trials',
+}
 CONTACT_PUBLIC_TOPIC = '/robotest/validation/contacts'
 CONTACT_GATE_NODE = '/robotest/contact_stream_gate'
 CONTACT_PRIVATE_RAW_TOPIC = '/robotest/internal/raw_contacts'
@@ -128,6 +379,7 @@ LIFECYCLE_SAMPLE_COUNT = 96
 SHA256_PATTERN = re.compile(r'^[0-9a-f]{64}$')
 GIT_SHA_PATTERN = re.compile(r'^[0-9a-f]{40}$')
 IDENTIFIER_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
+ENDPOINT_GID_PATTERN = re.compile(r'^[0-9a-f]{32}$')
 
 SCENARIOS: tuple[tuple[int, str, str], ...] = (
     (1, 'baseline_navigation', 'scenarios/phase3_s1_baseline.yaml'),
@@ -448,6 +700,875 @@ def verify_json_sidecar(path: Path) -> str:
     if line != expected:
         raise EvidenceError(f'SHA sidecar does not match canonical artifact: {sidecar}')
     return expected[:64]
+
+
+def load_canonical_json(path: Path, *, maximum_bytes: int = JSON_MAX_BYTES) -> Any:
+    """Load an exact canonical JSON artifact from one regular, non-symlink path."""
+    if path.is_symlink() or not path.is_file():
+        raise EvidenceError(f'canonical JSON artifact is not a regular file: {path}')
+    document = load_json(path, maximum_bytes=maximum_bytes)
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise EvidenceError(f'cannot read canonical JSON artifact {path}: {exc}') from exc
+    if payload != canonical_json_bytes(document):
+        raise EvidenceError(f'JSON artifact is not exact canonical JSON: {path}')
+    return document
+
+
+def _contact_control_arm_protocol(value: Any) -> dict[str, Any]:
+    """Validate the authoritative protocol projection supplied by the driver."""
+    protocol = _require_mapping(value, 'contact_control.arm_protocol')
+    if set(protocol) != CONTACT_CONTROL_ARM_PROTOCOL_KEYS:
+        raise EvidenceError('contact-control arm protocol keys are invalid')
+    schema_version = _require_int(
+        protocol.get('schema_version'), 'contact_control.arm_protocol.schema_version', minimum=1
+    )
+    if schema_version != SCHEMA_VERSION:
+        raise EvidenceError('contact-control arm protocol schema is unsupported')
+    for field in (
+        'ack_producer',
+        'action',
+        'fresh_clock_policy',
+        'request_producer',
+        'wait_deadline_policy',
+    ):
+        require_bounded_string(protocol.get(field), f'contact_control.arm_protocol.{field}')
+    for field in ('ack_max_bytes', 'request_max_bytes'):
+        maximum = _require_int(
+            protocol.get(field), f'contact_control.arm_protocol.{field}', minimum=1
+        )
+        if maximum > JSON_MAX_BYTES:
+            raise EvidenceError(f'contact-control arm protocol {field} exceeds JSON cap')
+    return dict(protocol)
+
+
+def validate_contact_control_ready(document: Any, *, expected_run_id: str) -> dict[str, Any]:
+    """Validate the driver readiness document used to derive motion authorization."""
+    ready = _require_mapping(document, 'contact_control.ready')
+    expected_keys = {
+        'arm_protocol',
+        'arm_protocol_sha256',
+        'control_configuration_sha256',
+        'expected_pair',
+        'fixture_sha256',
+        'identity',
+        'observed_robot_start',
+        'observed_wall',
+        'producer',
+        'ready_steady_ns',
+        'resolved_names',
+        'schema_version',
+        'spawn',
+    }
+    if set(ready) != expected_keys:
+        raise EvidenceError('contact-control readiness keys are invalid')
+    protocol = _contact_control_arm_protocol(ready.get('arm_protocol'))
+    protocol_sha256 = require_sha256(
+        ready.get('arm_protocol_sha256'), 'contact_control.ready.arm_protocol_sha256'
+    )
+    if canonical_sha256(protocol) != protocol_sha256:
+        raise EvidenceError('contact-control ready arm protocol hash mismatch')
+    if ready.get('producer') != protocol['ack_producer']:
+        raise EvidenceError('contact-control readiness producer is invalid')
+    if _require_int(ready.get('schema_version'), 'contact_control.ready.schema_version') != 1:
+        raise EvidenceError('contact-control readiness schema is invalid')
+    require_sha256(
+        ready.get('control_configuration_sha256'),
+        'contact_control.ready.control_configuration_sha256',
+    )
+    require_sha256(ready.get('fixture_sha256'), 'contact_control.ready.fixture_sha256')
+    _require_int(ready.get('ready_steady_ns'), 'contact_control.ready.ready_steady_ns', minimum=1)
+    identity = _require_mapping(ready.get('identity'), 'contact_control.ready.identity')
+    if set(identity) != {'fixture_id', 'run_id'}:
+        raise EvidenceError('contact-control readiness identity keys are invalid')
+    if (
+        identity.get('fixture_id') != 'collision_positive_control'
+        or identity.get('run_id') != expected_run_id
+    ):
+        raise EvidenceError('contact-control readiness identity mismatch')
+    expected_pair = ready.get('expected_pair')
+    if (
+        not isinstance(expected_pair, list)
+        or len(expected_pair) != 2
+        or any(not isinstance(item, str) or not item for item in expected_pair)
+    ):
+        raise EvidenceError('contact-control readiness expected pair is invalid')
+    for field in ('observed_robot_start', 'observed_wall', 'resolved_names', 'spawn'):
+        _require_mapping(ready.get(field), f'contact_control.ready.{field}')
+    return dict(ready)
+
+
+def build_contact_control_arm_request(
+    ready: Mapping[str, Any],
+    *,
+    ready_sha256: str,
+    runtime_gate_sha256: str,
+    arm_requested_steady_ns: int,
+) -> dict[str, Any]:
+    """Build the exact runner-owned request from the driver's frozen protocol."""
+    identity = _require_mapping(ready.get('identity'), 'contact_control.ready.identity')
+    protocol = _contact_control_arm_protocol(ready.get('arm_protocol'))
+    requested = _require_int(
+        arm_requested_steady_ns, 'contact_control.arm_requested_steady_ns', minimum=1
+    )
+    ready_steady_ns = _require_int(
+        ready.get('ready_steady_ns'), 'contact_control.ready.ready_steady_ns', minimum=1
+    )
+    if requested < ready_steady_ns:
+        raise EvidenceError('contact-control arm request predates readiness')
+    return {
+        'action': protocol['action'],
+        'arm_protocol_sha256': require_sha256(
+            ready.get('arm_protocol_sha256'), 'contact_control.ready.arm_protocol_sha256'
+        ),
+        'arm_requested_steady_ns': requested,
+        'producer': protocol['request_producer'],
+        'ready_sha256': require_sha256(ready_sha256, 'contact_control.ready_sha256'),
+        'run_id': require_bounded_string(identity.get('run_id'), 'contact_control.ready.run_id'),
+        'runtime_gate_sha256': require_sha256(
+            runtime_gate_sha256, 'contact_control.runtime_gate_sha256'
+        ),
+        'schema_version': protocol['schema_version'],
+    }
+
+
+def validate_contact_control_arm_request(
+    document: Any,
+    *,
+    ready: Mapping[str, Any],
+    ready_sha256: str,
+    runtime_gate_sha256: str,
+) -> dict[str, Any]:
+    """Validate an exact canonical arm request against ready and gate evidence."""
+    request = _require_mapping(document, 'contact_control.arm_request')
+    if set(request) != CONTACT_CONTROL_ARM_REQUEST_KEYS:
+        raise EvidenceError('contact-control arm request keys are invalid')
+    _require_int(
+        request.get('schema_version'), 'contact_control.arm_request.schema_version', minimum=1
+    )
+    expected = build_contact_control_arm_request(
+        ready,
+        ready_sha256=ready_sha256,
+        runtime_gate_sha256=runtime_gate_sha256,
+        arm_requested_steady_ns=_require_int(
+            request.get('arm_requested_steady_ns'),
+            'contact_control.arm_request.arm_requested_steady_ns',
+            minimum=1,
+        ),
+    )
+    if dict(request) != expected:
+        raise EvidenceError('contact-control arm request binding mismatch')
+    return dict(request)
+
+
+def validate_contact_control_armed(
+    document: Any,
+    *,
+    ready: Mapping[str, Any],
+    request: Mapping[str, Any],
+    request_sha256: str,
+) -> dict[str, Any]:
+    """Validate the driver acknowledgment and its mandatory fresh-clock barrier."""
+    acknowledgment = _require_mapping(document, 'contact_control.armed')
+    if set(acknowledgment) != CONTACT_CONTROL_ARM_ACK_KEYS:
+        raise EvidenceError('contact-control arm acknowledgment keys are invalid')
+    _require_int(
+        acknowledgment.get('schema_version'),
+        'contact_control.armed.schema_version',
+        minimum=1,
+    )
+    protocol = _contact_control_arm_protocol(ready.get('arm_protocol'))
+    expected_equalities = {
+        'arm_protocol_sha256': ready.get('arm_protocol_sha256'),
+        'arm_request_sha256': require_sha256(request_sha256, 'contact_control.arm_request_sha256'),
+        'arm_requested_steady_ns': request.get('arm_requested_steady_ns'),
+        'producer': protocol['ack_producer'],
+        'ready_sha256': request.get('ready_sha256'),
+        'run_id': request.get('run_id'),
+        'runtime_gate_sha256': request.get('runtime_gate_sha256'),
+        'schema_version': protocol['schema_version'],
+    }
+    if any(acknowledgment.get(key) != value for key, value in expected_equalities.items()):
+        raise EvidenceError('contact-control arm acknowledgment binding mismatch')
+    requested_steady_ns = _require_int(
+        acknowledgment.get('arm_requested_steady_ns'),
+        'contact_control.armed.arm_requested_steady_ns',
+        minimum=1,
+    )
+    observed_steady_ns = _require_int(
+        acknowledgment.get('arm_observed_steady_ns'),
+        'contact_control.armed.arm_observed_steady_ns',
+        minimum=1,
+    )
+    armed_steady_ns = _require_int(
+        acknowledgment.get('armed_steady_ns'),
+        'contact_control.armed.armed_steady_ns',
+        minimum=1,
+    )
+    observed_count = _require_int(
+        acknowledgment.get('arm_observed_clock_sample_count'),
+        'contact_control.armed.arm_observed_clock_sample_count',
+        minimum=1,
+    )
+    armed_count = _require_int(
+        acknowledgment.get('armed_clock_sample_count'),
+        'contact_control.armed.armed_clock_sample_count',
+        minimum=1,
+    )
+    observed_stamp = _require_int(
+        acknowledgment.get('arm_observed_sim_stamp_ns'),
+        'contact_control.armed.arm_observed_sim_stamp_ns',
+        minimum=1,
+    )
+    armed_stamp = _require_int(
+        acknowledgment.get('armed_sim_stamp_ns'),
+        'contact_control.armed.armed_sim_stamp_ns',
+        minimum=1,
+    )
+    if not requested_steady_ns <= observed_steady_ns <= armed_steady_ns:
+        raise EvidenceError('contact-control arm steady-time ordering is invalid')
+    if armed_count <= observed_count or armed_stamp <= observed_stamp:
+        raise EvidenceError('contact-control arm acknowledgment lacks a fresh /clock sample')
+    return dict(acknowledgment)
+
+
+def _validated_bounded_process(
+    path: Path,
+    *,
+    expected_role: str,
+    expected_workspace: Path | None,
+    require_zero_returncode: bool,
+) -> dict[str, Any]:
+    """Validate the exact bounded-process record emitted by the benchmark runner."""
+    label = f'positive_control.{expected_role}_process'
+    process = _require_mapping(
+        load_canonical_json(path, maximum_bytes=64 * 1024),
+        label,
+    )
+    if set(process) != BOUNDED_PROCESS_KEYS:
+        raise EvidenceError(f'{label} fields are invalid')
+    command = process.get('command')
+    wrapped_command = process.get('wrapped_command')
+    if (
+        not isinstance(command, list)
+        or not 1 <= len(command) <= 64
+        or any(not isinstance(item, str) or not item for item in command)
+        or not isinstance(wrapped_command, list)
+        or not 1 <= len(wrapped_command) <= 70
+        or any(not isinstance(item, str) or not item for item in wrapped_command)
+    ):
+        raise EvidenceError(f'{label} command fields are invalid')
+    if any(len(item.encode('utf-8')) > STRING_MAX_BYTES for item in (*command, *wrapped_command)):
+        raise EvidenceError(f'{label} command token exceeds its byte cap')
+    cwd_text = require_bounded_string(process.get('cwd'), f'{label}.cwd')
+    cwd = Path(cwd_text)
+    if not cwd.is_absolute() or str(cwd.resolve()) != cwd_text:
+        raise EvidenceError(f'{label} cwd is not one exact resolved workspace')
+    if expected_workspace is not None and cwd != expected_workspace.resolve():
+        raise EvidenceError(f'{label} workspace binding mismatch')
+    started_steady_ns = _require_int(
+        process.get('started_steady_ns'), f'{label}.started_steady_ns', minimum=1
+    )
+    finished_steady_ns = _require_int(
+        process.get('finished_steady_ns'), f'{label}.finished_steady_ns', minimum=1
+    )
+    pid = _require_int(process.get('pid'), f'{label}.pid', minimum=1)
+    pgid = _require_int(process.get('pgid'), f'{label}.pgid', minimum=1)
+    returncode = _require_int(process.get('returncode'), f'{label}.returncode')
+    wall_timeout_s = _require_number(
+        process.get('wall_timeout_s'), f'{label}.wall_timeout_s', minimum=0.001
+    )
+    if finished_steady_ns < started_steady_ns:
+        raise EvidenceError(f'{label} time regressed')
+    if (
+        process.get('role') != expected_role
+        or (require_zero_returncode and returncode != 0)
+        or _require_bool(process.get('timed_out'), f'{label}.timed_out')
+        or not _require_bool(process.get('group_confirmed_empty'), f'{label}.group_confirmed_empty')
+        or pid != pgid
+    ):
+        raise EvidenceError(f'{label} did not exit cleanly')
+    for stream_name in ('stdout', 'stderr'):
+        stream_label = f'{label}.{stream_name}'
+        stream = _require_mapping(process.get(stream_name), stream_label)
+        if set(stream) != BOUNDED_PROCESS_STREAM_KEYS:
+            raise EvidenceError(f'{stream_label} fields are invalid')
+        maximum_bytes = _require_int(
+            stream.get('maximum_bytes'), f'{stream_label}.maximum_bytes', minimum=1
+        )
+        observed_bytes = _require_int(
+            stream.get('observed_bytes'), f'{stream_label}.observed_bytes', minimum=0
+        )
+        retained_bytes = _require_int(
+            stream.get('retained_bytes'), f'{stream_label}.retained_bytes', minimum=0
+        )
+        if (
+            maximum_bytes != LOG_MAX_BYTES
+            or stream.get('error') is not None
+            or _require_bool(stream.get('overflow'), f'{stream_label}.overflow')
+            or not retained_bytes <= observed_bytes <= maximum_bytes
+        ):
+            raise EvidenceError(f'{stream_label} is incomplete or unbounded')
+    return {
+        **dict(process),
+        'command': list(command),
+        'cwd_path': cwd,
+        'finished_steady_ns': finished_steady_ns,
+        'pid': pid,
+        'returncode': returncode,
+        'started_steady_ns': started_steady_ns,
+        'wall_timeout_s': wall_timeout_s,
+        'wrapped_command': list(wrapped_command),
+    }
+
+
+def _canonical_command_int(value: str, name: str, *, minimum: int) -> int:
+    """Parse one decimal command token without accepting alternate spellings."""
+    try:
+        parsed = int(value, 10)
+    except (TypeError, ValueError) as exc:
+        raise EvidenceError(f'{name} must be a canonical integer token') from exc
+    if parsed < minimum or str(parsed) != value:
+        raise EvidenceError(f'{name} must be a canonical integer token >= {minimum}')
+    return parsed
+
+
+def _positive_runtime_gate_process_binding(
+    process: Mapping[str, Any], runtime_gate_path: Path
+) -> dict[str, Any]:
+    """Bind the runtime-gate command, wrapper, output, workspace, and live identities."""
+    command = process['command']
+    if len(command) != 18:
+        raise EvidenceError('positive-control runtime gate process command is invalid')
+    workspace = process['cwd_path']
+    watch_pid = _canonical_command_int(command[11], 'runtime gate watch PID', minimum=1)
+    launch_pid = _canonical_command_int(command[13], 'runtime gate launch PID', minimum=1)
+    domain_id = _canonical_command_int(command[15], 'runtime gate domain ID', minimum=0)
+    partition = require_bounded_string(command[17], 'runtime gate Gazebo partition')
+    if domain_id > MAX_DOMAIN_ID:
+        raise EvidenceError('runtime gate domain ID exceeds the ROS domain bound')
+    expected_command = [
+        'python3',
+        str(workspace / 'tests/phase3_runtime_gate.py'),
+        '--mode',
+        'positive-control',
+        '--output',
+        str(runtime_gate_path.resolve()),
+        '--workspace',
+        str(workspace),
+        '--wall-timeout-s',
+        str(POSITIVE_RUNTIME_GATE_INNER_TIMEOUT_S),
+        '--watch-pid',
+        str(watch_pid),
+        '--launch-pid',
+        str(launch_pid),
+        '--expected-domain-id',
+        str(domain_id),
+        '--expected-gz-partition',
+        partition,
+    ]
+    expected_wrapper = [
+        'timeout',
+        '--signal=TERM',
+        '--kill-after=10s',
+        f'{POSITIVE_RUNTIME_GATE_OUTER_TIMEOUT_S:.3f}s',
+        *expected_command,
+    ]
+    if command != expected_command:
+        raise EvidenceError('positive-control runtime gate process command binding mismatch')
+    if (
+        process['wrapped_command'] != expected_wrapper
+        or process['wall_timeout_s'] != POSITIVE_RUNTIME_GATE_OUTER_TIMEOUT_S
+    ):
+        raise EvidenceError('positive-control runtime gate process wrapper binding mismatch')
+    if len({process['pid'], watch_pid, launch_pid}) != 3:
+        raise EvidenceError('positive-control runtime gate process identities are not distinct')
+    return {
+        'domain_id': domain_id,
+        'launch_pid': launch_pid,
+        'partition': partition,
+        'watch_pid': watch_pid,
+        'workspace': workspace,
+    }
+
+
+def _validated_positive_static_qos(topic: str, value: Any, label: str) -> dict[str, Any]:
+    """Validate one exact static QoS contract projected by the runtime gate."""
+    static = _require_mapping(value, label)
+    if set(static) != POSITIVE_RUNTIME_GATE_STATIC_QOS_KEYS:
+        raise EvidenceError(f'{label} fields are invalid')
+    depth = _require_int(static.get('depth'), f'{label}.depth', minimum=1)
+    history = require_bounded_string(static.get('history'), f'{label}.history')
+    reliability = require_bounded_string(static.get('reliability'), f'{label}.reliability')
+    durability = require_bounded_string(static.get('durability'), f'{label}.durability')
+    overrides = static.get('endpoint_depth_overrides')
+    if not isinstance(overrides, list) or len(overrides) > POSITIVE_RUNTIME_GATE_MAX_ATTEMPTS:
+        raise EvidenceError(f'{label}.endpoint_depth_overrides is invalid')
+    validated_overrides: list[dict[str, Any]] = []
+    for index, raw_override in enumerate(overrides):
+        override_label = f'{label}.endpoint_depth_overrides[{index}]'
+        override = _require_mapping(raw_override, override_label)
+        if set(override) != POSITIVE_RUNTIME_GATE_QOS_OVERRIDE_KEYS:
+            raise EvidenceError(f'{override_label} fields are invalid')
+        validated_overrides.append(
+            {
+                'depth': _require_int(override.get('depth'), f'{override_label}.depth', minimum=1),
+                'node': require_bounded_string(override.get('node'), f'{override_label}.node'),
+                'side': require_bounded_string(override.get('side'), f'{override_label}.side'),
+            }
+        )
+    validated = {
+        'depth': depth,
+        'durability': durability,
+        'endpoint_depth_overrides': validated_overrides,
+        'history': history,
+        'reliability': reliability,
+    }
+    if validated != POSITIVE_RUNTIME_GATE_QOS_CONTRACTS[topic]:
+        raise EvidenceError(f'{label} differs from the frozen positive-control QoS contract')
+    return validated
+
+
+def _validated_positive_endpoint(value: Any, label: str) -> dict[str, Any]:
+    """Validate one exact, bounded ROS graph endpoint record."""
+    endpoint = _require_mapping(value, label)
+    if set(endpoint) != POSITIVE_RUNTIME_GATE_ENDPOINT_KEYS:
+        raise EvidenceError(f'{label} fields are invalid')
+    depth = _require_int(endpoint.get('depth'), f'{label}.depth', minimum=0)
+    if depth > POSITIVE_RUNTIME_GATE_MAX_ATTEMPTS:
+        raise EvidenceError(f'{label}.depth exceeds the endpoint bound')
+    history = require_bounded_string(endpoint.get('history'), f'{label}.history')
+    if history not in {'KEEP_ALL', 'KEEP_LAST', 'SYSTEM_DEFAULT', 'UNKNOWN'}:
+        raise EvidenceError(f'{label}.history is not a recognized ROS QoS policy')
+    gid = require_bounded_string(endpoint.get('gid'), f'{label}.gid')
+    if ENDPOINT_GID_PATTERN.fullmatch(gid) is None:
+        raise EvidenceError(f'{label}.gid is not an exact ROS endpoint GID')
+    return {
+        'depth': depth,
+        'durability': require_bounded_string(endpoint.get('durability'), f'{label}.durability'),
+        'gid': gid,
+        'history': history,
+        'node': require_bounded_string(endpoint.get('node'), f'{label}.node'),
+        'reliability': require_bounded_string(endpoint.get('reliability'), f'{label}.reliability'),
+        'topic_type': require_bounded_string(endpoint.get('topic_type'), f'{label}.topic_type'),
+    }
+
+
+def _positive_endpoint_qos_status(
+    endpoint: Mapping[str, Any], expected: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Reproduce the producer's fail-closed/unknown-live-QoS classification."""
+    history = endpoint['history']
+    observed_depth = endpoint['depth']
+    introspection_complete = history not in {'UNKNOWN', 'SYSTEM_DEFAULT'} and (observed_depth > 0)
+    explicit_keep_all = history == 'KEEP_ALL'
+    positive_keep_last = history == 'KEEP_LAST' and observed_depth > 0
+    exact_depth_live_proven = positive_keep_last and observed_depth == expected['depth']
+    policy_contract_pass = (
+        endpoint['reliability'] == expected['reliability']
+        and endpoint['durability'] == expected['durability']
+        and not explicit_keep_all
+        and (not positive_keep_last or exact_depth_live_proven)
+    )
+    return {
+        'bounded_depth_live_proven': positive_keep_last,
+        'exact_depth_live_proven': exact_depth_live_proven,
+        'explicit_keep_all': explicit_keep_all,
+        'expected_depth': expected['depth'],
+        'introspection_complete': introspection_complete,
+        'policy_contract_pass': policy_contract_pass,
+    }
+
+
+def _positive_endpoint_expected_qos(
+    static: Mapping[str, Any], *, side: str, node: str
+) -> dict[str, Any]:
+    """Apply the one frozen per-endpoint depth override to a topic contract."""
+    depth = static['depth']
+    for override in static['endpoint_depth_overrides']:
+        if override['side'] == side and override['node'] == node:
+            depth = override['depth']
+    return {
+        'depth': depth,
+        'durability': static['durability'],
+        'reliability': static['reliability'],
+    }
+
+
+def _validated_positive_topic(topic: str, value: Any) -> dict[str, Any]:
+    """Validate and rederive one complete runtime-gate topic record."""
+    label = f'positive_control.runtime_gate.topics.{topic}'
+    evidence = _require_mapping(value, label)
+    if set(evidence) != POSITIVE_RUNTIME_GATE_TOPIC_KEYS_NESTED:
+        raise EvidenceError(f'{label} fields are invalid')
+    static = _validated_positive_static_qos(topic, evidence.get('expected'), f'{label}.expected')
+    endpoints_by_side: dict[str, list[dict[str, Any]]] = {}
+    for side, field in (('publisher', 'publishers'), ('subscriber', 'subscribers')):
+        raw_endpoints = evidence.get(field)
+        if not isinstance(raw_endpoints, list) or len(raw_endpoints) > (
+            POSITIVE_RUNTIME_GATE_MAX_ATTEMPTS
+        ):
+            raise EvidenceError(f'{label}.{field} is invalid')
+        endpoints = [
+            _validated_positive_endpoint(endpoint, f'{label}.{field}[{index}]')
+            for index, endpoint in enumerate(raw_endpoints)
+        ]
+        if endpoints != sorted(endpoints, key=lambda item: (item['node'], item['topic_type'])):
+            raise EvidenceError(f'{label}.{field} is not in producer order')
+        endpoints_by_side[side] = endpoints
+    all_endpoints = endpoints_by_side['publisher'] + endpoints_by_side['subscriber']
+    if len(all_endpoints) > POSITIVE_RUNTIME_GATE_MAX_ATTEMPTS or len(
+        {endpoint['gid'] for endpoint in all_endpoints}
+    ) != len(all_endpoints):
+        raise EvidenceError(f'{label} endpoint GIDs/cardinality are invalid')
+
+    derived_checks: list[dict[str, Any]] = []
+    side_passes: dict[str, bool] = {}
+    for side in ('publisher', 'subscriber'):
+        endpoints = endpoints_by_side[side]
+        statuses = []
+        for endpoint in endpoints:
+            expected = _positive_endpoint_expected_qos(static, side=side, node=endpoint['node'])
+            status = _positive_endpoint_qos_status(endpoint, expected)
+            statuses.append(status)
+            derived_checks.append({**status, 'node': endpoint['node'], 'side': side})
+        side_passes[side] = (bool(endpoints) if side == 'publisher' else True) and all(
+            status['policy_contract_pass'] for status in statuses
+        )
+    derived_checks.sort(key=lambda item: (item['side'], item['node']))
+    raw_checks = evidence.get('qos_checks')
+    if not isinstance(raw_checks, list) or len(raw_checks) > POSITIVE_RUNTIME_GATE_MAX_ATTEMPTS:
+        raise EvidenceError(f'{label}.qos_checks is invalid')
+    validated_checks: list[dict[str, Any]] = []
+    for index, raw_check in enumerate(raw_checks):
+        check_label = f'{label}.qos_checks[{index}]'
+        check = _require_mapping(raw_check, check_label)
+        if set(check) != POSITIVE_RUNTIME_GATE_QOS_CHECK_KEYS:
+            raise EvidenceError(f'{check_label} fields are invalid')
+        validated_checks.append(
+            {
+                'bounded_depth_live_proven': _require_bool(
+                    check.get('bounded_depth_live_proven'),
+                    f'{check_label}.bounded_depth_live_proven',
+                ),
+                'exact_depth_live_proven': _require_bool(
+                    check.get('exact_depth_live_proven'),
+                    f'{check_label}.exact_depth_live_proven',
+                ),
+                'expected_depth': _require_int(
+                    check.get('expected_depth'), f'{check_label}.expected_depth', minimum=1
+                ),
+                'explicit_keep_all': _require_bool(
+                    check.get('explicit_keep_all'), f'{check_label}.explicit_keep_all'
+                ),
+                'introspection_complete': _require_bool(
+                    check.get('introspection_complete'),
+                    f'{check_label}.introspection_complete',
+                ),
+                'node': require_bounded_string(check.get('node'), f'{check_label}.node'),
+                'policy_contract_pass': _require_bool(
+                    check.get('policy_contract_pass'), f'{check_label}.policy_contract_pass'
+                ),
+                'side': require_bounded_string(check.get('side'), f'{check_label}.side'),
+            }
+        )
+    if validated_checks != derived_checks:
+        raise EvidenceError(f'{label}.qos_checks do not match the endpoint evidence')
+    topic_checks = {
+        'bounded_depth_live_proven': bool(derived_checks)
+        and all(check['bounded_depth_live_proven'] for check in derived_checks),
+        'exact_depth_live_proven': bool(derived_checks)
+        and all(check['exact_depth_live_proven'] for check in derived_checks),
+        'publisher_qos_pass': side_passes['publisher'],
+        'qos_introspection_complete': bool(derived_checks)
+        and all(check['introspection_complete'] for check in derived_checks),
+        'subscriber_qos_pass': side_passes['subscriber'],
+    }
+    for field, expected_value in topic_checks.items():
+        if _require_bool(evidence.get(field), f'{label}.{field}') is not expected_value:
+            raise EvidenceError(f'{label}.{field} does not match the endpoint evidence')
+    return {
+        'bounded_depth_live_proven': topic_checks['bounded_depth_live_proven'],
+        'exact_depth_live_proven': topic_checks['exact_depth_live_proven'],
+        'expected': static,
+        'publishers': endpoints_by_side['publisher'],
+        'publisher_qos_pass': topic_checks['publisher_qos_pass'],
+        'qos_checks': derived_checks,
+        'qos_introspection_complete': topic_checks['qos_introspection_complete'],
+        'subscribers': endpoints_by_side['subscriber'],
+        'subscriber_qos_pass': topic_checks['subscriber_qos_pass'],
+    }
+
+
+def _positive_exact_endpoint_owners(
+    endpoints: Sequence[Mapping[str, Any]],
+    expected_nodes: set[str],
+    *,
+    expected_type: str,
+    expected_cardinality: int | None = None,
+) -> bool:
+    """Recompute the producer's exact owner/type/cardinality/GID predicate."""
+    nodes = [endpoint['node'] for endpoint in endpoints]
+    gids = [endpoint['gid'] for endpoint in endpoints]
+    cardinality = len(expected_nodes) if expected_cardinality is None else expected_cardinality
+    return (
+        len(endpoints) == cardinality
+        and set(nodes) == expected_nodes
+        and len(set(gids)) == len(gids)
+        and all(gids)
+        and all(endpoint['topic_type'] == expected_type for endpoint in endpoints)
+    )
+
+
+def validate_positive_runtime_gate_artifacts(
+    runtime_gate_path: Path,
+    runtime_gate_process_path: Path,
+) -> dict[str, Any]:
+    """Validate semantic PASS plus an exact, exited runtime-gate process record."""
+    if runtime_gate_path.is_symlink() or not runtime_gate_path.is_file():
+        raise EvidenceError('positive-control runtime gate is not a regular file')
+    runtime_gate_sha256 = verify_json_sidecar(runtime_gate_path)
+    gate = _require_mapping(load_canonical_json(runtime_gate_path), 'positive_control.runtime_gate')
+    if set(gate) != POSITIVE_RUNTIME_GATE_KEYS:
+        raise EvidenceError('positive-control runtime gate fields are invalid')
+    gate_schema_version = _require_int(
+        gate.get('schema_version'), 'positive_control.runtime_gate.schema_version', minimum=1
+    )
+    if (
+        gate_schema_version != 1
+        or gate.get('producer') != 'robotest_phase3/runtime_gate'
+        or gate.get('mode') != 'positive_control'
+        or gate.get('verdict') != 'PASS'
+    ):
+        raise EvidenceError('positive-control runtime gate is not a semantic PASS')
+    attempt_count = _require_int(
+        gate.get('attempt_count'), 'positive_control.runtime_gate.attempt_count', minimum=1
+    )
+    elapsed_wall_s = _require_number(
+        gate.get('elapsed_wall_s'), 'positive_control.runtime_gate.elapsed_wall_s', minimum=0.0
+    )
+    if (
+        attempt_count > POSITIVE_RUNTIME_GATE_MAX_ATTEMPTS
+        or elapsed_wall_s > POSITIVE_RUNTIME_GATE_OUTER_TIMEOUT_S
+    ):
+        raise EvidenceError('positive-control runtime gate convergence evidence is unbounded')
+    for field in (
+        'cmd_vel_owner_pass',
+        'cmd_vel_subscriber_ownership_pass',
+        'namespace_isolation_pass',
+        'qos_contract_pass',
+        'validation_autonomy_isolation_pass',
+    ):
+        if _require_bool(gate.get(field), f'positive_control.runtime_gate.{field}') is not True:
+            raise EvidenceError(f'positive-control runtime gate {field} is not true')
+    # These are observational facts, not acceptance predicates: live DDS may report unknown QoS.
+    for field in ('bounded_depth_live_proven_for_all_endpoints', 'qos_introspection_complete'):
+        _require_bool(gate.get(field), f'positive_control.runtime_gate.{field}')
+    if (
+        gate.get('required_nodes_missing') != []
+        or gate.get('forbidden_nodes_present') != []
+        or gate.get('scenario_services_missing') != []
+    ):
+        raise EvidenceError('positive-control runtime gate graph inventory is not clean')
+    for field, expected in (
+        ('contact_publisher_ownership', POSITIVE_CONTACT_PUBLISHER_OWNERSHIP),
+        ('contact_subscriber_ownership', POSITIVE_CONTACT_SUBSCRIBER_OWNERSHIP),
+    ):
+        ownership = _require_mapping(gate.get(field), f'positive_control.runtime_gate.{field}')
+        if set(ownership) != set(expected) or any(
+            not isinstance(ownership.get(topic), bool) or ownership.get(topic) is not required
+            for topic, required in expected.items()
+        ):
+            kind = 'publisher' if field == 'contact_publisher_ownership' else 'subscriber'
+            raise EvidenceError(f'positive-control runtime gate {kind} ownership is not exact')
+    authoritative_ownership = _require_mapping(
+        gate.get('authoritative_publisher_ownership'),
+        'positive_control.runtime_gate.authoritative_publisher_ownership',
+    )
+    if set(authoritative_ownership) != set(POSITIVE_AUTHORITATIVE_PUBLISHER_CONTRACTS) or any(
+        not isinstance(authoritative_ownership.get(topic), bool)
+        or authoritative_ownership.get(topic) is not True
+        for topic in POSITIVE_AUTHORITATIVE_PUBLISHER_CONTRACTS
+    ):
+        raise EvidenceError(
+            'positive-control runtime gate authoritative publisher ownership is not exact'
+        )
+    nodes = gate.get('nodes')
+    if (
+        not isinstance(nodes, list)
+        or len(nodes) > POSITIVE_RUNTIME_GATE_MAX_ATTEMPTS
+        or any(not isinstance(node, str) or not node for node in nodes)
+        or nodes != sorted(set(nodes))
+    ):
+        raise EvidenceError('positive-control runtime gate node inventory is invalid')
+    topics = _require_mapping(gate.get('topics'), 'positive_control.runtime_gate.topics')
+    static_qos = _require_mapping(
+        gate.get('exact_static_qos_depth_contract'),
+        'positive_control.runtime_gate.exact_static_qos_depth_contract',
+    )
+    if set(topics) != POSITIVE_RUNTIME_GATE_TOPIC_KEYS or set(static_qos) != (
+        POSITIVE_RUNTIME_GATE_TOPIC_KEYS
+    ):
+        raise EvidenceError('positive-control runtime gate topic inventory is not exact')
+    validated_topics = {
+        topic: _validated_positive_topic(topic, topics[topic])
+        for topic in POSITIVE_RUNTIME_GATE_TOPIC_KEYS
+    }
+    for topic in POSITIVE_RUNTIME_GATE_TOPIC_KEYS:
+        projected_static = _validated_positive_static_qos(
+            topic,
+            static_qos[topic],
+            f'positive_control.runtime_gate.exact_static_qos_depth_contract.{topic}',
+        )
+        if projected_static != validated_topics[topic]['expected']:
+            raise EvidenceError(
+                f'positive-control runtime gate static/topic QoS projection differs for {topic}'
+            )
+
+    cmd_vel = validated_topics['/robotest/cmd_vel']
+    raw_contacts = validated_topics['/robotest/internal/raw_contacts']
+    public_contacts = validated_topics['/robotest/validation/contacts']
+    derived_cmd_owner = _positive_exact_endpoint_owners(
+        cmd_vel['publishers'],
+        {'/robotest/contact_control_driver'},
+        expected_type=POSITIVE_RUNTIME_GATE_COMMAND_TYPE,
+    )
+    derived_cmd_subscribers = _positive_exact_endpoint_owners(
+        cmd_vel['subscribers'],
+        {'/robotest/metrics_collector', '/robotest/parameter_bridge'},
+        expected_type=POSITIVE_RUNTIME_GATE_COMMAND_TYPE,
+    )
+    derived_authoritative_publishers = {
+        topic: _positive_exact_endpoint_owners(
+            validated_topics[topic]['publishers'],
+            expected_nodes,
+            expected_type=expected_type,
+            expected_cardinality=expected_cardinality,
+        )
+        for topic, (
+            expected_nodes,
+            expected_type,
+            expected_cardinality,
+        ) in POSITIVE_AUTHORITATIVE_PUBLISHER_CONTRACTS.items()
+    }
+    authoritative_gids = [
+        endpoint['gid']
+        for topic in POSITIVE_AUTHORITATIVE_PUBLISHER_CONTRACTS
+        for endpoint in validated_topics[topic]['publishers']
+    ]
+    duplicate_authoritative_gids = {
+        gid for gid, count in Counter(authoritative_gids).items() if count > 1
+    }
+    derived_authoritative_publishers = {
+        topic: accepted
+        and all(
+            endpoint['gid'] not in duplicate_authoritative_gids
+            for endpoint in validated_topics[topic]['publishers']
+        )
+        for topic, accepted in derived_authoritative_publishers.items()
+    }
+    derived_contact_publishers = {
+        '/robotest/internal/raw_contacts': _positive_exact_endpoint_owners(
+            raw_contacts['publishers'],
+            {'/robotest/parameter_bridge'},
+            expected_type=POSITIVE_RUNTIME_GATE_CONTACT_TYPE,
+        ),
+        '/robotest/validation/contacts': _positive_exact_endpoint_owners(
+            public_contacts['publishers'],
+            {'/robotest/contact_stream_gate'},
+            expected_type=POSITIVE_RUNTIME_GATE_CONTACT_TYPE,
+        ),
+    }
+    derived_contact_subscribers = {
+        '/robotest/internal/raw_contacts': _positive_exact_endpoint_owners(
+            raw_contacts['subscribers'],
+            {'/robotest/contact_stream_gate'},
+            expected_type=POSITIVE_RUNTIME_GATE_CONTACT_TYPE,
+        )
+    }
+    all_endpoints = [
+        endpoint
+        for evidence in validated_topics.values()
+        for field in ('publishers', 'subscribers')
+        for endpoint in evidence[field]
+    ]
+    derived_namespace_pass = all(
+        endpoint['node'].startswith('/robotest/') for endpoint in all_endpoints
+    )
+    node_short_names = {node.rsplit('/', 1)[-1] for node in nodes}
+    derived_required_missing = sorted(POSITIVE_RUNTIME_GATE_REQUIRED_NODE_NAMES - node_short_names)
+    derived_forbidden_present = sorted(
+        POSITIVE_RUNTIME_GATE_FORBIDDEN_NODE_NAMES & node_short_names
+    )
+    derived_qos_pass = all(
+        evidence['publisher_qos_pass'] and evidence['subscriber_qos_pass']
+        for evidence in validated_topics.values()
+    )
+    derived_qos_introspection = all(
+        evidence['qos_introspection_complete'] for evidence in validated_topics.values()
+    )
+    derived_bounded_depth = all(
+        evidence['bounded_depth_live_proven'] for evidence in validated_topics.values()
+    )
+    if (
+        gate.get('cmd_vel_owner_pass') is not derived_cmd_owner
+        or gate.get('cmd_vel_subscriber_ownership_pass') is not derived_cmd_subscribers
+        or dict(authoritative_ownership) != derived_authoritative_publishers
+        or dict(gate['contact_publisher_ownership']) != derived_contact_publishers
+        or dict(gate['contact_subscriber_ownership']) != derived_contact_subscribers
+    ):
+        raise EvidenceError('positive-control runtime gate ownership projection is inconsistent')
+    if (
+        gate.get('namespace_isolation_pass') is not derived_namespace_pass
+        or gate.get('qos_contract_pass') is not derived_qos_pass
+        or gate.get('qos_introspection_complete') is not derived_qos_introspection
+        or gate.get('bounded_depth_live_proven_for_all_endpoints') is not derived_bounded_depth
+        or gate.get('validation_autonomy_isolation_pass') is not (not derived_forbidden_present)
+        or gate.get('required_nodes_missing') != derived_required_missing
+        or gate.get('forbidden_nodes_present') != derived_forbidden_present
+    ):
+        raise EvidenceError(
+            'positive-control runtime gate top-level graph projection is inconsistent'
+        )
+
+    process = _validated_bounded_process(
+        runtime_gate_process_path,
+        expected_role='runtime_gate',
+        expected_workspace=None,
+        require_zero_returncode=True,
+    )
+    process_binding = _positive_runtime_gate_process_binding(process, runtime_gate_path)
+    for field in ('contact_aggregator_binary_attestation', 'contact_gate_binary_attestation'):
+        label = f'positive_control.runtime_gate.{field}'
+        attestation = _require_mapping(gate.get(field), label)
+        launch_root_pid = _require_int(
+            attestation.get('launch_root_pid'), f'{label}.launch_root_pid'
+        )
+        observed_domain = require_bounded_string(
+            attestation.get('observed_ros_domain_id'), f'{label}.observed_ros_domain_id'
+        )
+        observed_partition = require_bounded_string(
+            attestation.get('observed_gz_partition'), f'{label}.observed_gz_partition'
+        )
+        if (
+            attestation.get('verdict') != 'PASS'
+            or launch_root_pid != process_binding['launch_pid']
+            or observed_domain != str(process_binding['domain_id'])
+            or observed_partition != process_binding['partition']
+        ):
+            raise EvidenceError(f'positive-control runtime gate {field} binding is invalid')
+    return {
+        'domain_id': process_binding['domain_id'],
+        'finished_steady_ns': process['finished_steady_ns'],
+        'launch_pid': process_binding['launch_pid'],
+        'partition': process_binding['partition'],
+        'process_pid': process['pid'],
+        'runtime_gate_sha256': runtime_gate_sha256,
+        'started_steady_ns': process['started_steady_ns'],
+        'watch_pid': process_binding['watch_pid'],
+        'workspace': process_binding['workspace'],
+    }
 
 
 def safe_candidate_id(value: str) -> str:
@@ -1550,6 +2671,339 @@ def _captured_contact_episodes(
     )
 
 
+def _validate_positive_runtime_gate_reconciliation_bindings(
+    *,
+    workspace: Path,
+    result_run_id: str,
+    result_path: Path,
+    driver_ready_path: Path,
+    arm_request_path: Path,
+    armed_ack_path: Path,
+    runtime_gate_path: Path,
+    runtime_gate: Mapping[str, Any],
+) -> dict[str, Mapping[str, Any]]:
+    """Join the gate command to immutable plan identity and sibling process facts."""
+    resolved_workspace = workspace.resolve()
+    if runtime_gate.get('workspace') != resolved_workspace:
+        raise EvidenceError('positive-control runtime gate workspace differs from reconciliation')
+    suite_plan_path = runtime_gate_path.parent.parent / 'suite-plan.json'
+    verify_json_sidecar(suite_plan_path)
+    suite = _require_mapping(load_canonical_json(suite_plan_path), 'positive_control.suite_plan')
+    if set(suite) != SUITE_DOCUMENT_KEYS:
+        raise EvidenceError('positive-control suite plan fields are invalid')
+    schema_version = _require_int(
+        suite.get('schema_version'), 'positive_control.suite_plan.schema_version', minimum=1
+    )
+    positive = _require_mapping(
+        suite.get('positive_control'), 'positive_control.suite_plan.positive_control'
+    )
+    if set(positive) != {'gz_partition', 'ros_domain_id', 'run_id'}:
+        raise EvidenceError('positive-control suite-plan identity fields are invalid')
+    planned_domain = _require_int(
+        positive.get('ros_domain_id'),
+        'positive_control.suite_plan.positive_control.ros_domain_id',
+        minimum=0,
+    )
+    planned_partition = require_bounded_string(
+        positive.get('gz_partition'),
+        'positive_control.suite_plan.positive_control.gz_partition',
+    )
+    planned_run_id = require_bounded_string(
+        positive.get('run_id'), 'positive_control.suite_plan.positive_control.run_id'
+    )
+    if (
+        schema_version != SCHEMA_VERSION
+        or suite.get('producer') != PRODUCER
+        or planned_domain > MAX_DOMAIN_ID
+        or planned_domain != runtime_gate.get('domain_id')
+        or planned_partition != runtime_gate.get('partition')
+        or planned_run_id != result_run_id
+    ):
+        raise EvidenceError('positive-control suite-plan/runtime-gate identity binding mismatch')
+
+    process_dir = runtime_gate_path.parent / 'processes'
+    driver = _validated_bounded_process(
+        process_dir / 'contact_control_driver.process.json',
+        expected_role='contact_control_driver',
+        expected_workspace=resolved_workspace,
+        require_zero_returncode=True,
+    )
+    launch = _validated_bounded_process(
+        process_dir / 'sim_launch.process.json',
+        expected_role='sim_launch',
+        expected_workspace=resolved_workspace,
+        require_zero_returncode=False,
+    )
+    expected_driver_command = [
+        'ros2',
+        'run',
+        'robotest_scenarios',
+        'contact_control_driver',
+        '--output',
+        str(result_path.resolve()),
+        '--ready-file',
+        str(driver_ready_path.resolve()),
+        '--arm-file',
+        str(arm_request_path.resolve()),
+        '--armed-file',
+        str(armed_ack_path.resolve()),
+        '--run-id',
+        result_run_id,
+        '--coverage-manifest',
+        str(resolved_workspace / 'config/collision-coverage.yaml'),
+        '--wall-timeout-s',
+        str(CONTACT_CONTROL_WALL_TIMEOUT_S),
+        '--ros-args',
+        '-r',
+        '__ns:=/robotest',
+    ]
+    expected_launch_command = [
+        'ros2',
+        'launch',
+        'robotest_sim',
+        'sim.launch.py',
+        'namespace:=robotest',
+        'seed:=42',
+        'headless:=true',
+        'render_sensors:=true',
+        'rviz:=false',
+    ]
+    expected_driver_wrapper = [
+        'timeout',
+        '--signal=TERM',
+        '--kill-after=10s',
+        f'{CONTACT_CONTROL_PROCESS_WALL_TIMEOUT_S:.3f}s',
+        *expected_driver_command,
+    ]
+    expected_launch_wrapper = [
+        'timeout',
+        '--signal=TERM',
+        '--kill-after=10s',
+        f'{POSITIVE_SIM_LAUNCH_PROCESS_WALL_TIMEOUT_S:.3f}s',
+        *expected_launch_command,
+    ]
+    if (
+        driver['command'] != expected_driver_command
+        or driver['wrapped_command'] != expected_driver_wrapper
+        or driver['wall_timeout_s'] != CONTACT_CONTROL_PROCESS_WALL_TIMEOUT_S
+    ):
+        raise EvidenceError('positive-control driver process command binding mismatch')
+    if (
+        launch['command'] != expected_launch_command
+        or launch['wrapped_command'] != expected_launch_wrapper
+        or launch['wall_timeout_s'] != POSITIVE_SIM_LAUNCH_PROCESS_WALL_TIMEOUT_S
+    ):
+        raise EvidenceError('positive-control launch process command binding mismatch')
+    if driver['pid'] != runtime_gate.get('watch_pid') or launch['pid'] != runtime_gate.get(
+        'launch_pid'
+    ):
+        raise EvidenceError('positive-control runtime-gate sibling PID binding mismatch')
+    runtime_started = _require_int(
+        runtime_gate.get('started_steady_ns'), 'positive_control.runtime_gate.started_steady_ns'
+    )
+    runtime_finished = _require_int(
+        runtime_gate.get('finished_steady_ns'), 'positive_control.runtime_gate.finished_steady_ns'
+    )
+    if not (
+        launch['started_steady_ns']
+        <= runtime_started
+        <= runtime_finished
+        <= launch['finished_steady_ns']
+        and driver['started_steady_ns']
+        <= runtime_started
+        <= runtime_finished
+        <= driver['finished_steady_ns']
+    ):
+        raise EvidenceError('positive-control runtime-gate sibling process ordering is invalid')
+    return {'driver': driver, 'launch': launch}
+
+
+def _reconcile_contact_control_arm_handshake(
+    *,
+    workspace: Path,
+    result: Mapping[str, Any],
+    result_path: Path,
+    driver_ready_path: Path,
+    arm_request_path: Path,
+    armed_ack_path: Path,
+    runtime_gate_path: Path,
+) -> None:
+    """Prove runtime-gate completion and fresh-clock arming preceded any motion."""
+    identity = _require_mapping(result.get('identity'), 'positive_control.identity')
+    run_id = require_bounded_string(identity.get('run_id'), 'positive_control.run_id')
+    ready_document = validate_contact_control_ready(
+        load_canonical_json(driver_ready_path, maximum_bytes=64 * 1024),
+        expected_run_id=run_id,
+    )
+    ready_sha256 = file_sha256(driver_ready_path)
+    runtime_gate = validate_positive_runtime_gate_artifacts(
+        runtime_gate_path,
+        runtime_gate_path.parent / 'processes/runtime_gate.process.json',
+    )
+    sibling_processes = _validate_positive_runtime_gate_reconciliation_bindings(
+        workspace=workspace,
+        result_run_id=run_id,
+        result_path=result_path,
+        driver_ready_path=driver_ready_path,
+        arm_request_path=arm_request_path,
+        armed_ack_path=armed_ack_path,
+        runtime_gate_path=runtime_gate_path,
+        runtime_gate=runtime_gate,
+    )
+    protocol = _contact_control_arm_protocol(ready_document.get('arm_protocol'))
+    request_document = validate_contact_control_arm_request(
+        load_canonical_json(
+            arm_request_path,
+            maximum_bytes=_require_int(
+                protocol.get('request_max_bytes'),
+                'contact_control.arm_protocol.request_max_bytes',
+                minimum=1,
+            ),
+        ),
+        ready=ready_document,
+        ready_sha256=ready_sha256,
+        runtime_gate_sha256=runtime_gate['runtime_gate_sha256'],
+    )
+    request_sha256 = file_sha256(arm_request_path)
+    acknowledgment_document = validate_contact_control_armed(
+        load_canonical_json(
+            armed_ack_path,
+            maximum_bytes=_require_int(
+                protocol.get('ack_max_bytes'),
+                'contact_control.arm_protocol.ack_max_bytes',
+                minimum=1,
+            ),
+        ),
+        ready=ready_document,
+        request=request_document,
+        request_sha256=request_sha256,
+    )
+
+    configuration = _require_mapping(result.get('configuration'), 'positive_control.configuration')
+    control_configuration = _require_mapping(
+        configuration.get('control_configuration'),
+        'positive_control.configuration.control_configuration',
+    )
+    declared_configuration_sha256 = require_sha256(
+        configuration.get('control_configuration_sha256'),
+        'positive_control.configuration.control_configuration_sha256',
+    )
+    if (
+        canonical_sha256(control_configuration) != declared_configuration_sha256
+        or ready_document.get('control_configuration_sha256') != declared_configuration_sha256
+    ):
+        raise EvidenceError('contact-control configuration handshake binding mismatch')
+    configured_protocol = _contact_control_arm_protocol(control_configuration.get('arm_protocol'))
+    if configured_protocol != protocol or canonical_sha256(
+        configured_protocol
+    ) != ready_document.get('arm_protocol_sha256'):
+        raise EvidenceError('contact-control authoritative arm protocol binding mismatch')
+
+    control = _require_mapping(result.get('control'), 'positive_control.control')
+    ready_identity = _require_mapping(
+        ready_document.get('identity'), 'contact_control.ready.identity'
+    )
+    result_expected_pair = configuration.get('expected_pair')
+    result_fixture_sha256 = require_sha256(
+        configuration.get('fixture_sha256'), 'positive_control.configuration.fixture_sha256'
+    )
+    if (
+        identity.get('fixture_id') != ready_identity.get('fixture_id')
+        or identity.get('run_id') != ready_identity.get('run_id')
+        or identity.get('scenario_sha256') != ready_document.get('fixture_sha256')
+        or result_fixture_sha256 != ready_document.get('fixture_sha256')
+        or result_expected_pair != ready_document.get('expected_pair')
+    ):
+        raise EvidenceError('contact-control readiness identity/fixture binding mismatch')
+    contact = _require_mapping(control.get('contact'), 'positive_control.control.contact')
+    setup = _require_mapping(control.get('setup'), 'positive_control.control.setup')
+    expected_setup = {
+        'observed_robot_start': ready_document.get('observed_robot_start'),
+        'observed_wall': ready_document.get('observed_wall'),
+        'spawn': ready_document.get('spawn'),
+    }
+    if (
+        contact.get('expected_pair') != ready_document.get('expected_pair')
+        or control.get('observed_robot_start') != ready_document.get('observed_robot_start')
+        or dict(setup) != expected_setup
+    ):
+        raise EvidenceError('contact-control readiness setup binding mismatch')
+    arm = _require_mapping(control.get('arm'), 'positive_control.control.arm')
+    if set(arm) != {
+        'acknowledgment',
+        'acknowledgment_sha256',
+        'first_nonzero_publish_returned_steady_ns',
+        'first_nonzero_publish_started_steady_ns',
+        'request',
+        'request_sha256',
+    }:
+        raise EvidenceError('positive-control result arm proof keys are invalid')
+    if (
+        arm.get('request') != request_document
+        or arm.get('request_sha256') != request_sha256
+        or arm.get('acknowledgment') != acknowledgment_document
+        or arm.get('acknowledgment_sha256') != file_sha256(armed_ack_path)
+    ):
+        raise EvidenceError('positive-control result arm artifact binding mismatch')
+    first_publish_started_ns = _require_int(
+        arm.get('first_nonzero_publish_started_steady_ns'),
+        'positive_control.control.arm.first_nonzero_publish_started_steady_ns',
+        minimum=1,
+    )
+    first_publish_returned_ns = _require_int(
+        arm.get('first_nonzero_publish_returned_steady_ns'),
+        'positive_control.control.arm.first_nonzero_publish_returned_steady_ns',
+        minimum=1,
+    )
+    timeline = _require_mapping(control.get('timeline'), 'positive_control.control.timeline')
+    control_started_steady_ns = _require_int(
+        timeline.get('control_started_steady_ns'),
+        'positive_control.control.timeline.control_started_steady_ns',
+        minimum=1,
+    )
+    ready_steady_ns = _require_int(
+        ready_document.get('ready_steady_ns'),
+        'contact_control.ready.ready_steady_ns',
+        minimum=1,
+    )
+    arm_requested_steady_ns = _require_int(
+        request_document.get('arm_requested_steady_ns'),
+        'contact_control.arm_request.arm_requested_steady_ns',
+        minimum=1,
+    )
+    armed_steady_ns = _require_int(
+        acknowledgment_document.get('armed_steady_ns'),
+        'contact_control.armed.armed_steady_ns',
+        minimum=1,
+    )
+    if control_started_steady_ns != first_publish_started_ns:
+        raise EvidenceError('positive-control control-start steady evidence diverged')
+    if not (
+        ready_steady_ns
+        <= runtime_gate['started_steady_ns']
+        <= runtime_gate['finished_steady_ns']
+        <= arm_requested_steady_ns
+        <= acknowledgment_document['arm_observed_steady_ns']
+        <= armed_steady_ns
+        <= control_started_steady_ns
+        <= first_publish_started_ns
+        <= first_publish_returned_ns
+    ):
+        raise EvidenceError('positive-control gate/arm/motion steady-time ordering is invalid')
+    for role, process in sibling_processes.items():
+        if not (
+            process['started_steady_ns']
+            <= acknowledgment_document['arm_observed_steady_ns']
+            <= armed_steady_ns
+            <= first_publish_started_ns
+            <= first_publish_returned_ns
+            <= process['finished_steady_ns']
+        ):
+            raise EvidenceError(
+                f'positive-control {role} process did not span arm acknowledgment and motion'
+            )
+
+
 def reconcile_positive_control(
     *,
     workspace: Path,
@@ -1557,6 +3011,10 @@ def reconcile_positive_control(
     result_path: Path,
     capture_path: Path,
     contact_progress_path: Path,
+    driver_ready_path: Path,
+    arm_request_path: Path,
+    armed_ack_path: Path,
+    runtime_gate_path: Path,
     manifest_path: Path,
     collector_configuration_sha256: str,
     owned_process_group_shutdown: bool,
@@ -1595,6 +3053,15 @@ def reconcile_positive_control(
     run_id = require_bounded_string(identity.get('run_id'), 'positive_control.run_id')
     scenario_hash = require_sha256(
         identity.get('scenario_sha256'), 'positive_control.scenario_sha256'
+    )
+    _reconcile_contact_control_arm_handshake(
+        workspace=workspace,
+        result=result,
+        result_path=result_path,
+        driver_ready_path=driver_ready_path,
+        arm_request_path=arm_request_path,
+        armed_ack_path=armed_ack_path,
+        runtime_gate_path=runtime_gate_path,
     )
     quality = _require_mapping(result.get('quality'), 'positive_control.quality')
     if quality.get('overflow_free') is not True:

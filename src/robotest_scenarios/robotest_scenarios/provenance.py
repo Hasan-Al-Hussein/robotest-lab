@@ -105,9 +105,29 @@ def source_binding() -> dict[str, object]:
     return {'aggregate_sha256': aggregate, 'files': files}
 
 
+def contact_control_arm_protocol() -> dict[str, object]:
+    """Return the frozen runner-to-driver motion-arm protocol."""
+    return {
+        'ack_max_bytes': constants.CONTROL_ARM_ACK_MAX_BYTES,
+        'ack_producer': constants.CONTROL_ARM_ACK_PRODUCER,
+        'action': constants.CONTROL_ARM_ACTION,
+        'fresh_clock_policy': constants.CONTROL_ARM_FRESH_CLOCK_POLICY,
+        'request_max_bytes': constants.CONTROL_ARM_REQUEST_MAX_BYTES,
+        'request_producer': constants.CONTROL_ARM_REQUEST_PRODUCER,
+        'schema_version': constants.CONTROL_ARM_SCHEMA_VERSION,
+        'wait_deadline_policy': constants.CONTROL_ARM_WAIT_DEADLINE_POLICY,
+    }
+
+
+def contact_control_arm_protocol_sha256() -> str:
+    """Hash the canonical positive-control motion-arm protocol."""
+    return hashlib.sha256(canonical_json_bytes(contact_control_arm_protocol())).hexdigest()
+
+
 def contact_control_configuration() -> dict[str, object]:
     """Return every frozen policy literal used by the positive-control driver."""
     return {
+        'arm_protocol': contact_control_arm_protocol(),
         'capacities': {
             'actor_state': constants.ACTOR_STATE_CAPACITY,
             'command': constants.COMMAND_CAPACITY,
