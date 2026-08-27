@@ -3,12 +3,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: I001
 
-"""Bounded ROS observers needed by the Phase 3 orchestration lane.
+"""
+Bounded ROS observers needed by the Phase 3 orchestration lane.
 
 The goal observer is armed only after the scenario controller is ready.  It
 binds the first newly active FollowWaypoints UUID, preserves the immutable
 action-status goal stamp as T0, and optionally emits the absolute Scenario-4
-lifecycle schedule.  The contact-drain observer binds the first authoritative
+lifecycle schedule.  The contact-drain observer binds the latest authoritative
 public snapshot strictly beyond terminal + 0.25 s to a caught-up /clock sample.
 """
 
@@ -256,7 +257,7 @@ class ContactDrainObserver:
             self.first_contact_stamp_ns = stamp_ns
         self.latest_contact_stamp_ns = stamp_ns
         self.previous_pair_set = pair_set
-        if self.qualifying_contact_snapshot_stamp_ns is None and stamp_ns > self.target_stamp_ns:
+        if stamp_ns > self.target_stamp_ns:
             self.qualifying_contact_snapshot_stamp_ns = stamp_ns
 
     def observe_clock(self, stamp_ns: int) -> None:
@@ -275,9 +276,7 @@ class ContactDrainObserver:
         latest_clock = self.clock_latest_stamp_ns
         if qualifying is None or latest_clock is None or latest_clock < qualifying:
             return False
-        if latest_clock - qualifying > CONTACT_MAX_CLOCK_LAG_NS:
-            raise EvidenceError('simulation clock is more than 220 ms beyond drain snapshot')
-        return True
+        return latest_clock - qualifying <= CONTACT_MAX_CLOCK_LAG_NS
 
     def evidence(self) -> dict[str, Any]:
         if not self.complete():
@@ -593,6 +592,23 @@ def _self_test() -> int:
     drain.observe_clock(1_470_000_001)
     assert drain.complete() is True
     assert drain.evidence()['clock_minus_qualifying_contact_ns'] == 220_000_000
+    catching_up = ContactDrainObserver(1)
+    catching_up.observe_contact(
+        stamp_ns=300_000_000,
+        frame_id='',
+        pair_set=pair_a,
+        record_count=1,
+    )
+    catching_up.observe_clock(520_000_001)
+    assert catching_up.complete() is False
+    catching_up.observe_contact(
+        stamp_ns=520_000_000,
+        frame_id='',
+        pair_set=pair_a,
+        record_count=1,
+    )
+    assert catching_up.complete() is True
+    assert catching_up.qualifying_contact_snapshot_stamp_ns == 520_000_000
     return 0
 
 

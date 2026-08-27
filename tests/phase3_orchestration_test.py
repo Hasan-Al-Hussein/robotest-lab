@@ -1489,11 +1489,19 @@ def test_contact_drain_source_gap_and_clock_lag_boundaries() -> None:
             stamp_ns=520_000_001, frame_id='', pair_set=pair, record_count=1
         )
 
-    lag_failure = runtime_observer.ContactDrainObserver(1)
-    lag_failure.observe_contact(stamp_ns=300_000_000, frame_id='', pair_set=pair, record_count=1)
-    lag_failure.observe_clock(520_000_001)
-    with pytest.raises(orchestration.EvidenceError, match='220 ms'):
-        lag_failure.complete()
+    catching_up = runtime_observer.ContactDrainObserver(1)
+    catching_up.observe_contact(stamp_ns=300_000_000, frame_id='', pair_set=pair, record_count=1)
+    catching_up.observe_clock(520_000_001)
+    assert catching_up.complete() is False
+    catching_up.observe_contact(
+        stamp_ns=520_000_000,
+        frame_id='',
+        pair_set=pair,
+        record_count=1,
+    )
+    assert catching_up.qualifying_contact_snapshot_stamp_ns == 520_000_000
+    assert catching_up.complete() is True
+    assert catching_up.evidence()['clock_minus_qualifying_contact_ns'] == 1
 
 
 def test_contact_drain_rejects_duplicate_regression_frame_and_early_heartbeat() -> None:
