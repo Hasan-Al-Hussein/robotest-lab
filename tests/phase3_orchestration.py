@@ -154,10 +154,21 @@ PHASE3_GRAPH_OBSERVED_KEYS = {
     'topics',
 }
 COLLECTOR_WALL_TIMEOUT_S = 360.0
+COLLECTOR_PROCESS_WALL_TIMEOUT_S = 370.0
 TRIAL_WALL_TIMEOUT_S = 300.0
 CONTACT_CONTROL_WALL_TIMEOUT_S = 30.0
 CONTACT_CONTROL_PROCESS_WALL_TIMEOUT_S = 45.0
 POSITIVE_SIM_LAUNCH_PROCESS_WALL_TIMEOUT_S = 120.0
+CONTACT_CONTROL_ARM_SCHEMA_VERSION = 2
+COMMAND_DELIVERY_PROBE_MAX_SIM_LAG_NS = 100_000_000
+COMMAND_DELIVERY_PROBE_POLICY = (
+    'exact_two_matches_then_one_untracked_zero_with_partial_ordered_collector_progress_before_arm'
+)
+COMMAND_PROGRESS_MAX_BYTES = 4_096
+COMMAND_PROGRESS_SCHEMA_VERSION = 1
+COMMAND_PROGRESS_PRODUCER = 'robotest_metrics/metrics_collector'
+COMMAND_PROGRESS_PUBLIC_TOPIC = '/robotest/cmd_vel'
+COMMAND_PROGRESS_REQUIRED_SUBSCRIPTION_COUNT = 2
 CONTACT_DRAIN_NS = 250_000_000
 CONTACT_HEARTBEAT_NS = 200_000_000
 CONTACT_MAX_PUBLIC_GAP_NS = 220_000_000
@@ -166,11 +177,45 @@ CONTACT_CONTROL_ARM_PROTOCOL_KEYS = {
     'ack_max_bytes',
     'ack_producer',
     'action',
+    'command_delivery_probe',
     'fresh_clock_policy',
     'request_max_bytes',
     'request_producer',
     'schema_version',
     'wait_deadline_policy',
+}
+COMMAND_DELIVERY_PROBE_PROTOCOL_KEYS = {
+    'max_sim_lag_ns',
+    'policy',
+    'progress_max_bytes',
+    'progress_producer',
+    'progress_schema_version',
+    'public_topic',
+    'required_subscription_count',
+    'safe_zero',
+}
+COMMAND_DELIVERY_PROBE_ACK_KEYS = {
+    'collector_progress_observed_steady_ns',
+    'collector_progress_sha256',
+    'collector_progress_stamp_ns',
+    'matched_subscription_count',
+    'match_observed_steady_ns',
+    'probe_publish_returned_steady_ns',
+    'probe_publish_started_steady_ns',
+    'probe_sim_stamp_ns',
+    'required_subscription_count',
+}
+COMMAND_PROGRESS_KEYS = {
+    'angular_z_rad_s',
+    'linear_x_m_s',
+    'linear_y_m_s',
+    'observed_steady_ns',
+    'producer',
+    'public_topic',
+    'retained_command_count',
+    'run_id',
+    'schema_version',
+    'stamp_ns',
 }
 CONTACT_CONTROL_ARM_REQUEST_KEYS = {
     'action',
@@ -192,6 +237,7 @@ CONTACT_CONTROL_ARM_ACK_KEYS = {
     'armed_clock_sample_count',
     'armed_sim_stamp_ns',
     'armed_steady_ns',
+    'command_delivery_probe',
     'producer',
     'ready_sha256',
     'run_id',
@@ -1570,7 +1616,7 @@ def _contact_control_arm_protocol(value: Any) -> dict[str, Any]:
     schema_version = _require_int(
         protocol.get('schema_version'), 'contact_control.arm_protocol.schema_version', minimum=1
     )
-    if schema_version != SCHEMA_VERSION:
+    if schema_version != CONTACT_CONTROL_ARM_SCHEMA_VERSION:
         raise EvidenceError('contact-control arm protocol schema is unsupported')
     for field in (
         'ack_producer',
@@ -1586,6 +1632,63 @@ def _contact_control_arm_protocol(value: Any) -> dict[str, Any]:
         )
         if maximum > JSON_MAX_BYTES:
             raise EvidenceError(f'contact-control arm protocol {field} exceeds JSON cap')
+    probe = _require_mapping(
+        protocol.get('command_delivery_probe'),
+        'contact_control.arm_protocol.command_delivery_probe',
+    )
+    if set(probe) != COMMAND_DELIVERY_PROBE_PROTOCOL_KEYS:
+        raise EvidenceError('contact-control command-delivery probe protocol keys are invalid')
+    safe_zero = _require_mapping(
+        probe.get('safe_zero'),
+        'contact_control.arm_protocol.command_delivery_probe.safe_zero',
+    )
+    if set(safe_zero) != {'angular_z_rad_s', 'linear_x_m_s', 'linear_y_m_s'}:
+        raise EvidenceError('contact-control command-delivery probe zero vector keys are invalid')
+    max_sim_lag_ns = _require_int(
+        probe.get('max_sim_lag_ns'),
+        'contact_control.arm_protocol.command_delivery_probe.max_sim_lag_ns',
+        minimum=1,
+    )
+    progress_max_bytes = _require_int(
+        probe.get('progress_max_bytes'),
+        'contact_control.arm_protocol.command_delivery_probe.progress_max_bytes',
+        minimum=1,
+    )
+    if progress_max_bytes > JSON_MAX_BYTES:
+        raise EvidenceError('contact-control command progress byte cap exceeds JSON cap')
+    progress_schema_version = _require_int(
+        probe.get('progress_schema_version'),
+        'contact_control.arm_protocol.command_delivery_probe.progress_schema_version',
+        minimum=1,
+    )
+    required_subscription_count = _require_int(
+        probe.get('required_subscription_count'),
+        'contact_control.arm_protocol.command_delivery_probe.required_subscription_count',
+        minimum=1,
+    )
+    zero_vector = {
+        field: _require_number(
+            safe_zero.get(field),
+            f'contact_control.arm_protocol.command_delivery_probe.safe_zero.{field}',
+        )
+        for field in ('angular_z_rad_s', 'linear_x_m_s', 'linear_y_m_s')
+    }
+    if (
+        max_sim_lag_ns != COMMAND_DELIVERY_PROBE_MAX_SIM_LAG_NS
+        or probe.get('policy') != COMMAND_DELIVERY_PROBE_POLICY
+        or progress_max_bytes != COMMAND_PROGRESS_MAX_BYTES
+        or probe.get('progress_producer') != COMMAND_PROGRESS_PRODUCER
+        or progress_schema_version != COMMAND_PROGRESS_SCHEMA_VERSION
+        or probe.get('public_topic') != COMMAND_PROGRESS_PUBLIC_TOPIC
+        or required_subscription_count != COMMAND_PROGRESS_REQUIRED_SUBSCRIPTION_COUNT
+        or zero_vector
+        != {
+            'angular_z_rad_s': 0.0,
+            'linear_x_m_s': 0.0,
+            'linear_y_m_s': 0.0,
+        }
+    ):
+        raise EvidenceError('contact-control command-delivery probe protocol changed')
     return dict(protocol)
 
 
@@ -1751,12 +1854,67 @@ def validate_contact_control_arm_request(
     return dict(request)
 
 
+def validate_command_progress(
+    document: Any,
+    *,
+    expected_run_id: str,
+) -> dict[str, Any]:
+    """Validate the collector's immutable first retained command receipt."""
+    progress = _require_mapping(document, 'contact_control.command_progress')
+    if set(progress) != COMMAND_PROGRESS_KEYS:
+        raise EvidenceError('contact-control command progress keys are invalid')
+    schema_version = _require_int(
+        progress.get('schema_version'),
+        'contact_control.command_progress.schema_version',
+        minimum=1,
+    )
+    retained_count = _require_int(
+        progress.get('retained_command_count'),
+        'contact_control.command_progress.retained_command_count',
+        minimum=1,
+    )
+    _require_int(
+        progress.get('stamp_ns'),
+        'contact_control.command_progress.stamp_ns',
+        minimum=1,
+    )
+    _require_int(
+        progress.get('observed_steady_ns'),
+        'contact_control.command_progress.observed_steady_ns',
+        minimum=1,
+    )
+    velocities = {
+        field: _require_number(
+            progress.get(field),
+            f'contact_control.command_progress.{field}',
+        )
+        for field in ('angular_z_rad_s', 'linear_x_m_s', 'linear_y_m_s')
+    }
+    if (
+        schema_version != COMMAND_PROGRESS_SCHEMA_VERSION
+        or progress.get('producer') != COMMAND_PROGRESS_PRODUCER
+        or progress.get('public_topic') != COMMAND_PROGRESS_PUBLIC_TOPIC
+        or progress.get('run_id') != expected_run_id
+        or retained_count != 1
+        or velocities
+        != {
+            'angular_z_rad_s': 0.0,
+            'linear_x_m_s': 0.0,
+            'linear_y_m_s': 0.0,
+        }
+    ):
+        raise EvidenceError('contact-control command progress contract changed')
+    return dict(progress)
+
+
 def validate_contact_control_armed(
     document: Any,
     *,
     ready: Mapping[str, Any],
     request: Mapping[str, Any],
     request_sha256: str,
+    command_progress: Mapping[str, Any],
+    command_progress_sha256: str,
 ) -> dict[str, Any]:
     """Validate the driver acknowledgment and its mandatory fresh-clock barrier."""
     acknowledgment = _require_mapping(document, 'contact_control.armed')
@@ -1780,6 +1938,18 @@ def validate_contact_control_armed(
     }
     if any(acknowledgment.get(key) != value for key, value in expected_equalities.items()):
         raise EvidenceError('contact-control arm acknowledgment binding mismatch')
+    progress_document = validate_command_progress(
+        command_progress,
+        expected_run_id=require_bounded_string(
+            request.get('run_id'), 'contact_control.arm_request.run_id'
+        ),
+    )
+    progress_sha256 = require_sha256(
+        command_progress_sha256,
+        'contact_control.command_progress.sha256',
+    )
+    if canonical_sha256(progress_document) != progress_sha256:
+        raise EvidenceError('contact-control command progress hash mismatch')
     requested_steady_ns = _require_int(
         acknowledgment.get('arm_requested_steady_ns'),
         'contact_control.armed.arm_requested_steady_ns',
@@ -1815,8 +1985,85 @@ def validate_contact_control_armed(
         'contact_control.armed.armed_sim_stamp_ns',
         minimum=1,
     )
+    probe = _require_mapping(
+        acknowledgment.get('command_delivery_probe'),
+        'contact_control.armed.command_delivery_probe',
+    )
+    if set(probe) != COMMAND_DELIVERY_PROBE_ACK_KEYS:
+        raise EvidenceError('contact-control command-delivery probe keys are invalid')
+    collector_progress_sha256 = require_sha256(
+        probe.get('collector_progress_sha256'),
+        'contact_control.armed.command_delivery_probe.collector_progress_sha256',
+    )
+    collector_progress_stamp_ns = _require_int(
+        probe.get('collector_progress_stamp_ns'),
+        'contact_control.armed.command_delivery_probe.collector_progress_stamp_ns',
+        minimum=1,
+    )
+    collector_progress_observed_steady_ns = _require_int(
+        probe.get('collector_progress_observed_steady_ns'),
+        'contact_control.armed.command_delivery_probe.collector_progress_observed_steady_ns',
+        minimum=1,
+    )
+    matched_subscription_count = _require_int(
+        probe.get('matched_subscription_count'),
+        'contact_control.armed.command_delivery_probe.matched_subscription_count',
+        minimum=1,
+    )
+    match_observed_steady_ns = _require_int(
+        probe.get('match_observed_steady_ns'),
+        'contact_control.armed.command_delivery_probe.match_observed_steady_ns',
+        minimum=1,
+    )
+    probe_publish_started_steady_ns = _require_int(
+        probe.get('probe_publish_started_steady_ns'),
+        'contact_control.armed.command_delivery_probe.probe_publish_started_steady_ns',
+        minimum=1,
+    )
+    probe_publish_returned_steady_ns = _require_int(
+        probe.get('probe_publish_returned_steady_ns'),
+        'contact_control.armed.command_delivery_probe.probe_publish_returned_steady_ns',
+        minimum=1,
+    )
+    probe_sim_stamp_ns = _require_int(
+        probe.get('probe_sim_stamp_ns'),
+        'contact_control.armed.command_delivery_probe.probe_sim_stamp_ns',
+        minimum=1,
+    )
+    required_subscription_count = _require_int(
+        probe.get('required_subscription_count'),
+        'contact_control.armed.command_delivery_probe.required_subscription_count',
+        minimum=1,
+    )
+    if (
+        collector_progress_sha256 != progress_sha256
+        or collector_progress_stamp_ns != progress_document['stamp_ns']
+        or collector_progress_observed_steady_ns != progress_document['observed_steady_ns']
+        or matched_subscription_count != COMMAND_PROGRESS_REQUIRED_SUBSCRIPTION_COUNT
+        or required_subscription_count != COMMAND_PROGRESS_REQUIRED_SUBSCRIPTION_COUNT
+    ):
+        raise EvidenceError('contact-control command-delivery probe binding mismatch')
     if not requested_steady_ns <= observed_steady_ns <= armed_steady_ns:
         raise EvidenceError('contact-control arm steady-time ordering is invalid')
+    if not (
+        observed_steady_ns
+        <= match_observed_steady_ns
+        <= probe_publish_started_steady_ns
+        <= probe_publish_returned_steady_ns
+        <= armed_steady_ns
+        and probe_publish_started_steady_ns
+        <= collector_progress_observed_steady_ns
+        <= armed_steady_ns
+    ):
+        raise EvidenceError(
+            'contact-control command-delivery probe steady-time ordering is invalid'
+        )
+    if abs(collector_progress_stamp_ns - probe_sim_stamp_ns) > (
+        COMMAND_DELIVERY_PROBE_MAX_SIM_LAG_NS
+    ):
+        raise EvidenceError('contact-control command-delivery probe simulation lag is invalid')
+    if not observed_stamp < probe_sim_stamp_ns <= armed_stamp:
+        raise EvidenceError('contact-control probe fresh-clock bracket is invalid')
     if armed_count <= observed_count or armed_stamp <= observed_stamp:
         raise EvidenceError('contact-control arm acknowledgment lacks a fresh /clock sample')
     return dict(acknowledgment)
@@ -3572,6 +3819,7 @@ def _validate_positive_runtime_gate_reconciliation_bindings(
     driver_ready_path: Path,
     arm_request_path: Path,
     armed_ack_path: Path,
+    command_progress_path: Path,
     runtime_gate_path: Path,
     runtime_gate: Mapping[str, Any],
 ) -> dict[str, Mapping[str, Any]]:
@@ -3627,6 +3875,12 @@ def _validate_positive_runtime_gate_reconciliation_bindings(
         expected_workspace=resolved_workspace,
         require_zero_returncode=False,
     )
+    collector = _validated_bounded_process(
+        process_dir / 'metrics_collector.process.json',
+        expected_role='metrics_collector',
+        expected_workspace=resolved_workspace,
+        require_zero_returncode=True,
+    )
     expected_driver_command = [
         'ros2',
         'run',
@@ -3640,6 +3894,8 @@ def _validate_positive_runtime_gate_reconciliation_bindings(
         str(arm_request_path.resolve()),
         '--armed-file',
         str(armed_ack_path.resolve()),
+        '--command-progress-file',
+        str(command_progress_path.resolve()),
         '--run-id',
         result_run_id,
         '--coverage-manifest',
@@ -3661,6 +3917,30 @@ def _validate_positive_runtime_gate_reconciliation_bindings(
         'render_sensors:=true',
         'rviz:=false',
     ]
+    positive_dir = runtime_gate_path.parent
+    expected_collector_command = [
+        'ros2',
+        'run',
+        'robotest_metrics',
+        'metrics_collector',
+        '--output',
+        str((positive_dir / 'capture.json').resolve()),
+        '--ready-file',
+        str((positive_dir / 'metrics.ready.json').resolve()),
+        '--stop-file',
+        str((positive_dir / 'metrics.stop').resolve()),
+        '--contact-progress-file',
+        str((positive_dir / 'contact-progress.json').resolve()),
+        '--command-progress-file',
+        str(command_progress_path.resolve()),
+        '--command-progress-run-id',
+        result_run_id,
+        '--wall-timeout-s',
+        f'{COLLECTOR_WALL_TIMEOUT_S:.0f}',
+        '--ros-args',
+        '-r',
+        '__ns:=/robotest',
+    ]
     expected_driver_wrapper = [
         'timeout',
         '--signal=TERM',
@@ -3675,6 +3955,13 @@ def _validate_positive_runtime_gate_reconciliation_bindings(
         f'{POSITIVE_SIM_LAUNCH_PROCESS_WALL_TIMEOUT_S:.3f}s',
         *expected_launch_command,
     ]
+    expected_collector_wrapper = [
+        'timeout',
+        '--signal=TERM',
+        '--kill-after=10s',
+        f'{COLLECTOR_PROCESS_WALL_TIMEOUT_S:.3f}s',
+        *expected_collector_command,
+    ]
     if (
         driver['command'] != expected_driver_command
         or driver['wrapped_command'] != expected_driver_wrapper
@@ -3687,6 +3974,12 @@ def _validate_positive_runtime_gate_reconciliation_bindings(
         or launch['wall_timeout_s'] != POSITIVE_SIM_LAUNCH_PROCESS_WALL_TIMEOUT_S
     ):
         raise EvidenceError('positive-control launch process command binding mismatch')
+    if (
+        collector['command'] != expected_collector_command
+        or collector['wrapped_command'] != expected_collector_wrapper
+        or collector['wall_timeout_s'] != COLLECTOR_PROCESS_WALL_TIMEOUT_S
+    ):
+        raise EvidenceError('positive-control collector process command binding mismatch')
     if driver['pid'] != runtime_gate.get('watch_pid') or launch['pid'] != runtime_gate.get(
         'launch_pid'
     ):
@@ -3706,9 +3999,13 @@ def _validate_positive_runtime_gate_reconciliation_bindings(
         <= runtime_started
         <= runtime_finished
         <= driver['finished_steady_ns']
+        and collector['started_steady_ns']
+        <= runtime_started
+        <= runtime_finished
+        <= collector['finished_steady_ns']
     ):
         raise EvidenceError('positive-control runtime-gate sibling process ordering is invalid')
-    return {'driver': driver, 'launch': launch}
+    return {'collector': collector, 'driver': driver, 'launch': launch}
 
 
 def _reconcile_contact_control_arm_handshake(
@@ -3719,8 +4016,9 @@ def _reconcile_contact_control_arm_handshake(
     driver_ready_path: Path,
     arm_request_path: Path,
     armed_ack_path: Path,
+    command_progress_path: Path,
     runtime_gate_path: Path,
-) -> None:
+) -> dict[str, Any]:
     """Prove runtime-gate completion and fresh-clock arming preceded any motion."""
     identity = _require_mapping(result.get('identity'), 'positive_control.identity')
     run_id = require_bounded_string(identity.get('run_id'), 'positive_control.run_id')
@@ -3740,6 +4038,7 @@ def _reconcile_contact_control_arm_handshake(
         driver_ready_path=driver_ready_path,
         arm_request_path=arm_request_path,
         armed_ack_path=armed_ack_path,
+        command_progress_path=command_progress_path,
         runtime_gate_path=runtime_gate_path,
         runtime_gate=runtime_gate,
     )
@@ -3758,6 +4057,22 @@ def _reconcile_contact_control_arm_handshake(
         runtime_gate_sha256=runtime_gate['runtime_gate_sha256'],
     )
     request_sha256 = file_sha256(arm_request_path)
+    probe_protocol = _require_mapping(
+        protocol.get('command_delivery_probe'),
+        'contact_control.arm_protocol.command_delivery_probe',
+    )
+    command_progress_document = validate_command_progress(
+        load_canonical_json(
+            command_progress_path,
+            maximum_bytes=_require_int(
+                probe_protocol.get('progress_max_bytes'),
+                'contact_control.arm_protocol.command_delivery_probe.progress_max_bytes',
+                minimum=1,
+            ),
+        ),
+        expected_run_id=run_id,
+    )
+    command_progress_sha256 = file_sha256(command_progress_path)
     acknowledgment_document = validate_contact_control_armed(
         load_canonical_json(
             armed_ack_path,
@@ -3770,6 +4085,8 @@ def _reconcile_contact_control_arm_handshake(
         ready=ready_document,
         request=request_document,
         request_sha256=request_sha256,
+        command_progress=command_progress_document,
+        command_progress_sha256=command_progress_sha256,
     )
 
     configuration = _require_mapping(result.get('configuration'), 'positive_control.configuration')
@@ -3895,6 +4212,11 @@ def _reconcile_contact_control_arm_handshake(
             raise EvidenceError(
                 f'positive-control {role} process did not span arm acknowledgment and motion'
             )
+    return {
+        'acknowledgment': acknowledgment_document,
+        'command_progress': command_progress_document,
+        'command_progress_sha256': command_progress_sha256,
+    }
 
 
 def reconcile_positive_control(
@@ -3907,6 +4229,7 @@ def reconcile_positive_control(
     driver_ready_path: Path,
     arm_request_path: Path,
     armed_ack_path: Path,
+    command_progress_path: Path,
     runtime_gate_path: Path,
     manifest_path: Path,
     collector_configuration_sha256: str,
@@ -3947,13 +4270,14 @@ def reconcile_positive_control(
     scenario_hash = require_sha256(
         identity.get('scenario_sha256'), 'positive_control.scenario_sha256'
     )
-    _reconcile_contact_control_arm_handshake(
+    handshake = _reconcile_contact_control_arm_handshake(
         workspace=workspace,
         result=result,
         result_path=result_path,
         driver_ready_path=driver_ready_path,
         arm_request_path=arm_request_path,
         armed_ack_path=armed_ack_path,
+        command_progress_path=command_progress_path,
         runtime_gate_path=runtime_gate_path,
     )
     quality = _require_mapping(result.get('quality'), 'positive_control.quality')
@@ -4199,12 +4523,32 @@ def reconcile_positive_control(
         (
             _require_int(item.get('stamp_ns'), 'captured command stamp', minimum=1),
             _require_number(item.get('linear_x_m_s'), 'captured command linear_x'),
+            _require_number(item.get('linear_y_m_s'), 'captured command linear_y'),
             _require_number(item.get('angular_z_rad_s'), 'captured command angular_z'),
         )
         for item_value in captured_commands
         for item in [_require_mapping(item_value, 'captured command')]
     ]
-    cursor = 0
+    command_progress = _require_mapping(
+        handshake.get('command_progress'),
+        'positive_control.command_progress',
+    )
+    probe_capture = captured_command_projection[0] if captured_command_projection else None
+    expected_probe_capture = (
+        command_progress['stamp_ns'],
+        command_progress['linear_x_m_s'],
+        command_progress['linear_y_m_s'],
+        command_progress['angular_z_rad_s'],
+    )
+    if probe_capture != expected_probe_capture:
+        raise EvidenceError(
+            'collector capture does not begin with the distinct command-delivery zero probe'
+        )
+    if len(captured_command_projection) != len(component_commands) + 1:
+        raise EvidenceError(
+            'collector command stream is not exactly one probe plus the component trace'
+        )
+    cursor = 1
     for command_value in component_commands:
         command = _require_mapping(command_value, 'component command')
         expected_stamp = _require_int(
@@ -4217,11 +4561,13 @@ def reconcile_positive_control(
             captured_command = captured_command_projection[cursor]
             captured_stamp = captured_command[0]
             captured_linear = captured_command[1]
-            captured_angular = captured_command[2]
+            captured_linear_y = captured_command[2]
+            captured_angular = captured_command[3]
             stamp_matches = expected_stamp <= captured_stamp <= latest_expected_stamp
             if (
                 stamp_matches
                 and captured_linear == expected_linear
+                and captured_linear_y == 0.0
                 and captured_angular == expected_angular
             ):
                 break
@@ -4229,6 +4575,8 @@ def reconcile_positive_control(
         if cursor >= len(captured_command_projection):
             raise EvidenceError('collector command stream is not a complete component subsequence')
         cursor += 1
+    if cursor != len(captured_command_projection):
+        raise EvidenceError('collector command stream has unmatched observations after the trace')
     timeline = _require_mapping(control.get('timeline'), 'positive_control.control.timeline')
     release_boundary = _require_int(
         timeline.get('release_required_through_stamp_ns'),
@@ -4255,6 +4603,7 @@ def reconcile_positive_control(
             'positive_control_external_quality': {
                 'checksum_verified': True,
                 'collector_capture_sha256': capture_hash,
+                'collector_command_progress_sha256': handshake['command_progress_sha256'],
                 'collector_reconciled': True,
                 'owned_process_group_shutdown': True,
             },
@@ -4266,6 +4615,9 @@ def reconcile_positive_control(
         'capture_sha256': capture_hash,
         'collector_reconciliation': {
             'captured_command_count': len(captured_command_projection),
+            'command_progress_artifact_sha256': handshake['command_progress_sha256'],
+            'command_progress_observed_steady_ns': command_progress['observed_steady_ns'],
+            'command_progress_stamp_ns': command_progress['stamp_ns'],
             'captured_exact_pair_count': captured_exact_count,
             'captured_release_expected_pair_count': release_expected_pair_count,
             'captured_release_snapshot_count': len(release_messages),

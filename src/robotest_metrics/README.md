@@ -134,16 +134,24 @@ nonzero motion while the runner completes and semantically verifies the
 runtime gate and confirms its process group is empty. The runner then
 atomically writes the exact run-bound ARM artifact. The driver validates its
 canonical bytes, identity, hashes, and ordering, observes a strictly newer
-positive `/clock` sample, and atomically writes its ARMED acknowledgement before
-the first nonzero command. A fail-safe zero is the only command allowed before
-arm. The complete pre-arm wait remains inside the original, never-reset 30 s
-steady-wall fixture deadline.
+positive `/clock` sample, requires exactly two subscriptions matched to its
+publisher, and publishes one untracked safe-zero probe. The collector writes a
+canonical progress artifact for that first retained command. Its hash,
+producer, run ID, topic, count, zero vector, callback time, and simulation stamp
+must bind to the probe under the frozen partial steady-time orders and absolute
+100 ms simulation-time bracket. Only then may the driver atomically write its
+ARMED acknowledgement before the first nonzero command. A fail-safe zero is
+the only command allowed before arm. The complete pre-arm wait remains inside
+the original, never-reset 30 s steady-wall fixture deadline.
 
-Reconciliation requires a distinct retained collector observation for every
-component command publication within 0.10 simulation seconds. This includes
-the active stop command, which must be published within 0.10 simulation
-seconds of the qualifying contact. Missing, tampered, stale, wrongly bound, or
-out-of-order READY, runtime-gate, ARM, or ARMED evidence fails the control.
+Reconciliation requires the distinct retained zero probe first, followed by a
+distinct retained collector observation for every component command
+publication within 0.10 simulation seconds. The capture cardinality is exactly
+the component trace length plus one, with no unmatched leading, interleaved,
+duplicated, or trailing records. This includes the active stop command, which
+must be published within 0.10 simulation seconds of the qualifying contact.
+Missing, tampered, stale, wrongly bound, or out-of-order READY, runtime-gate,
+ARM, command-progress, or ARMED evidence fails the control.
 
 Scenario 4 lifecycle freshness is collected by a dedicated bounded sampler.
 The schedule contains one to 96 strictly increasing simulation stamps and the

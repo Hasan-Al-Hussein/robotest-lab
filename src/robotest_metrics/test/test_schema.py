@@ -45,6 +45,18 @@ def test_complete_fixture_validates_all_three_contracts(
     validate_document(analyze_run(analysis_request), 'run-result.schema.json')
 
 
+def test_analysis_schema_requires_command_progress_hash(
+    analysis_request: dict[str, object],
+) -> None:
+    external_quality = analysis_request['collision']['benchmark_binding'][
+        'positive_control_external_quality'
+    ]
+    del external_quality['collector_command_progress_sha256']
+
+    with pytest.raises(ArtifactError, match='collector_command_progress_sha256'):
+        validate_document(analysis_request, 'analysis-request.schema.json')
+
+
 def test_schema_rejects_nonidentity_world_alignment(
     analysis_request: dict[str, object],
 ) -> None:

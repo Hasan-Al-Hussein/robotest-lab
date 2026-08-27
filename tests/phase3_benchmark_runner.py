@@ -941,9 +941,13 @@ def _metrics_collector_command(
     ready_path: Path,
     stop_path: Path,
     contact_progress_path: Path,
+    command_progress_path: Path | None = None,
+    command_progress_run_id: str | None = None,
 ) -> list[str]:
-    """Build the collector command around its one producer/consumer ACK path."""
-    return [
+    """Build the collector command with optional paired command-probe evidence."""
+    if (command_progress_path is None) != (command_progress_run_id is None):
+        raise EvidenceError('command-progress path and run ID must be supplied together')
+    command = [
         'ros2',
         'run',
         'robotest_metrics',
@@ -956,12 +960,26 @@ def _metrics_collector_command(
         str(stop_path),
         '--contact-progress-file',
         str(contact_progress_path),
-        '--wall-timeout-s',
-        '360',
-        '--ros-args',
-        '-r',
-        '__ns:=/robotest',
     ]
+    if command_progress_path is not None and command_progress_run_id is not None:
+        command.extend(
+            [
+                '--command-progress-file',
+                str(command_progress_path),
+                '--command-progress-run-id',
+                command_progress_run_id,
+            ]
+        )
+    command.extend(
+        [
+            '--wall-timeout-s',
+            '360',
+            '--ros-args',
+            '-r',
+            '__ns:=/robotest',
+        ]
+    )
+    return command
 
 
 def _base_environment_for_mode(
@@ -1245,7 +1263,18 @@ class BenchmarkRunner:
             collector_ready = run_dir / 'metrics.ready.json'
             collector_stop = run_dir / 'metrics.stop'
             contact_progress_path = run_dir / 'contact-progress.json'
+            command_progress_path = run_dir / 'command-progress.json'
             capture_path = run_dir / 'capture.json'
+            _require_fresh_distinct_paths(
+                (
+                    capture_path,
+                    collector_ready,
+                    collector_stop,
+                    command_progress_path,
+                    contact_progress_path,
+                ),
+                label='positive-control collector artifacts',
+            )
             collector = registry.start(
                 'metrics_collector',
                 _metrics_collector_command(
@@ -1253,6 +1282,8 @@ class BenchmarkRunner:
                     ready_path=collector_ready,
                     stop_path=collector_stop,
                     contact_progress_path=contact_progress_path,
+                    command_progress_path=command_progress_path,
+                    command_progress_run_id=stage['run_id'],
                 ),
                 wall_timeout_s=370.0,
             )
@@ -1284,6 +1315,8 @@ class BenchmarkRunner:
                     str(driver_arm),
                     '--armed-file',
                     str(driver_armed),
+                    '--command-progress-file',
+                    str(command_progress_path),
                     '--run-id',
                     stage['run_id'],
                     '--coverage-manifest',
@@ -1375,6 +1408,13 @@ class BenchmarkRunner:
                 ready=driver_ready_document,
                 request=arm_request,
                 request_sha256=arm_request_sha256,
+                command_progress=load_canonical_json(
+                    command_progress_path,
+                    maximum_bytes=driver_ready_document['arm_protocol']['command_delivery_probe'][
+                        'progress_max_bytes'
+                    ],
+                ),
+                command_progress_sha256=file_sha256(command_progress_path),
             )
             _require_processes_alive((launch, collector, driver), stage='positive_driver_armed')
             driver_status = driver.wait(50.0)
@@ -1498,6 +1538,7 @@ class BenchmarkRunner:
                 driver_ready_path=driver_ready,
                 arm_request_path=driver_arm,
                 armed_ack_path=driver_armed,
+                command_progress_path=command_progress_path,
                 runtime_gate_path=runtime_gate_path,
                 manifest_path=self.workspace / 'config/collision-coverage.yaml',
                 collector_configuration_sha256=binding['collector_configuration_sha256'],

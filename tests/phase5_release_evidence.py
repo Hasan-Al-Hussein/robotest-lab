@@ -391,6 +391,7 @@ PHASE3_POSITIVE_PROCESS_ROLES = (
 PHASE3_POSITIVE_TOP_LEVEL_COMPONENT_PATHS = frozenset(
     {
         'capture.json',
+        'command-progress.json',
         'contact-control-result.json',
         'contact-control-result.json.sha256',
         'contact-control.ready.json',
@@ -1150,6 +1151,7 @@ def _validate_positive_component_processes(
     ready_path = str((positive_directory / 'contact-control.ready.json').resolve())
     arm_path = str((positive_directory / 'contact-control.arm.json').resolve())
     armed_path = str((positive_directory / 'contact-control.armed.json').resolve())
+    command_progress_path = str((positive_directory / 'command-progress.json').resolve())
     expected_commands = {
         'domain_preflight': [
             'python3',
@@ -1188,6 +1190,10 @@ def _validate_positive_component_processes(
             str((positive_directory / 'metrics.stop').resolve()),
             '--contact-progress-file',
             str((positive_directory / 'contact-progress.json').resolve()),
+            '--command-progress-file',
+            command_progress_path,
+            '--command-progress-run-id',
+            run_id,
             '--wall-timeout-s',
             '360',
             '--ros-args',
@@ -1207,6 +1213,8 @@ def _validate_positive_component_processes(
             arm_path,
             '--armed-file',
             armed_path,
+            '--command-progress-file',
+            command_progress_path,
             '--run-id',
             run_id,
             '--coverage-manifest',
@@ -3309,6 +3317,7 @@ def _phase3_evidence(
     positive_marker_path = positive_directory / 'PASS.json'
     positive_result_path = positive_directory / 'contact-control-result.json'
     positive_capture_path = positive_directory / 'capture.json'
+    positive_command_progress_path = positive_directory / 'command-progress.json'
     positive_contact_progress_path = positive_directory / 'contact-progress.json'
     positive_driver_ready_path = positive_directory / 'contact-control.ready.json'
     positive_arm_request_path = positive_directory / 'contact-control.arm.json'
@@ -3332,6 +3341,11 @@ def _phase3_evidence(
         positive_capture_path,
         'Phase 3 positive-control capture',
         maximum_bytes=PHASE3_RESULT_JSON_MAX_BYTES,
+    )
+    _load_canonical_json(
+        positive_command_progress_path,
+        'Phase 3 positive-control command progress',
+        maximum_bytes=4_096,
     )
     _load_canonical_json(
         positive_contact_progress_path,
@@ -3562,6 +3576,7 @@ def _phase3_evidence(
         == {
             'checksum_verified': True,
             'collector_capture_sha256': positive_binding.get('capture_sha256'),
+            'collector_command_progress_sha256': file_sha256(positive_command_progress_path),
             'collector_reconciled': True,
             'owned_process_group_shutdown': True,
         }
@@ -3571,6 +3586,9 @@ def _phase3_evidence(
             'captured_exact_pair_count',
             'captured_release_expected_pair_count',
             'captured_release_snapshot_count',
+            'command_progress_artifact_sha256',
+            'command_progress_observed_steady_ns',
+            'command_progress_stamp_ns',
             'contact_projection_episode_count',
             'contact_projection_first_stamp_ns',
             'contact_projection_record_count',
@@ -3592,6 +3610,7 @@ def _phase3_evidence(
             for key, value in collector_reconciliation.items()
             if key
             not in {
+                'command_progress_artifact_sha256',
                 'contact_progress_artifact_sha256',
                 'contact_projection_sha256',
                 'release_delivery_clock_offset_ns',
@@ -3600,6 +3619,12 @@ def _phase3_evidence(
         and _passive_release_clock_offset_is_consistent(collector_reconciliation)
         and isinstance(collector_reconciliation['contact_progress_artifact_sha256'], str)
         and isinstance(collector_reconciliation['contact_projection_sha256'], str)
+        and isinstance(collector_reconciliation['command_progress_artifact_sha256'], str)
+        and re.fullmatch(
+            r'[0-9a-f]{64}',
+            collector_reconciliation['command_progress_artifact_sha256'],
+        )
+        is not None
         and re.fullmatch(
             r'[0-9a-f]{64}',
             collector_reconciliation['contact_progress_artifact_sha256'],
@@ -3609,8 +3634,10 @@ def _phase3_evidence(
         is not None
         and collector_reconciliation['contact_progress_artifact_sha256']
         == file_sha256(positive_contact_progress_path)
+        and collector_reconciliation['command_progress_artifact_sha256']
+        == file_sha256(positive_command_progress_path)
         and collector_reconciliation['captured_command_count']
-        >= collector_reconciliation['component_command_count']
+        == collector_reconciliation['component_command_count'] + 1
         and collector_reconciliation['captured_exact_pair_count']
         == collector_reconciliation['component_exact_pair_count']
         and collector_reconciliation['contact_projection_episode_count'] == 1
@@ -3681,6 +3708,7 @@ def _phase3_evidence(
             result_path=positive_result_path,
             capture_path=positive_capture_path,
             contact_progress_path=positive_contact_progress_path,
+            command_progress_path=positive_command_progress_path,
             driver_ready_path=positive_driver_ready_path,
             arm_request_path=positive_arm_request_path,
             armed_ack_path=positive_armed_ack_path,

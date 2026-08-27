@@ -31,13 +31,18 @@ from robotest_scenarios.artifacts import canonical_json_bytes, write_canonical_j
 from robotest_scenarios.constants import (
     ACTION_STATUS_TOPIC,
     CONTROL_ARM_REQUEST_MAX_BYTES,
+    CONTROL_ARM_SCHEMA_VERSION,
     CONTROL_COMMAND_PERIOD_NS,
+    CONTROL_COMMAND_PROGRESS_MAX_BYTES,
+    CONTROL_COMMAND_PROGRESS_SCHEMA_VERSION,
+    CONTROL_COMMAND_REQUIRED_SUBSCRIPTION_COUNT,
     CONTROL_REVERSE_MPS,
 )
 from robotest_scenarios.contact_control_driver import (
     ContactControlApp,
     ContactControlNode,
     _decode_arm_request,
+    _decode_command_progress,
     _read_regular_nonsymlink,
 )
 from robotest_scenarios.contact_evidence import load_coverage_manifest
@@ -77,6 +82,18 @@ def _init_ros() -> None:
     rclpy.init(args=['--ros-args', '-r', '__ns:=/robotest'])
 
 
+class _FakeCommandPublisher:
+    def __init__(self) -> None:
+        self.matched_subscription_count = 1
+        self.published: list[object] = []
+
+    def get_subscription_count(self) -> int:
+        return self.matched_subscription_count
+
+    def publish(self, message: object) -> None:
+        self.published.append(message)
+
+
 class _ArmTestNode:
     def __init__(self, acknowledgment_path: Path) -> None:
         self.acknowledgment_path = acknowledgment_path
@@ -84,9 +101,14 @@ class _ArmTestNode:
         self.clock_seen = True
         self.control_started_stamp_ns = None
         self.current_sim_stamp_ns = 2_000_000_000
+        self.command_publisher = _FakeCommandPublisher()
         self.fatal_error = None
         self.first_qualifying_contact = None
         self.motion_armed = False
+
+    @staticmethod
+    def resolve_topic_name(name: str) -> str:
+        return f'/robotest/{name}'
 
     def arm_motion(self) -> None:
         assert self.acknowledgment_path.is_file()
@@ -106,6 +128,7 @@ def _arm_test_app(tmp_path: Path) -> ContactControlApp:
         ready_path=tmp_path / 'ready.json',
         arm_path=tmp_path / 'arm.json',
         armed_path=tmp_path / 'armed.json',
+        command_progress_path=tmp_path / 'command-progress.json',
         run_id='arm-test',
         wall_timeout_s=30.0,
         service_timeout_s=2.0,
@@ -126,7 +149,31 @@ def _arm_request(app: ContactControlApp, *, ready_sha256: str | None = None) -> 
         'ready_sha256': app.ready_sha256 if ready_sha256 is None else ready_sha256,
         'run_id': app.run_id,
         'runtime_gate_sha256': 'b' * 64,
-        'schema_version': 1,
+        'schema_version': CONTROL_ARM_SCHEMA_VERSION,
+    }
+
+
+def _command_progress(
+    app: ContactControlApp,
+    *,
+    observed_steady_ns: int | None = None,
+    retained_command_count: int = 1,
+    run_id: str | None = None,
+    stamp_ns: int | None = None,
+) -> dict[str, object]:
+    return {
+        'angular_z_rad_s': 0.0,
+        'linear_x_m_s': 0.0,
+        'linear_y_m_s': 0.0,
+        'observed_steady_ns': (
+            time.monotonic_ns() if observed_steady_ns is None else observed_steady_ns
+        ),
+        'producer': 'robotest_metrics/metrics_collector',
+        'public_topic': '/robotest/cmd_vel',
+        'retained_command_count': retained_command_count,
+        'run_id': app.run_id if run_id is None else run_id,
+        'schema_version': CONTROL_COMMAND_PROGRESS_SCHEMA_VERSION,
+        'stamp_ns': app._node.current_sim_stamp_ns if stamp_ns is None else stamp_ns,
     }
 
 
@@ -150,6 +197,7 @@ def test_contact_spawn_success_returns_complete_ready_and_result_projection(
         ready_path=tmp_path / 'ready.json',
         arm_path=tmp_path / 'arm.json',
         armed_path=tmp_path / 'armed.json',
+        command_progress_path=tmp_path / 'command-progress.json',
         run_id='spawn-projection-test',
         wall_timeout_s=30.0,
         service_timeout_s=2.0,
@@ -216,11 +264,21 @@ def test_contact_arm_waits_for_request_and_strictly_newer_positive_clock(
         elif spin_count == 3:
             node.clock_sample_count += 1
             node.current_sim_stamp_ns += 1
+        elif spin_count == 4:
+            node.command_publisher.matched_subscription_count = (
+                CONTROL_COMMAND_REQUIRED_SUBSCRIPTION_COUNT
+            )
+        elif spin_count == 5:
+            write_canonical_json(
+                app.command_progress_path,
+                _command_progress(app),
+                write_sidecar=False,
+            )
 
     monkeypatch.setattr(app, '_spin_once', spin_once)
     app._wait_for_arm()
 
-    assert spin_count == 3
+    assert spin_count == 5
     assert node.motion_armed
     acknowledgment_bytes = app.armed_path.read_bytes()
     acknowledgment = json.loads(acknowledgment_bytes)
@@ -230,6 +288,25 @@ def test_contact_arm_waits_for_request_and_strictly_newer_positive_clock(
     assert acknowledgment['arm_observed_sim_stamp_ns'] == 2_000_000_000
     assert acknowledgment['armed_sim_stamp_ns'] == 2_000_000_001
     assert acknowledgment['arm_request_sha256'] == app.arm_request_sha256
+    probe = acknowledgment['command_delivery_probe']
+    assert probe['matched_subscription_count'] == 2
+    assert probe['required_subscription_count'] == 2
+    assert (
+        acknowledgment['arm_observed_steady_ns']
+        <= probe['match_observed_steady_ns']
+        <= probe['probe_publish_started_steady_ns']
+        <= probe['probe_publish_returned_steady_ns']
+        <= acknowledgment['armed_steady_ns']
+    )
+    assert (
+        probe['probe_publish_started_steady_ns']
+        <= probe['collector_progress_observed_steady_ns']
+        <= acknowledgment['armed_steady_ns']
+    )
+    assert abs(probe['collector_progress_stamp_ns'] - probe['probe_sim_stamp_ns']) <= 100_000_000
+    assert len(node.command_publisher.published) == 1
+    safe_zero = node.command_publisher.published[0]
+    assert safe_zero.linear.x == safe_zero.linear.y == safe_zero.angular.z == 0.0
     assert app.armed_acknowledgment_sha256 == hashlib.sha256(acknowledgment_bytes).hexdigest()
 
     node.first_qualifying_contact = {'sim_stamp_ns': node.current_sim_stamp_ns}
@@ -239,6 +316,232 @@ def test_contact_arm_waits_for_request_and_strictly_newer_positive_clock(
         <= app.first_nonzero_publish_started_steady_ns
         <= app.first_nonzero_publish_returned_steady_ns
     )
+
+
+def test_contact_arm_rejects_more_than_two_command_subscriptions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _arm_test_app(tmp_path)
+    node = app._node
+    node.command_publisher.matched_subscription_count = 3
+    write_canonical_json(app.arm_path, _arm_request(app), write_sidecar=False)
+
+    def fresh_clock() -> None:
+        node.clock_sample_count += 1
+        node.current_sim_stamp_ns += 1
+
+    monkeypatch.setattr(app, '_spin_once', fresh_clock)
+    with pytest.raises(InfrastructureError, match='more than two matched subscriptions'):
+        app._wait_for_arm()
+
+    assert node.command_publisher.published == []
+    assert app.armed_acknowledgment is None
+    assert not node.motion_armed
+
+
+def test_contact_arm_rejects_stale_command_progress_before_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _arm_test_app(tmp_path)
+    node = app._node
+    node.command_publisher.matched_subscription_count = 2
+    write_canonical_json(app.arm_path, _arm_request(app), write_sidecar=False)
+    write_canonical_json(
+        app.command_progress_path,
+        _command_progress(app),
+        write_sidecar=False,
+    )
+
+    def fresh_clock() -> None:
+        node.clock_sample_count += 1
+        node.current_sim_stamp_ns += 1
+
+    monkeypatch.setattr(app, '_spin_once', fresh_clock)
+    with pytest.raises(ProtocolError, match='command progress path is not fresh'):
+        app._wait_for_arm()
+
+    assert node.command_publisher.published == []
+    assert not node.motion_armed
+
+
+@pytest.mark.parametrize(
+    ('updates', 'message'),
+    [
+        ({'run_id': 'wrong-run'}, 'belongs to another run'),
+        ({'retained_command_count': 2}, 'not the first command'),
+        ({'linear_x_m_s': 0.05}, 'did not retain safe zero'),
+        ({'public_topic': '/wrong/cmd_vel'}, 'topic is not frozen'),
+    ],
+)
+def test_contact_arm_rejects_wrong_command_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    updates: dict[str, object],
+    message: str,
+) -> None:
+    app = _arm_test_app(tmp_path)
+    node = app._node
+    node.command_publisher.matched_subscription_count = 2
+    write_canonical_json(app.arm_path, _arm_request(app), write_sidecar=False)
+    spin_count = 0
+
+    def spin_once() -> None:
+        nonlocal spin_count
+        spin_count += 1
+        if spin_count == 1:
+            node.clock_sample_count += 1
+            node.current_sim_stamp_ns += 1
+        elif node.command_publisher.published:
+            progress = _command_progress(app)
+            progress.update(updates)
+            write_canonical_json(
+                app.command_progress_path,
+                progress,
+                write_sidecar=False,
+            )
+
+    monkeypatch.setattr(app, '_spin_once', spin_once)
+    with pytest.raises(ProtocolError, match=message):
+        app._wait_for_arm()
+
+    assert len(node.command_publisher.published) == 1
+    assert app.armed_acknowledgment is None
+    assert not node.motion_armed
+
+
+@pytest.mark.parametrize('sim_delta_ns', [-100_000_001, 100_000_001])
+def test_contact_arm_rejects_command_progress_outside_absolute_sim_bracket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sim_delta_ns: int,
+) -> None:
+    app = _arm_test_app(tmp_path)
+    node = app._node
+    node.command_publisher.matched_subscription_count = 2
+    write_canonical_json(app.arm_path, _arm_request(app), write_sidecar=False)
+    spin_count = 0
+
+    def spin_once() -> None:
+        nonlocal spin_count
+        spin_count += 1
+        if spin_count == 1:
+            node.clock_sample_count += 1
+            node.current_sim_stamp_ns += 1
+        elif node.command_publisher.published:
+            write_canonical_json(
+                app.command_progress_path,
+                _command_progress(app, stamp_ns=node.current_sim_stamp_ns + sim_delta_ns),
+                write_sidecar=False,
+            )
+
+    monkeypatch.setattr(app, '_spin_once', spin_once)
+    with pytest.raises(ProtocolError, match='missed its 100 ms sim bracket'):
+        app._wait_for_arm()
+
+    assert not node.motion_armed
+    assert not app.armed_path.exists()
+
+
+def test_command_progress_accepts_callback_before_publish_return_and_lagging_clock(
+    tmp_path: Path,
+) -> None:
+    app = _arm_test_app(tmp_path)
+    progress = _command_progress(
+        app,
+        observed_steady_ns=150,
+        stamp_ns=app._node.current_sim_stamp_ns - 100_000_000,
+    )
+
+    assert app._validate_command_progress(
+        progress,
+        probe_publish_started_steady_ns=100,
+        probe_sim_stamp_ns=app._node.current_sim_stamp_ns,
+        progress_read_complete_steady_ns=250,
+    ) == (app._node.current_sim_stamp_ns - 100_000_000, 150)
+
+
+def test_contact_arm_rejects_progress_that_precedes_probe_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _arm_test_app(tmp_path)
+    node = app._node
+    node.command_publisher.matched_subscription_count = 2
+    write_canonical_json(app.arm_path, _arm_request(app), write_sidecar=False)
+    spin_count = 0
+
+    def spin_once() -> None:
+        nonlocal spin_count
+        spin_count += 1
+        if spin_count == 1:
+            node.clock_sample_count += 1
+            node.current_sim_stamp_ns += 1
+        elif node.command_publisher.published:
+            write_canonical_json(
+                app.command_progress_path,
+                _command_progress(app, observed_steady_ns=1),
+                write_sidecar=False,
+            )
+
+    monkeypatch.setattr(app, '_spin_once', spin_once)
+    with pytest.raises(ProtocolError, match='steady ordering is invalid'):
+        app._wait_for_arm()
+
+    assert not node.motion_armed
+    assert not app.armed_path.exists()
+
+
+def test_command_progress_decoder_requires_exact_canonical_schema() -> None:
+    progress = {
+        'angular_z_rad_s': 0.0,
+        'linear_x_m_s': 0.0,
+        'linear_y_m_s': 0.0,
+        'observed_steady_ns': 2,
+        'producer': 'robotest_metrics/metrics_collector',
+        'public_topic': '/robotest/cmd_vel',
+        'retained_command_count': 1,
+        'run_id': 'control-1',
+        'schema_version': 1,
+        'stamp_ns': 1,
+    }
+    canonical = canonical_json_bytes(progress)
+    assert _decode_command_progress(canonical) == progress
+    with pytest.raises(ProtocolError, match='exact canonical'):
+        _decode_command_progress(json.dumps(progress).encode('utf-8'))
+    with pytest.raises(ProtocolError, match='fields do not match'):
+        _decode_command_progress(canonical_json_bytes({**progress, 'extra': 1}))
+    with pytest.raises(ProtocolError, match='byte bound'):
+        _decode_command_progress(b' ' * (CONTROL_COMMAND_PROGRESS_MAX_BYTES + 1))
+
+
+def test_command_progress_reader_rejects_symlink(tmp_path: Path) -> None:
+    target = tmp_path / 'progress-target.json'
+    write_canonical_json(
+        target,
+        {
+            'angular_z_rad_s': 0.0,
+            'linear_x_m_s': 0.0,
+            'linear_y_m_s': 0.0,
+            'observed_steady_ns': 2,
+            'producer': 'robotest_metrics/metrics_collector',
+            'public_topic': '/robotest/cmd_vel',
+            'retained_command_count': 1,
+            'run_id': 'control-1',
+            'schema_version': 1,
+            'stamp_ns': 1,
+        },
+        write_sidecar=False,
+    )
+    progress_path = tmp_path / 'command-progress.json'
+    progress_path.symlink_to(target)
+    with pytest.raises(ProtocolError, match='regular non-symlink'):
+        _read_regular_nonsymlink(
+            progress_path,
+            maximum_bytes=CONTROL_COMMAND_PROGRESS_MAX_BYTES,
+            label='contact-control command progress',
+        )
 
 
 def test_contact_arm_timeout_cannot_arm_or_publish(tmp_path: Path) -> None:
@@ -291,6 +594,13 @@ def test_contact_arm_ack_commit_crossing_deadline_is_retained_without_arming(
     def spin_once() -> None:
         node.clock_sample_count += 1
         node.current_sim_stamp_ns += 1
+        node.command_publisher.matched_subscription_count = 2
+        if node.command_publisher.published and not app.command_progress_path.exists():
+            write_canonical_json(
+                app.command_progress_path,
+                _command_progress(app),
+                write_sidecar=False,
+            )
 
     def crossing_write(path: Path, value: object, **kwargs: object) -> str:
         digest = write_canonical_json(path, value, **kwargs)
@@ -327,6 +637,13 @@ def test_contact_first_nonzero_rechecks_wall_deadline_after_ack(
     def spin_once() -> None:
         node.clock_sample_count += 1
         node.current_sim_stamp_ns += 1
+        node.command_publisher.matched_subscription_count = 2
+        if node.command_publisher.published and not app.command_progress_path.exists():
+            write_canonical_json(
+                app.command_progress_path,
+                _command_progress(app),
+                write_sidecar=False,
+            )
 
     monkeypatch.setattr(app, '_spin_once', spin_once)
     app._wait_for_arm()
@@ -1098,6 +1415,7 @@ def test_contact_cleanup_retains_successful_response_when_quiet_wait_fails(
         ready_path=tmp_path / 'ready.json',
         arm_path=tmp_path / 'arm.json',
         armed_path=tmp_path / 'armed.json',
+        command_progress_path=tmp_path / 'command-progress.json',
         run_id='cleanup-proof-test',
         wall_timeout_s=1.0,
         service_timeout_s=1.0,

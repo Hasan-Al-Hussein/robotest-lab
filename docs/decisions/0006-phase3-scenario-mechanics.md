@@ -419,15 +419,21 @@ Motion uses this frozen fail-closed authorization sequence:
    missing, stale, oversized, symlinked, malformed, noncanonical, wrong-run,
    wrong-producer, or hash-mismatched ARM evidence.
 4. After accepting ARM, the driver records its current clock sample and keeps
-   spinning until a strictly newer positive `/clock` sample arrives. It then
-   atomically writes the driver-owned ARMED acknowledgement bound to ARM, READY,
-   and runtime-gate evidence.
-5. Only a valid ARMED acknowledgement permits the first nonzero command. The
-   retained timing evidence must prove runtime-gate completion before ARM
-   authorization, driver observation before fresh-clock arming, and arming
-   before the first nonzero publication. Any missing artifact, hash mismatch,
-   or ordering violation fails closed. A best-effort zero remains allowed
-   before arm solely for fail-safe cleanup.
+   spinning until a strictly newer positive `/clock` sample arrives.
+5. The driver requires exactly two subscriptions matched to its command
+   publisher, publishes one untracked safe-zero probe, and waits for the
+   collector's canonical first-retained-command progress artifact. It validates
+   the artifact hash, schema, producer, run ID, topic, single zero-valued
+   command, callback time, and simulation stamp. Evidence must satisfy
+   `arm_observed <= match <= publish_start <= publish_return <= armed` and
+   `publish_start <= collector_observed <= armed` in steady time, plus
+   `arm_observed_sim < probe_sim <= armed_sim` and an absolute 100 ms bracket
+   between the probe and retained-command simulation stamps.
+6. The driver atomically writes the driver-owned ARMED acknowledgement bound to
+   ARM, READY, runtime-gate, and command-progress evidence. Only a valid ARMED
+   acknowledgement permits the first nonzero command. Any missing artifact,
+   hash mismatch, cardinality error, or ordering violation fails closed. A
+   best-effort zero remains allowed before arm solely for fail-safe cleanup.
 
 During preparation, before READY, the driver spawns:
 
@@ -449,8 +455,9 @@ retained authoritative snapshot `q` with the wall absent and
 `q > final_zero_stamp + 0.25 s`; equality and a clock-only target do not close
 the episode. The collector acknowledges and retains that exact `q`. A `30 s`
 steady-wall escape bounds the complete fixture, including preparation, the
-stationary runtime gate, ARM and fresh-clock waits, motion, release, and
-cleanup. READY, ARM, and ARMED do not start or reset that deadline.
+stationary runtime gate, ARM, fresh-clock, matched-subscription, and delivered
+zero-probe waits, motion, release, and cleanup. READY, ARM, and ARMED do not
+start or reset that deadline.
 
 The expected non-excluded pair is the coverage manifest's exact rendered
 chassis collision and
@@ -463,9 +470,11 @@ Passive collector callback offsets are retained as noncausal diagnostics; the
 active driver's own callback-time bound remains fail-closed. Exact graph
 endpoint cardinality/GID continuity, the final command being zero, false
 collector overflows, actor deletion, and termination of both owned process
-groups are also required. Every component command publication must have a
-distinct collector observation within `0.10 s`; the active contact stop retains
-the same `0.10 s` maximum response bound.
+groups are also required. The captured command stream begins with the distinct
+delivered zero probe and then contains exactly one observation for every
+component command publication within `0.10 s`; its cardinality is exactly the
+component trace length plus one, with no unmatched record. The active contact
+stop retains the same `0.10 s` maximum response bound.
 
 The coverage manifest, not this one chassis contact alone, must enumerate and
 bind every rendered robot collision geometry. A chassis-only production

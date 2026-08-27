@@ -81,7 +81,7 @@ def test_contact_arm_evidence_schema_requires_complete_passing_proof() -> None:
         'ready_sha256': sha,
         'run_id': 'control-1',
         'runtime_gate_sha256': sha,
-        'schema_version': 1,
+        'schema_version': 2,
     }
     acknowledgment = {
         'arm_observed_clock_sample_count': 3,
@@ -93,11 +93,22 @@ def test_contact_arm_evidence_schema_requires_complete_passing_proof() -> None:
         'armed_clock_sample_count': 4,
         'armed_sim_stamp_ns': 101,
         'armed_steady_ns': 40,
+        'command_delivery_probe': {
+            'collector_progress_observed_steady_ns': 39,
+            'collector_progress_sha256': sha,
+            'collector_progress_stamp_ns': 101,
+            'matched_subscription_count': 2,
+            'match_observed_steady_ns': 35,
+            'probe_publish_returned_steady_ns': 38,
+            'probe_publish_started_steady_ns': 37,
+            'probe_sim_stamp_ns': 100,
+            'required_subscription_count': 2,
+        },
         'producer': 'robotest_scenarios/contact_control_driver',
         'ready_sha256': sha,
         'run_id': 'control-1',
         'runtime_gate_sha256': sha,
-        'schema_version': 1,
+        'schema_version': 2,
     }
     evidence = {
         'acknowledgment': acknowledgment,

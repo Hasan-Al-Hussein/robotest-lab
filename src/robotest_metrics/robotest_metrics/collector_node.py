@@ -57,6 +57,8 @@ from robotest_metrics.errors import ArtifactError
 
 FeedbackMessage = FollowWaypoints.Impl.FeedbackMessage
 PUBLIC_CONTACT_SNAPSHOT_TOPIC = '/robotest/validation/contacts'
+PUBLIC_COMMAND_TOPIC = '/robotest/cmd_vel'
+COMMAND_PROGRESS_MAX_BYTES = 4_096
 
 
 def _qos(depth: int, *, reliable: bool) -> QoSProfile:
@@ -285,14 +287,27 @@ def _fault_event_item(message: FaultEvent) -> dict[str, Any]:
 class MetricsCollectorNode(Node):
     """Normalize only observed ROS messages into a bounded ``CollectorCore``."""
 
-    def __init__(self, *, contact_progress_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        contact_progress_path: Path | None = None,
+        command_progress_path: Path | None = None,
+        command_progress_run_id: str | None = None,
+    ) -> None:
         """Create subscriptions for every Phase 3 observer stream."""
+        if (command_progress_path is None) != (command_progress_run_id is None):
+            raise ValueError(
+                'command_progress_path and command_progress_run_id must be provided together'
+            )
         super().__init__(
             'metrics_collector',
             parameter_overrides=[Parameter('use_sim_time', value=True)],
         )
         self.core = CollectorCore()
         self.contact_progress_path = contact_progress_path
+        self.command_progress_path = command_progress_path
+        self.command_progress_run_id = command_progress_run_id
+        self.command_progress_written = False
         self.retained_contact_message_count = 0
         self.latest_retained_contact_stamp_ns: int | None = None
         self.pre_clock_contact_message_count = 0
@@ -411,15 +426,37 @@ class MetricsCollectorNode(Node):
         self.core.observe_clock(stamp)
 
     def _on_cmd_vel(self, message: Twist) -> None:
-        self.core.record(
+        stamp_ns = self._callback_stamp_ns()
+        item = {
+            'angular_z_rad_s': float(message.angular.z),
+            'linear_x_m_s': float(message.linear.x),
+            'linear_y_m_s': float(message.linear.y),
+            'stamp_ns': stamp_ns,
+        }
+        retained = self.core.record(
             'cmd_vel',
-            {
-                'angular_z_rad_s': float(message.angular.z),
-                'linear_x_m_s': float(message.linear.x),
-                'linear_y_m_s': float(message.linear.y),
-                'stamp_ns': self._callback_stamp_ns(),
-            },
+            item,
         )
+        if not retained or self.command_progress_path is None or self.command_progress_written:
+            return
+        assert self.command_progress_run_id is not None
+        write_json_atomic(
+            {
+                'angular_z_rad_s': item['angular_z_rad_s'],
+                'linear_x_m_s': item['linear_x_m_s'],
+                'linear_y_m_s': item['linear_y_m_s'],
+                'observed_steady_ns': time.monotonic_ns(),
+                'producer': 'robotest_metrics/metrics_collector',
+                'public_topic': PUBLIC_COMMAND_TOPIC,
+                'retained_command_count': 1,
+                'run_id': self.command_progress_run_id,
+                'schema_version': 1,
+                'stamp_ns': stamp_ns,
+            },
+            self.command_progress_path,
+            maximum_bytes=COMMAND_PROGRESS_MAX_BYTES,
+        )
+        self.command_progress_written = True
 
     def _on_contacts(self, message: Contacts) -> None:
         if self.latest_clock_ns is None or self.latest_clock_ns <= 0:
@@ -538,6 +575,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--ready-file', required=True, type=Path)
     parser.add_argument('--stop-file', required=True, type=Path)
     parser.add_argument('--contact-progress-file', required=True, type=Path)
+    parser.add_argument('--command-progress-file', type=Path)
+    parser.add_argument('--command-progress-run-id')
     parser.add_argument('--wall-timeout-s', type=float, default=360.0)
     return parser
 
@@ -559,7 +598,12 @@ def _wait_for_startup_ready(
 def main(argv: Sequence[str] | None = None) -> int:
     """Run until the stop-file appears or the bounded wall deadline expires."""
     raw_arguments = list(sys.argv) if argv is None else [sys.argv[0], *argv]
-    arguments = _parser().parse_args(remove_ros_args(args=raw_arguments)[1:])
+    parser = _parser()
+    arguments = parser.parse_args(remove_ros_args(args=raw_arguments)[1:])
+    if (arguments.command_progress_file is None) != (arguments.command_progress_run_id is None):
+        raise SystemExit(
+            '--command-progress-file and --command-progress-run-id must be provided together'
+        )
     if not math.isfinite(arguments.wall_timeout_s) or arguments.wall_timeout_s <= 0.0:
         raise SystemExit('--wall-timeout-s must be finite and positive')
     for label, path in (
@@ -570,6 +614,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         if path.exists():
             raise SystemExit(f'stale {label} file already exists: {path}')
+    if arguments.command_progress_file is not None and (
+        arguments.command_progress_file.exists() or arguments.command_progress_file.is_symlink()
+    ):
+        raise SystemExit(
+            f'stale command progress file already exists: {arguments.command_progress_file}'
+        )
     artifact_paths = {
         path.expanduser().resolve()
         for path in (
@@ -581,13 +631,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     if len(artifact_paths) != 4:
         raise SystemExit('output, ready, stop, and contact-progress paths must be distinct')
+    if arguments.command_progress_file is not None:
+        resolved_command_progress = arguments.command_progress_file.expanduser().resolve()
+        if resolved_command_progress in artifact_paths:
+            raise SystemExit(
+                'command-progress path must be distinct from output, ready, stop, '
+                'and contact-progress paths'
+            )
     rclpy.init(args=raw_arguments)
     node: MetricsCollectorNode | None = None
     timed_out = False
     runtime_interrupted = False
     started_wall_ns = time.monotonic_ns()
     try:
-        node = MetricsCollectorNode(contact_progress_path=arguments.contact_progress_file)
+        node = MetricsCollectorNode(
+            contact_progress_path=arguments.contact_progress_file,
+            command_progress_path=arguments.command_progress_file,
+            command_progress_run_id=arguments.command_progress_run_id,
+        )
         deadline = time.monotonic() + arguments.wall_timeout_s
         startup_ready = _wait_for_startup_ready(
             node,

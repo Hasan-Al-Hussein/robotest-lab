@@ -443,6 +443,7 @@ def test_positive_control_runtime_gate_finishes_before_motion_arm() -> None:
     arm_write = positive_source.index('arm_request_sha256 = atomic_write_json(')
     arm_ack = positive_source.index("stage='positive_driver_armed'")
     driver_wait = positive_source.index('driver_status = driver.wait(50.0)')
+    progress_validation = positive_source.index('command_progress=load_canonical_json(')
 
     assert (
         driver_ready < runtime_gate
@@ -450,10 +451,13 @@ def test_positive_control_runtime_gate_finishes_before_motion_arm() -> None:
         and group_empty < owners_alive
         and owners_alive < arm_write
         and arm_write < arm_ack
+        and arm_ack < progress_validation
+        and progress_validation < driver_wait
         and arm_ack < driver_wait
     )
     assert "'--arm-file'" in positive_source
     assert "'--armed-file'" in positive_source
+    assert "'--command-progress-file'" in positive_source
 
 
 def test_contact_control_arm_paths_must_be_fresh_and_distinct(tmp_path: Path) -> None:
@@ -930,6 +934,29 @@ def test_trial_collector_and_drain_wait_share_exact_contact_progress_path(
     progress_option = command.index('--contact-progress-file')
     assert command[progress_option + 1] == str(contact_progress_path)
     assert command.count(str(contact_progress_path)) == 1
+
+    command_progress_path = tmp_path / 'command-progress.json'
+    positive_command = runner._metrics_collector_command(
+        capture_path=tmp_path / 'positive-capture.json',
+        ready_path=tmp_path / 'positive-metrics.ready.json',
+        stop_path=tmp_path / 'positive-metrics.stop',
+        contact_progress_path=tmp_path / 'positive-contact-progress.json',
+        command_progress_path=command_progress_path,
+        command_progress_run_id='candidate-positive-control',
+    )
+    command_progress_option = positive_command.index('--command-progress-file')
+    command_progress_run_option = positive_command.index('--command-progress-run-id')
+    assert positive_command[command_progress_option + 1] == str(command_progress_path)
+    assert positive_command[command_progress_run_option + 1] == 'candidate-positive-control'
+    assert command_progress_option < command_progress_run_option
+    with pytest.raises(runner.EvidenceError, match='supplied together'):
+        runner._metrics_collector_command(
+            capture_path=tmp_path / 'invalid-capture.json',
+            ready_path=tmp_path / 'invalid-metrics.ready.json',
+            stop_path=tmp_path / 'invalid-metrics.stop',
+            contact_progress_path=tmp_path / 'invalid-contact-progress.json',
+            command_progress_path=command_progress_path,
+        )
 
     orchestration.atomic_write_json(
         contact_progress_path,

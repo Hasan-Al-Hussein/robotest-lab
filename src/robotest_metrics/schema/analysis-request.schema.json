@@ -47,12 +47,14 @@
               "required": [
                 "checksum_verified",
                 "collector_capture_sha256",
+                "collector_command_progress_sha256",
                 "collector_reconciled",
                 "owned_process_group_shutdown"
               ],
               "properties": {
                 "checksum_verified": {"type": "boolean"},
                 "collector_capture_sha256": {"$ref": "#/$defs/sha256"},
+                "collector_command_progress_sha256": {"$ref": "#/$defs/sha256"},
                 "collector_reconciled": {"type": "boolean"},
                 "owned_process_group_shutdown": {"type": "boolean"}
               }

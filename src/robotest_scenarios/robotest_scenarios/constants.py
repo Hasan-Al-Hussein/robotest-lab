@@ -94,8 +94,17 @@ CONTROL_ARM_ACK_PRODUCER = 'robotest_scenarios/contact_control_driver'
 CONTROL_ARM_FRESH_CLOCK_POLICY = 'strictly_newer_positive_stamp_after_valid_arm'
 CONTROL_ARM_REQUEST_MAX_BYTES = 4_096
 CONTROL_ARM_REQUEST_PRODUCER = 'robotest_phase3/benchmark_runner'
-CONTROL_ARM_SCHEMA_VERSION = 1
+CONTROL_ARM_SCHEMA_VERSION = 2
 CONTROL_ARM_WAIT_DEADLINE_POLICY = 'complete_fixture_steady_wall_deadline_without_reset'
+CONTROL_COMMAND_DELIVERY_PROBE_MAX_LAG_NS = 100_000_000
+CONTROL_COMMAND_DELIVERY_PROBE_POLICY = (
+    'exact_two_matches_then_one_untracked_zero_with_partial_ordered_collector_progress_before_arm'
+)
+CONTROL_COMMAND_PROGRESS_MAX_BYTES = 4_096
+CONTROL_COMMAND_PROGRESS_PRODUCER = 'robotest_metrics/metrics_collector'
+CONTROL_COMMAND_PROGRESS_SCHEMA_VERSION = 1
+CONTROL_COMMAND_PROGRESS_TOPIC = '/robotest/cmd_vel'
+CONTROL_COMMAND_REQUIRED_SUBSCRIPTION_COUNT = 2
 
 DEFAULT_SERVICE_TIMEOUT_S = 2.0
 DEFAULT_CONTROL_WALL_TIMEOUT_S = 30.0

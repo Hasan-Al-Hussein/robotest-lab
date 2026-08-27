@@ -146,11 +146,23 @@ _ARM_ACKNOWLEDGMENT_FIELDS = {
     'armed_clock_sample_count',
     'armed_sim_stamp_ns',
     'armed_steady_ns',
+    'command_delivery_probe',
     'producer',
     'ready_sha256',
     'run_id',
     'runtime_gate_sha256',
     'schema_version',
+}
+_COMMAND_DELIVERY_PROBE_FIELDS = {
+    'collector_progress_observed_steady_ns',
+    'collector_progress_sha256',
+    'collector_progress_stamp_ns',
+    'matched_subscription_count',
+    'match_observed_steady_ns',
+    'probe_publish_returned_steady_ns',
+    'probe_publish_started_steady_ns',
+    'probe_sim_stamp_ns',
+    'required_subscription_count',
 }
 _ARM_RESULT_FIELDS = {
     'acknowledgment',
@@ -180,7 +192,7 @@ def _validate_contact_control_arm(
     *,
     expected_run_id: str,
     control_configuration: Mapping[str, Any],
-) -> None:
+) -> str:
     """Validate the component-owned motion authorization and fresh-clock barrier."""
     arm = control.get('arm')
     if not isinstance(arm, Mapping) or set(arm) != _ARM_RESULT_FIELDS:
@@ -252,6 +264,56 @@ def _validate_contact_control_arm(
         acknowledgment.get('armed_sim_stamp_ns'),
         'positive_control.control.arm.acknowledgment.armed_sim_stamp_ns',
     )
+    probe_protocol = protocol.get('command_delivery_probe')
+    if not isinstance(probe_protocol, Mapping):
+        raise MetricUnavailable('positive-control command-delivery probe protocol is missing')
+    probe = acknowledgment.get('command_delivery_probe')
+    if not isinstance(probe, Mapping) or set(probe) != _COMMAND_DELIVERY_PROBE_FIELDS:
+        raise MetricUnavailable('positive-control command-delivery probe fields are incomplete')
+    progress_sha256 = _sha256(
+        probe.get('collector_progress_sha256'),
+        'positive_control.control.arm.command_delivery_probe.collector_progress_sha256',
+    )
+    progress_stamp_ns = _positive_int(
+        probe.get('collector_progress_stamp_ns'),
+        'positive_control.control.arm.command_delivery_probe.collector_progress_stamp_ns',
+    )
+    progress_observed_steady_ns = _positive_int(
+        probe.get('collector_progress_observed_steady_ns'),
+        'positive_control.control.arm.command_delivery_probe.collector_progress_observed_steady_ns',
+    )
+    matched_subscription_count = _positive_int(
+        probe.get('matched_subscription_count'),
+        'positive_control.control.arm.command_delivery_probe.matched_subscription_count',
+    )
+    match_observed_steady_ns = _positive_int(
+        probe.get('match_observed_steady_ns'),
+        'positive_control.control.arm.command_delivery_probe.match_observed_steady_ns',
+    )
+    probe_publish_started_steady_ns = _positive_int(
+        probe.get('probe_publish_started_steady_ns'),
+        'positive_control.control.arm.command_delivery_probe.probe_publish_started_steady_ns',
+    )
+    probe_publish_returned_steady_ns = _positive_int(
+        probe.get('probe_publish_returned_steady_ns'),
+        'positive_control.control.arm.command_delivery_probe.probe_publish_returned_steady_ns',
+    )
+    probe_sim_stamp_ns = _positive_int(
+        probe.get('probe_sim_stamp_ns'),
+        'positive_control.control.arm.command_delivery_probe.probe_sim_stamp_ns',
+    )
+    required_subscription_count = _positive_int(
+        probe.get('required_subscription_count'),
+        'positive_control.control.arm.command_delivery_probe.required_subscription_count',
+    )
+    protocol_required_count = _positive_int(
+        probe_protocol.get('required_subscription_count'),
+        'positive_control.control.arm.command_delivery_probe.protocol_required_count',
+    )
+    max_sim_lag_ns = _positive_int(
+        probe_protocol.get('max_sim_lag_ns'),
+        'positive_control.control.arm.command_delivery_probe.max_sim_lag_ns',
+    )
     if (
         acknowledgment.get('arm_protocol_sha256') != protocol_sha256
         or acknowledgment.get('arm_request_sha256') != request_sha256
@@ -271,6 +333,27 @@ def _validate_contact_control_arm(
         raise MetricUnavailable('positive-control arm acknowledgment hash mismatch')
     if armed_clock_count <= observed_clock_count or armed_sim_stamp_ns <= observed_sim_stamp_ns:
         raise MetricUnavailable('positive-control arm acknowledgment lacks a fresh clock sample')
+    if (
+        matched_subscription_count != protocol_required_count
+        or required_subscription_count != protocol_required_count
+        or protocol_required_count != 2
+    ):
+        raise MetricUnavailable('positive-control command-delivery probe match count changed')
+    if not (
+        observed_steady_ns
+        <= match_observed_steady_ns
+        <= probe_publish_started_steady_ns
+        <= probe_publish_returned_steady_ns
+        <= armed_steady_ns
+        and probe_publish_started_steady_ns <= progress_observed_steady_ns <= armed_steady_ns
+    ):
+        raise MetricUnavailable('positive-control command-delivery probe ordering is invalid')
+    if abs(progress_stamp_ns - probe_sim_stamp_ns) > max_sim_lag_ns:
+        raise MetricUnavailable('positive-control command-delivery probe lag is invalid')
+    if not observed_sim_stamp_ns < probe_sim_stamp_ns <= armed_sim_stamp_ns:
+        raise MetricUnavailable(
+            'positive-control command-delivery probe fresh-clock bracket is invalid'
+        )
 
     first_publish_started_ns = _positive_int(
         arm.get('first_nonzero_publish_started_steady_ns'),
@@ -296,6 +379,7 @@ def _validate_contact_control_arm(
         <= first_publish_returned_ns
     ):
         raise MetricUnavailable('positive-control arm steady-time ordering is invalid')
+    return progress_sha256
 
 
 def _require_bounded_buffer(
@@ -941,7 +1025,7 @@ def _positive_control_evidence(
     control = positive_control.get('control')
     if not isinstance(control, Mapping):
         raise MetricUnavailable('positive-control control evidence is missing')
-    _validate_contact_control_arm(
+    command_progress_sha256 = _validate_contact_control_arm(
         control,
         expected_run_id=identity['run_id'],
         control_configuration=expected_control_configuration,
@@ -1705,6 +1789,7 @@ def _positive_control_evidence(
     ):
         raise MetricUnavailable('positive-control retained buffers do not match evidence')
     return {
+        'command_progress_sha256': command_progress_sha256,
         'control_configuration_sha256': configuration['control_configuration_sha256'],
         'driver_source_sha256': driver_source_sha,
         'fixture_sha256': configuration['fixture_sha256'],
@@ -1805,6 +1890,12 @@ def validate_collision_qualification(
         external_quality.get('collector_capture_sha256'),
         'positive_control_external_quality.collector_capture_sha256',
     )
+    external_progress_sha256 = _sha256(
+        external_quality.get('collector_command_progress_sha256'),
+        'positive_control_external_quality.collector_command_progress_sha256',
+    )
+    if external_progress_sha256 != positive_identity['command_progress_sha256']:
+        raise MetricUnavailable('positive-control command-progress hash binding mismatch')
     positive_json_sha = _sha256(
         benchmark_binding.get('positive_control_json_sha256'),
         'benchmark_binding.positive_control_json_sha256',

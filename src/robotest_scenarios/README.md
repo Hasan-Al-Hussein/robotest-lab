@@ -27,6 +27,7 @@ ros2 run robotest_scenarios contact_control_driver \
   --ready-file artifacts/control/contact-control-ready.json \
   --arm-file artifacts/control/contact-control-arm.json \
   --armed-file artifacts/control/contact-control-armed.json \
+  --command-progress-file artifacts/control/command-progress.json \
   --run-id CONTROL \
   --coverage-manifest config/collision-coverage.yaml
 ```
@@ -48,9 +49,20 @@ process group is empty. Only then may the runner atomically write the exact
 run-bound ARM artifact. The driver validates its canonical encoding, exact
 schema and types, run ID, producer, READY hash, and runtime-gate hash; records a
 pre-arm clock baseline; and waits for a strictly newer positive `/clock`
-sample. It then atomically writes the driver-owned ARMED acknowledgement. No
-nonzero command may be published before that acknowledgement. A best-effort
-zero remains permitted for fail-safe cleanup before arm.
+sample. It then requires exactly two subscriptions matched to its publisher,
+publishes one untracked safe-zero probe, and waits for the collector's
+canonical first-retained-command progress artifact. The driver binds that
+artifact's hash, schema, run ID, topic, single zero-valued command, callback
+time, and simulation stamp to the probe. The two steady-time partial orders and
+the absolute 100 ms simulation-time bracket must hold before the driver
+atomically writes its ARMED acknowledgement. No nonzero command may be
+published before that acknowledgement. A best-effort zero remains permitted
+for fail-safe cleanup before arm.
+
+The retained collector command stream begins with that distinct zero probe and
+then contains exactly one ordered observation for every component command; its
+cardinality is therefore the component trace length plus one, with no leading,
+interleaved, duplicated, or trailing observations.
 
 Missing, stale, oversized, symlinked, malformed, noncanonical, wrongly bound,
 or hash-mismatched handshake artifacts fail closed, as does any ordering

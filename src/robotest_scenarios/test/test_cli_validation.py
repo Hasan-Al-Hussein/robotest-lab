@@ -58,6 +58,8 @@ def _contact_args(tmp_path: Path) -> list[str]:
         str(tmp_path / 'contact-arm.json'),
         '--armed-file',
         str(tmp_path / 'contact-armed.json'),
+        '--command-progress-file',
+        str(tmp_path / 'command-progress.json'),
         '--run-id',
         'control-1',
         '--coverage-manifest',
@@ -86,6 +88,13 @@ def test_contact_rejects_arm_and_armed_path_aliasing(tmp_path: Path) -> None:
         contact_inputs(args)
 
 
+def test_contact_rejects_command_progress_path_aliasing_arm(tmp_path: Path) -> None:
+    args = _contact_args(tmp_path)
+    args[args.index('--command-progress-file') + 1] = args[args.index('--arm-file') + 1]
+    with pytest.raises(ValidationError, match='must be distinct'):
+        contact_inputs(args)
+
+
 def test_contact_rejects_stale_or_symlink_arm_path(tmp_path: Path) -> None:
     stale_args = _contact_args(tmp_path)
     (tmp_path / 'contact-arm.json').write_text('{}\n', encoding='utf-8')
@@ -95,6 +104,12 @@ def test_contact_rejects_stale_or_symlink_arm_path(tmp_path: Path) -> None:
     (tmp_path / 'contact-arm.json').unlink()
     (tmp_path / 'target.json').write_text('{}\n', encoding='utf-8')
     (tmp_path / 'contact-arm.json').symlink_to(tmp_path / 'target.json')
+    with pytest.raises(ValidationError, match='already exists'):
+        contact_inputs(_contact_args(tmp_path))
+
+
+def test_contact_rejects_stale_command_progress_path(tmp_path: Path) -> None:
+    (tmp_path / 'command-progress.json').write_text('{}\n', encoding='utf-8')
     with pytest.raises(ValidationError, match='already exists'):
         contact_inputs(_contact_args(tmp_path))
 

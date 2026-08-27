@@ -132,6 +132,51 @@ def _rehash_arm_acknowledgment(positive: dict[str, Any]) -> None:
             ),
             'fresh clock sample',
         ),
+        (
+            lambda positive: (
+                positive['control']['arm']['acknowledgment']['command_delivery_probe'].__setitem__(
+                    'matched_subscription_count', 1
+                ),
+                _rehash_arm_acknowledgment(positive),
+            ),
+            'match count',
+        ),
+        (
+            lambda positive: (
+                positive['control']['arm']['acknowledgment']['command_delivery_probe'].__setitem__(
+                    'collector_progress_observed_steady_ns', 5_199_999
+                ),
+                _rehash_arm_acknowledgment(positive),
+            ),
+            'probe ordering',
+        ),
+        (
+            lambda positive: (
+                positive['control']['arm']['acknowledgment']['command_delivery_probe'].__setitem__(
+                    'collector_progress_stamp_ns', 950_000_001
+                ),
+                _rehash_arm_acknowledgment(positive),
+            ),
+            'probe lag',
+        ),
+        (
+            lambda positive: (
+                positive['control']['arm']['acknowledgment']['command_delivery_probe'].__setitem__(
+                    'probe_sim_stamp_ns', 900_000_001
+                ),
+                _rehash_arm_acknowledgment(positive),
+            ),
+            'fresh-clock bracket',
+        ),
+        (
+            lambda positive: (
+                positive['control']['arm']['acknowledgment']['command_delivery_probe'].__setitem__(
+                    'collector_progress_sha256', '0' * 64
+                ),
+                _rehash_arm_acknowledgment(positive),
+            ),
+            'command-progress hash binding',
+        ),
     ],
 )
 def test_positive_control_arm_handshake_fails_closed(

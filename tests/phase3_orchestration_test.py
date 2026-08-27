@@ -1829,12 +1829,36 @@ def _contact_control_arm_protocol_fixture() -> dict[str, object]:
         'ack_max_bytes': 4_096,
         'ack_producer': 'robotest_scenarios/contact_control_driver',
         'action': 'start_positive_control_motion',
+        'command_delivery_probe': {
+            'max_sim_lag_ns': orchestration.COMMAND_DELIVERY_PROBE_MAX_SIM_LAG_NS,
+            'policy': orchestration.COMMAND_DELIVERY_PROBE_POLICY,
+            'progress_max_bytes': orchestration.COMMAND_PROGRESS_MAX_BYTES,
+            'progress_producer': orchestration.COMMAND_PROGRESS_PRODUCER,
+            'progress_schema_version': orchestration.COMMAND_PROGRESS_SCHEMA_VERSION,
+            'public_topic': orchestration.COMMAND_PROGRESS_PUBLIC_TOPIC,
+            'required_subscription_count': (
+                orchestration.COMMAND_PROGRESS_REQUIRED_SUBSCRIPTION_COUNT
+            ),
+            'safe_zero': {
+                'angular_z_rad_s': 0.0,
+                'linear_x_m_s': 0.0,
+                'linear_y_m_s': 0.0,
+            },
+        },
         'fresh_clock_policy': 'strictly_newer_positive_stamp_after_valid_arm',
         'request_max_bytes': 4_096,
         'request_producer': 'robotest_phase3/benchmark_runner',
-        'schema_version': 1,
+        'schema_version': orchestration.CONTACT_CONTROL_ARM_SCHEMA_VERSION,
         'wait_deadline_policy': 'complete_fixture_steady_wall_deadline_without_reset',
     }
+
+
+def test_command_delivery_probe_protocol_matches_authoritative_source() -> None:
+    """Keep the standalone orchestrator projection identical to the driver."""
+    from robotest_scenarios.provenance import contact_control_arm_protocol
+
+    protocol = contact_control_arm_protocol()
+    assert orchestration._contact_control_arm_protocol(protocol) == protocol
 
 
 def _successful_contact_control_spawn_fixture() -> dict[str, object]:
@@ -1963,6 +1987,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     domain_id = 16
     launch_pid = 44
     driver_pid = 43
+    collector_pid = 45
     runtime_gate_pid = 42
     orchestration.atomic_write_json(
         tmp_path / 'suite-plan.json',
@@ -2196,6 +2221,27 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     )
     processes_dir = runtime_gate_process_path.parent
     result_path = positive_dir / 'contact-control-result.json'
+    capture_path = positive_dir / 'capture.json'
+    collector_ready_path = positive_dir / 'metrics.ready.json'
+    collector_stop_path = positive_dir / 'metrics.stop'
+    contact_progress_path = positive_dir / 'contact-progress.json'
+    command_progress_path = positive_dir / 'command-progress.json'
+    command_progress = {
+        'angular_z_rad_s': 0.0,
+        'linear_x_m_s': 0.0,
+        'linear_y_m_s': 0.0,
+        'observed_steady_ns': 55,
+        'producer': orchestration.COMMAND_PROGRESS_PRODUCER,
+        'public_topic': orchestration.COMMAND_PROGRESS_PUBLIC_TOPIC,
+        'retained_command_count': 1,
+        'run_id': 'positive',
+        'schema_version': orchestration.COMMAND_PROGRESS_SCHEMA_VERSION,
+        'stamp_ns': 5,
+    }
+    command_progress_sha256 = orchestration.atomic_write_json(
+        command_progress_path,
+        command_progress,
+    )
     driver_command = [
         'ros2',
         'run',
@@ -2209,6 +2255,8 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         str(positive_dir / 'contact-control.arm.json'),
         '--armed-file',
         str(positive_dir / 'contact-control.armed.json'),
+        '--command-progress-file',
+        str(command_progress_path),
         '--run-id',
         'positive',
         '--coverage-manifest',
@@ -2219,6 +2267,40 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         '-r',
         '__ns:=/robotest',
     ]
+    orchestration.atomic_write_json(
+        processes_dir / 'metrics_collector.process.json',
+        _bounded_process_fixture(
+            command=[
+                'ros2',
+                'run',
+                'robotest_metrics',
+                'metrics_collector',
+                '--output',
+                str(capture_path),
+                '--ready-file',
+                str(collector_ready_path),
+                '--stop-file',
+                str(collector_stop_path),
+                '--contact-progress-file',
+                str(contact_progress_path),
+                '--command-progress-file',
+                str(command_progress_path),
+                '--command-progress-run-id',
+                'positive',
+                '--wall-timeout-s',
+                '360',
+                '--ros-args',
+                '-r',
+                '__ns:=/robotest',
+            ],
+            finished_steady_ns=95,
+            pid=collector_pid,
+            role='metrics_collector',
+            started_steady_ns=3,
+            wall_timeout_s=370.0,
+            workspace=workspace,
+        ),
+    )
     orchestration.atomic_write_json(
         processes_dir / 'contact_control_driver.process.json',
         _bounded_process_fixture(
@@ -2265,24 +2347,36 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     armed_ack_path = positive_dir / 'contact-control.armed.json'
     armed_ack = {
         'arm_observed_clock_sample_count': 5,
-        'arm_observed_sim_stamp_ns': 100,
+        'arm_observed_sim_stamp_ns': 1,
         'arm_observed_steady_ns': 50,
         'arm_protocol_sha256': driver_ready['arm_protocol_sha256'],
         'arm_request_sha256': arm_request_sha256,
         'arm_requested_steady_ns': 40,
         'armed_clock_sample_count': 6,
-        'armed_sim_stamp_ns': 101,
+        'armed_sim_stamp_ns': 6,
         'armed_steady_ns': 60,
+        'command_delivery_probe': {
+            'collector_progress_observed_steady_ns': 55,
+            'collector_progress_sha256': command_progress_sha256,
+            'collector_progress_stamp_ns': 5,
+            'matched_subscription_count': 2,
+            'match_observed_steady_ns': 52,
+            'probe_publish_returned_steady_ns': 54,
+            'probe_publish_started_steady_ns': 53,
+            'probe_sim_stamp_ns': 5,
+            'required_subscription_count': 2,
+        },
         'producer': arm_protocol['ack_producer'],
         'ready_sha256': driver_ready_sha256,
         'run_id': 'positive',
         'runtime_gate_sha256': arm_request['runtime_gate_sha256'],
-        'schema_version': 1,
+        'schema_version': arm_protocol['schema_version'],
     }
     armed_ack_sha256 = orchestration.atomic_write_json(armed_ack_path, armed_ack)
     handshake_paths = {
         'arm_request_path': arm_request_path,
         'armed_ack_path': armed_ack_path,
+        'command_progress_path': command_progress_path,
         'driver_ready_path': driver_ready_path,
         'runtime_gate_path': runtime_gate_path,
     }
@@ -2448,12 +2542,20 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                 'items': [
                     {
                         'angular_z_rad_s': 0.0,
+                        'linear_x_m_s': 0.0,
+                        'linear_y_m_s': 0.0,
+                        'stamp_ns': 5,
+                    },
+                    {
+                        'angular_z_rad_s': 0.0,
                         'linear_x_m_s': 0.05,
+                        'linear_y_m_s': 0.0,
                         'stamp_ns': 10,
                     },
                     {
                         'angular_z_rad_s': 0.0,
                         'linear_x_m_s': 0.0,
+                        'linear_y_m_s': 0.0,
                         'stamp_ns': 20,
                     },
                 ]
@@ -2488,9 +2590,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             },
         },
     }
-    capture_path = tmp_path / 'capture.json'
     orchestration.atomic_write_json(capture_path, capture)
-    contact_progress_path = tmp_path / 'contact-progress.json'
     contact_progress = {
         'latest_retained_stamp_ns': 300_000_000,
         'producer': 'robotest_metrics/metrics_collector',
@@ -2517,7 +2617,10 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         == manifest['manifest_sha256']
     )
     assert bound['collector_reconciliation'] == {
-        'captured_command_count': 2,
+        'captured_command_count': 3,
+        'command_progress_artifact_sha256': command_progress_sha256,
+        'command_progress_observed_steady_ns': 55,
+        'command_progress_stamp_ns': 5,
         'captured_exact_pair_count': 1,
         'captured_release_expected_pair_count': 0,
         'captured_release_snapshot_count': 1,
@@ -2551,6 +2654,77 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         'release_required_through_stamp_ns': 250_000_000,
     }
 
+    missing_probe_capture = copy.deepcopy(capture)
+    missing_probe_capture['streams']['cmd_vel']['items'].pop(0)
+    orchestration.atomic_write_json(capture_path, missing_probe_capture)
+    with pytest.raises(orchestration.EvidenceError, match='distinct command-delivery zero probe'):
+        orchestration.reconcile_positive_control(
+            workspace=workspace,
+            build_binding=positive_build_binding,
+            result_path=result_path,
+            capture_path=capture_path,
+            contact_progress_path=contact_progress_path,
+            **handshake_paths,
+            manifest_path=manifest_path,
+            collector_configuration_sha256='7' * 64,
+            owned_process_group_shutdown=True,
+            checksum_verified=True,
+        )
+    preprobe_capture = copy.deepcopy(capture)
+    preprobe_capture['streams']['cmd_vel']['items'].insert(
+        0,
+        {
+            'angular_z_rad_s': 0.0,
+            'linear_x_m_s': 0.0,
+            'linear_y_m_s': 0.0,
+            'stamp_ns': 4,
+        },
+    )
+    orchestration.atomic_write_json(capture_path, preprobe_capture)
+    with pytest.raises(orchestration.EvidenceError, match='distinct command-delivery zero probe'):
+        orchestration.reconcile_positive_control(
+            workspace=workspace,
+            build_binding=positive_build_binding,
+            result_path=result_path,
+            capture_path=capture_path,
+            contact_progress_path=contact_progress_path,
+            **handshake_paths,
+            manifest_path=manifest_path,
+            collector_configuration_sha256='7' * 64,
+            owned_process_group_shutdown=True,
+            checksum_verified=True,
+        )
+    trailing_command_capture = copy.deepcopy(capture)
+    trailing_command_capture['streams']['cmd_vel']['items'].append(
+        {
+            'angular_z_rad_s': 0.0,
+            'linear_x_m_s': 0.0,
+            'linear_y_m_s': 0.0,
+            'stamp_ns': 21,
+        }
+    )
+    duplicate_command_capture = copy.deepcopy(capture)
+    duplicate_command_capture['streams']['cmd_vel']['items'].insert(
+        2,
+        copy.deepcopy(duplicate_command_capture['streams']['cmd_vel']['items'][1]),
+    )
+    for extra_capture in (trailing_command_capture, duplicate_command_capture):
+        orchestration.atomic_write_json(capture_path, extra_capture)
+        with pytest.raises(orchestration.EvidenceError, match='exactly one probe'):
+            orchestration.reconcile_positive_control(
+                workspace=workspace,
+                build_binding=positive_build_binding,
+                result_path=result_path,
+                capture_path=capture_path,
+                contact_progress_path=contact_progress_path,
+                **handshake_paths,
+                manifest_path=manifest_path,
+                collector_configuration_sha256='7' * 64,
+                owned_process_group_shutdown=True,
+                checksum_verified=True,
+            )
+    orchestration.atomic_write_json(capture_path, capture)
+
     missing_spawn_error = copy.deepcopy(result)
     del missing_spawn_error['control']['setup']['spawn']['error']
     divergent_spawn_stamp = copy.deepcopy(result)
@@ -2567,6 +2741,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                 driver_ready_path=driver_ready_path,
                 arm_request_path=arm_request_path,
                 armed_ack_path=armed_ack_path,
+                command_progress_path=command_progress_path,
                 runtime_gate_path=runtime_gate_path,
             )
 
@@ -2847,6 +3022,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                 driver_ready_path=driver_ready_path,
                 arm_request_path=arm_request_path,
                 armed_ack_path=armed_ack_path,
+                command_progress_path=command_progress_path,
                 runtime_gate_path=runtime_gate_path,
                 runtime_gate=runtime_binding,
             )
@@ -2873,6 +3049,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             driver_ready_path=driver_ready_path,
             arm_request_path=arm_request_path,
             armed_ack_path=armed_ack_path,
+            command_progress_path=command_progress_path,
             runtime_gate_path=runtime_gate_path,
             runtime_gate=runtime_binding,
         )
@@ -2881,14 +3058,17 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
 
     driver_process_path = processes_dir / 'contact_control_driver.process.json'
     launch_process_path = processes_dir / 'sim_launch.process.json'
+    collector_process_path = processes_dir / 'metrics_collector.process.json'
     frozen_driver_process = orchestration.load_json(driver_process_path)
     frozen_launch_process = orchestration.load_json(launch_process_path)
+    frozen_collector_process = orchestration.load_json(collector_process_path)
     runtime_binding = orchestration.validate_positive_runtime_gate_artifacts(
         runtime_gate_path, runtime_gate_process_path
     )
     sibling_command_mutations = (
         (driver_process_path, frozen_driver_process, 0, 'python3', 'driver'),
         (launch_process_path, frozen_launch_process, 0, 'python3', 'launch'),
+        (collector_process_path, frozen_collector_process, 0, 'python3', 'collector'),
     )
     for (
         process_path,
@@ -2912,6 +3092,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                 driver_ready_path=driver_ready_path,
                 arm_request_path=arm_request_path,
                 armed_ack_path=armed_ack_path,
+                command_progress_path=command_progress_path,
                 runtime_gate_path=runtime_gate_path,
                 runtime_gate=runtime_binding,
             )
@@ -2928,6 +3109,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             driver_ready_path=driver_ready_path,
             arm_request_path=arm_request_path,
             armed_ack_path=armed_ack_path,
+            command_progress_path=command_progress_path,
             runtime_gate_path=runtime_gate_path,
             runtime_gate=runtime_binding,
         )
@@ -2936,6 +3118,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     for role, process_path, frozen_sibling in (
         ('driver', driver_process_path, frozen_driver_process),
         ('launch', launch_process_path, frozen_launch_process),
+        ('collector', collector_process_path, frozen_collector_process),
     ):
         early_exit = copy.deepcopy(frozen_sibling)
         early_exit['finished_steady_ns'] = 55
@@ -2948,6 +3131,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                 driver_ready_path=driver_ready_path,
                 arm_request_path=arm_request_path,
                 armed_ack_path=armed_ack_path,
+                command_progress_path=command_progress_path,
                 runtime_gate_path=runtime_gate_path,
             )
         orchestration.atomic_write_json(process_path, frozen_sibling)
@@ -2961,7 +3145,101 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             ready=driver_ready,
             request=arm_request,
             request_sha256=arm_request_sha256,
+            command_progress=command_progress,
+            command_progress_sha256=command_progress_sha256,
         )
+
+    wrong_match_ack = copy.deepcopy(armed_ack)
+    wrong_match_ack['command_delivery_probe']['matched_subscription_count'] = 1
+    with pytest.raises(orchestration.EvidenceError, match='probe binding'):
+        orchestration.validate_contact_control_armed(
+            wrong_match_ack,
+            ready=driver_ready,
+            request=arm_request,
+            request_sha256=arm_request_sha256,
+            command_progress=command_progress,
+            command_progress_sha256=command_progress_sha256,
+        )
+
+    early_progress_ack = copy.deepcopy(armed_ack)
+    early_progress_ack['command_delivery_probe']['collector_progress_observed_steady_ns'] = 52
+    early_progress = {**command_progress, 'observed_steady_ns': 52}
+    early_progress_sha256 = orchestration.canonical_sha256(early_progress)
+    early_progress_ack['command_delivery_probe']['collector_progress_sha256'] = (
+        early_progress_sha256
+    )
+    with pytest.raises(orchestration.EvidenceError, match='steady-time ordering'):
+        orchestration.validate_contact_control_armed(
+            early_progress_ack,
+            ready=driver_ready,
+            request=arm_request,
+            request_sha256=arm_request_sha256,
+            command_progress=early_progress,
+            command_progress_sha256=early_progress_sha256,
+        )
+
+    late_progress = {
+        **command_progress,
+        'stamp_ns': armed_ack['command_delivery_probe']['probe_sim_stamp_ns']
+        + orchestration.COMMAND_DELIVERY_PROBE_MAX_SIM_LAG_NS
+        + 1,
+    }
+    late_progress_ack = copy.deepcopy(armed_ack)
+    late_progress_ack['command_delivery_probe']['collector_progress_stamp_ns'] = late_progress[
+        'stamp_ns'
+    ]
+    late_progress_ack['command_delivery_probe']['collector_progress_sha256'] = (
+        orchestration.canonical_sha256(late_progress)
+    )
+    with pytest.raises(orchestration.EvidenceError, match='simulation lag'):
+        orchestration.validate_contact_control_armed(
+            late_progress_ack,
+            ready=driver_ready,
+            request=arm_request,
+            request_sha256=arm_request_sha256,
+            command_progress=late_progress,
+            command_progress_sha256=orchestration.canonical_sha256(late_progress),
+        )
+
+    future_probe_ack = copy.deepcopy(armed_ack)
+    future_probe_ack['command_delivery_probe']['probe_sim_stamp_ns'] = 7
+    with pytest.raises(orchestration.EvidenceError, match='fresh-clock bracket'):
+        orchestration.validate_contact_control_armed(
+            future_probe_ack,
+            ready=driver_ready,
+            request=arm_request,
+            request_sha256=arm_request_sha256,
+            command_progress=command_progress,
+            command_progress_sha256=command_progress_sha256,
+        )
+
+    nonzero_progress = {**command_progress, 'linear_x_m_s': 0.01}
+    with pytest.raises(orchestration.EvidenceError, match='progress contract'):
+        orchestration.validate_contact_control_armed(
+            armed_ack,
+            ready=driver_ready,
+            request=arm_request,
+            request_sha256=arm_request_sha256,
+            command_progress=nonzero_progress,
+            command_progress_sha256=orchestration.canonical_sha256(nonzero_progress),
+        )
+
+    command_progress_path.write_text(
+        json.dumps(command_progress, indent=2) + '\n',
+        encoding='utf-8',
+    )
+    with pytest.raises(orchestration.EvidenceError, match='not exact canonical JSON'):
+        orchestration._reconcile_contact_control_arm_handshake(
+            workspace=workspace,
+            result=result,
+            result_path=result_path,
+            driver_ready_path=driver_ready_path,
+            arm_request_path=arm_request_path,
+            armed_ack_path=armed_ack_path,
+            command_progress_path=command_progress_path,
+            runtime_gate_path=runtime_gate_path,
+        )
+    orchestration.atomic_write_json(command_progress_path, command_progress)
 
     incomplete_gate_process = orchestration.load_json(runtime_gate_process_path)
     incomplete_gate_process['group_confirmed_empty'] = False
@@ -3034,6 +3312,17 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         },
     )
     orchestration.atomic_write_json(result_path, missing_repeated_command, sidecar=True)
+    missing_repeated_capture = copy.deepcopy(capture)
+    missing_repeated_capture['streams']['cmd_vel']['items'].insert(
+        2,
+        {
+            'angular_z_rad_s': 0.1,
+            'linear_x_m_s': 0.05,
+            'linear_y_m_s': 0.0,
+            'stamp_ns': 16,
+        },
+    )
+    orchestration.atomic_write_json(capture_path, missing_repeated_capture)
     with pytest.raises(orchestration.EvidenceError, match='complete component subsequence'):
         orchestration.reconcile_positive_control(
             workspace=Path(__file__).parents[1],
@@ -3047,6 +3336,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             owned_process_group_shutdown=True,
             checksum_verified=True,
         )
+    orchestration.atomic_write_json(capture_path, capture)
 
     result_with_support_suffix = copy.deepcopy(result)
     result_with_support_suffix['control']['contact']['snapshot_records'].append(

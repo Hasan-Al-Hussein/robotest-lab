@@ -15,17 +15,35 @@
 from __future__ import annotations
 
 import inspect
+import json
+import math
+from pathlib import Path
 
 import pytest
 import rclpy
 import robotest_metrics.collector_node as collector_node
-from geometry_msgs.msg import Transform, Vector3
-from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import Transform, Twist, Vector3
+from nav_msgs.msg import Odometry
+from nav_msgs.msg import Path as NavPath
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, ReliabilityPolicy
+from robotest_metrics.artifacts import canonical_json_bytes
 from robotest_metrics.constants import COMMAND_CAPACITY, COMMAND_QOS_DEPTH
 from ros_gz_interfaces.msg import Contact, Contacts, JointWrench
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import LaserScan
+
+
+def _collector_cli_arguments(tmp_path: Path) -> list[str]:
+    return [
+        '--output',
+        str(tmp_path / 'capture.json'),
+        '--ready-file',
+        str(tmp_path / 'ready.json'),
+        '--stop-file',
+        str(tmp_path / 'stop'),
+        '--contact-progress-file',
+        str(tmp_path / 'contact-progress.json'),
+    ]
 
 
 def test_collector_source_is_observer_only() -> None:
@@ -132,7 +150,7 @@ def test_odometry_and_plan_normalization_are_planar() -> None:
     assert item['x_m'] == 1.0
     assert item['y_m'] == 2.0
     assert item['yaw_rad'] == 0.0
-    path = Path()
+    path = NavPath()
     path.header.frame_id = 'map'
     path.poses = []
     assert collector_node._plan_item(path) == {'frame_id': 'map', 'poses': [], 'stamp_ns': 0}
@@ -239,3 +257,148 @@ def test_collector_rejects_every_stale_artifact_path(
                 str(paths[3]),
             ]
         )
+
+
+@pytest.mark.parametrize(
+    'unpaired_arguments',
+    (
+        ['--command-progress-file', 'command-progress.json'],
+        ['--command-progress-run-id', 'scenario1-trial01'],
+    ),
+)
+def test_command_progress_arguments_must_be_paired(
+    tmp_path: Path,
+    unpaired_arguments: list[str],
+) -> None:
+    with pytest.raises(SystemExit, match='must be provided together'):
+        collector_node.main(_collector_cli_arguments(tmp_path) + unpaired_arguments)
+
+
+@pytest.mark.parametrize(
+    'conflicting_name',
+    ('capture.json', 'ready.json', 'stop', 'contact-progress.json'),
+)
+def test_command_progress_path_must_be_distinct(
+    tmp_path: Path,
+    conflicting_name: str,
+) -> None:
+    with pytest.raises(SystemExit, match='command-progress path must be distinct'):
+        collector_node.main(
+            [
+                *_collector_cli_arguments(tmp_path),
+                '--command-progress-file',
+                str(tmp_path / conflicting_name),
+                '--command-progress-run-id',
+                'scenario1-trial01',
+            ]
+        )
+
+
+def test_command_progress_path_must_be_fresh(tmp_path: Path) -> None:
+    progress_path = tmp_path / 'command-progress.json'
+    progress_path.write_text('stale', encoding='utf-8')
+    with pytest.raises(SystemExit, match='stale command progress file'):
+        collector_node.main(
+            [
+                *_collector_cli_arguments(tmp_path),
+                '--command-progress-file',
+                str(progress_path),
+                '--command-progress-run-id',
+                'scenario1-trial01',
+            ]
+        )
+
+
+def test_first_retained_command_writes_exact_canonical_bounded_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    progress_path = tmp_path / 'command-progress.json'
+    rclpy.init()
+    node = collector_node.MetricsCollectorNode(
+        command_progress_path=progress_path,
+        command_progress_run_id='scenario1-trial01',
+    )
+    try:
+        callback_stamps = iter((4_000_000_005, 4_000_000_006))
+        steady_stamps = iter((8_000_000_009, 8_000_000_010))
+        monkeypatch.setattr(node, '_callback_stamp_ns', lambda: next(callback_stamps))
+        monkeypatch.setattr(collector_node.time, 'monotonic_ns', lambda: next(steady_stamps))
+        first = Twist()
+        first.linear.x = 0.25
+        first.linear.y = -0.5
+        first.angular.z = 0.75
+        node._on_cmd_vel(first)
+        first_bytes = progress_path.read_bytes()
+        document = json.loads(first_bytes)
+        assert set(document) == {
+            'angular_z_rad_s',
+            'linear_x_m_s',
+            'linear_y_m_s',
+            'observed_steady_ns',
+            'producer',
+            'public_topic',
+            'retained_command_count',
+            'run_id',
+            'schema_version',
+            'stamp_ns',
+        }
+        assert document == {
+            'angular_z_rad_s': 0.75,
+            'linear_x_m_s': 0.25,
+            'linear_y_m_s': -0.5,
+            'observed_steady_ns': 8_000_000_009,
+            'producer': 'robotest_metrics/metrics_collector',
+            'public_topic': '/robotest/cmd_vel',
+            'retained_command_count': 1,
+            'run_id': 'scenario1-trial01',
+            'schema_version': 1,
+            'stamp_ns': 4_000_000_005,
+        }
+        assert first_bytes == canonical_json_bytes(document)
+        assert len(first_bytes) <= collector_node.COMMAND_PROGRESS_MAX_BYTES
+
+        second = Twist()
+        second.linear.x = 9.0
+        second.linear.y = 8.0
+        second.angular.z = 7.0
+        node._on_cmd_vel(second)
+        assert progress_path.read_bytes() == first_bytes
+        assert node.core.snapshot()['streams']['cmd_vel']['quality']['retained_count'] == 2
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_invalid_and_nonretained_commands_do_not_write_progress(
+    tmp_path: Path,
+) -> None:
+    progress_path = tmp_path / 'command-progress.json'
+    rclpy.init()
+    node = collector_node.MetricsCollectorNode(
+        command_progress_path=progress_path,
+        command_progress_run_id='scenario1-trial01',
+    )
+    try:
+        invalid = Twist()
+        invalid.linear.x = math.nan
+        node._on_cmd_vel(invalid)
+        assert not progress_path.exists()
+        assert node.core.snapshot()['streams']['cmd_vel']['quality']['invalid_count'] == 1
+
+        for stamp_ns in range(COMMAND_CAPACITY):
+            assert node.core.record(
+                'cmd_vel',
+                {
+                    'angular_z_rad_s': 0.0,
+                    'linear_x_m_s': 0.0,
+                    'linear_y_m_s': 0.0,
+                    'stamp_ns': stamp_ns,
+                },
+            )
+        node._on_cmd_vel(Twist())
+        assert not progress_path.exists()
+        assert node.core.snapshot()['streams']['cmd_vel']['quality']['overflow_count'] == 1
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()

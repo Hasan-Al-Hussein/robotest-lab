@@ -324,6 +324,8 @@ hash. Qualification fails when the control run did not pass, a referenced hash
 does not match, or any source/rendered/configuration hash differs between the
 control and benchmark candidates. In those cases `collision_count` is null and
 the benchmark fails; a silent mission contact topic cannot be reported as zero.
+The external positive binding also stores the exact capture and command-progress
+hashes; both must agree with the driver acknowledgement and the final capture.
 
 Positive-control motion is authorized by a stationary, artifact-bound
 handshake. The driver completes preparation, atomically writes READY, and keeps
@@ -337,13 +339,28 @@ wrong-run, wrong-producer, or hash-mismatched artifact.
 
 After accepting ARM, the driver records its clock baseline and continues
 spinning until it observes a strictly newer positive `/clock` sample. It then
-atomically writes a driver-owned ARMED acknowledgement bound to ARM, READY, and
-runtime-gate evidence. Only that completed acknowledgement authorizes the first
-nonzero publication. A fail-safe zero may be published during pre-arm failure
-cleanup, but never authorizes motion. Canonical evidence must prove the order
-runtime-gate completion, ARM authorization, driver observation, fresh-clock
-arming, and first nonzero publication. Missing evidence or an order/hash
-violation fails closed.
+waits for exactly the two frozen `/robotest/cmd_vel` subscriptions, publishes
+one untracked safe-zero delivery probe, and waits for the metrics collector's
+canonical `command-progress.json`. That immutable progress document is written
+only for the collector's first retained command and has exact schema/producer,
+run ID, public topic, retained count `1`, positive callback simulation and
+steady stamps, and a three-axis zero vector. The driver rejects a probe unless
+the collector callback's simulation stamp is within an absolute 100 ms of the
+publish-side simulation stamp. That publish stamp must be strictly newer than
+the arm-observed clock baseline and no later than the clock stamp stored in
+ARMED.
+
+The driver then atomically writes its ARMED acknowledgement, bound to ARM,
+READY, the runtime gate, and the exact SHA-256 of `command-progress.json`.
+Steady evidence proves both partial orders
+`arm_observed <= match <= publish_start <= publish_return <= armed` and
+`publish_start <= collector_observed <= armed`; publisher return and collector
+callback are deliberately not ordered against one another. Both reported
+subscription counts are exactly two. Only that completed acknowledgement
+authorizes the first nonzero publication. A fail-safe zero may be published
+during pre-arm failure cleanup, but never authorizes motion. Missing evidence
+or an identity, cardinality, order, simulation-bracket, or hash violation fails
+closed.
 
 The complete positive-control fixture, including preparation, runtime gate,
 ARM wait, fresh-clock wait, motion, release, and cleanup, shares one 30 s
@@ -353,10 +370,15 @@ Actuator-facing `cmd_vel` endpoints remain RELIABLE, VOLATILE, and
 KEEP_LAST(1). The independent metrics observer alone uses a bounded
 KEEP_LAST(4096) reader history equal to its retained command capacity, so a
 short single-thread callback backlog cannot overwrite admissible evidence or
-queue stale commands to the actuator. Qualification still requires a distinct
-collector observation for every component publication within 100 ms; this
-history exception does not relax that latency or completeness rule. The active
-stop command must likewise be issued within 100 ms of the qualifying contact.
+queue stale commands to the actuator. Qualification requires a distinct first
+retained zero observation that exactly matches `command-progress.json`,
+followed by a distinct collector observation for every component publication
+within 100 ms. The captured command count is exactly the component trace count
+plus one: reconciliation cannot reuse the delivery probe as a component match
+or admit unmatched leading, interleaved, or trailing observations. This history
+exception does not relax the latency or
+completeness rule. The active stop command must likewise be issued within
+100 ms of the qualifying contact.
 
 The component and metrics collector are independent observers of the public
 snapshot stream. Their retained traces are reconciled bijectively from the

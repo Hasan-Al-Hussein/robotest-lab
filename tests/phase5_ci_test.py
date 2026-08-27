@@ -2169,6 +2169,20 @@ def _write_phase3_positive_handshake(
     arm_request_path = directory / 'contact-control.arm.json'
     _canonical_file(arm_request_path, arm_request)
     arm_request_sha256 = phase5_module.file_sha256(arm_request_path)
+    command_progress = {
+        'angular_z_rad_s': 0.0,
+        'linear_x_m_s': 0.0,
+        'linear_y_m_s': 0.0,
+        'observed_steady_ns': 5_300_000,
+        'producer': 'robotest_metrics/metrics_collector',
+        'public_topic': '/robotest/cmd_vel',
+        'retained_command_count': 1,
+        'run_id': arm_request['run_id'],
+        'schema_version': 1,
+        'stamp_ns': 840_000_000,
+    }
+    command_progress_path = directory / 'command-progress.json'
+    _canonical_file(command_progress_path, command_progress)
     acknowledgment = {
         'arm_observed_clock_sample_count': 10,
         'arm_observed_sim_stamp_ns': 800_000_000,
@@ -2179,6 +2193,17 @@ def _write_phase3_positive_handshake(
         'armed_clock_sample_count': 11,
         'armed_sim_stamp_ns': 900_000_000,
         'armed_steady_ns': 6_000_000,
+        'command_delivery_probe': {
+            'collector_progress_observed_steady_ns': command_progress['observed_steady_ns'],
+            'collector_progress_sha256': phase5_module.file_sha256(command_progress_path),
+            'collector_progress_stamp_ns': command_progress['stamp_ns'],
+            'matched_subscription_count': 2,
+            'match_observed_steady_ns': 5_100_000,
+            'probe_publish_returned_steady_ns': 5_400_000,
+            'probe_publish_started_steady_ns': 5_200_000,
+            'probe_sim_stamp_ns': 850_000_000,
+            'required_subscription_count': 2,
+        },
         'producer': protocol['ack_producer'],
         'ready_sha256': arm_request['ready_sha256'],
         'run_id': arm_request['run_id'],
@@ -2237,6 +2262,8 @@ def _write_phase3_positive_handshake(
                 str(arm_request_path),
                 '--armed-file',
                 str(armed_path),
+                '--command-progress-file',
+                str(command_progress_path),
                 '--run-id',
                 positive_control['identity']['run_id'],
                 '--coverage-manifest',
@@ -2300,6 +2327,10 @@ def _write_phase3_positive_handshake(
                 str(directory / 'metrics.stop'),
                 '--contact-progress-file',
                 str(directory / 'contact-progress.json'),
+                '--command-progress-file',
+                str(command_progress_path),
+                '--command-progress-run-id',
+                positive_control['identity']['run_id'],
                 '--wall-timeout-s',
                 '360',
                 '--ros-args',
@@ -3875,6 +3906,65 @@ def _rebind_phase3_positive_runtime_gate(
     _refresh_phase3_positive_component_manifest(positive_directory, orchestration)
 
 
+def _rebind_phase3_positive_command_probe(
+    candidate_root: Path,
+    repository: Path,
+) -> None:
+    """Cascade command-progress and ARMED bytes through the positive binding."""
+    positive_directory = candidate_root / 'positive-control'
+    progress_path = positive_directory / 'command-progress.json'
+    progress = json.loads(progress_path.read_text(encoding='utf-8'))
+    progress_sha256 = phase5_module.file_sha256(progress_path)
+    acknowledgment_path = positive_directory / 'contact-control.armed.json'
+    acknowledgment = json.loads(acknowledgment_path.read_text(encoding='utf-8'))
+    result_path = positive_directory / 'contact-control-result.json'
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    result['control']['arm']['acknowledgment'] = copy.deepcopy(acknowledgment)
+    result['control']['arm']['acknowledgment_sha256'] = phase5_module.file_sha256(
+        acknowledgment_path
+    )
+    _canonical_file(result_path, result, sidecar=True)
+
+    binding_path = positive_directory / 'positive-binding.json'
+    binding = json.loads(binding_path.read_text(encoding='utf-8'))
+    binding['positive_control'] = copy.deepcopy(result)
+    external_quality = binding['benchmark_binding']['positive_control_external_quality']
+    external_quality['collector_command_progress_sha256'] = progress_sha256
+    reconciliation = binding['collector_reconciliation']
+    reconciliation.update(
+        {
+            'command_progress_artifact_sha256': progress_sha256,
+            'command_progress_observed_steady_ns': progress['observed_steady_ns'],
+            'command_progress_stamp_ns': progress['stamp_ns'],
+        }
+    )
+    _refresh_phase3_positive_binding(candidate_root, binding)
+    _refresh_phase3_positive_component_manifest_from_repository(
+        candidate_root,
+        repository,
+    )
+
+
+def _rebind_phase3_positive_capture(
+    candidate_root: Path,
+    repository: Path,
+) -> None:
+    """Cascade changed capture bytes while retaining downstream semantic replay."""
+    positive_directory = candidate_root / 'positive-control'
+    capture_sha256 = phase5_module.file_sha256(positive_directory / 'capture.json')
+    binding_path = positive_directory / 'positive-binding.json'
+    binding = json.loads(binding_path.read_text(encoding='utf-8'))
+    binding['capture_sha256'] = capture_sha256
+    binding['benchmark_binding']['positive_control_external_quality'][
+        'collector_capture_sha256'
+    ] = capture_sha256
+    _refresh_phase3_positive_binding(candidate_root, binding)
+    _refresh_phase3_positive_component_manifest_from_repository(
+        candidate_root,
+        repository,
+    )
+
+
 def _rewrite_process_command(process: dict, command: list[str]) -> None:
     process['command'] = command
     process['wrapped_command'] = [*process['wrapped_command'][:4], *command]
@@ -3896,6 +3986,7 @@ def _rebind_phase3_positive_raw(candidate_root: Path, repository: Path) -> None:
         result_path=positive_directory / 'contact-control-result.json',
         capture_path=positive_directory / 'capture.json',
         contact_progress_path=positive_directory / 'contact-progress.json',
+        command_progress_path=positive_directory / 'command-progress.json',
         driver_ready_path=positive_directory / 'contact-control.ready.json',
         arm_request_path=positive_directory / 'contact-control.arm.json',
         armed_ack_path=positive_directory / 'contact-control.armed.json',
@@ -4370,6 +4461,18 @@ PY
                 'stamp_ns': stamp_ns,
             },
         )
+    command_progress = json.loads(
+        (positive_directory / 'command-progress.json').read_text(encoding='utf-8')
+    )
+    core.record(
+        'cmd_vel',
+        {
+            'angular_z_rad_s': command_progress['angular_z_rad_s'],
+            'linear_x_m_s': command_progress['linear_x_m_s'],
+            'linear_y_m_s': command_progress['linear_y_m_s'],
+            'stamp_ns': command_progress['stamp_ns'],
+        },
+    )
     for command in positive_control['control']['command_trace']:
         core.record(
             'cmd_vel',
@@ -4455,6 +4558,7 @@ PY
         result_path=positive_result_path,
         capture_path=positive_capture_path,
         contact_progress_path=positive_directory / 'contact-progress.json',
+        command_progress_path=positive_directory / 'command-progress.json',
         driver_ready_path=positive_directory / 'contact-control.ready.json',
         arm_request_path=positive_directory / 'contact-control.arm.json',
         armed_ack_path=positive_directory / 'contact-control.armed.json',
@@ -4998,6 +5102,7 @@ def _relocate_phase3_evidence(
         result_path=positive_result_path,
         capture_path=positive_directory / 'capture.json',
         contact_progress_path=positive_directory / 'contact-progress.json',
+        command_progress_path=positive_directory / 'command-progress.json',
         driver_ready_path=positive_directory / 'contact-control.ready.json',
         arm_request_path=positive_directory / 'contact-control.arm.json',
         armed_ack_path=positive_directory / 'contact-control.armed.json',
@@ -7667,6 +7772,148 @@ def test_release_evidence_rejects_positive_control_arm_forgeries(
         _validate_release_fixture(fixture)
 
 
+@pytest.mark.parametrize('case', ['missing', 'symlink'])
+def test_release_evidence_requires_regular_positive_command_progress(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    progress_path = Path(fixture['candidate_root']) / 'positive-control/command-progress.json'
+    if case == 'missing':
+        progress_path.unlink()
+    else:
+        target = tmp_path / 'external-command-progress.json'
+        target.write_bytes(progress_path.read_bytes())
+        progress_path.unlink()
+        progress_path.symlink_to(target)
+
+    with pytest.raises(
+        EvidenceError,
+        match=r'command[- ]progress|component manifest|component artifact',
+    ):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        'wrong_run',
+        'nonzero',
+        'retained_count_two',
+        'matched_count_one',
+        'matched_count_three',
+        'callback_before_publish',
+        'probe_before_observed_sim',
+        'probe_after_armed_sim',
+        'sim_lag',
+        'valid_progress_capture_mismatch',
+        'wrong_hash',
+    ],
+)
+def test_release_evidence_rejects_rebound_positive_command_probe(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    positive_directory = candidate_root / 'positive-control'
+    progress_path = positive_directory / 'command-progress.json'
+    progress = json.loads(progress_path.read_text(encoding='utf-8'))
+    acknowledgment_path = positive_directory / 'contact-control.armed.json'
+    acknowledgment = json.loads(acknowledgment_path.read_text(encoding='utf-8'))
+    probe = acknowledgment['command_delivery_probe']
+    if case == 'wrong_run':
+        progress['run_id'] = 'foreign-positive-control'
+    elif case == 'nonzero':
+        progress['linear_x_m_s'] = 0.01
+    elif case == 'retained_count_two':
+        progress['retained_command_count'] = 2
+    elif case == 'matched_count_one':
+        probe['matched_subscription_count'] = 1
+    elif case == 'matched_count_three':
+        probe['matched_subscription_count'] = 3
+    elif case == 'callback_before_publish':
+        progress['observed_steady_ns'] = probe['probe_publish_started_steady_ns'] - 1
+    elif case == 'probe_before_observed_sim':
+        probe['probe_sim_stamp_ns'] = acknowledgment['arm_observed_sim_stamp_ns']
+        progress['stamp_ns'] = probe['probe_sim_stamp_ns']
+    elif case == 'probe_after_armed_sim':
+        probe['probe_sim_stamp_ns'] = acknowledgment['armed_sim_stamp_ns'] + 1
+        progress['stamp_ns'] = probe['probe_sim_stamp_ns']
+    elif case == 'sim_lag':
+        progress['stamp_ns'] = probe['probe_sim_stamp_ns'] + 100_000_001
+    elif case == 'valid_progress_capture_mismatch':
+        progress['stamp_ns'] += 1
+    else:
+        probe['collector_progress_sha256'] = '0' * 64
+    _canonical_file(progress_path, progress)
+    if case != 'wrong_hash':
+        probe.update(
+            {
+                'collector_progress_observed_steady_ns': progress['observed_steady_ns'],
+                'collector_progress_sha256': phase5_module.file_sha256(progress_path),
+                'collector_progress_stamp_ns': progress['stamp_ns'],
+            }
+        )
+    _canonical_file(acknowledgment_path, acknowledgment)
+    _rebind_phase3_positive_command_probe(candidate_root, repository)
+
+    if case == 'valid_progress_capture_mismatch':
+        expected_error = 'distinct command-delivery zero probe'
+    elif case in {'matched_count_one', 'matched_count_three'}:
+        expected_error = 'positive-control result schema failed'
+    elif case in {
+        'callback_before_publish',
+        'probe_before_observed_sim',
+        'probe_after_armed_sim',
+        'sim_lag',
+        'wrong_hash',
+    }:
+        expected_error = 'collision qualification failed'
+    else:
+        expected_error = 'positive-control recomposition failed'
+    with pytest.raises(EvidenceError, match=expected_error):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize('case', ['missing_probe', 'duplicate_probe', 'trailing_extra'])
+def test_release_evidence_rejects_rebound_positive_command_capture(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    capture_path = candidate_root / 'positive-control/capture.json'
+    capture = json.loads(capture_path.read_text(encoding='utf-8'))
+    stream = capture['streams']['cmd_vel']
+    items = stream['items']
+    quality = stream['quality']
+    if case == 'missing_probe':
+        items.pop(0)
+        quality['ingress_count'] -= 1
+        quality['retained_count'] -= 1
+    elif case == 'duplicate_probe':
+        duplicate = copy.deepcopy(items[0])
+        duplicate['collector_sequence'] += 100_000
+        items.insert(1, duplicate)
+        quality['ingress_count'] += 1
+        quality['retained_count'] += 1
+    else:
+        trailing = copy.deepcopy(items[-1])
+        trailing['collector_sequence'] += 100_000
+        trailing['stamp_ns'] += 1
+        items.append(trailing)
+        quality['ingress_count'] += 1
+        quality['retained_count'] += 1
+    _canonical_file(capture_path, capture)
+    _rebind_phase3_positive_capture(candidate_root, repository)
+
+    with pytest.raises(EvidenceError, match='positive-control recomposition failed'):
+        _validate_release_fixture(fixture)
+
+
 @pytest.mark.parametrize(
     'case',
     [
@@ -7861,6 +8108,8 @@ def test_release_evidence_rejects_cascaded_nested_runtime_gate_qos_forgery(
         'missing_runtime_stream_field',
         'extra_runtime_stream_field',
         'missing_driver_cwd',
+        'missing_driver_command_progress',
+        'wrong_collector_command_progress_run_id',
         'missing_sim_stream_field',
     ],
 )
@@ -7873,8 +8122,10 @@ def test_release_evidence_rejects_rebound_runtime_gate_process_forgery(
     candidate_root = Path(fixture['candidate_root'])
     process_directory = candidate_root / 'positive-control/processes'
     process_path = process_directory / 'runtime_gate.process.json'
-    if case == 'missing_driver_cwd':
+    if case in {'missing_driver_cwd', 'missing_driver_command_progress'}:
         process_path = process_directory / 'contact_control_driver.process.json'
+    elif case == 'wrong_collector_command_progress_run_id':
+        process_path = process_directory / 'metrics_collector.process.json'
     elif case == 'missing_sim_stream_field':
         process_path = process_directory / 'sim_launch.process.json'
     process = json.loads(process_path.read_text(encoding='utf-8'))
@@ -7921,6 +8172,14 @@ def test_release_evidence_rejects_rebound_runtime_gate_process_forgery(
         _rewrite_process_command(process, command)
     elif case in {'missing_runtime_cwd', 'missing_driver_cwd'}:
         del process['cwd']
+    elif case == 'missing_driver_command_progress':
+        progress_index = command.index('--command-progress-file')
+        del command[progress_index : progress_index + 2]
+        _rewrite_process_command(process, command)
+    elif case == 'wrong_collector_command_progress_run_id':
+        run_index = command.index('--command-progress-run-id') + 1
+        command[run_index] = f'{command[run_index]}-forged'
+        _rewrite_process_command(process, command)
     elif case == 'extra_runtime_field':
         process['unexpected'] = 'forged'
     elif case == 'missing_runtime_stream_field':

@@ -102,17 +102,31 @@ verify the runtime gate, prove its process group empty, and recheck the owned
 fixture processes before atomically writing the exact run-bound ARM artifact.
 The driver must validate the canonical artifact and its identity/hash bindings,
 observe a strictly newer positive `/clock` sample than its pre-arm baseline,
-and atomically write the driver-owned ARMED acknowledgement before publishing
-any nonzero command. A fail-safe zero is allowed before arm only for cleanup.
+observe exactly two command subscriptions, and publish one untracked safe-zero
+probe. The metrics collector must atomically record that probe as its first
+retained command in canonical `command-progress.json`; its exact zero vector,
+run/topic/producer/schema, count `1`, and SHA-256 are bound into the
+driver-owned ARMED acknowledgement before any nonzero command. A fail-safe zero
+is allowed before arm only for cleanup.
 
 READY, runtime-gate, ARM, ARMED, and first-command evidence must be complete,
 hash-bound, and correctly ordered. Missing, stale, oversized, symlinked,
 malformed, noncanonical, wrongly bound, tampered, or out-of-order artifacts fail
 closed. One never-reset **30 steady-wall-second** deadline includes preparation,
 the stationary runtime gate, all pre-arm waits, motion, release, and cleanup.
-Every component command publication requires a distinct collector observation
-within **0.10 simulation seconds**, and the active stop remains bounded by
-**0.10 simulation seconds** from the qualifying contact.
+The probe callback simulation stamp must be within an absolute **0.10
+simulation seconds** of its publish stamp; the publish stamp is strictly after
+the arm-observed clock baseline and no later than the ARMED clock stamp. Steady
+evidence proves
+`arm-observed <= match <= publish-start <= publish-return <= armed` and,
+separately, `publish-start <= collector-observed <= armed`; publish return and
+collector callback have no asserted order. Final capture must begin with the
+distinct probe observation, then every component command publication requires
+a separate in-order collector observation within **0.10 simulation seconds**;
+the captured command count is exactly the component trace count plus one, with
+no unmatched leading, interleaved, or trailing observations. The active stop
+remains bounded by **0.10 simulation seconds** from the
+qualifying contact.
 
 All trials, including failures and timeouts, remain in the denominator.
 
@@ -332,9 +346,14 @@ second systemd-owned ROS process is failure.
   terminal contact drain fails closed.
 - Positive-control READY, runtime-gate, ARM, and ARMED evidence proves the
   stationary authorization order, exact run/hash bindings, fresh post-arm
-  clock, and absence of nonzero motion before acknowledgement.
-- Positive-control command traces reconcile every component publication to one
-  distinct collector observation within 0.10 simulation seconds.
+  clock, exactly two command subscriptions, and absence of nonzero motion
+  before acknowledgement. ARMED binds the exact canonical first-retained zero
+  `command-progress.json`, both valid steady-time partial orders, and its
+  absolute 0.10 simulation-second probe bracket.
+- Positive-control capture begins with that distinct delivery probe; only later
+  observations may reconcile every component publication, one-to-one and in
+  order, within 0.10 simulation seconds. Its exact count is one plus the
+  component trace count; extra observations fail closed.
 - Reports derive all displayed numbers from canonical run JSON.
 - Null/unavailable values never become zero.
 

@@ -386,7 +386,29 @@
         "ready_sha256": {"$ref": "#/$defs/sha256"},
         "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
         "runtime_gate_sha256": {"$ref": "#/$defs/sha256"},
-        "schema_version": {"const": 1}
+        "schema_version": {"const": 2}
+      }
+    },
+    "commandDeliveryProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "collector_progress_observed_steady_ns", "collector_progress_sha256",
+        "collector_progress_stamp_ns", "matched_subscription_count",
+        "match_observed_steady_ns", "probe_publish_returned_steady_ns",
+        "probe_publish_started_steady_ns", "probe_sim_stamp_ns",
+        "required_subscription_count"
+      ],
+      "properties": {
+        "collector_progress_observed_steady_ns": {"type": "integer", "minimum": 1},
+        "collector_progress_sha256": {"$ref": "#/$defs/sha256"},
+        "collector_progress_stamp_ns": {"type": "integer", "minimum": 1},
+        "matched_subscription_count": {"const": 2},
+        "match_observed_steady_ns": {"type": "integer", "minimum": 1},
+        "probe_publish_returned_steady_ns": {"type": "integer", "minimum": 1},
+        "probe_publish_started_steady_ns": {"type": "integer", "minimum": 1},
+        "probe_sim_stamp_ns": {"type": "integer", "minimum": 1},
+        "required_subscription_count": {"const": 2}
       }
     },
     "armedAcknowledgment": {
@@ -396,7 +418,7 @@
         "arm_observed_clock_sample_count", "arm_observed_sim_stamp_ns",
         "arm_observed_steady_ns", "arm_protocol_sha256", "arm_request_sha256",
         "arm_requested_steady_ns", "armed_clock_sample_count", "armed_sim_stamp_ns",
-        "armed_steady_ns", "producer", "ready_sha256", "run_id",
+        "armed_steady_ns", "command_delivery_probe", "producer", "ready_sha256", "run_id",
         "runtime_gate_sha256", "schema_version"
       ],
       "properties": {
@@ -409,11 +431,12 @@
         "armed_clock_sample_count": {"type": "integer", "minimum": 1},
         "armed_sim_stamp_ns": {"type": "integer", "minimum": 1},
         "armed_steady_ns": {"type": "integer", "minimum": 1},
+        "command_delivery_probe": {"$ref": "#/$defs/commandDeliveryProbe"},
         "producer": {"const": "robotest_scenarios/contact_control_driver"},
         "ready_sha256": {"$ref": "#/$defs/sha256"},
         "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
         "runtime_gate_sha256": {"$ref": "#/$defs/sha256"},
-        "schema_version": {"const": 1}
+        "schema_version": {"const": 2}
       }
     },
     "armEvidence": {
