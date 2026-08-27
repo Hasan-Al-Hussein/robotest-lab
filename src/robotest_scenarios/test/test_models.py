@@ -23,6 +23,11 @@ from robotest_scenarios.models import EXPECTED_NAMES, load_scenario
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 SCENARIOS = tuple(sorted((REPOSITORY / 'scenarios').glob('phase3_s*.yaml')))
+EXPECTED_PHASE3_WAYPOINTS = (
+    (-2.0, -3.5, 0.0),
+    (-0.2, 0.0, 0.0),
+    (-0.2, 3.5, 0.0),
+)
 
 
 @pytest.mark.parametrize('path', SCENARIOS, ids=lambda path: path.stem)
@@ -32,6 +37,25 @@ def test_all_frozen_phase3_documents_load(path: Path) -> None:
     assert document.controller_seed == 42
     assert document.sha256
     assert document.has_actor is (document.scenario_id in {2, 3})
+    assert (
+        tuple((waypoint.x, waypoint.y, waypoint.yaw) for waypoint in document.waypoints)
+        == EXPECTED_PHASE3_WAYPOINTS
+    )
+
+
+@pytest.mark.parametrize('scenario_path', SCENARIOS, ids=lambda path: path.stem)
+@pytest.mark.parametrize('waypoint_index', (1, 2))
+def test_legacy_centerline_waypoint_is_rejected(
+    tmp_path: Path,
+    scenario_path: Path,
+    waypoint_index: int,
+) -> None:
+    payload = yaml.safe_load(scenario_path.read_text(encoding='utf-8'))
+    payload['waypoints'][waypoint_index]['x'] = 0.0
+    path = tmp_path / 'scenario.yaml'
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding='utf-8')
+    with pytest.raises(ValidationError, match='schema violation'):
+        load_scenario(str(path))
 
 
 def test_unknown_root_field_is_rejected(tmp_path: Path) -> None:

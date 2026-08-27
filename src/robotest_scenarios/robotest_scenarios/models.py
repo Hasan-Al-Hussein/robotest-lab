@@ -35,6 +35,12 @@ EXPECTED_NAMES = {
     4: 'temporary_lidar_dropout',
     5: 'deterministic_odometry_drift',
 }
+_PHASE3_FROZEN_CONTRACT = 'target-set revision 3 / ADR0007'
+_PHASE3_WAYPOINTS = (
+    (-2.0, -3.5, 0.0),
+    (-0.2, 0.0, 0.0),
+    (-0.2, 3.5, 0.0),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +128,6 @@ def _validate_schema(value: Any) -> None:
 
 
 def _assert_common_frozen(value: dict[str, Any]) -> tuple[Waypoint, ...]:
-    expected_waypoints = ((-2.0, -3.5, 0.0), (0.0, 0.0, 0.0), (0.0, 3.5, 0.0))
     actual_waypoints = tuple(
         (
             _finite_float(item['x'], label='waypoint.x'),
@@ -131,8 +136,8 @@ def _assert_common_frozen(value: dict[str, Any]) -> tuple[Waypoint, ...]:
         )
         for item in value['waypoints']
     )
-    if actual_waypoints != expected_waypoints:
-        raise ValidationError('waypoints differ from the ADR 0006 frozen mission')
+    if actual_waypoints != _PHASE3_WAYPOINTS:
+        raise ValidationError(f'waypoints differ from the {_PHASE3_FROZEN_CONTRACT} frozen mission')
     frozen = {
         'allowed_collision_count': 0,
         'expected_outcome': 'succeeded',
@@ -147,10 +152,12 @@ def _assert_common_frozen(value: dict[str, Any]) -> tuple[Waypoint, ...]:
     }
     for key, expected in frozen.items():
         if value[key] != expected:
-            raise ValidationError(f'{key} differs from the ADR 0006 frozen value {expected!r}')
+            raise ValidationError(
+                f'{key} differs from the {_PHASE3_FROZEN_CONTRACT} frozen value {expected!r}'
+            )
     start = value['start_pose']
     if (start['x'], start['y'], start['yaw']) != (0.0, -3.5, 0.0):
-        raise ValidationError('start_pose differs from the ADR 0006 frozen pose')
+        raise ValidationError(f'start_pose differs from the {_PHASE3_FROZEN_CONTRACT} frozen pose')
     return tuple(Waypoint(*item) for item in actual_waypoints)
 
 

@@ -167,3 +167,14 @@ def test_incremental_build_reconfigures_and_rebinds_pipeline_inventory(tmp_path:
     assert updated == _inventory_sha256(source_root)
     assert updated_plugin == updated
     assert updated != initial
+
+    system_source = source_root / 'src' / 'contact_aggregator_system.cpp'
+    system_source.write_bytes(
+        system_source.read_bytes() + b'\n// Aggregator configure-dependency regression probe.\n'
+    )
+    _build(source_root, build_root, environment)
+    system_updated = _embedded_sha256(executable)
+    system_updated_plugin = _embedded_sha256(plugin)
+    assert system_updated == _inventory_sha256(source_root)
+    assert system_updated_plugin == system_updated
+    assert system_updated != updated

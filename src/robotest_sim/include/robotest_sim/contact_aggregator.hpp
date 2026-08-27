@@ -21,6 +21,60 @@ namespace robotest_sim
 inline constexpr std::int64_t kContactAggregatePeriodNs = 20000000;
 inline constexpr std::size_t kContactAggregateSourceCount = 7U;
 
+namespace internal
+{
+
+inline constexpr std::int64_t kContactProfileEmissionPeriodNs = 5000000000LL;
+
+enum class ContactProfileCategory : std::size_t
+{
+  LockedBindingValidation = 0U,
+  CachedEventStateCheck = 1U,
+  ExhaustiveEventRescan = 2U,
+  ContactPolicyProtobuf = 3U,
+  Publish = 4U,
+  Count = 5U,
+};
+
+/// Fixed-size cumulative state behind the optional live attribution log.
+class ContactProfileAccumulator {
+public:
+  explicit ContactProfileAccumulator(bool enabled = false) noexcept;
+
+  bool enabled() const noexcept;
+  void disable() noexcept;
+  void lock(std::int64_t simulation_stamp_ns) noexcept;
+  void restart_cadence(std::int64_t simulation_stamp_ns) noexcept;
+  void add_timing(
+    ContactProfileCategory category,
+    std::uint64_t elapsed_ns,
+    std::int64_t linux_tid) noexcept;
+  void count_observation() noexcept;
+  void count_rescan() noexcept;
+  void count_publish() noexcept;
+  std::optional<std::string> emit_if_due(std::int64_t simulation_stamp_ns);
+
+private:
+  void saturating_add(
+    std::uint64_t & target,
+    std::uint64_t increment) noexcept;
+  void count(std::uint64_t & target) noexcept;
+
+  std::array<std::uint64_t,
+    static_cast<std::size_t>(ContactProfileCategory::Count)> cumulative_ns_{};
+  std::optional<std::int64_t> next_emission_stamp_ns_;
+  std::optional<std::int64_t> profile_epoch_start_sim_stamp_ns_;
+  std::optional<std::int64_t> linux_tid_;
+  std::uint64_t observation_count_{0U};
+  std::uint64_t rescan_count_{0U};
+  std::uint64_t publish_count_{0U};
+  bool enabled_{false};
+  bool locked_{false};
+  bool saturated_{false};
+};
+
+}  // namespace internal
+
 using ContactAggregateSources =
   std::array<const gz::msgs::Contacts *, kContactAggregateSourceCount>;
 

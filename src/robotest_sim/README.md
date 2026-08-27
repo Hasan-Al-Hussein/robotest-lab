@@ -24,6 +24,28 @@ aggregate on the private Gazebo topic
 `/robotest/internal/contact_aggregate`. Only that topic is bridged to the
 compiled ROS contact gate; the seven sensor-local topics are deliberately
 unbridged.
+
+Before observation starts, the aggregator exhaustively proves the one-model,
+seven-sensor/link/collision inventory and locks the exact entity bindings.
+After lock, every completed, unpaused physics step directly validates those
+seven cached bindings, checks the component state of every existing cached
+Model, ContactSensor, Link, and Collision without a global entity traversal,
+and reads all seven contact payloads. A relevant entity or cached
+structural-component event triggers the same exhaustive inventory/SDF rescan.
+On one-time activity, conditional typed scans over Model, ContactSensor, Link,
+and Collision inspect primary, `Name`, and `ParentEntity` state and catch
+structural components added to previously uncached existing entities;
+unrelated Pose and physics-rate payload changes do not. The 500 Hz source
+observation and 50 Hz output grid are unchanged. Interval groups update
+in place only after step validation, and the complete union is then
+revalidated. Any invalid or over-limit union latches fatal before publication;
+policy reset clears partial interval state, while a deployed system fatal
+requires a clean stack restart. The performance change and its still-pending
+live keep/revert evidence are frozen in
+[ADR 0008](../../docs/decisions/0008-phase3-contact-aggregation-performance.md).
+Configuration writers must signal changes through Gazebo ECM `SetChanged`;
+an unsignalled in-place sensor-SDF edit violates that writer contract.
+
 Phase 3 also exposes bounded Gazebo user-command services below
 `/robotest/scenario/{spawn_entity,set_entity_pose,delete_entity}` and bridges
 the observed 10 Hz actor pose streams plus a permanent ground-plane heartbeat

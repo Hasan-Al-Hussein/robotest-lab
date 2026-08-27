@@ -1,21 +1,23 @@
 # RoboTest Lab Acceptance Criteria
 
-Status: **Frozen Phase 3 target set, revision 2**
+Status: **Frozen Phase 3 target set, revision 3**
 
 These values are targets, not results. No measurement in this document is
-claimed to have occurred. Revision 2 freezes the Phase 3 fault, metric,
-collision, scenario, and repeated-trial semantics before the first Phase 3
-candidate suite. Run manifests copy this target-set revision and hash before
-execution. Results are recorded elsewhere and are never written back into the
-target fields.
+claimed to have occurred. Revision 3 retains the revision-2 fault, metric,
+collision, scenario, and repeated-trial semantics while replacing the Phase 3
+northbound route before any replacement candidate is run. Run manifests copy
+this target-set revision and hash before execution. Results are recorded
+elsewhere and are never written back into the target fields.
 
 The normative calculation details live in the
 [metrics contract](../architecture/metrics-contract.md), the deterministic
 fault-control protocol lives in
 [ADR 0005](../decisions/0005-phase3-deterministic-fault-protocol.md), and the
 scenario mechanics live in
-[ADR 0006](../decisions/0006-phase3-scenario-mechanics.md). Those files and
-their SHA-256 hashes are part of the target set.
+[ADR 0006](../decisions/0006-phase3-scenario-mechanics.md), with the revised
+northbound lane frozen by
+[ADR 0007](../decisions/0007-phase3-northbound-lane.md). Those files and their
+SHA-256 hashes are part of the target set.
 
 Changing a target requires a dated decision record before the affected run.
 Changing a threshold after seeing a result invalidates that result for
@@ -45,6 +47,12 @@ may not loosen these targets without a prior decision record.
 
 Unless a scenario below overrides a value:
 
+- the Phase 3 ordered route is `(-2.0, -3.5)`, `(-0.2, 0.0)`, and
+  `(-0.2, 3.5)` in `map`; the Phase 2 baseline route is unchanged;
+- the final Phase 3 lane retains at least `0.10 m` nominal west clearance for
+  the configured PolygonStop envelope and at least `0.15 m` east clearance
+  under the frozen `0.35 m` eastward centre-error plus `0.10 rad` heading-error
+  geometry guard;
 - benchmark acceptance requires **3 of 3** repeated trials;
 - allowed collision count is **0**;
 - mission simulation-time timeout is **180 s**;

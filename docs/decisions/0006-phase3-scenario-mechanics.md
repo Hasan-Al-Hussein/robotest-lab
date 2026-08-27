@@ -1,6 +1,6 @@
 # ADR 0006: Phase 3 Scenario Mechanics and Trial Independence
 
-- Status: Accepted and implemented; authoritative Phase 3 benchmark evidence pending
+- Status: Accepted for target-set revision 2; Phase 3 route coordinates superseded by ADR 0007
 - Date: 2026-08-26
 - Decision owners: RoboTest Lab scenario, metrics, safety, and benchmark gate
 
@@ -22,6 +22,11 @@ preload-before-goal and UUID-bound arm ordering introduced by
 governed by [ADR 0004](0004-phase2-command-ownership.md), and validation data
 remains observational under the
 [topic and TF contract](../architecture/topic-and-tf-contract.md).
+
+The route coordinates below remain the historical revision-2 decision.
+[ADR 0007](0007-phase3-northbound-lane.md) supersedes only waypoint 1 and
+waypoint 2 for Phase 3 target-set revision 3; it does not rewrite evidence
+produced under this decision.
 
 ## Frozen source frame
 

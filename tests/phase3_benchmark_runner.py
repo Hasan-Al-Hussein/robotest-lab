@@ -80,8 +80,10 @@ from phase3_orchestration import (
     verify_component_manifest,
     verify_json_sidecar,
 )
+from phase3_smoke_host_profiler import ProfileError, validate_campaign_smoke_profile
 
 CAMPAIGN_AUTHORIZATION = 'I_AUTHORIZE_EXACTLY_15_COLD_STACK_TRIALS_NO_RETRIES'
+CONTACT_PROFILE_ENV = 'ROBOTEST_CONTACT_PROFILE'
 MAX_PROCESSES = 64
 MAX_RESOURCE_SAMPLES = 4096
 MAX_RESOURCE_PID_IDENTITIES = 4096
@@ -962,8 +964,33 @@ def _metrics_collector_command(
     ]
 
 
-def _environment(domain_id: int, partition: str) -> dict[str, str]:
-    env = dict(os.environ)
+def _base_environment_for_mode(
+    mode: str,
+    environment: Mapping[str, str],
+) -> dict[str, str]:
+    """Freeze an environment whose contact profiler state is valid for one mode."""
+    env = dict(environment)
+    profile_present = CONTACT_PROFILE_ENV in env
+    profile_value = env.get(CONTACT_PROFILE_ENV)
+    if mode == 'smoke':
+        if profile_present and profile_value != '1':
+            raise EvidenceError(
+                f'{CONTACT_PROFILE_ENV} must be absent or exactly "1" in smoke mode'
+            )
+    elif mode in {'prepare', 'positive-control', 'campaign'}:
+        if profile_present:
+            raise EvidenceError(f'{CONTACT_PROFILE_ENV} must be absent in {mode} mode')
+    else:
+        raise EvidenceError(f'unsupported benchmark runner mode: {mode!r}')
+    return env
+
+
+def _environment(
+    domain_id: int,
+    partition: str,
+    base_environment: Mapping[str, str],
+) -> dict[str, str]:
+    env = dict(base_environment)
     env.update(
         {
             'GZ_PARTITION': partition,
@@ -1083,10 +1110,26 @@ def _graph_probe_command(
     return command
 
 
+def _smoke_trial_plan(plan: Mapping[str, Any], candidate_id: str) -> dict[str, Any]:
+    """Project the first candidate trial onto the suite's frozen smoke identity."""
+    smoke_contract = plan['smoke']
+    smoke = dict(plan['trials'][0])
+    smoke.update(
+        {
+            'candidate_id': f'{candidate_id}-smoke',
+            'gz_partition': smoke_contract['gz_partition'],
+            'ros_domain_id': smoke_contract['ros_domain_id'],
+            'run_id': smoke_contract['run_id'],
+        }
+    )
+    return smoke
+
+
 class BenchmarkRunner:
     """Staged Phase 3 runner with no replacement retry path."""
 
     def __init__(self, arguments: argparse.Namespace) -> None:
+        self.base_environment = _base_environment_for_mode(arguments.mode, os.environ)
         self.workspace = arguments.workspace.resolve()
         self.candidate_id = safe_candidate_id(arguments.candidate_id)
         self.domain_base = arguments.domain_base
@@ -1147,7 +1190,11 @@ class BenchmarkRunner:
         stage = plan['positive_control']
         run_dir = self.candidate_root / 'positive-control'
         _new_directory(run_dir)
-        env = _environment(stage['ros_domain_id'], stage['gz_partition'])
+        env = _environment(
+            stage['ros_domain_id'],
+            stage['gz_partition'],
+            self.base_environment,
+        )
         registry = ProcessRegistry(run_dir / 'processes', self.workspace, env)
         self._active_registry = registry
         sampler = ResourceSampler(registry, run_dir / 'resources.jsonl')
@@ -1476,16 +1523,7 @@ class BenchmarkRunner:
     def smoke(self) -> None:
         plan, binding = self._load_state()
         positive = self._load_positive()
-        smoke = dict(plan['trials'][0])
-        smoke_candidate = f'{self.candidate_id}-smoke'
-        smoke.update(
-            {
-                'candidate_id': smoke_candidate,
-                'gz_partition': f'robotest_p3_{smoke_candidate}_00',
-                'ros_domain_id': plan['smoke']['ros_domain_id'],
-                'run_id': plan['smoke']['run_id'],
-            }
-        )
+        smoke = _smoke_trial_plan(plan, self.candidate_id)
         result_path = self._run_trial(smoke, binding, positive, self.candidate_root / 'smoke')
         result = load_json(result_path)
         if result.get('verdict', {}).get('automated_status') != 'PASS':
@@ -1510,6 +1548,16 @@ class BenchmarkRunner:
         verify_json_sidecar(smoke_marker)
         if load_json(smoke_marker).get('status') != 'PASS':
             raise EvidenceError('campaign requires a passing single-scenario smoke')
+        try:
+            validate_campaign_smoke_profile(
+                self.workspace,
+                self.candidate_root,
+                self.candidate_id,
+            )
+        except ProfileError as exc:
+            raise EvidenceError(
+                f'campaign requires a valid profiled smoke ({exc.kind}): {exc}'
+            ) from exc
         run_results: list[Path] = []
         abort_failure: StageFailure | None = None
         for item in plan['trials']:
@@ -1549,7 +1597,11 @@ class BenchmarkRunner:
         registry = ProcessRegistry(
             aggregate_dir / 'processes',
             self.workspace,
-            _environment(self.domain_base, f'robotest_p3_{self.candidate_id}_aggregate'),
+            _environment(
+                self.domain_base,
+                f'robotest_p3_{self.candidate_id}_aggregate',
+                self.base_environment,
+            ),
         )
         self._active_registry = registry
         aggregate_cleanup_ok = False
@@ -1583,7 +1635,11 @@ class BenchmarkRunner:
     ) -> Path:
         _require_exact_affinity()
         _new_directory(run_dir)
-        env = _environment(plan['ros_domain_id'], plan['gz_partition'])
+        env = _environment(
+            plan['ros_domain_id'],
+            plan['gz_partition'],
+            self.base_environment,
+        )
         registry = ProcessRegistry(run_dir / 'processes', self.workspace, env)
         self._active_registry = registry
         sampler = ResourceSampler(registry, run_dir / 'resources.jsonl')
@@ -2507,7 +2563,11 @@ class BenchmarkRunner:
         registry = ProcessRegistry(
             run_dir / 'analysis-process',
             self.workspace,
-            _environment(0, 'robotest_phase3_offline_analysis'),
+            _environment(
+                0,
+                'robotest_phase3_offline_analysis',
+                self.base_environment,
+            ),
         )
         self._active_registry = registry
         try:
@@ -2585,7 +2645,11 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run exactly one explicit orchestration stage."""
     arguments = _parser().parse_args(argv)
-    runner = BenchmarkRunner(arguments)
+    try:
+        runner = BenchmarkRunner(arguments)
+    except (EvidenceError, OSError) as exc:
+        print(f'phase3 benchmark runner error: {exc}', file=sys.stderr)
+        return 2
 
     def terminate(_signum: int, _frame: Any) -> None:
         runner.stop_active()

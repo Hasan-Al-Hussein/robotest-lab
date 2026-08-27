@@ -9,12 +9,54 @@
 #include <utility>
 #include <vector>
 
+#include "gz/sim/EntityComponentManager.hh"
+#include "gz/sim/components/Collision.hh"
+#include "gz/sim/components/ContactSensor.hh"
+#include "gz/sim/components/ContactSensorData.hh"
+#include "gz/sim/components/Link.hh"
+#include "gz/sim/components/Model.hh"
+#include "gz/sim/components/Name.hh"
+#include "gz/sim/components/ParentEntity.hh"
+#include "gz/sim/components/Pose.hh"
+#include "gz/sim/components/World.hh"
 #include "google/protobuf/unknown_field_set.h"
 #include "robotest_sim/contact_aggregator.hpp"
 #include "gtest/gtest.h"
 
 namespace robotest_sim
 {
+namespace internal
+{
+
+bool nameless_contact_sensor_under_model(
+  gz::sim::Entity sensor_entity,
+  gz::sim::Entity model_entity,
+  const gz::sim::EntityComponentManager & ecm);
+
+std::array<bool, 2U> cached_inventory_component_changes(
+  const gz::sim::EntityComponentManager & ecm,
+  const std::vector<gz::sim::Entity> & model_entities,
+  const std::vector<gz::sim::Entity> & sensor_entities,
+  const std::vector<gz::sim::Entity> & link_entities,
+  const std::vector<gz::sim::Entity> & collision_entities);
+
+bool relevant_one_time_inventory_component_changed(
+  const gz::sim::EntityComponentManager & ecm);
+
+bool relevant_periodic_inventory_type_changed(
+  const gz::sim::EntityComponentManager & ecm);
+
+bool locked_inventory_scan_required(
+  bool new_entities,
+  bool entities_marked_for_removal,
+  bool removed_components,
+  bool relevant_one_time_change,
+  bool relevant_periodic_change,
+  bool unrelated_one_time_change,
+  bool unrelated_periodic_change) noexcept;
+
+}  // namespace internal
+
 namespace
 {
 
@@ -66,6 +108,13 @@ std::int64_t stamp_ns(const gz::msgs::Header & header)
   return header.stamp().sec() * 1000000000LL + header.stamp().nsec();
 }
 
+void set_stamp(gz::msgs::Header & header, const std::int64_t value_ns)
+{
+  header.mutable_stamp()->set_sec(value_ns / 1000000000LL);
+  header.mutable_stamp()->set_nsec(
+    static_cast<std::int32_t>(value_ns % 1000000000LL));
+}
+
 Pair normalized_pair(const gz::msgs::Contact & contact)
 {
   auto first = contact.collision1().name();
@@ -85,7 +134,575 @@ void synchronize(
   ASSERT_FALSE(decision.output.has_value());
 }
 
+void set_inventory_component_states(
+  gz::sim::EntityComponentManager & ecm,
+  const gz::sim::Entity entity,
+  const gz::sim::ComponentTypeId primary_type,
+  const gz::sim::ComponentState state)
+{
+  ecm.SetChanged(entity, primary_type, state);
+  ecm.SetChanged(entity, gz::sim::components::Name::typeId, state);
+  ecm.SetChanged(entity, gz::sim::components::ParentEntity::typeId, state);
+}
+
+bool real_ecm_inventory_gate_requires_scan(
+  const gz::sim::EntityComponentManager & ecm)
+{
+  const bool has_one_time_component_changes =
+    ecm.HasOneTimeComponentChanges();
+  const bool relevant_one_time_change =
+    has_one_time_component_changes &&
+    internal::relevant_one_time_inventory_component_changed(ecm);
+  return internal::locked_inventory_scan_required(
+    ecm.HasNewEntities(), ecm.HasEntitiesMarkedForRemoval(),
+    ecm.HasRemovedComponents(), relevant_one_time_change,
+    internal::relevant_periodic_inventory_type_changed(ecm),
+    has_one_time_component_changes, ecm.HasPeriodicComponentChanges());
+}
+
+template<typename Component>
+void expect_existing_entity_promotion_requires_scan(const Component & component)
+{
+  gz::sim::EntityComponentManager ecm;
+  const auto entity = ecm.CreateEntity();
+  ecm.ClearNewlyCreatedEntities();
+  ecm.SetAllComponentsUnchanged();
+  ASSERT_FALSE(ecm.HasNewEntities());
+  ASSERT_FALSE(ecm.HasOneTimeComponentChanges());
+
+  ASSERT_NE(ecm.CreateComponent(entity, component), nullptr);
+  ASSERT_FALSE(ecm.HasNewEntities());
+  ASSERT_TRUE(ecm.HasOneTimeComponentChanges());
+  EXPECT_TRUE(
+    internal::relevant_one_time_inventory_component_changed(ecm));
+  EXPECT_TRUE(real_ecm_inventory_gate_requires_scan(ecm));
+}
+
+template<typename InventoryComponent, typename AddedComponentFactory>
+void expect_existing_structural_entity_addition_requires_scan(
+  const InventoryComponent & inventory_component,
+  AddedComponentFactory make_added_component)
+{
+  gz::sim::EntityComponentManager ecm;
+  const auto parent = ecm.CreateEntity();
+  const auto entity = ecm.CreateEntity();
+  ASSERT_NE(ecm.CreateComponent(entity, inventory_component), nullptr);
+  ecm.ClearNewlyCreatedEntities();
+  ecm.SetAllComponentsUnchanged();
+  ASSERT_FALSE(ecm.HasNewEntities());
+  ASSERT_FALSE(ecm.HasOneTimeComponentChanges());
+
+  ASSERT_NE(
+    ecm.CreateComponent(entity, make_added_component(parent)), nullptr);
+  ASSERT_FALSE(ecm.HasNewEntities());
+  ASSERT_TRUE(ecm.HasOneTimeComponentChanges());
+  EXPECT_TRUE(
+    internal::relevant_one_time_inventory_component_changed(ecm));
+  EXPECT_TRUE(real_ecm_inventory_gate_requires_scan(ecm));
+}
+
 }  // namespace
+
+TEST(ContactAggregatorInventoryGate,
+     RelevantEventsRetriggerButHighRatePayloadChangesDoNot) {
+  EXPECT_FALSE(internal::locked_inventory_scan_required(
+      false, false, false, false, false, false, false));
+
+  struct GateCase
+  {
+    const char *name;
+    std::array<bool, 5U> events;
+  };
+  const std::array<GateCase, 5U> cases = {{
+    {"new entity", {true, false, false, false, false}},
+    {"marked removal", {false, true, false, false, false}},
+    {"removed relevant entity or component",
+      {false, false, true, false, false}},
+    {"relevant one-time component state",
+      {false, false, false, true, false}},
+    {"relevant periodic component state",
+      {false, false, false, false, true}},
+  }};
+  for (const auto & test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    EXPECT_TRUE(internal::locked_inventory_scan_required(
+        test_case.events[0], test_case.events[1], test_case.events[2],
+        test_case.events[3], test_case.events[4], false, false));
+  }
+
+  // Global one-time controller changes and high-rate periodic Pose /
+  // ContactSensorData changes are intentionally irrelevant to source identity.
+  EXPECT_FALSE(internal::locked_inventory_scan_required(
+      false, false, false, false, false, true, false));
+  EXPECT_FALSE(internal::locked_inventory_scan_required(
+      false, false, false, false, false, false, true));
+  EXPECT_FALSE(internal::locked_inventory_scan_required(
+      false, false, false, false, false, true, true));
+}
+
+TEST(ContactAggregatorInventoryGate,
+     CachedRealEcmStatesSelectStructuralChangesOnly) {
+  gz::sim::EntityComponentManager ecm;
+  const auto parent = ecm.CreateEntity();
+  const auto model = ecm.CreateEntity();
+  const auto sensor = ecm.CreateEntity();
+  const auto link = ecm.CreateEntity();
+  const auto collision = ecm.CreateEntity();
+  const auto unbound_link = ecm.CreateEntity();
+  const auto unbound_collision = ecm.CreateEntity();
+
+  ASSERT_NE(ecm.CreateComponent(model, gz::sim::components::Model()), nullptr);
+  ASSERT_NE(
+    ecm.CreateComponent(model, gz::sim::components::Name("model")), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      model, gz::sim::components::ParentEntity(parent)), nullptr);
+  ASSERT_NE(
+    ecm.CreateComponent(sensor, gz::sim::components::ContactSensor()), nullptr);
+  ASSERT_NE(
+    ecm.CreateComponent(sensor, gz::sim::components::Name("sensor")), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      sensor, gz::sim::components::ParentEntity(link)), nullptr);
+  ASSERT_NE(ecm.CreateComponent(link, gz::sim::components::Link()), nullptr);
+  ASSERT_NE(
+    ecm.CreateComponent(link, gz::sim::components::Name("link")), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      link, gz::sim::components::ParentEntity(model)), nullptr);
+  ASSERT_NE(
+    ecm.CreateComponent(collision, gz::sim::components::Collision()), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      collision, gz::sim::components::Name("collision")), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      collision, gz::sim::components::ParentEntity(link)), nullptr);
+  ASSERT_NE(
+    ecm.CreateComponent(unbound_link, gz::sim::components::Link()), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      unbound_link, gz::sim::components::Name("spare_link")), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      unbound_link, gz::sim::components::ParentEntity(model)), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      unbound_collision, gz::sim::components::Collision()), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      unbound_collision, gz::sim::components::Name("spare_collision")),
+    nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      unbound_collision, gz::sim::components::ParentEntity(link)), nullptr);
+
+  const std::vector<gz::sim::Entity> models{model};
+  const std::vector<gz::sim::Entity> sensors{sensor};
+  const std::vector<gz::sim::Entity> links{link, unbound_link};
+  const std::vector<gz::sim::Entity> collisions{
+    collision, unbound_collision};
+  const auto changes = [&]() {
+      return internal::cached_inventory_component_changes(
+        ecm, models, sensors, links, collisions);
+    };
+  const auto clear_relevant_states = [&]() {
+      set_inventory_component_states(
+        ecm, model, gz::sim::components::Model::typeId,
+        gz::sim::ComponentState::NoChange);
+      set_inventory_component_states(
+        ecm, sensor, gz::sim::components::ContactSensor::typeId,
+        gz::sim::ComponentState::NoChange);
+      set_inventory_component_states(
+        ecm, link, gz::sim::components::Link::typeId,
+        gz::sim::ComponentState::NoChange);
+      set_inventory_component_states(
+        ecm, collision, gz::sim::components::Collision::typeId,
+        gz::sim::ComponentState::NoChange);
+      set_inventory_component_states(
+        ecm, unbound_link, gz::sim::components::Link::typeId,
+        gz::sim::ComponentState::NoChange);
+      set_inventory_component_states(
+        ecm, unbound_collision, gz::sim::components::Collision::typeId,
+        gz::sim::ComponentState::NoChange);
+    };
+
+  clear_relevant_states();
+  EXPECT_EQ(changes(), (std::array<bool, 2U>{false, false}));
+
+  ecm.SetChanged(
+    sensor, gz::sim::components::ContactSensor::typeId,
+    gz::sim::ComponentState::OneTimeChange);
+  EXPECT_EQ(changes(), (std::array<bool, 2U>{true, false}));
+  clear_relevant_states();
+
+  ecm.SetChanged(
+    sensor, gz::sim::components::Name::typeId,
+    gz::sim::ComponentState::PeriodicChange);
+  EXPECT_EQ(changes(), (std::array<bool, 2U>{false, true}));
+  clear_relevant_states();
+
+  ecm.SetChanged(
+    sensor, gz::sim::components::ParentEntity::typeId,
+    gz::sim::ComponentState::OneTimeChange);
+  EXPECT_EQ(changes(), (std::array<bool, 2U>{true, false}));
+  clear_relevant_states();
+
+  ecm.SetChanged(
+    link, gz::sim::components::Link::typeId,
+    gz::sim::ComponentState::PeriodicChange);
+  EXPECT_EQ(changes(), (std::array<bool, 2U>{false, true}));
+  clear_relevant_states();
+
+  ecm.SetChanged(
+    collision, gz::sim::components::Collision::typeId,
+    gz::sim::ComponentState::OneTimeChange);
+  EXPECT_EQ(changes(), (std::array<bool, 2U>{true, false}));
+  clear_relevant_states();
+
+  struct UnboundOneTimeCase
+  {
+    const char *name;
+    gz::sim::Entity entity;
+    gz::sim::ComponentTypeId type;
+  };
+  const std::array<UnboundOneTimeCase, 6U> unbound_cases = {{
+    {"unbound link primary", unbound_link,
+      gz::sim::components::Link::typeId},
+    {"unbound link name", unbound_link,
+      gz::sim::components::Name::typeId},
+    {"unbound link parent", unbound_link,
+      gz::sim::components::ParentEntity::typeId},
+    {"unbound collision primary", unbound_collision,
+      gz::sim::components::Collision::typeId},
+    {"unbound collision name", unbound_collision,
+      gz::sim::components::Name::typeId},
+    {"unbound collision parent", unbound_collision,
+      gz::sim::components::ParentEntity::typeId},
+  }};
+  for (const auto & test_case : unbound_cases) {
+    SCOPED_TRACE(test_case.name);
+    ecm.SetChanged(
+      test_case.entity, test_case.type,
+      gz::sim::ComponentState::OneTimeChange);
+    EXPECT_EQ(changes(), (std::array<bool, 2U>{true, false}));
+    clear_relevant_states();
+  }
+
+  ASSERT_NE(
+    ecm.CreateComponent(model, gz::sim::components::Pose()), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      collision, gz::sim::components::ContactSensorData()), nullptr);
+  ecm.SetChanged(
+    model, gz::sim::components::Pose::typeId,
+    gz::sim::ComponentState::PeriodicChange);
+  ecm.SetChanged(
+    collision, gz::sim::components::ContactSensorData::typeId,
+    gz::sim::ComponentState::PeriodicChange);
+  EXPECT_EQ(changes(), (std::array<bool, 2U>{false, false}));
+
+  // ComponentTypesWithPeriodicChanges() retains type-level update state for
+  // the current ECM cycle, so isolate the type-filter assertions from the
+  // relevant periodic changes exercised above.
+  gz::sim::EntityComponentManager periodic_ecm;
+  const auto periodic_model = periodic_ecm.CreateEntity();
+  const auto periodic_collision = periodic_ecm.CreateEntity();
+  const auto periodic_sensor = periodic_ecm.CreateEntity();
+  ASSERT_NE(periodic_ecm.CreateComponent(
+      periodic_model, gz::sim::components::Pose()), nullptr);
+  ASSERT_NE(periodic_ecm.CreateComponent(
+      periodic_collision, gz::sim::components::ContactSensorData()), nullptr);
+  ASSERT_NE(periodic_ecm.CreateComponent(
+      periodic_sensor, gz::sim::components::Name("sensor")), nullptr);
+  periodic_ecm.SetChanged(
+    periodic_model, gz::sim::components::Pose::typeId,
+    gz::sim::ComponentState::PeriodicChange);
+  periodic_ecm.SetChanged(
+    periodic_collision, gz::sim::components::ContactSensorData::typeId,
+    gz::sim::ComponentState::PeriodicChange);
+  EXPECT_FALSE(
+    internal::relevant_periodic_inventory_type_changed(periodic_ecm));
+
+  periodic_ecm.SetChanged(
+    periodic_sensor, gz::sim::components::Name::typeId,
+    gz::sim::ComponentState::PeriodicChange);
+  EXPECT_TRUE(
+    internal::relevant_periodic_inventory_type_changed(periodic_ecm));
+}
+
+TEST(ContactAggregatorInventoryGate,
+     ExistingEntityStructuralPromotionRetriggersRealEcmInventoryScan) {
+  expect_existing_entity_promotion_requires_scan(
+    gz::sim::components::Model());
+  expect_existing_entity_promotion_requires_scan(
+    gz::sim::components::ContactSensor());
+  expect_existing_entity_promotion_requires_scan(
+    gz::sim::components::Link());
+  expect_existing_entity_promotion_requires_scan(
+    gz::sim::components::Collision());
+
+  const auto expect_name_and_parent_additions = [](const auto & component) {
+      expect_existing_structural_entity_addition_requires_scan(
+        component, [](const gz::sim::Entity) {
+          return gz::sim::components::Name("promoted");
+        });
+      expect_existing_structural_entity_addition_requires_scan(
+        component, [](const gz::sim::Entity parent) {
+          return gz::sim::components::ParentEntity(parent);
+        });
+    };
+  expect_name_and_parent_additions(gz::sim::components::Model());
+  expect_name_and_parent_additions(gz::sim::components::ContactSensor());
+  expect_name_and_parent_additions(gz::sim::components::Link());
+  expect_name_and_parent_additions(gz::sim::components::Collision());
+}
+
+TEST(ContactAggregatorInventoryGate,
+     UnrelatedExistingEntityOneTimeChurnDoesNotRetriggerInventoryScan) {
+  {
+    gz::sim::EntityComponentManager ecm;
+    const auto entity = ecm.CreateEntity();
+    ecm.ClearNewlyCreatedEntities();
+    ecm.SetAllComponentsUnchanged();
+    ASSERT_NE(
+      ecm.CreateComponent(entity, gz::sim::components::Name("generic")),
+      nullptr);
+    ASSERT_FALSE(ecm.HasNewEntities());
+    ASSERT_TRUE(ecm.HasOneTimeComponentChanges());
+    EXPECT_FALSE(
+      internal::relevant_one_time_inventory_component_changed(ecm));
+    EXPECT_FALSE(real_ecm_inventory_gate_requires_scan(ecm));
+  }
+
+  {
+    gz::sim::EntityComponentManager ecm;
+    const auto entity = ecm.CreateEntity();
+    ASSERT_NE(
+      ecm.CreateComponent(entity, gz::sim::components::Model()), nullptr);
+    ecm.ClearNewlyCreatedEntities();
+    ecm.SetAllComponentsUnchanged();
+    ASSERT_NE(
+      ecm.CreateComponent(entity, gz::sim::components::Pose()), nullptr);
+    ASSERT_FALSE(ecm.HasNewEntities());
+    ASSERT_TRUE(ecm.HasOneTimeComponentChanges());
+    EXPECT_FALSE(
+      internal::relevant_one_time_inventory_component_changed(ecm));
+    EXPECT_FALSE(real_ecm_inventory_gate_requires_scan(ecm));
+  }
+}
+
+TEST(ContactAggregatorInventoryGate,
+     NamelessContactSensorUnderRobotModelIsNotSilentlyIgnored) {
+  gz::sim::EntityComponentManager ecm;
+  const auto world = ecm.CreateEntity();
+  const auto robot_model = ecm.CreateEntity();
+  const auto robot_link = ecm.CreateEntity();
+  const auto robot_sensor = ecm.CreateEntity();
+  const auto other_model = ecm.CreateEntity();
+  const auto other_link = ecm.CreateEntity();
+  const auto other_sensor = ecm.CreateEntity();
+
+  ASSERT_NE(
+    ecm.CreateComponent(world, gz::sim::components::World()), nullptr);
+  ASSERT_NE(
+    ecm.CreateComponent(robot_model, gz::sim::components::Model()), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      robot_model, gz::sim::components::ParentEntity(world)), nullptr);
+  ASSERT_NE(
+    ecm.CreateComponent(robot_link, gz::sim::components::Link()), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      robot_link, gz::sim::components::ParentEntity(robot_model)), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      robot_sensor, gz::sim::components::ContactSensor()), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      robot_sensor, gz::sim::components::ParentEntity(robot_link)), nullptr);
+
+  ASSERT_NE(
+    ecm.CreateComponent(other_model, gz::sim::components::Model()), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      other_model, gz::sim::components::ParentEntity(world)), nullptr);
+  ASSERT_NE(
+    ecm.CreateComponent(other_link, gz::sim::components::Link()), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      other_link, gz::sim::components::ParentEntity(other_model)), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      other_sensor, gz::sim::components::ContactSensor()), nullptr);
+  ASSERT_NE(ecm.CreateComponent(
+      other_sensor, gz::sim::components::ParentEntity(other_link)), nullptr);
+
+  EXPECT_TRUE(internal::nameless_contact_sensor_under_model(
+      robot_sensor, robot_model, ecm));
+  EXPECT_FALSE(internal::nameless_contact_sensor_under_model(
+      other_sensor, robot_model, ecm));
+
+  ASSERT_NE(ecm.CreateComponent(
+      robot_sensor, gz::sim::components::Name("named_sensor")), nullptr);
+  EXPECT_FALSE(internal::nameless_contact_sensor_under_model(
+      robot_sensor, robot_model, ecm));
+}
+
+TEST(ContactAggregatorProfile,
+     CanonicalRecordIsExactAndCumulativeValuesAreMonotonic) {
+  internal::ContactProfileAccumulator profile(true);
+  constexpr std::int64_t lock_stamp_ns = 1000;
+  constexpr std::int64_t linux_tid = 4321;
+  profile.lock(lock_stamp_ns);
+  profile.add_timing(
+    internal::ContactProfileCategory::LockedBindingValidation, 10U, linux_tid);
+  profile.add_timing(
+    internal::ContactProfileCategory::CachedEventStateCheck, 20U, linux_tid);
+  profile.add_timing(
+    internal::ContactProfileCategory::ExhaustiveEventRescan, 30U, linux_tid);
+  profile.add_timing(
+    internal::ContactProfileCategory::ContactPolicyProtobuf, 40U, linux_tid);
+  profile.add_timing(
+    internal::ContactProfileCategory::Publish, 50U, linux_tid);
+  profile.count_observation();
+  profile.count_observation();
+  profile.count_rescan();
+  profile.count_publish();
+
+  EXPECT_FALSE(profile.emit_if_due(
+      lock_stamp_ns + internal::kContactProfileEmissionPeriodNs - 1)
+    .has_value());
+  const auto first = profile.emit_if_due(
+    lock_stamp_ns + internal::kContactProfileEmissionPeriodNs);
+  ASSERT_TRUE(first.has_value());
+  EXPECT_EQ(
+    *first,
+    "{\"cached_event_state_check_ns\":20,"
+    "\"clock_id\":\"CLOCK_THREAD_CPUTIME_ID\","
+    "\"contact_policy_protobuf_ns\":40,"
+    "\"exhaustive_event_rescan_ns\":30,"
+    "\"linux_tid\":4321,"
+    "\"locked_binding_validation_ns\":10,"
+    "\"measured_total_ns\":150,"
+    "\"observation_count\":2,"
+    "\"profile_epoch_start_sim_stamp_ns\":1000,"
+    "\"publish_count\":1,"
+    "\"publish_ns\":50,"
+    "\"rescan_count\":1,"
+    "\"saturated\":false,"
+    "\"schema_version\":1,"
+    "\"sim_stamp_ns\":5000001000}");
+  EXPECT_FALSE(profile.emit_if_due(
+      lock_stamp_ns + internal::kContactProfileEmissionPeriodNs)
+    .has_value());
+
+  profile.add_timing(
+    internal::ContactProfileCategory::LockedBindingValidation, 1U, linux_tid);
+  profile.add_timing(
+    internal::ContactProfileCategory::CachedEventStateCheck, 2U, linux_tid);
+  profile.add_timing(
+    internal::ContactProfileCategory::ExhaustiveEventRescan, 3U, linux_tid);
+  profile.add_timing(
+    internal::ContactProfileCategory::ContactPolicyProtobuf, 4U, linux_tid);
+  profile.add_timing(
+    internal::ContactProfileCategory::Publish, 5U, linux_tid);
+  profile.count_observation();
+  profile.count_rescan();
+  profile.count_publish();
+  const auto second = profile.emit_if_due(
+    lock_stamp_ns + 2 * internal::kContactProfileEmissionPeriodNs);
+  ASSERT_TRUE(second.has_value());
+  EXPECT_EQ(
+    *second,
+    "{\"cached_event_state_check_ns\":22,"
+    "\"clock_id\":\"CLOCK_THREAD_CPUTIME_ID\","
+    "\"contact_policy_protobuf_ns\":44,"
+    "\"exhaustive_event_rescan_ns\":33,"
+    "\"linux_tid\":4321,"
+    "\"locked_binding_validation_ns\":11,"
+    "\"measured_total_ns\":165,"
+    "\"observation_count\":3,"
+    "\"profile_epoch_start_sim_stamp_ns\":1000,"
+    "\"publish_count\":2,"
+    "\"publish_ns\":55,"
+    "\"rescan_count\":2,"
+    "\"saturated\":false,"
+    "\"schema_version\":1,"
+    "\"sim_stamp_ns\":10000001000}");
+}
+
+TEST(ContactAggregatorProfile, SimulationTimeJumpNeverProducesABurst) {
+  internal::ContactProfileAccumulator profile(true);
+  constexpr std::int64_t linux_tid = 17;
+  profile.lock(0);
+  profile.add_timing(
+    internal::ContactProfileCategory::LockedBindingValidation, 1U, linux_tid);
+  EXPECT_TRUE(profile.emit_if_due(
+      internal::kContactProfileEmissionPeriodNs)
+    .has_value());
+  EXPECT_FALSE(profile.emit_if_due(
+      internal::kContactProfileEmissionPeriodNs)
+    .has_value());
+  EXPECT_TRUE(profile.emit_if_due(
+      6 * internal::kContactProfileEmissionPeriodNs)
+    .has_value());
+  EXPECT_FALSE(profile.emit_if_due(
+      6 * internal::kContactProfileEmissionPeriodNs)
+    .has_value());
+  EXPECT_FALSE(profile.emit_if_due(
+      7 * internal::kContactProfileEmissionPeriodNs - 1)
+    .has_value());
+  EXPECT_TRUE(profile.emit_if_due(
+      7 * internal::kContactProfileEmissionPeriodNs)
+    .has_value());
+}
+
+TEST(ContactAggregatorProfile, DisabledOrMixedThreadStateCannotEmit) {
+  internal::ContactProfileAccumulator disabled(false);
+  disabled.lock(0);
+  disabled.add_timing(
+    internal::ContactProfileCategory::Publish, 1U, 7);
+  disabled.count_observation();
+  EXPECT_FALSE(disabled.emit_if_due(
+      internal::kContactProfileEmissionPeriodNs)
+    .has_value());
+
+  internal::ContactProfileAccumulator mixed_thread(true);
+  mixed_thread.lock(0);
+  mixed_thread.add_timing(
+    internal::ContactProfileCategory::LockedBindingValidation, 1U, 7);
+  mixed_thread.add_timing(
+    internal::ContactProfileCategory::CachedEventStateCheck, 1U, 8);
+  EXPECT_FALSE(mixed_thread.enabled());
+  EXPECT_FALSE(mixed_thread.emit_if_due(
+      internal::kContactProfileEmissionPeriodNs)
+    .has_value());
+}
+
+TEST(ContactAggregatorProfile, NewEpochClearsCountersTimingsAndThreadIdentity) {
+  internal::ContactProfileAccumulator profile(true);
+  profile.lock(100);
+  profile.add_timing(
+    internal::ContactProfileCategory::LockedBindingValidation, 99U, 7);
+  profile.count_observation();
+  profile.count_rescan();
+
+  profile.lock(200);
+  profile.add_timing(internal::ContactProfileCategory::Publish, 3U, 8);
+  profile.count_publish();
+  const auto record = profile.emit_if_due(
+    200 + internal::kContactProfileEmissionPeriodNs);
+  ASSERT_TRUE(record.has_value());
+  EXPECT_NE(record->find("\"linux_tid\":8"), std::string::npos);
+  EXPECT_NE(record->find("\"measured_total_ns\":3"), std::string::npos);
+  EXPECT_NE(
+    record->find("\"profile_epoch_start_sim_stamp_ns\":200"),
+    std::string::npos);
+  EXPECT_NE(record->find("\"observation_count\":0"), std::string::npos);
+  EXPECT_NE(record->find("\"rescan_count\":0"), std::string::npos);
+  EXPECT_NE(record->find("\"publish_count\":1"), std::string::npos);
+  EXPECT_EQ(record->find("\"linux_tid\":7"), std::string::npos);
+}
+
+TEST(ContactAggregatorProfile, SaturationIsExplicitAndNeverWraps) {
+  internal::ContactProfileAccumulator profile(true);
+  profile.lock(0);
+  constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+  profile.add_timing(
+    internal::ContactProfileCategory::LockedBindingValidation, maximum, 9);
+  profile.add_timing(
+    internal::ContactProfileCategory::CachedEventStateCheck, 1U, 9);
+  const auto record = profile.emit_if_due(
+    internal::kContactProfileEmissionPeriodNs);
+  ASSERT_TRUE(record.has_value());
+  EXPECT_NE(
+    record->find("\"measured_total_ns\":" + std::to_string(maximum)),
+    std::string::npos);
+  EXPECT_NE(record->find("\"saturated\":true"), std::string::npos);
+}
 
 TEST(ContactAggregatorPolicy,
      SuppressesEmptyBoundariesUntilFirstNonemptyInterval) {
@@ -171,6 +788,61 @@ TEST(ContactAggregatorPolicy,
   EXPECT_DOUBLE_EQ(completed.output->contact(1).position(0).x(), 8.0);
   EXPECT_EQ(completed.output->contact(0).collision1().name(), first);
   EXPECT_EQ(completed.output->contact(1).collision1().name(), second);
+}
+
+TEST(ContactAggregatorPolicy,
+     MultiStepSerializedOutputAndFatalDetailMatchReferenceContract) {
+  ContactAggregatorPolicy policy;
+  synchronize(policy);
+
+  EXPECT_FALSE(policy.observe(
+      1002000000LL,
+      contacts_for({
+      contact_for("z::collision", "y::collision", 1.0),
+      contact_for("b::collision", "a::collision", 2.0),
+      })).fatal);
+  EXPECT_FALSE(policy.observe(
+      1004000000LL,
+      contacts_for({
+      contact_for("z::collision", "y::collision", 7.0),
+      contact_for("y::collision", "z::collision", 8.0),
+      contact_for("c::collision", "d::collision", 3.0),
+      })).fatal);
+  EXPECT_FALSE(policy.observe(1018000000LL, gz::msgs::Contacts()).fatal);
+  const auto completed = policy.observe(
+    1020000000LL, one_contact("m::collision", "n::collision", 4.0));
+  ASSERT_TRUE(completed.output.has_value());
+
+  auto expected = contacts_for({
+      contact_for("b::collision", "a::collision", 2.0),
+      contact_for("c::collision", "d::collision", 3.0),
+      contact_for("m::collision", "n::collision", 4.0),
+      contact_for("z::collision", "y::collision", 7.0),
+      contact_for("y::collision", "z::collision", 8.0),
+    });
+  set_stamp(*expected.mutable_header(), 1020000000LL);
+  for (auto & contact : *expected.mutable_contact()) {
+    set_stamp(*contact.mutable_header(), 1020000000LL);
+  }
+  EXPECT_EQ(completed.output->SerializeAsString(), expected.SerializeAsString());
+
+  std::vector<gz::msgs::Contact> sixteen_pairs;
+  for (int index = 0; index < 16; ++index) {
+    sixteen_pairs.push_back(contact_for(
+        "robot::collision_" + std::to_string(index),
+        "wall::collision_" + std::to_string(index)));
+  }
+  EXPECT_FALSE(policy.observe(1022000000LL, contacts_for(sixteen_pairs)).fatal);
+  const auto overflow = policy.observe(
+    1024000000LL,
+    one_contact("robot::collision_16", "wall::collision_16"));
+  EXPECT_TRUE(overflow.fatal);
+  EXPECT_FALSE(overflow.output.has_value());
+  EXPECT_EQ(
+    overflow.detail,
+    "contact aggregate interval union exceeds the 16-record bound");
+  EXPECT_EQ(policy.observe(1026000000LL, gz::msgs::Contacts()).detail,
+            overflow.detail);
 }
 
 TEST(ContactAggregatorPolicy,
@@ -440,7 +1112,22 @@ TEST(ContactAggregatorPolicy,
     one_contact("robot::link::collision_16", "wall::link::collision_16");
   const auto overflow = policy.observe(1004000000LL, seventeenth);
   EXPECT_TRUE(overflow.fatal);
+  EXPECT_FALSE(overflow.output.has_value());
   EXPECT_NE(overflow.detail.find("interval union"), std::string::npos);
+
+  const auto latched = policy.observe(1006000000LL, gz::msgs::Contacts());
+  EXPECT_TRUE(latched.fatal);
+  EXPECT_EQ(latched.detail, overflow.detail);
+
+  policy.reset();
+  synchronize(policy, 2000000000LL);
+  const auto fresh =
+    one_contact("ground::link::collision", "robot::wheel::collision", 19.0);
+  EXPECT_FALSE(policy.observe(2002000000LL, fresh).fatal);
+  const auto completed = policy.observe(2020000000LL, gz::msgs::Contacts());
+  ASSERT_TRUE(completed.output.has_value());
+  ASSERT_EQ(completed.output->contact_size(), 1);
+  EXPECT_DOUBLE_EQ(completed.output->contact(0).position(0).x(), 19.0);
 }
 
 TEST(ContactAggregatorPolicy,

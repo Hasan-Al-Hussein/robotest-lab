@@ -56,6 +56,31 @@ sys.modules[RUNTIME_GATE_SPEC.name] = runtime_gate
 RUNTIME_GATE_SPEC.loader.exec_module(runtime_gate)
 
 
+@pytest.mark.parametrize(
+    'decision',
+    (
+        'docs/decisions/0007-phase3-northbound-lane.md',
+        'docs/decisions/0008-phase3-contact-aggregation-performance.md',
+    ),
+)
+def test_phase3_decisions_are_source_and_configuration_bound(decision: str) -> None:
+    """Keep ADRs 0007 and 0008 in both immutable build bindings."""
+    assert decision in orchestration.SOURCE_CONFIGURATION_FILES
+    assert decision in orchestration.SOURCE_TREE_ROOTS
+
+
+@pytest.mark.parametrize(
+    'profiler_path',
+    (
+        'tests/phase3_smoke_host_profiler.py',
+        'tests/phase3_smoke_host_profiler_test.py',
+    ),
+)
+def test_phase3_profiler_is_source_tree_bound(profiler_path: str) -> None:
+    """Bind the profiler producer and its contract test into Phase 3."""
+    assert profiler_path in orchestration.SOURCE_TREE_ROOTS
+
+
 def _contact_stream_contract() -> dict:
     workspace = Path(__file__).parents[1]
     policy = copy.deepcopy(orchestration.EXPECTED_CONTACT_STREAM_POLICY)

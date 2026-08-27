@@ -63,6 +63,11 @@ and `(0, 3.5)`. It requests `number_of_loops=0` and `goal_index=0`. Fault
 schedule and fault seed are intentionally null; simulator and mission seeds are
 fixed at 42.
 
+Phase 3 target-set revision 3 keeps three goals but uses the common
+west-offset northbound lane `(-2.0, -3.5)`, `(-0.2, 0.0)`, and
+`(-0.2, 3.5)`. The strict Phase 3 schema owns that route independently of the
+unchanged Phase 2 baseline.
+
 A Phase 3 invocation adds exact cold-suite identity. All four identity arguments
 are mandatory together, and `suite-index` must equal
 `(scenario_id - 1) * 3 + repetition_index`:

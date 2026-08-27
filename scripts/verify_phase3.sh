@@ -57,6 +57,7 @@ fi
 for required in \
   "$HELPER" \
   "$WORKSPACE/tests/phase3_benchmark_runner.py" \
+  "$WORKSPACE/tests/phase3_smoke_host_profiler.py" \
   "$WORKSPACE/tests/phase3_runtime_gate.py" \
   "$WORKSPACE/tests/phase3_runtime_observer.py" \
   "$WORKSPACE/src/robotest_metrics/schema/trial-context.schema.json"; do
@@ -161,7 +162,8 @@ run_logged colcon-test-result 120s colcon test-result --verbose
 run_logged phase3-pytest 120s \
   pytest -q \
     tests/phase3_orchestration_test.py \
-    tests/phase3_benchmark_runner_test.py
+    tests/phase3_benchmark_runner_test.py \
+    tests/phase3_smoke_host_profiler_test.py
 run_logged phase3-graph-probe-self-test 30s \
   python3 tests/phase2_graph_probe.py --self-test
 run_logged phase3-pycompile 30s \
@@ -169,6 +171,7 @@ run_logged phase3-pycompile 30s \
     tests/phase2_graph_probe.py \
     tests/phase3_orchestration.py \
     tests/phase3_benchmark_runner.py \
+    tests/phase3_smoke_host_profiler.py \
     tests/phase3_runtime_gate.py \
     tests/phase3_runtime_observer.py
 run_logged phase3-ament-flake8 60s \
@@ -176,10 +179,12 @@ run_logged phase3-ament-flake8 60s \
     tests/phase2_graph_probe.py \
     tests/phase3_orchestration.py \
     tests/phase3_benchmark_runner.py \
+    tests/phase3_smoke_host_profiler.py \
     tests/phase3_runtime_gate.py \
     tests/phase3_runtime_observer.py \
     tests/phase3_orchestration_test.py \
-    tests/phase3_benchmark_runner_test.py
+    tests/phase3_benchmark_runner_test.py \
+    tests/phase3_smoke_host_profiler_test.py
 run_logged phase3-observer-self-test 30s \
   python3 tests/phase3_runtime_observer.py self-test
 run_logged phase3-gate-self-test 30s \
@@ -192,18 +197,22 @@ if command -v ruff >/dev/null 2>&1; then
     ruff check \
       tests/phase3_orchestration.py \
       tests/phase3_benchmark_runner.py \
+      tests/phase3_smoke_host_profiler.py \
       tests/phase3_runtime_gate.py \
       tests/phase3_runtime_observer.py \
       tests/phase3_orchestration_test.py \
-      tests/phase3_benchmark_runner_test.py
+      tests/phase3_benchmark_runner_test.py \
+      tests/phase3_smoke_host_profiler_test.py
   run_logged ruff-format 60s \
     ruff format --check \
       tests/phase3_orchestration.py \
       tests/phase3_benchmark_runner.py \
+      tests/phase3_smoke_host_profiler.py \
       tests/phase3_runtime_gate.py \
       tests/phase3_runtime_observer.py \
       tests/phase3_orchestration_test.py \
-      tests/phase3_benchmark_runner_test.py
+      tests/phase3_benchmark_runner_test.py \
+      tests/phase3_smoke_host_profiler_test.py
 fi
 
 run_logged mission-help 30s ros2 run robotest_missions mission_runner --help

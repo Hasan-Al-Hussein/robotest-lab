@@ -12,11 +12,14 @@ tree, and the canonical Phase 2 launch file.
 - Robot footprint: `x=+/-0.24 m`, `y=+/-0.21 m`, plus `0.02 m` costmap
   footprint padding.
 - AMCL initial pose: `(x=0.0, y=-3.5, yaw=0.0)`.
-- Ordered mission waypoints: `(-2.0, -3.5)`, `(0.0, 0.0)`, and
+- Phase 2 baseline waypoints: `(-2.0, -3.5)`, `(0.0, 0.0)`, and
   `(0.0, 3.5)` in `map`.
+- Phase 3 revision-3 waypoints: `(-2.0, -3.5)`, `(-0.2, 0.0)`, and
+  `(-0.2, 3.5)` in `map`.
 
-The final leg crosses the `1.2 m` opening in the divider at `y=1.5`. The
-checked-in map is generated directly from the collision geometry in
+The Phase 3 final leg uses the west-offset lane through the `1.2 m` opening in
+the divider at `y=1.5`; Phase 2 retains its historical centreline baseline.
+The checked-in map is generated directly from the collision geometry in
 `robotest_sim/worlds/robotest_lab.sdf`; it does not use a hand-painted or
 SLAM-derived raster.
 

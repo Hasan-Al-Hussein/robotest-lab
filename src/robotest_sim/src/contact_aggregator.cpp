@@ -9,8 +9,18 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
+
+#include "gz/sim/EntityComponentManager.hh"
+#include "gz/sim/components/Collision.hh"
+#include "gz/sim/components/ContactSensor.hh"
+#include "gz/sim/components/Link.hh"
+#include "gz/sim/components/Model.hh"
+#include "gz/sim/components/Name.hh"
+#include "gz/sim/components/ParentEntity.hh"
+#include "gz/sim/components/World.hh"
 
 namespace robotest_sim
 {
@@ -25,6 +35,7 @@ constexpr std::size_t kMaxBodyNameBytes = 4096U;
 constexpr std::size_t kMaxFrameIdBytes = 256U;
 constexpr std::size_t kMaxPairStringBytes = 8192U;
 constexpr std::size_t kMaxAggregateStringBytes = 65536U;
+constexpr std::size_t kMaxEntityAncestryDepth = 64U;
 
 bool checked_add(
   const std::size_t value, std::size_t & total,
@@ -221,6 +232,341 @@ void stamp_header(gz::msgs::Header & header, const std::int64_t stamp_ns)
 
 }  // namespace
 
+namespace internal
+{
+
+gz::sim::Entity top_level_model_ancestor(
+  const gz::sim::Entity entity,
+  const gz::sim::EntityComponentManager & ecm)
+{
+  std::set<gz::sim::Entity> visited;
+  auto current = entity;
+  auto top_level_model = gz::sim::kNullEntity;
+  for (std::size_t depth = 0U;
+    current != gz::sim::kNullEntity && depth < kMaxEntityAncestryDepth;
+    ++depth)
+  {
+    if (!visited.insert(current).second) {
+      return gz::sim::kNullEntity;
+    }
+    if (ecm.Component<gz::sim::components::Model>(current) != nullptr) {
+      top_level_model = current;
+    }
+    const auto parent = ecm.ParentEntity(current);
+    if (parent == gz::sim::kNullEntity) {
+      return top_level_model;
+    }
+    if (ecm.Component<gz::sim::components::World>(parent) != nullptr) {
+      return top_level_model;
+    }
+    current = parent;
+  }
+  return gz::sim::kNullEntity;
+}
+
+bool nameless_contact_sensor_under_model(
+  const gz::sim::Entity sensor_entity,
+  const gz::sim::Entity model_entity,
+  const gz::sim::EntityComponentManager & ecm)
+{
+  return model_entity != gz::sim::kNullEntity &&
+         ecm.Component<gz::sim::components::Name>(sensor_entity) == nullptr &&
+         top_level_model_ancestor(sensor_entity, ecm) == model_entity;
+}
+
+ContactProfileAccumulator::ContactProfileAccumulator(
+  const bool enabled) noexcept
+: enabled_(enabled)
+{
+}
+
+bool ContactProfileAccumulator::enabled() const noexcept
+{
+  return enabled_;
+}
+
+void ContactProfileAccumulator::disable() noexcept
+{
+  enabled_ = false;
+}
+
+void ContactProfileAccumulator::lock(
+  const std::int64_t simulation_stamp_ns) noexcept
+{
+  if (!enabled_ || simulation_stamp_ns < 0) {
+    return;
+  }
+  cumulative_ns_.fill(0U);
+  profile_epoch_start_sim_stamp_ns_ = simulation_stamp_ns;
+  linux_tid_.reset();
+  observation_count_ = 0U;
+  rescan_count_ = 0U;
+  publish_count_ = 0U;
+  saturated_ = false;
+  locked_ = true;
+  restart_cadence(simulation_stamp_ns);
+}
+
+void ContactProfileAccumulator::restart_cadence(
+  const std::int64_t simulation_stamp_ns) noexcept
+{
+  if (!enabled_ || !locked_ || simulation_stamp_ns < 0) {
+    return;
+  }
+  constexpr auto maximum = std::numeric_limits<std::int64_t>::max();
+  next_emission_stamp_ns_ =
+    simulation_stamp_ns > maximum - kContactProfileEmissionPeriodNs ?
+    maximum : simulation_stamp_ns + kContactProfileEmissionPeriodNs;
+}
+
+void ContactProfileAccumulator::saturating_add(
+  std::uint64_t & target,
+  const std::uint64_t increment) noexcept
+{
+  constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+  if (increment > maximum - target) {
+    target = maximum;
+    saturated_ = true;
+  } else {
+    target += increment;
+  }
+}
+
+void ContactProfileAccumulator::add_timing(
+  const ContactProfileCategory category,
+  const std::uint64_t elapsed_ns,
+  const std::int64_t linux_tid) noexcept
+{
+  if (!enabled_ || !locked_) {
+    return;
+  }
+  if (linux_tid <= 0) {
+    disable();
+    return;
+  }
+  if (!linux_tid_.has_value()) {
+    linux_tid_ = linux_tid;
+  } else if (*linux_tid_ != linux_tid) {
+    // A single record must never combine CPU clocks from different threads.
+    disable();
+    return;
+  }
+  const auto index = static_cast<std::size_t>(category);
+  if (index >= cumulative_ns_.size()) {
+    disable();
+    return;
+  }
+  saturating_add(cumulative_ns_[index], elapsed_ns);
+}
+
+void ContactProfileAccumulator::count(std::uint64_t & target) noexcept
+{
+  if (enabled_ && locked_) {
+    saturating_add(target, 1U);
+  }
+}
+
+void ContactProfileAccumulator::count_observation() noexcept
+{
+  count(observation_count_);
+}
+
+void ContactProfileAccumulator::count_rescan() noexcept
+{
+  count(rescan_count_);
+}
+
+void ContactProfileAccumulator::count_publish() noexcept
+{
+  count(publish_count_);
+}
+
+std::optional<std::string> ContactProfileAccumulator::emit_if_due(
+  const std::int64_t simulation_stamp_ns)
+{
+  if (!enabled_ || !locked_ || !linux_tid_.has_value() ||
+    !profile_epoch_start_sim_stamp_ns_.has_value() ||
+    simulation_stamp_ns < 0 || !next_emission_stamp_ns_.has_value() ||
+    simulation_stamp_ns < *next_emission_stamp_ns_)
+  {
+    return std::nullopt;
+  }
+
+  const auto scheduled_stamp_ns = *next_emission_stamp_ns_;
+  constexpr auto maximum = std::numeric_limits<std::int64_t>::max();
+  const auto intervals =
+    (simulation_stamp_ns - scheduled_stamp_ns) /
+    kContactProfileEmissionPeriodNs + 1;
+  if (intervals >
+    (maximum - scheduled_stamp_ns) / kContactProfileEmissionPeriodNs)
+  {
+    next_emission_stamp_ns_.reset();
+  } else {
+    next_emission_stamp_ns_ =
+      scheduled_stamp_ns + intervals * kContactProfileEmissionPeriodNs;
+  }
+
+  std::uint64_t measured_total_ns = 0U;
+  for (const auto elapsed_ns : cumulative_ns_) {
+    saturating_add(measured_total_ns, elapsed_ns);
+  }
+  const auto category = [this](const ContactProfileCategory value) {
+      return cumulative_ns_[static_cast<std::size_t>(value)];
+    };
+  std::string record;
+  record.reserve(640U);
+  record += "{\"cached_event_state_check_ns\":" +
+    std::to_string(category(ContactProfileCategory::CachedEventStateCheck));
+  record += ",\"clock_id\":\"CLOCK_THREAD_CPUTIME_ID\"";
+  record += ",\"contact_policy_protobuf_ns\":" +
+    std::to_string(category(ContactProfileCategory::ContactPolicyProtobuf));
+  record += ",\"exhaustive_event_rescan_ns\":" +
+    std::to_string(category(ContactProfileCategory::ExhaustiveEventRescan));
+  record += ",\"linux_tid\":" + std::to_string(*linux_tid_);
+  record += ",\"locked_binding_validation_ns\":" +
+    std::to_string(category(ContactProfileCategory::LockedBindingValidation));
+  record += ",\"measured_total_ns\":" + std::to_string(measured_total_ns);
+  record += ",\"observation_count\":" + std::to_string(observation_count_);
+  record += ",\"profile_epoch_start_sim_stamp_ns\":" +
+    std::to_string(*profile_epoch_start_sim_stamp_ns_);
+  record += ",\"publish_count\":" + std::to_string(publish_count_);
+  record += ",\"publish_ns\":" +
+    std::to_string(category(ContactProfileCategory::Publish));
+  record += ",\"rescan_count\":" + std::to_string(rescan_count_);
+  record += saturated_ ? ",\"saturated\":true" : ",\"saturated\":false";
+  record += ",\"schema_version\":1";
+  record += ",\"sim_stamp_ns\":" + std::to_string(simulation_stamp_ns) + "}";
+  return record;
+}
+
+std::array<bool, 2U> cached_inventory_component_changes(
+  const gz::sim::EntityComponentManager & ecm,
+  const std::vector<gz::sim::Entity> & model_entities,
+  const std::vector<gz::sim::Entity> & sensor_entities,
+  const std::vector<gz::sim::Entity> & link_entities,
+  const std::vector<gz::sim::Entity> & collision_entities)
+{
+  std::array<bool, 2U> changes{};
+  const auto inspect_entity = [&ecm, &changes](
+    const gz::sim::Entity entity,
+    const gz::sim::ComponentTypeId primary_type) {
+      const std::array<gz::sim::ComponentTypeId, 3U> types = {{
+        primary_type,
+        gz::sim::components::Name::typeId,
+        gz::sim::components::ParentEntity::typeId,
+      }};
+      for (const auto type : types) {
+        const auto state = ecm.ComponentState(entity, type);
+        changes[0] = changes[0] ||
+          state == gz::sim::ComponentState::OneTimeChange;
+        changes[1] = changes[1] ||
+          state == gz::sim::ComponentState::PeriodicChange;
+      }
+      return changes[0] || changes[1];
+    };
+  const auto inspect_cache = [&inspect_entity](const auto & entities,
+    const gz::sim::ComponentTypeId primary_type) {
+      return std::any_of(
+        entities.begin(), entities.end(),
+        [&inspect_entity, primary_type](const auto entity) {
+          return inspect_entity(entity, primary_type);
+        });
+    };
+
+  if (inspect_cache(model_entities, gz::sim::components::Model::typeId) ||
+    inspect_cache(sensor_entities,
+      gz::sim::components::ContactSensor::typeId) ||
+    inspect_cache(link_entities, gz::sim::components::Link::typeId) ||
+    inspect_cache(collision_entities,
+      gz::sim::components::Collision::typeId))
+  {
+    return changes;
+  }
+  return changes;
+}
+
+template<typename InventoryComponent>
+bool inventory_type_has_one_time_structural_change(
+  const gz::sim::EntityComponentManager & ecm)
+{
+  bool changed = false;
+  ecm.Each<InventoryComponent>(
+    [&ecm, &changed](const gz::sim::Entity & entity,
+    const InventoryComponent *) {
+      const std::array<gz::sim::ComponentTypeId, 3U> types = {{
+        InventoryComponent::typeId,
+        gz::sim::components::Name::typeId,
+        gz::sim::components::ParentEntity::typeId,
+      }};
+      changed = std::any_of(
+        types.begin(), types.end(),
+        [&ecm, entity](const auto type) {
+          return ecm.ComponentState(entity, type) ==
+                 gz::sim::ComponentState::OneTimeChange;
+        });
+      return !changed;
+    });
+  return changed;
+}
+
+bool relevant_one_time_inventory_component_changed(
+  const gz::sim::EntityComponentManager & ecm)
+{
+  // Gazebo Sim 8 exposes a periodic changed-type set, but its one-time set is
+  // private. The caller guards these typed views with
+  // HasOneTimeComponentChanges(), so existing-entity component promotion is
+  // visible without traversing any global view during steady-state steps.
+  return
+    inventory_type_has_one_time_structural_change<
+    gz::sim::components::Model>(ecm) ||
+    inventory_type_has_one_time_structural_change<
+    gz::sim::components::ContactSensor>(ecm) ||
+    inventory_type_has_one_time_structural_change<
+    gz::sim::components::Link>(ecm) ||
+    inventory_type_has_one_time_structural_change<
+    gz::sim::components::Collision>(ecm);
+}
+
+bool relevant_periodic_inventory_type_changed(
+  const gz::sim::EntityComponentManager & ecm)
+{
+  if (!ecm.HasPeriodicComponentChanges()) {
+    return false;
+  }
+  const auto & changed_types = ecm.ComponentTypesWithPeriodicChanges();
+  const std::array<gz::sim::ComponentTypeId, 6U> inventory_types = {{
+    gz::sim::components::Model::typeId,
+    gz::sim::components::Name::typeId,
+    gz::sim::components::ParentEntity::typeId,
+    gz::sim::components::ContactSensor::typeId,
+    gz::sim::components::Link::typeId,
+    gz::sim::components::Collision::typeId,
+  }};
+  return std::any_of(
+    inventory_types.begin(), inventory_types.end(),
+    [&changed_types](const auto type) {
+      return changed_types.find(type) != changed_types.end();
+    });
+}
+
+bool locked_inventory_scan_required(
+  const bool new_entities,
+  const bool entities_marked_for_removal,
+  const bool removed_components,
+  const bool relevant_one_time_change,
+  const bool relevant_periodic_change,
+  const bool,
+  const bool) noexcept
+{
+  // The final two arguments witness unrelated one-time / periodic activity.
+  // They are intentionally excluded so physics-rate payload and Pose changes
+  // cannot make the structural inventory scan hot.
+  return new_entities || entities_marked_for_removal || removed_components ||
+         relevant_one_time_change || relevant_periodic_change;
+}
+
+}  // namespace internal
+
 std::optional<std::string> ContactAggregatorPolicy::validated_step_groups(
   const gz::msgs::Contacts * const * contacts,
   const std::size_t source_count,
@@ -416,14 +762,12 @@ ContactAggregatorPolicy::observe_sources(
   // complete latest physics-step group (one to four records in source order).
   // Replacement is the declared reduction; absence never removes a pair from
   // the current interval and no pair is retained into the next interval.
-  auto projected = interval_groups_;
   for (auto & entry : step_groups) {
-    projected.insert_or_assign(entry.first, std::move(entry.second));
+    interval_groups_.insert_or_assign(entry.first, std::move(entry.second));
   }
-  if (const auto error = validate_complete_groups(projected)) {
+  if (const auto error = validate_complete_groups(interval_groups_)) {
     return fail(*error);
   }
-  interval_groups_ = std::move(projected);
 
   if (simulation_stamp_ns < *next_boundary_stamp_ns_) {
     return decision;

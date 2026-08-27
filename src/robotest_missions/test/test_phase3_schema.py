@@ -23,6 +23,11 @@ from robotest_missions.schema import MissionValidationError, load_mission
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 SCENARIOS = tuple(sorted((REPOSITORY / 'scenarios').glob('phase3_s*.yaml')))
+EXPECTED_PHASE3_WAYPOINTS = (
+    (-2.0, -3.5, 0.0),
+    (-0.2, 0.0, 0.0),
+    (-0.2, 3.5, 0.0),
+)
 
 
 @pytest.mark.parametrize('path', SCENARIOS, ids=lambda path: path.stem)
@@ -31,6 +36,10 @@ def test_frozen_phase3_scenario_loads_with_computed_schedule(path: Path) -> None
     assert document.config.schema_version == 1
     assert document.config.scenario_id in range(1, 6)
     assert document.config.scenario_controller_seed == 42
+    assert (
+        tuple((waypoint.x, waypoint.y, waypoint.yaw) for waypoint in document.config.waypoints)
+        == EXPECTED_PHASE3_WAYPOINTS
+    )
     assert document.config.fault_schedule is not None
     assert (
         document.config.fault_schedule.sha256
@@ -42,6 +51,19 @@ def _write(tmp_path: Path, payload: dict) -> Path:
     path = tmp_path / 'scenario.yaml'
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding='utf-8')
     return path
+
+
+@pytest.mark.parametrize('path', SCENARIOS, ids=lambda path: path.stem)
+@pytest.mark.parametrize('waypoint_index', (1, 2))
+def test_legacy_centerline_waypoint_is_rejected(
+    tmp_path: Path,
+    path: Path,
+    waypoint_index: int,
+) -> None:
+    payload = yaml.safe_load(path.read_text(encoding='utf-8'))
+    payload['waypoints'][waypoint_index]['x'] = 0.0
+    with pytest.raises(MissionValidationError):
+        load_mission(_write(tmp_path, payload))
 
 
 @pytest.mark.parametrize(

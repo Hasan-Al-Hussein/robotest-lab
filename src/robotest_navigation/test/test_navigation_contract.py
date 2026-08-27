@@ -32,11 +32,24 @@ from launch.actions import DeclareLaunchArgument
 import yaml
 
 PACKAGE = Path(__file__).resolve().parents[1]
+REPOSITORY = PACKAGE.parents[1]
 INITIAL_POSE = (0.0, -3.5)
-WAYPOINTS = ((-2.0, -3.5), (0.0, 0.0), (0.0, 3.5))
+EXPECTED_PHASE2_WAYPOINTS = ((-2.0, -3.5), (0.0, 0.0), (0.0, 3.5))
+EXPECTED_PHASE3_WAYPOINTS = ((-2.0, -3.5), (-0.2, 0.0), (-0.2, 3.5))
 FOOTPRINT_HALF_LENGTH = 0.24
 FOOTPRINT_HALF_WIDTH = 0.21
 FOOTPRINT_PADDING = 0.02
+PHASE3_EASTWARD_CENTER_ERROR_ALLOWANCE_M = 0.35
+PHASE3_HEADING_ERROR_ALLOWANCE_RAD = 0.10
+PHASE3_MINIMUM_NOMINAL_STOP_CLEARANCE_M = 0.10
+PHASE3_MINIMUM_GUARDED_EAST_CLEARANCE_M = 0.15
+PHASE3_SCENARIO_FILENAMES = (
+    'phase3_s1_baseline.yaml',
+    'phase3_s2_static_obstacle.yaml',
+    'phase3_s3_dynamic_obstacle.yaml',
+    'phase3_s4_lidar_dropout.yaml',
+    'phase3_s5_odom_drift.yaml',
+)
 
 
 def load_module(name: str, path: Path):
@@ -54,6 +67,35 @@ def source_world() -> Path:
     world = PACKAGE.parent / 'robotest_sim' / 'worlds' / 'robotest_lab.sdf'
     assert world.is_file(), f'missing sibling world: {world}'
     return world
+
+
+def mission_waypoints(path: Path) -> tuple[tuple[float, float], ...]:
+    """Load one document's ordered planar waypoint projection."""
+    payload = yaml.safe_load(path.read_text(encoding='utf-8'))
+    return tuple((float(item['x']), float(item['y'])) for item in payload['waypoints'])
+
+
+def phase3_scenario_paths() -> tuple[Path, ...]:
+    """Return the exact ordered five-file Phase 3 scenario set."""
+    paths = tuple(sorted((REPOSITORY / 'scenarios').glob('phase3_s*.yaml')))
+    assert tuple(path.name for path in paths) == PHASE3_SCENARIO_FILENAMES
+    return paths
+
+
+def divider_inner_faces() -> tuple[float, float]:
+    """Derive the west/east opening faces from the authoritative SDF collisions."""
+    generator = load_module('robotest_divider_shapes', PACKAGE / 'tools' / 'generate_map.py')
+    shapes = {
+        shape.name.split('/')[0]: shape
+        for shape in generator.collision_shapes(source_world())
+        if shape.name.split('/')[0] in {'divider_west', 'divider_east'}
+    }
+    assert set(shapes) == {'divider_west', 'divider_east'}
+    west = shapes['divider_west']
+    east = shapes['divider_east']
+    assert west.kind == east.kind == 'box'
+    assert west.pose.yaw == east.pose.yaw == 0.0
+    return west.pose.x + west.size_x / 2.0, east.pose.x - east.size_x / 2.0
 
 
 def parse_pgm(path: Path) -> tuple[int, int, list[int]]:
@@ -200,21 +242,84 @@ def test_map_geometry_identity_and_mission_clearance() -> None:
         (2.7, -3.5),
     ):
         assert value(*point) == 0
-    for point in (INITIAL_POSE, *WAYPOINTS, (0.0, 1.5)):
+    phase2_waypoints = mission_waypoints(REPOSITORY / 'scenarios' / 'phase2_baseline.yaml')
+    phase3_waypoint_sets = {mission_waypoints(path) for path in phase3_scenario_paths()}
+    assert phase2_waypoints == EXPECTED_PHASE2_WAYPOINTS
+    assert phase3_waypoint_sets == {EXPECTED_PHASE3_WAYPOINTS}
+    phase3_waypoints = next(iter(phase3_waypoint_sets))
+    for point in (INITIAL_POSE, *phase2_waypoints, *phase3_waypoints, (0.0, 1.5)):
         assert value(*point) == 254
 
-    route = (INITIAL_POSE, *WAYPOINTS)
     half_length = FOOTPRINT_HALF_LENGTH + FOOTPRINT_PADDING
     half_width = FOOTPRINT_HALF_WIDTH + FOOTPRINT_PADDING
-    for start, end in pairwise(route):
-        for center_x, center_y, yaw in sample_segment(start, end):
-            cos_yaw = math.cos(yaw)
-            sin_yaw = math.sin(yaw)
-            for local_x in (-half_length, 0.0, half_length):
-                for local_y in (-half_width, 0.0, half_width):
-                    x = center_x + cos_yaw * local_x - sin_yaw * local_y
-                    y = center_y + sin_yaw * local_x + cos_yaw * local_y
-                    assert value(x, y) == 254, (center_x, center_y, x, y)
+    for route in (
+        (INITIAL_POSE, *phase2_waypoints),
+        (INITIAL_POSE, *phase3_waypoints),
+    ):
+        for start, end in pairwise(route):
+            for center_x, center_y, yaw in sample_segment(start, end):
+                cos_yaw = math.cos(yaw)
+                sin_yaw = math.sin(yaw)
+                for local_x in (-half_length, 0.0, half_length):
+                    for local_y in (-half_width, 0.0, half_width):
+                        x = center_x + cos_yaw * local_x - sin_yaw * local_y
+                        y = center_y + sin_yaw * local_x + cos_yaw * local_y
+                        assert value(x, y) == 254, (center_x, center_y, x, y)
+
+
+def test_phase3_northbound_lane_preserves_collision_stop_clearance() -> None:
+    """The revision-3 lane retains the frozen stop envelope inside the divider."""
+    params = yaml.safe_load((PACKAGE / 'config' / 'nav2_params.yaml').read_text())
+    polygon = ast.literal_eval(
+        params['collision_monitor']['ros__parameters']['PolygonStop']['points']
+    )
+    stop_half_length = max(abs(point[0]) for point in polygon)
+    stop_half_width = max(abs(point[1]) for point in polygon)
+    assert stop_half_length == 0.30
+    assert stop_half_width == 0.27
+
+    phase3_routes = {mission_waypoints(path) for path in phase3_scenario_paths()}
+    assert phase3_routes == {EXPECTED_PHASE3_WAYPOINTS}
+    lane_start = EXPECTED_PHASE3_WAYPOINTS[1]
+    lane_end = EXPECTED_PHASE3_WAYPOINTS[2]
+    assert lane_start[0] == lane_end[0] == -0.2
+    assert lane_start[1] < 1.5 < lane_end[1]
+
+    west_inner_face, east_inner_face = divider_inner_faces()
+    assert math.isclose(west_inner_face, -0.6, abs_tol=1e-12)
+    assert math.isclose(east_inner_face, 0.6, abs_tol=1e-12)
+
+    heading_error = PHASE3_HEADING_ERROR_ALLOWANCE_RAD
+    projected_half_width = stop_half_width * math.cos(heading_error) + stop_half_length * math.sin(
+        heading_error
+    )
+
+    def clearances(
+        route_start: tuple[float, float],
+        route_end: tuple[float, float],
+    ) -> tuple[float, float]:
+        fraction = (1.5 - route_start[1]) / (route_end[1] - route_start[1])
+        lane_x = route_start[0] + fraction * (route_end[0] - route_start[0])
+        return (
+            lane_x - projected_half_width - west_inner_face,
+            east_inner_face
+            - (lane_x + PHASE3_EASTWARD_CENTER_ERROR_ALLOWANCE_M + projected_half_width),
+        )
+
+    nominal_west_clearance, guarded_east_clearance = clearances(lane_start, lane_end)
+    assert nominal_west_clearance >= PHASE3_MINIMUM_NOMINAL_STOP_CLEARANCE_M
+    assert guarded_east_clearance >= PHASE3_MINIMUM_GUARDED_EAST_CLEARANCE_M
+
+    scenario3 = yaml.safe_load(
+        (REPOSITORY / 'scenarios' / 'phase3_s3_dynamic_obstacle.yaml').read_text(encoding='utf-8')
+    )
+    dynamic_actor_half_width = float(scenario3['entity']['geometry']['size_x_m']) / 2.0
+    assert abs(lane_start[0]) < stop_half_width + dynamic_actor_half_width
+
+    legacy_clearance = clearances((0.0, 0.0), (0.0, 3.5))[1]
+    final_target_only_clearance = clearances((0.0, 0.0), (-0.2, 3.5))[1]
+    assert legacy_clearance < PHASE3_MINIMUM_GUARDED_EAST_CLEARANCE_M
+    assert final_target_only_clearance < PHASE3_MINIMUM_GUARDED_EAST_CLEARANCE_M
 
 
 def test_world_shape_set_is_complete() -> None:

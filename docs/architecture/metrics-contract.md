@@ -383,6 +383,36 @@ into the next interval. Repeated physics samples are intentionally reduced and
 are not claimed as an exact pre-aggregate sample stream or as raw force/depth
 peaks.
 
+Binding discovery is exhaustive until exactly one top-level `robotest` model
+and the seven unique sensor/link/collision mappings are locked and all seven
+`ContactSensorData` components exist. Thereafter every completed, unpaused
+physics step retains an O(7) direct check of the locked entity types, names,
+parents, and contact-data presence before reading all seven payloads. A
+separate cache-scoped state check covers every existing Model, ContactSensor,
+Link, and Collision entity's primary, `Name`, and `ParentEntity` component
+without a global entity traversal. Any new entity, entity marked for removal,
+removed component, or relevant cached structural state change triggers the
+same exhaustive inventory/SDF scan before observation. On one-time activity,
+conditional typed scans over Model, ContactSensor, Link, and Collision check
+each entity's primary, `Name`, and `ParentEntity` state, including structural
+components added to an existing entity that was not previously in a typed
+cache. Unrelated Pose and physics-rate payload changes do not. Ambiguity,
+absence, rebinding, or structural drift remains fatal. This
+event-filtered validation changes neither
+the 500 Hz physics-step observation nor the 50 Hz aggregate contract; see
+[ADR 0008](../decisions/0008-phase3-contact-aggregation-performance.md).
+Runtime component writers must use Gazebo ECM change state for configuration
+mutations; an unsignalled in-place SDF edit is outside that writer contract.
+
+Each already-validated step map updates the interval map in place, after which
+the complete union is revalidated. An over-limit union latches policy fatal
+state before publication, returns no output, and returns the same fatal result
+on later observations. Policy reset clears the possibly partial interval,
+stamps, stream state, and fatal detail. The deployed system additionally
+latches fatal and emits Stop; its Gazebo Reset callback does not clear that
+system latch, so a live failure requires a clean stack restart. Removing the
+former full-map copy does not authorize an invalid partial aggregate.
+
 The gate consumes one private aggregate per stamp and publishes a strictly
 increasing, complete snapshot of its delivered active-pair state. A
 collision episode begins when a counterpart is present in an authoritative

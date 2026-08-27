@@ -538,6 +538,8 @@ SOURCE_CONFIGURATION_FILES = (
     'docs/architecture/topic-and-tf-contract.md',
     'docs/decisions/0005-phase3-deterministic-fault-protocol.md',
     'docs/decisions/0006-phase3-scenario-mechanics.md',
+    'docs/decisions/0007-phase3-northbound-lane.md',
+    'docs/decisions/0008-phase3-contact-aggregation-performance.md',
     'docs/testing/acceptance-criteria.md',
     'docs/testing/verification-matrix.md',
     *(item[2] for item in SCENARIOS),
@@ -550,6 +552,8 @@ SOURCE_TREE_ROOTS = (
     'docs/architecture/topic-and-tf-contract.md',
     'docs/decisions/0005-phase3-deterministic-fault-protocol.md',
     'docs/decisions/0006-phase3-scenario-mechanics.md',
+    'docs/decisions/0007-phase3-northbound-lane.md',
+    'docs/decisions/0008-phase3-contact-aggregation-performance.md',
     'docs/testing/acceptance-criteria.md',
     'docs/testing/verification-matrix.md',
     'scenarios',
@@ -565,6 +569,8 @@ SOURCE_TREE_ROOTS = (
     'tests/phase3_orchestration_test.py',
     'tests/phase3_runtime_gate.py',
     'tests/phase3_runtime_observer.py',
+    'tests/phase3_smoke_host_profiler.py',
+    'tests/phase3_smoke_host_profiler_test.py',
     'src/robotest_interfaces',
     'src/robotest_description',
     'src/robotest_faults',
@@ -2532,7 +2538,7 @@ def suite_document(workspace: Path, candidate_id: str, domain_base: int) -> dict
         'producer': PRODUCER,
         'schema_version': SCHEMA_VERSION,
         'smoke': {
-            'gz_partition': f'robotest_p3_{candidate_id}_smoke',
+            'gz_partition': f'robotest_p3_{candidate_id}-smoke_00',
             'ros_domain_id': domain_base + 16,
             'run_id': f'{candidate_id}-smoke-s1-r0',
             'scenario_path': SCENARIOS[0][2],
@@ -3055,7 +3061,7 @@ def lifecycle_schedule(run_id: str, accepted_goal_stamp_ns: int) -> dict[str, An
 
 
 def acceptance_for_scenario(scenario_id: int) -> tuple[dict[str, Any], list[str]]:
-    """Return only thresholds frozen in the revision-2 target set."""
+    """Return only thresholds frozen in the revision-3 target set."""
     if scenario_id not in range(1, 6):
         raise EvidenceError('scenario_id must be in [1, 5]')
     acceptance: dict[str, Any] = {

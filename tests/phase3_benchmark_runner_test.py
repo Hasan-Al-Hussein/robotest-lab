@@ -31,6 +31,7 @@ def _load(name: str, filename: str):
 
 orchestration = _load('phase3_orchestration', 'phase3_orchestration.py')
 startup_gate = _load('phase2_startup_gate', 'phase2_startup_gate.py')
+profiler = _load('phase3_smoke_host_profiler', 'phase3_smoke_host_profiler.py')
 runner = _load('phase3_benchmark_runner', 'phase3_benchmark_runner.py')
 runtime_gate = _load('phase3_runtime_gate', 'phase3_runtime_gate.py')
 metrics_constants = _load(
@@ -672,6 +673,208 @@ def test_runner_has_no_global_kill_primitive() -> None:
 
 def test_campaign_authorization_literal_is_nonempty_and_exact_token() -> None:
     assert runner.CAMPAIGN_AUTHORIZATION == ('I_AUTHORIZE_EXACTLY_15_COLD_STACK_TRIALS_NO_RETRIES')
+
+
+def test_campaign_profile_failure_precedes_trial_or_aggregate_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark = runner.BenchmarkRunner.__new__(runner.BenchmarkRunner)
+    benchmark.authorization = runner.CAMPAIGN_AUTHORIZATION
+    benchmark.workspace = tmp_path / 'workspace'
+    benchmark.candidate_id = 'phase3-deadbee-001'
+    benchmark.candidate_root = (
+        benchmark.workspace / 'artifacts/evidence/phase3-benchmarks' / benchmark.candidate_id
+    )
+    benchmark.candidate_root.mkdir(parents=True)
+    smoke_marker = benchmark.candidate_root / 'smoke/PASS.json'
+    orchestration.atomic_write_json(
+        smoke_marker,
+        {'producer': runner.PRODUCER, 'run_result_sha256': '1' * 64, 'status': 'PASS'},
+        sidecar=True,
+    )
+    benchmark._load_state = lambda: ({'trials': []}, {})
+    benchmark._load_positive = lambda: {}
+    benchmark._run_trial = lambda *_args, **_kwargs: pytest.fail('trial process started')
+
+    def reject_profile(*_args, **_kwargs):
+        raise profiler.ProfileError('missing_identity', 'profile is absent')
+
+    monkeypatch.setattr(runner, 'validate_campaign_smoke_profile', reject_profile)
+    monkeypatch.setattr(
+        runner,
+        'ProcessRegistry',
+        lambda *_args, **_kwargs: pytest.fail('campaign process registry created'),
+    )
+
+    with pytest.raises(orchestration.EvidenceError, match='valid profiled smoke'):
+        benchmark.campaign()
+
+    assert not (benchmark.candidate_root / 'runs').exists()
+    assert not (benchmark.candidate_root / 'aggregate').exists()
+
+
+@pytest.mark.parametrize(
+    ('mode', 'profile_value'),
+    (
+        ('prepare', None),
+        ('positive-control', None),
+        ('campaign', None),
+        ('smoke', None),
+        ('smoke', '1'),
+    ),
+)
+def test_contact_profiler_mode_guard_accepts_only_intended_states(
+    mode: str,
+    profile_value: str | None,
+) -> None:
+    environment = {'PATH': '/usr/bin'}
+    if profile_value is not None:
+        environment[runner.CONTACT_PROFILE_ENV] = profile_value
+
+    frozen = runner._base_environment_for_mode(mode, environment)
+
+    assert frozen is not environment
+    assert frozen['PATH'] == '/usr/bin'
+    if profile_value is None:
+        assert runner.CONTACT_PROFILE_ENV not in frozen
+    else:
+        assert frozen[runner.CONTACT_PROFILE_ENV] == '1'
+
+
+@pytest.mark.parametrize(
+    ('mode', 'profile_value'),
+    (
+        ('prepare', ''),
+        ('prepare', '1'),
+        ('positive-control', ''),
+        ('positive-control', '0'),
+        ('positive-control', '1'),
+        ('positive-control', 'true'),
+        ('campaign', ''),
+        ('campaign', '0'),
+        ('campaign', '1'),
+        ('campaign', 'other'),
+        ('smoke', ''),
+        ('smoke', '0'),
+        ('smoke', 'true'),
+        ('smoke', ' 1'),
+        ('smoke', '1 '),
+    ),
+)
+def test_contact_profiler_mode_guard_rejects_present_invalid_states(
+    mode: str,
+    profile_value: str,
+) -> None:
+    with pytest.raises(orchestration.EvidenceError, match=runner.CONTACT_PROFILE_ENV):
+        runner._base_environment_for_mode(
+            mode,
+            {runner.CONTACT_PROFILE_ENV: profile_value},
+        )
+
+
+def _benchmark_argv(tmp_path: Path, mode: str) -> list[str]:
+    workspace = tmp_path / 'workspace'
+    arguments = [
+        '--mode',
+        mode,
+        '--workspace',
+        str(workspace),
+        '--candidate-id',
+        'phase3-deadbee-001',
+        '--domain-base',
+        '100',
+        '--output-root',
+        str(workspace / 'artifacts/evidence/phase3-benchmarks'),
+        '--build-binding',
+        str(workspace / 'build-binding.json'),
+    ]
+    if mode == 'campaign':
+        arguments.extend(['--authorization', runner.CAMPAIGN_AUTHORIZATION])
+    return arguments
+
+
+@pytest.mark.parametrize(
+    ('mode', 'profile_value'),
+    (
+        ('prepare', '1'),
+        ('positive-control', ''),
+        ('smoke', '0'),
+        ('campaign', '1'),
+    ),
+)
+def test_main_rejects_profile_state_before_stage_or_evidence_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mode: str,
+    profile_value: str,
+) -> None:
+    stage_name = mode.replace('-', '_')
+    called = False
+
+    def unexpected_stage(_benchmark: runner.BenchmarkRunner) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setenv(runner.CONTACT_PROFILE_ENV, profile_value)
+    monkeypatch.setattr(runner.BenchmarkRunner, stage_name, unexpected_stage)
+    monkeypatch.setattr(runner.signal, 'signal', lambda *_args: None)
+
+    assert runner.main(_benchmark_argv(tmp_path, mode)) == 2
+    assert called is False
+    assert not (tmp_path / 'workspace').exists()
+    assert runner.CONTACT_PROFILE_ENV in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ('mode', 'profile_value'),
+    (
+        ('prepare', None),
+        ('positive-control', None),
+        ('smoke', None),
+        ('smoke', '1'),
+        ('campaign', None),
+    ),
+)
+def test_main_freezes_allowed_profile_state_for_child_processes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    profile_value: str | None,
+) -> None:
+    stage_name = mode.replace('-', '_')
+    observed: list[str | None] = []
+    if profile_value is None:
+        monkeypatch.delenv(runner.CONTACT_PROFILE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(runner.CONTACT_PROFILE_ENV, profile_value)
+
+    def inspect_stage(benchmark: runner.BenchmarkRunner) -> None:
+        if profile_value is None:
+            monkeypatch.setenv(runner.CONTACT_PROFILE_ENV, '1')
+        else:
+            monkeypatch.delenv(runner.CONTACT_PROFILE_ENV)
+        child = runner._environment(100, 'robotest_test', benchmark.base_environment)
+        observed.append(child.get(runner.CONTACT_PROFILE_ENV))
+
+    monkeypatch.setattr(runner.BenchmarkRunner, stage_name, inspect_stage)
+    monkeypatch.setattr(runner.signal, 'signal', lambda *_args: None)
+
+    assert runner.main(_benchmark_argv(tmp_path, mode)) == 0
+    assert observed == [profile_value]
+
+
+def test_smoke_trial_uses_the_exact_suite_plan_partition() -> None:
+    plan = orchestration.suite_document(TEST_DIR.parent, 'phase3-deadbee-001', 100)
+
+    smoke = runner._smoke_trial_plan(plan, plan['candidate_id'])
+
+    assert smoke['candidate_id'] == 'phase3-deadbee-001-smoke'
+    assert smoke['gz_partition'] == plan['smoke']['gz_partition']
+    assert smoke['gz_partition'] == 'robotest_p3_phase3-deadbee-001-smoke_00'
+    assert smoke['ros_domain_id'] == 116
+    assert smoke['run_id'] == 'phase3-deadbee-001-smoke-s1-r0'
 
 
 def test_frozen_candidate_evidence_tree_is_ignored_by_git() -> None:

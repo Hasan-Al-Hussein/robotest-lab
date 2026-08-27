@@ -328,6 +328,190 @@ def test_contact_aggregator_avoids_unbounded_raw_message_staging() -> None:
     assert 'gz::msgs::Contacts aggregate' not in post_update
 
 
+def test_contact_aggregator_revalidates_locked_inventory_only_on_ecm_events() -> None:
+    system = (PACKAGE / 'src' / 'contact_aggregator_system.cpp').read_text(encoding='utf-8')
+    policy = (PACKAGE / 'src' / 'contact_aggregator.cpp').read_text(encoding='utf-8')
+    pre_update = system.split('  void PreUpdate(', 1)[1].split('  void PostUpdate(', 1)[0]
+    post_update = system.split('  void PostUpdate(', 1)[1].split('  void Reset(', 1)[0]
+    cached_state_check = policy.split(
+        'std::array<bool, 2U> cached_inventory_component_changes(', 1
+    )[1].split('template<typename InventoryComponent>', 1)[0]
+    one_time_gate = policy.split('template<typename InventoryComponent>', 1)[1].split(
+        'bool relevant_periodic_inventory_type_changed(', 1
+    )[0]
+    periodic_gate = policy.split('bool relevant_periodic_inventory_type_changed(', 1)[1].split(
+        'bool locked_inventory_scan_required(', 1
+    )[0]
+    removal_check = system.split('  bool locked_entity_marked_for_removal(', 1)[1].split(
+        '  bool inventory_event_requires_full_validation(', 1
+    )[0]
+    event_gate = system.split('  bool inventory_event_requires_full_validation(', 1)[1].split(
+        '  bool validate_locked_inventory(', 1
+    )[0]
+    inventory_scan = system.split('  InventorySnapshot scan_inventory(', 1)[1].split(
+        '  static std::size_t discovered_binding_count(', 1
+    )[0]
+    cache_refresh = system.split('  void refresh_locked_inventory_cache(', 1)[1].split(
+        '  void discover_and_lock_bindings(', 1
+    )[0]
+
+    assert 'if (bindings_locked_)' in pre_update
+    assert 'discover_and_lock_bindings(ecm);' in pre_update
+    assert 'scan_inventory' not in pre_update
+    assert 'validate_locked_binding_state(ecm)' in post_update
+    assert 'locked_entity_marked_for_removal(ecm)' in post_update
+    assert 'inventory_event_requires_full_validation(ecm)' in post_update
+    assert 'validate_locked_inventory(ecm)' in post_update
+    for event in (
+        'HasNewEntities()',
+        'HasEntitiesMarkedForRemoval()',
+        'HasRemovedComponents()',
+    ):
+        assert event in event_gate
+    for component in (
+        'components::Model::typeId',
+        'components::ContactSensor::typeId',
+        'components::Link::typeId',
+        'components::Collision::typeId',
+        'components::Name::typeId',
+        'components::ParentEntity::typeId',
+        'ComponentState(entity, type)',
+    ):
+        assert component in cached_state_check
+    assert '.Each<' not in cached_state_check
+    assert '.Each<' not in event_gate
+    assert 'ContactSensorData' not in cached_state_check
+    assert 'Pose' not in cached_state_check
+    for component in ('Model', 'ContactSensor', 'Link', 'Collision'):
+        assert f'gz::sim::components::{component}>(ecm)' in one_time_gate
+    for component in (
+        'InventoryComponent::typeId',
+        'components::Name::typeId',
+        'components::ParentEntity::typeId',
+        'ComponentState(entity, type)',
+    ):
+        assert component in one_time_gate
+    assert '.Each<InventoryComponent>' in one_time_gate
+    assert 'ecm.HasOneTimeComponentChanges()' not in one_time_gate
+    assert 'ContactSensorData' not in one_time_gate
+    assert 'Pose' not in one_time_gate
+    assert 'ComponentTypesWithPeriodicChanges()' in periodic_gate
+    assert 'ContactSensorData::typeId' not in periodic_gate
+    assert 'Pose::typeId' not in periodic_gate
+    assert 'HasOneTimeComponentChanges()' in event_gate
+    assert 'HasPeriodicComponentChanges()' in event_gate
+    assert 'cached_inventory_component_changes(' in event_gate
+    assert 'relevant_one_time_inventory_component_changed(ecm)' in event_gate
+    assert 'relevant_periodic_inventory_type_changed(ecm)' in event_gate
+    assert 'locked_inventory_scan_required(' in event_gate
+    assert event_gate.index('HasOneTimeComponentChanges()') < event_gate.index(
+        'relevant_one_time_inventory_component_changed(ecm)'
+    )
+    assert 'EachRemoved<gz::sim::components::Name>' in removal_check
+    assert removal_check.index('HasEntitiesMarkedForRemoval()') < removal_check.index(
+        'EachRemoved<gz::sim::components::Name>'
+    )
+    assert system.count('scan_inventory(ecm)') == 2
+    assert system.count('refresh_locked_inventory_cache(snapshot);') == 2
+    assert 'cached_model_entities_' in system
+    assert 'cached_sensor_entities_' in system
+    assert 'cached_link_entities_' in system
+    assert 'cached_collision_entities_' in system
+    for component, field, entity_name in (
+        ('Model', 'model_entities', 'entity'),
+        ('ContactSensor', 'sensor_entities', 'sensor_entity'),
+        ('Link', 'link_entities', 'entity'),
+        ('Collision', 'collision_entities', 'entity'),
+    ):
+        assert f'Each<gz::sim::components::{component}>' in inventory_scan
+        assert f'snapshot.{field}.push_back({entity_name});' in inventory_scan
+        assert f'cached_{field}_ = snapshot.{field};' in cache_refresh
+    assert 'nameless_contact_sensor_under_model(' in inventory_scan
+    assert 'contact sensor under top-level robotest model lacks a Name' in inventory_scan
+    assert inventory_scan.index('if (sensor_name == nullptr)') < inventory_scan.index(
+        'nameless_contact_sensor_under_model('
+    )
+    assert inventory_scan.index('nameless_contact_sensor_under_model(') < inventory_scan.index(
+        'return !snapshot.error.has_value();'
+    )
+    assert 'Unsignalled in-place SDF mutation violates the' in event_gate
+
+    assert 'auto projected = interval_groups_;' not in policy
+    assert 'interval_groups_.insert_or_assign' in policy
+    assert 'validate_complete_groups(interval_groups_)' in policy
+
+
+def test_contact_profiler_is_opt_in_bounded_and_wired_to_exact_categories() -> None:
+    header = (PACKAGE / 'include' / 'robotest_sim' / 'contact_aggregator.hpp').read_text(
+        encoding='utf-8'
+    )
+    policy = (PACKAGE / 'src' / 'contact_aggregator.cpp').read_text(encoding='utf-8')
+    system = (PACKAGE / 'src' / 'contact_aggregator_system.cpp').read_text(encoding='utf-8')
+    post_update = system.split('  void PostUpdate(', 1)[1].split('  void Reset(', 1)[0]
+    profiled_path = system.split('  void post_update_profiled(', 1)[1].split(
+        '  void latch_fatal(', 1
+    )[0]
+    emission = system.split('  void emit_contact_profile_if_due(', 1)[1].split(
+        '  void post_update_profiled(', 1
+    )[0]
+
+    assert 'kContactProfileEmissionPeriodNs = 5000000000LL' in header
+    assert 'constexpr char kProfileEnvironment[] = "ROBOTEST_CONTACT_PROFILE";' in system
+    assert 'constexpr char kProfilePrefix[] = "ROBOTEST_CONTACT_PROFILE ";' in system
+    assert 'clock_gettime(CLOCK_THREAD_CPUTIME_ID' in system
+    assert '::syscall(SYS_gettid)' in system
+    assert 'if (profile_.enabled())' in post_update
+    assert 'post_update_profiled(info, ecm);' in post_update
+    assert post_update.index('post_update_profiled(info, ecm);') < post_update.index(
+        'validate_locked_binding_state(ecm)'
+    )
+    for profiler_only_symbol in (
+        'thread_cpu_timing_start',
+        'measure_profile_category',
+        'ContactProfileCategory::',
+        'count_observation',
+        'count_rescan',
+        'count_publish',
+        'emit_contact_profile_if_due',
+    ):
+        assert profiler_only_symbol not in post_update
+    assert 'std::cout << kProfilePrefix << *record << std::endl;' in emission
+    assert 'catch (...)' in emission
+    assert 'profile_.disable();' in emission
+
+    exact_wiring = (
+        ('LockedBindingValidation', 'validate_locked_binding_state(ecm)'),
+        ('CachedEventStateCheck', 'inventory_event_requires_full_validation(ecm)'),
+        ('ExhaustiveEventRescan', 'validate_locked_inventory(ecm)'),
+        ('ContactPolicyProtobuf', 'policy_.observe(stamp_ns, current_sources)'),
+        ('Publish', 'publisher_.Publish(*decision.output)'),
+    )
+    for category, operation in exact_wiring:
+        category_position = profiled_path.index(f'ContactProfileCategory::{category}')
+        operation_position = profiled_path.index(operation, category_position)
+        assert operation_position > category_position
+
+    canonical_keys = (
+        'cached_event_state_check_ns',
+        'clock_id',
+        'contact_policy_protobuf_ns',
+        'exhaustive_event_rescan_ns',
+        'linux_tid',
+        'locked_binding_validation_ns',
+        'measured_total_ns',
+        'observation_count',
+        'profile_epoch_start_sim_stamp_ns',
+        'publish_count',
+        'publish_ns',
+        'rescan_count',
+        'saturated',
+        'schema_version',
+        'sim_stamp_ns',
+    )
+    positions = [policy.index(f'\\"{key}\\"') for key in canonical_keys]
+    assert positions == sorted(positions)
+
+
 def test_world_is_local_enclosed_and_deterministic_friendly() -> None:
     world_path = PACKAGE / 'worlds' / 'robotest_lab.sdf'
     text = world_path.read_text(encoding='utf-8')

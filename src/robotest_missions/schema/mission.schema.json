@@ -67,8 +67,8 @@
       "type": "array",
       "prefixItems": [
         {"allOf": [{"$ref": "#/$defs/pose"}, {"properties": {"x": {"const": -2.0}, "y": {"const": -3.5}, "yaw": {"const": 0.0}}}]},
-        {"allOf": [{"$ref": "#/$defs/pose"}, {"properties": {"x": {"const": 0.0}, "y": {"const": 0.0}, "yaw": {"const": 0.0}}}]},
-        {"allOf": [{"$ref": "#/$defs/pose"}, {"properties": {"x": {"const": 0.0}, "y": {"const": 3.5}, "yaw": {"const": 0.0}}}]}
+        {"allOf": [{"$ref": "#/$defs/pose"}, {"properties": {"x": {"const": -0.2}, "y": {"const": 0.0}, "yaw": {"const": 0.0}}}]},
+        {"allOf": [{"$ref": "#/$defs/pose"}, {"properties": {"x": {"const": -0.2}, "y": {"const": 3.5}, "yaw": {"const": 0.0}}}]}
       ],
       "items": false,
       "minItems": 3,

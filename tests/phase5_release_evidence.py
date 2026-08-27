@@ -3131,6 +3131,35 @@ def _phase3_evidence(
     _reject_tree_symlinks(candidate_root, 'Phase 3 candidate root')
     candidate_id = candidate_root.name
     _require(CANDIDATE_ID.fullmatch(candidate_id) is not None, 'Phase 3 candidate ID is invalid')
+    profiler = _load_repository_module(
+        repository,
+        'tests/phase3_smoke_host_profiler.py',
+        'Phase 3 smoke host profiler',
+    )
+    smoke_profile_path = (
+        repository
+        / 'artifacts/evidence/phase3/performance-profiles'
+        / f'{candidate_id}-smoke-profile.json'
+    )
+    try:
+        smoke_profile_binding = profiler.validate_campaign_smoke_profile(
+            repository, candidate_root, candidate_id
+        )
+    except Exception as exc:
+        raise EvidenceError(f'Phase 3 smoke host profile failed validation: {exc}') from exc
+    _require(
+        isinstance(smoke_profile_binding, dict)
+        and smoke_profile_binding.get('profile_relative_path')
+        == smoke_profile_path.relative_to(repository).as_posix(),
+        'Phase 3 smoke host profile returned a foreign path binding',
+    )
+    smoke_profile_sha256 = file_sha256(
+        _regular_file(smoke_profile_path, 'Phase 3 smoke host profile')
+    )
+    _require(
+        smoke_profile_binding.get('profile_sha256') == smoke_profile_sha256,
+        'Phase 3 smoke host profile changed after validation',
+    )
     expected_aggregate = candidate_root / 'aggregate/aggregate-result.json'
     _regular_file(aggregate_path, 'Phase 3 aggregate')
     _require(
@@ -3676,7 +3705,7 @@ def _phase3_evidence(
     _require(
         smoke_plan
         == {
-            'gz_partition': f'robotest_p3_{candidate_id}_smoke',
+            'gz_partition': f'robotest_p3_{candidate_id}-smoke_00',
             'ros_domain_id': domain_base + 16,
             'run_id': f'{candidate_id}-smoke-s1-r0',
             'scenario_path': PHASE3_SCENARIO_PATHS[1],
@@ -3686,7 +3715,7 @@ def _phase3_evidence(
     first_trial = _mapping(trials[0], 'Phase 3 first trial')
     smoke_identity = {
         'candidate_id': f'{candidate_id}-smoke',
-        'gz_partition': f'robotest_p3_{candidate_id}-smoke_00',
+        'gz_partition': smoke_plan.get('gz_partition'),
         'repetition_index': 0,
         'ros_domain_id': smoke_plan.get('ros_domain_id'),
         'run_id': smoke_plan.get('run_id'),
@@ -3869,6 +3898,8 @@ def _phase3_evidence(
         'candidate_root': str(candidate_root),
         'git_sha': git_sha,
         'scenario_count': 5,
+        'smoke_profile_path': str(smoke_profile_path),
+        'smoke_profile_sha256': smoke_profile_sha256,
         'trial_count': 15,
     }
 
@@ -4797,9 +4828,9 @@ def validate_release_evidence(
         'schema_version': 1,
         'status': 'PASS',
         'verification_scope': (
-            'Read-only revalidation of caller-selected Phase 3 campaign, Phase 4 Scenario 6, '
-            'tracked exact-SHA Phase 5 remote evidence, and a prior local aggregate; no latest '
-            'discovery or execution'
+            'Read-only revalidation of the clone-local Phase 3 smoke host profile and '
+            'caller-selected Phase 3 campaign, Phase 4 Scenario 6, tracked exact-SHA Phase 5 '
+            'remote evidence, and a prior local aggregate; no latest discovery or execution'
         ),
     }
 

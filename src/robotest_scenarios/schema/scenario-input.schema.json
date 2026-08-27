@@ -171,13 +171,13 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["x", "y", "yaw"],
-      "properties": {"x": {"const": 0.0}, "y": {"const": 0.0}, "yaw": {"const": 0.0}}
+      "properties": {"x": {"const": -0.2}, "y": {"const": 0.0}, "yaw": {"const": 0.0}}
     },
     "waypoint2": {
       "type": "object",
       "additionalProperties": false,
       "required": ["x", "y", "yaw"],
-      "properties": {"x": {"const": 0.0}, "y": {"const": 3.5}, "yaw": {"const": 0.0}}
+      "properties": {"x": {"const": -0.2}, "y": {"const": 3.5}, "yaw": {"const": 0.0}}
     },
     "emptySchedule": {
       "type": "object",

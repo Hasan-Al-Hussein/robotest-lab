@@ -1035,6 +1035,297 @@ def _canonical_file(path: Path, value: object, *, sidecar: bool = False) -> None
         )
 
 
+def _phase3_contact_profile_record(*, linux_tid: int, step: int) -> dict[str, object]:
+    buckets = {
+        'cached_event_state_check_ns': 20 + step,
+        'contact_policy_protobuf_ns': 40 + step,
+        'exhaustive_event_rescan_ns': 30 + step,
+        'locked_binding_validation_ns': 10 + step,
+        'publish_ns': 50 + step,
+    }
+    return {
+        **buckets,
+        'clock_id': 'CLOCK_THREAD_CPUTIME_ID',
+        'linux_tid': linux_tid,
+        'measured_total_ns': sum(buckets.values()),
+        'observation_count': 2 + step,
+        'profile_epoch_start_sim_stamp_ns': 1_000,
+        'publish_count': 1 + step,
+        'rescan_count': 1 + step,
+        'saturated': False,
+        'schema_version': 1,
+        'sim_stamp_ns': 5_000_001_000 + step * 5_000_000_000,
+    }
+
+
+def _phase3_contact_profile_stdout(*, linux_tid: int) -> bytes:
+    prefix = b'[gazebo-1] ROBOTEST_CONTACT_PROFILE '
+    return b''.join(
+        prefix
+        + phase5_module.canonical_json_bytes(
+            _phase3_contact_profile_record(linux_tid=linux_tid, step=step)
+        ).rstrip(b'\n')
+        + b'\n'
+        for step in range(2)
+    )
+
+
+def _phase3_profile_proc_stat(
+    pid: int,
+    *,
+    process_group: int,
+    start_ticks: int,
+    user_ticks: int,
+) -> str:
+    fields = ['0'] * 50
+    fields[0] = 'S'
+    fields[1] = '1'
+    fields[2] = str(process_group)
+    fields[3] = str(process_group)
+    fields[11] = str(user_ticks)
+    fields[12] = '5'
+    fields[17] = '1'
+    fields[19] = str(start_ticks)
+    fields[36] = '2'
+    return f'{pid} (gz sim server) {" ".join(fields)}\n'
+
+
+def _write_phase3_profile_proc_host(proc_root: Path) -> None:
+    (proc_root / 'pressure').mkdir(parents=True)
+    (proc_root / 'loadavg').write_text('1.00 0.50 0.25 2/100 999\n', encoding='ascii')
+    (proc_root / 'stat').write_text(
+        'ctxt 100\nprocesses 20\nprocs_running 2\nprocs_blocked 0\n',
+        encoding='ascii',
+    )
+    profiler_vmstat_keys = (
+        'oom_kill',
+        'pgfault',
+        'pgmajfault',
+        'pgpgin',
+        'pgpgout',
+        'pswpin',
+        'pswpout',
+    )
+    (proc_root / 'vmstat').write_text(
+        ''.join(f'{key} {index}\n' for index, key in enumerate(profiler_vmstat_keys, 1)),
+        encoding='ascii',
+    )
+    some = 'some avg10=0.10 avg60=0.20 avg300=0.30 total=10\n'
+    full = 'full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n'
+    (proc_root / 'pressure/cpu').write_text(some, encoding='ascii')
+    (proc_root / 'pressure/io').write_text(some + full, encoding='ascii')
+    (proc_root / 'pressure/memory').write_text(some + full, encoding='ascii')
+
+
+def _write_phase3_profile_proc_process(
+    proc_root: Path,
+    *,
+    pid: int,
+    start_ticks: int,
+    user_ticks: int,
+    domain_id: int,
+    gz_partition: str,
+    plugin_path: Path,
+) -> Path:
+    process_root = proc_root / str(pid)
+    thread_root = process_root / 'task' / str(pid)
+    thread_root.mkdir(parents=True, exist_ok=True)
+    process_root.joinpath('environ').write_bytes(
+        f'ROS_DOMAIN_ID={domain_id}\0GZ_PARTITION={gz_partition}\0'.encode()
+    )
+    process_root.joinpath('cmdline').write_bytes(b'/usr/bin/gz\0sim\0-s\0')
+    stat_text = _phase3_profile_proc_stat(
+        pid,
+        process_group=pid,
+        start_ticks=start_ticks,
+        user_ticks=user_ticks,
+    )
+    process_root.joinpath('stat').write_text(stat_text, encoding='ascii')
+    thread_root.joinpath('stat').write_text(stat_text, encoding='ascii')
+    process_root.joinpath('exe').symlink_to(Path(sys.executable).resolve(strict=True))
+    plugin_stat = plugin_path.stat()
+    device = f'{os.major(plugin_stat.st_dev):x}:{os.minor(plugin_stat.st_dev):x}'
+    process_root.joinpath('maps').write_text(
+        f'1000-2000 r--p 00000000 {device} {plugin_stat.st_ino} {plugin_path}\n'
+        f'2000-3000 r-xp 00001000 {device} {plugin_stat.st_ino} {plugin_path}\n',
+        encoding='utf-8',
+    )
+    return process_root
+
+
+def _write_phase3_smoke_profile_fixture(
+    repository: Path,
+    candidate_root: Path,
+    *,
+    candidate_sha: str,
+) -> tuple[Path, str]:
+    """Write one canonical PASS profile joined to the production-shaped smoke."""
+    profiler = release_module._load_repository_module(
+        repository,
+        'tests/phase3_smoke_host_profiler.py',
+        'Phase 3 smoke host profiler fixture',
+    )
+    candidate_id = candidate_root.name
+    plan = json.loads((candidate_root / 'suite-plan.json').read_text(encoding='utf-8'))
+    smoke = plan['smoke']
+    output = (
+        repository
+        / 'artifacts/evidence/phase3/performance-profiles'
+        / f'{candidate_id}-smoke-profile.json'
+    )
+    renderer_path = output.with_name(f'{candidate_id}-renderer.log')
+    config = profiler.ProfileConfig(
+        workspace=repository,
+        candidate_root=candidate_root,
+        candidate_id=candidate_id,
+        build_binding=candidate_root / 'build-binding.json',
+        ros_domain_id=smoke['ros_domain_id'],
+        gz_partition=smoke['gz_partition'],
+        startup_timeout_s=profiler.CANONICAL_STARTUP_TIMEOUT_S,
+        sample_period_s=profiler.CANONICAL_SAMPLE_PERIOD_S,
+        max_duration_s=profiler.CANONICAL_MAX_DURATION_S,
+        renderer_log=renderer_path,
+        output_path=output,
+    )
+    identity = profiler.collect_static_identity(
+        config,
+        git_reader=lambda _workspace: {'sha': candidate_sha, 'status_porcelain': ''},
+        environment={'ROBOTEST_CONTACT_PROFILE': '1'},
+        producer_path=repository / 'tests/phase3_smoke_host_profiler.py',
+    )
+    full_stack_metadata = json.loads(
+        (candidate_root / 'smoke/processes/full_stack.process.json').read_text(encoding='utf-8')
+    )
+    pid = full_stack_metadata['pid']
+    start_ticks = 100
+    profile_started_epoch_ns = 1_800_000_000_000_000_000
+    profile_started_monotonic_ns = 0
+    sample_elapsed_ns = (
+        500_000_000,
+        1_000_000_000,
+        1_500_000_000,
+        18_000_000_000,
+        18_500_000_000,
+    )
+    state = profiler.ProfileState()
+    with tempfile.TemporaryDirectory(
+        prefix='robotest-profile-proc-', dir=repository.parent
+    ) as name:
+        proc_root = Path(name)
+        _write_phase3_profile_proc_host(proc_root)
+        plugin_path = Path(identity['plugin']['path'])
+        process_root = _write_phase3_profile_proc_process(
+            proc_root,
+            pid=pid,
+            start_ticks=start_ticks,
+            user_ticks=10,
+            domain_id=config.ros_domain_id,
+            gz_partition=config.gz_partition,
+            plugin_path=plugin_path,
+        )
+        anchor, exact_count = profiler.discover_anchor(
+            proc_root,
+            config.ros_domain_id,
+            config.gz_partition,
+            identity['plugin'],
+        )
+        assert anchor is not None and exact_count == 1
+        for step in range(4):
+            stat_text = _phase3_profile_proc_stat(
+                pid,
+                process_group=pid,
+                start_ticks=start_ticks,
+                user_ticks=10 + step * 5,
+            )
+            process_root.joinpath('stat').write_text(stat_text, encoding='ascii')
+            process_root.joinpath('task', str(pid), 'stat').write_text(stat_text, encoding='ascii')
+            assert profiler.capture_sample(
+                proc_root,
+                config,
+                anchor,
+                state,
+                monotonic_ns=lambda: sample_elapsed_ns[len(state.samples)],
+                wall_time_ns=lambda: (
+                    profile_started_epoch_ns + sample_elapsed_ns[len(state.samples)]
+                ),
+            )
+        shutil.rmtree(process_root)
+        assert not profiler.capture_sample(
+            proc_root,
+            config,
+            anchor,
+            state,
+            monotonic_ns=lambda: sample_elapsed_ns[len(state.samples)],
+            wall_time_ns=lambda: profile_started_epoch_ns + sample_elapsed_ns[len(state.samples)],
+        )
+
+    full_stack = profiler.wait_for_full_stack_close(
+        candidate_root / 'smoke',
+        anchor,
+        monotonic=lambda: 0.0,
+        sleep=lambda _duration: None,
+        profile_started_monotonic_ns=profile_started_monotonic_ns,
+    )
+    full_stack['pre_smoke_outputs_absent'] = True
+    profile_finished_epoch_ns = profile_started_epoch_ns + (
+        full_stack['finished_steady_ns'] - profile_started_monotonic_ns
+    )
+    contact = profiler.parse_contact_profile_logs(candidate_root / 'smoke')
+    profiler.reconcile_contact_log_sources(contact, full_stack)
+    contact['host_thread_binding'] = profiler.bind_contact_profile_thread(contact, anchor, state)
+    renderer_path.parent.mkdir(parents=True, exist_ok=True)
+    renderer_baseline = profiler._renderer_baseline(renderer_path)
+    renderer_path.write_bytes(b'Device Name: llvmpipe deterministic fixture\n')
+    os.utime(
+        renderer_path,
+        ns=(profile_started_epoch_ns + 1, profile_started_epoch_ns + 1),
+    )
+    renderer = profiler.collect_renderer(renderer_path, renderer_baseline, profile_started_epoch_ns)
+    renderer_path.unlink()
+    document = {
+        'anchor': anchor,
+        'candidate': identity,
+        'contact_profile': contact,
+        'finished_utc': profiler._utc(profile_finished_epoch_ns),
+        'full_stack_process': full_stack,
+        'host_clock_ticks_per_second': 100,
+        'limits': {
+            'maximum_duration_s': profiler.CANONICAL_MAX_DURATION_S,
+            'maximum_output_bytes': profiler.OUTPUT_MAX_BYTES,
+            'maximum_process_identities': profiler.MAX_PROCESSES,
+            'maximum_retained_cmdline_bytes': profiler.MAX_CMDLINE_TOTAL_BYTES,
+            'maximum_samples': profiler.MAX_SAMPLES,
+            'maximum_thread_identities': profiler.MAX_THREAD_IDENTITIES,
+            'maximum_thread_records': profiler.MAX_THREAD_RECORDS,
+            'sample_period_s': profiler.CANONICAL_SAMPLE_PERIOD_S,
+            'startup_timeout_s': profiler.CANONICAL_STARTUP_TIMEOUT_S,
+        },
+        'process_lifecycles': profiler._process_lifecycles(state),
+        'producer': profiler.PRODUCER,
+        'profile_started_boot_ticks': 0,
+        'profile_started_monotonic_ns': profile_started_monotonic_ns,
+        'profile_started_utc': profiler._utc(profile_started_epoch_ns),
+        'renderer': renderer,
+        'sampling': {
+            'anchor_alive_sample_count': 4,
+            'cadence_overrun_count': 0,
+            'exact_processes_seen_before_anchor': exact_count,
+            'retained_cmdline_bytes': state.cmdline_bytes,
+            'sample_count': len(state.samples),
+            'samples': state.samples,
+            'target_alive_sample_count': 4,
+            'thread_record_count': state.thread_records,
+            'totals': profiler._cpu_totals(state, 100),
+        },
+        'schema_version': profiler.SCHEMA_VERSION,
+        'status': 'PASS',
+    }
+    digest = profiler.write_profile(output, document)
+    binding = profiler.validate_campaign_smoke_profile(repository, candidate_root, candidate_id)
+    assert binding['profile_sha256'] == digest
+    return output, digest
+
+
 def _phase3_fault_event(
     metrics_fixture: object,
     *,
@@ -2587,6 +2878,7 @@ def _write_phase3_graph_prerequisites(
     *,
     orchestration: object,
     plan: dict,
+    full_stack_stdout_bytes: bytes | None = None,
 ) -> tuple[dict, dict]:
     """Write the graph pair and the complete successful-run process registry."""
     runtime_gate_source = release_module._load_repository_module(
@@ -2658,7 +2950,13 @@ def _write_phase3_graph_prerequisites(
                 returncode=(-15 if role == 'full_stack' else allowed_returncodes[-1]),
             ),
             stdout_bytes=(
-                b'[robotest] full stack stopped cleanly' if role == 'full_stack' else b''
+                (
+                    full_stack_stdout_bytes
+                    if full_stack_stdout_bytes is not None
+                    else b'[robotest] full stack stopped cleanly'
+                )
+                if role == 'full_stack'
+                else b''
             ),
             stderr_bytes=(b'[robotest] shutdown complete\n' if role == 'full_stack' else b''),
         )
@@ -2690,6 +2988,7 @@ def _phase3_bundle(
     git_sha: str,
     build_binding: dict,
     positive_binding_path: Path,
+    full_stack_stdout_bytes: bytes | None = None,
 ) -> str:
     directory.mkdir(parents=True)
     metrics_fixture = release_module._load_repository_module(
@@ -3203,6 +3502,7 @@ def _phase3_bundle(
         run_root,
         orchestration=orchestration,
         plan=plan,
+        full_stack_stdout_bytes=full_stack_stdout_bytes,
     )
     _write_phase3_final_launch_log_gate(repository, run_root)
     mission_process = json.loads(
@@ -3397,7 +3697,7 @@ def _rebind_phase3_smoke_runtime_gate(
     smoke_plan = {
         **suite_plan['trials'][0],
         'candidate_id': f'{suite_plan["candidate_id"]}-smoke',
-        'gz_partition': f'robotest_p3_{suite_plan["candidate_id"]}-smoke_00',
+        'gz_partition': smoke['gz_partition'],
         'ros_domain_id': smoke['ros_domain_id'],
         'run_id': smoke['run_id'],
     }
@@ -3995,7 +4295,7 @@ PY
             'producer': 'robotest_phase3/benchmark_orchestrator',
             'schema_version': 1,
             'smoke': {
-                'gz_partition': f'robotest_p3_{candidate_id}_smoke',
+                'gz_partition': f'robotest_p3_{candidate_id}-smoke_00',
                 'ros_domain_id': 116,
                 'run_id': smoke_id,
                 'scenario_path': scenario_paths[1],
@@ -4212,6 +4512,9 @@ PY
         git_sha=candidate_sha,
         build_binding=build_binding,
         positive_binding_path=positive_binding,
+        full_stack_stdout_bytes=_phase3_contact_profile_stdout(
+            linux_tid=40_000 + smoke_plan['ros_domain_id']
+        ),
     )
     _canonical_file(
         candidate_root / 'smoke/PASS.json',
@@ -4221,6 +4524,11 @@ PY
             'status': 'PASS',
         },
         sidecar=True,
+    )
+    smoke_profile_path, smoke_profile_sha256 = _write_phase3_smoke_profile_fixture(
+        repository,
+        candidate_root,
+        candidate_sha=candidate_sha,
     )
     aggregate = release_module._recompute_phase3_aggregate(repository, run_results, result_hashes)
     aggregate_path = candidate_root / 'aggregate/aggregate-result.json'
@@ -4444,6 +4752,8 @@ PY
         'remote': remote_path,
         'repository': repository,
         'scenario6': scenario6_path,
+        'smoke_profile': smoke_profile_path,
+        'smoke_profile_sha256': smoke_profile_sha256,
     }
 
 
@@ -4469,6 +4779,99 @@ def _relocate_json(
     assert isinstance(relocated, dict)
     _canonical_file(path, relocated, sidecar=sidecar)
     return relocated
+
+
+def _rebind_phase3_smoke_profile_outputs(
+    repository: Path,
+    candidate_root: Path,
+) -> tuple[Path, str]:
+    """Rebind valid full-stack outputs while preserving sampled host identity."""
+    profiler = release_module._load_repository_module(
+        repository,
+        'tests/phase3_smoke_host_profiler.py',
+        'rebound Phase 3 smoke host profiler',
+    )
+    candidate_id = candidate_root.name
+    profile_path = (
+        repository
+        / 'artifacts/evidence/phase3/performance-profiles'
+        / f'{candidate_id}-smoke-profile.json'
+    )
+    profile = json.loads(profile_path.read_text(encoding='utf-8'))
+    anchor = profile['anchor']
+    full_stack = profiler.wait_for_full_stack_close(
+        candidate_root / 'smoke',
+        anchor,
+        monotonic=lambda: 0.0,
+        sleep=lambda _duration: None,
+        profile_started_monotonic_ns=profile['profile_started_monotonic_ns'],
+    )
+    full_stack['pre_smoke_outputs_absent'] = True
+    profile_started_epoch_ns = profiler._profile_utc(
+        profile['profile_started_utc'],
+        'profile start UTC',
+    )
+    profile['finished_utc'] = profiler._utc(
+        profile_started_epoch_ns
+        + full_stack['finished_steady_ns']
+        - profile['profile_started_monotonic_ns']
+    )
+    profile['full_stack_process'] = full_stack
+    host_thread_binding = profile['contact_profile']['host_thread_binding']
+    contact = profiler.parse_contact_profile_logs(candidate_root / 'smoke')
+    profiler.reconcile_contact_log_sources(contact, full_stack)
+    contact['host_thread_binding'] = host_thread_binding
+    profile['contact_profile'] = contact
+    _canonical_file(profile_path, profile, sidecar=True)
+    binding = profiler.validate_campaign_smoke_profile(repository, candidate_root, candidate_id)
+    digest = phase5_module.file_sha256(profile_path)
+    assert binding['profile_sha256'] == digest
+    return profile_path, digest
+
+
+def _relocate_phase3_smoke_profile(
+    repository: Path,
+    candidate_root: Path,
+    *,
+    old_root: str,
+) -> tuple[Path, str]:
+    """Rebind the copied profile to replayed clone-local smoke artifacts."""
+    profiler = release_module._load_repository_module(
+        repository,
+        'tests/phase3_smoke_host_profiler.py',
+        'relocated Phase 3 smoke host profiler',
+    )
+    candidate_id = candidate_root.name
+    profile_path = (
+        repository
+        / 'artifacts/evidence/phase3/performance-profiles'
+        / f'{candidate_id}-smoke-profile.json'
+    )
+    profile = _relocate_json(profile_path, old_root, str(repository))
+    anchor = profile['anchor']
+    anchor['mapping_fingerprint_sha256'] = hashlib.sha256(
+        profiler.canonical_json_bytes(anchor['mappings'])
+    ).hexdigest()
+    full_stack = profiler.wait_for_full_stack_close(
+        candidate_root / 'smoke',
+        anchor,
+        monotonic=lambda: 0.0,
+        sleep=lambda _duration: None,
+        profile_started_monotonic_ns=profile['profile_started_monotonic_ns'],
+    )
+    full_stack['pre_smoke_outputs_absent'] = True
+    profile['full_stack_process'] = full_stack
+    host_thread_binding = profile['contact_profile']['host_thread_binding']
+    contact = profiler.parse_contact_profile_logs(candidate_root / 'smoke')
+    profiler.reconcile_contact_log_sources(contact, full_stack)
+    contact['host_thread_binding'] = host_thread_binding
+    profile['contact_profile'] = contact
+    _canonical_file(profile_path, profile, sidecar=True)
+    assert old_root.encode() not in profile_path.read_bytes()
+    binding = profiler.validate_campaign_smoke_profile(repository, candidate_root, candidate_id)
+    digest = phase5_module.file_sha256(profile_path)
+    assert binding['profile_sha256'] == digest
+    return profile_path, digest
 
 
 def _rebind_phase3_gate_attestation_workspace(
@@ -4792,7 +5195,7 @@ def _relocate_phase3_evidence(
     smoke_plan = {
         **first_trial,
         'candidate_id': f'{suite_plan["candidate_id"]}-smoke',
-        'gz_partition': f'robotest_p3_{suite_plan["candidate_id"]}-smoke_00',
+        'gz_partition': smoke['gz_partition'],
         'ros_domain_id': smoke['ros_domain_id'],
         'run_id': smoke['run_id'],
     }
@@ -4801,6 +5204,11 @@ def _relocate_phase3_evidence(
     smoke_marker = json.loads(smoke_marker_path.read_text(encoding='utf-8'))
     smoke_marker['run_result_sha256'] = smoke_sha
     _canonical_file(smoke_marker_path, smoke_marker, sidecar=True)
+    _relocate_phase3_smoke_profile(
+        repository,
+        candidate_root,
+        old_root=old_root,
+    )
 
     aggregate = release_module._recompute_phase3_aggregate(
         repository,
@@ -5008,6 +5416,9 @@ def _release_fixture(tmp_path: Path) -> dict[str, Path | str]:
             checked_at='2026-08-26T00:11:00+00:00',
         ),
     )
+    smoke_profile = (
+        repository / 'artifacts/evidence/phase3/performance-profiles/candidate-1-smoke-profile.json'
+    )
     return {
         'aggregate': aggregate_path,
         'call_log': tmp_path / 'release-calls.jsonl',
@@ -5020,6 +5431,8 @@ def _release_fixture(tmp_path: Path) -> dict[str, Path | str]:
         'remote': remote_path,
         'repository': repository,
         'scenario6': scenario6_path,
+        'smoke_profile': smoke_profile,
+        'smoke_profile_sha256': phase5_module.file_sha256(smoke_profile),
     }
 
 
@@ -5034,6 +5447,60 @@ def _validate_release_fixture(fixture: dict[str, Path | str]) -> dict[str, objec
         Path(fixture['remote']),
         Path(fixture['evidence_remote']),
     )
+
+
+def _fixture_smoke_profile(fixture: dict[str, Path | str]) -> Path:
+    return Path(fixture['smoke_profile'])
+
+
+def _rewrite_fixture_smoke_profile(
+    fixture: dict[str, Path | str],
+    mutate: object,
+) -> None:
+    profile_path = _fixture_smoke_profile(fixture)
+    document = json.loads(profile_path.read_text(encoding='utf-8'))
+    assert callable(mutate)
+    mutate(document)
+    _canonical_file(profile_path, document, sidecar=True)
+
+
+def _rebind_phase3_smoke_profile_candidate_inputs(
+    fixture: dict[str, Path | str],
+    *,
+    plugin_source_inventory_sha256: str | None = None,
+) -> None:
+    """Cascade candidate-input hashes through prepared and profile evidence."""
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    binding_path = candidate_root / 'build-binding.json'
+    plan_path = candidate_root / 'suite-plan.json'
+    prepared_path = candidate_root / 'prepared.json'
+    prepared = json.loads(prepared_path.read_text(encoding='utf-8'))
+    prepared['build_binding_sha256'] = phase5_module.file_sha256(binding_path)
+    prepared['suite_plan_sha256'] = phase5_module.file_sha256(plan_path)
+    _canonical_file(prepared_path, prepared, sidecar=True)
+
+    profile_path = _fixture_smoke_profile(fixture)
+    profile = json.loads(profile_path.read_text(encoding='utf-8'))
+    profile_candidate = profile['candidate']
+    profile_candidate['build_binding']['sha256'] = phase5_module.file_sha256(binding_path)
+    profile_candidate['suite_plan']['sha256'] = phase5_module.file_sha256(plan_path)
+    profile_candidate['prepared_marker']['sha256'] = phase5_module.file_sha256(prepared_path)
+    if plugin_source_inventory_sha256 is not None:
+        profile_candidate['plugin']['source_inventory_sha256'] = plugin_source_inventory_sha256
+    _canonical_file(profile_path, profile, sidecar=True)
+
+    profiler = release_module._load_repository_module(
+        repository,
+        'tests/phase3_smoke_host_profiler.py',
+        'rebound candidate-input smoke host profiler',
+    )
+    profile_binding = profiler.validate_campaign_smoke_profile(
+        repository,
+        candidate_root,
+        candidate_root.name,
+    )
+    assert profile_binding['profile_sha256'] == phase5_module.file_sha256(profile_path)
 
 
 def _release_evidence_command(fixture: dict[str, Path | str]) -> list[str]:
@@ -5064,6 +5531,9 @@ def test_release_evidence_mode_passes_only_exact_selected_artifacts(tmp_path: Pa
     assert report['status'] == 'PASS'
     assert report['release_eligible'] is True
     assert report['candidate_git_sha'] == fixture['candidate_sha']
+    assert report['phase3']['smoke_profile_path'] == str(fixture['smoke_profile'])
+    assert report['phase3']['smoke_profile_sha256'] == fixture['smoke_profile_sha256']
+    assert 'clone-local Phase 3 smoke host profile' in report['verification_scope']
     command = _release_evidence_command(fixture)
     local_paths = [
         Path(fixture['local_aggregate']),
@@ -5095,11 +5565,165 @@ def test_release_evidence_mode_passes_only_exact_selected_artifacts(tmp_path: Pa
     assert not Path(fixture['call_log']).exists()
 
 
+@pytest.mark.parametrize(
+    'case',
+    [
+        'missing',
+        'profile_symlink',
+        'sidecar_symlink',
+        'noncanonical',
+        'bad_sidecar',
+        'failed_status',
+        'schema',
+        'producer',
+    ],
+)
+def test_release_evidence_rejects_invalid_phase3_smoke_profile_artifact(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    profile_path = _fixture_smoke_profile(fixture)
+    sidecar_path = Path(f'{profile_path}.sha256')
+    if case == 'missing':
+        profile_path.unlink()
+    elif case == 'profile_symlink':
+        payload = profile_path.read_bytes()
+        profile_path.unlink()
+        target = profile_path.with_name('foreign-profile-target.json')
+        target.write_bytes(payload)
+        profile_path.symlink_to(target)
+    elif case == 'sidecar_symlink':
+        payload = sidecar_path.read_bytes()
+        sidecar_path.unlink()
+        target = sidecar_path.with_name('foreign-profile-sidecar')
+        target.write_bytes(payload)
+        sidecar_path.symlink_to(target)
+    elif case == 'noncanonical':
+        document = json.loads(profile_path.read_text(encoding='utf-8'))
+        profile_path.write_text(json.dumps(document, indent=2) + '\n', encoding='utf-8')
+        sidecar_path.write_text(
+            f'{phase5_module.file_sha256(profile_path)}  {profile_path.name}\n',
+            encoding='ascii',
+        )
+    elif case == 'bad_sidecar':
+        sidecar_path.write_text(f'{"0" * 64}  {profile_path.name}\n', encoding='ascii')
+    elif case == 'failed_status':
+        _rewrite_fixture_smoke_profile(
+            fixture, lambda document: document.__setitem__('status', 'FAIL')
+        )
+    elif case == 'schema':
+        _rewrite_fixture_smoke_profile(
+            fixture, lambda document: document.__setitem__('schema_version', 2)
+        )
+    else:
+        _rewrite_fixture_smoke_profile(
+            fixture,
+            lambda document: document.__setitem__('producer', 'forged/smoke_host_profiler'),
+        )
+
+    with pytest.raises(EvidenceError, match='smoke host profile failed validation'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        'candidate_id',
+        'smoke_identity',
+        'smoke_marker_hash',
+        'smoke_result_hash',
+        'build_binding_hash',
+        'suite_plan_hash',
+        'prepared_marker_hash',
+        'git_sha',
+        'plugin_hash',
+        'source_inventory_hash',
+        'profiler_hash',
+    ],
+)
+def test_release_evidence_rejects_phase3_smoke_profile_identity_hash_forgery(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    candidate_root = Path(fixture['candidate_root'])
+    if case == 'smoke_marker_hash':
+        marker_path = candidate_root / 'smoke/PASS.json'
+        marker = json.loads(marker_path.read_text(encoding='utf-8'))
+        marker['run_result_sha256'] = '0' * 64
+        _canonical_file(marker_path, marker, sidecar=True)
+    elif case == 'smoke_result_hash':
+        result_path = candidate_root / 'smoke/result/run-result.json'
+        result = json.loads(result_path.read_text(encoding='utf-8'))
+        result['quality']['infrastructure_failure'] = 'forged'
+        _canonical_file(result_path, result)
+    else:
+
+        def mutate(document: dict) -> None:
+            candidate = document['candidate']
+            if case == 'candidate_id':
+                candidate['candidate_id'] = 'foreign-candidate'
+            elif case == 'smoke_identity':
+                candidate['smoke']['run_id'] = 'foreign-smoke-run'
+            elif case == 'build_binding_hash':
+                candidate['build_binding']['sha256'] = '0' * 64
+            elif case == 'suite_plan_hash':
+                candidate['suite_plan']['sha256'] = '0' * 64
+            elif case == 'prepared_marker_hash':
+                candidate['prepared_marker']['sha256'] = '0' * 64
+            elif case == 'git_sha':
+                candidate['git']['sha'] = '0' * 40
+            elif case == 'plugin_hash':
+                candidate['plugin']['sha256'] = '0' * 64
+            elif case == 'source_inventory_hash':
+                candidate['plugin']['source_inventory_sha256'] = '0' * 64
+            else:
+                candidate['profiler_producer']['sha256'] = '0' * 64
+
+        _rewrite_fixture_smoke_profile(fixture, mutate)
+
+    with pytest.raises(EvidenceError, match='smoke host profile failed validation'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_foreign_renamed_phase3_profile_candidate(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    candidate_root = Path(fixture['candidate_root'])
+    foreign_root = candidate_root.with_name('candidate-foreign')
+    candidate_root.rename(foreign_root)
+    profile_path = _fixture_smoke_profile(fixture)
+    foreign_profile = profile_path.with_name('candidate-foreign-smoke-profile.json')
+    profile_path.rename(foreign_profile)
+    original_sidecar = Path(f'{profile_path}.sha256')
+    foreign_sidecar = Path(f'{foreign_profile}.sha256')
+    original_sidecar.rename(foreign_sidecar)
+    foreign_sidecar.write_text(
+        f'{phase5_module.file_sha256(foreign_profile)}  {foreign_profile.name}\n',
+        encoding='ascii',
+    )
+    fixture['candidate_root'] = foreign_root
+    fixture['aggregate'] = foreign_root / 'aggregate/aggregate-result.json'
+    fixture['smoke_profile'] = foreign_profile
+
+    with pytest.raises(EvidenceError, match='smoke host profile failed validation'):
+        _validate_release_fixture(fixture)
+
+
 def test_release_fixture_clones_are_self_contained_and_reload_producers(
     tmp_path: Path,
 ) -> None:
     first = _release_fixture(tmp_path / 'first')
     first_repository = Path(first['repository'])
+    first_report = _validate_release_fixture(first)
+    first_profile = _fixture_smoke_profile(first)
+    template_repository = Path(_release_fixture_template()['repository'])
+    assert first_report['phase3']['smoke_profile_sha256'] == phase5_module.file_sha256(
+        first_profile
+    )
+    assert str(template_repository).encode() not in first_profile.read_bytes()
     assert not any(path.is_symlink() for path in (first_repository / 'install').rglob('*'))
     release_module._activate_repository_packages(first_repository)
     first_analysis = importlib.import_module('robotest_metrics.analysis')
@@ -5109,6 +5733,13 @@ def test_release_fixture_clones_are_self_contained_and_reload_producers(
 
     second = _release_fixture(tmp_path / 'second')
     second_repository = Path(second['repository'])
+    second_report = _validate_release_fixture(second)
+    second_profile = _fixture_smoke_profile(second)
+    assert second_report['phase3']['smoke_profile_sha256'] == phase5_module.file_sha256(
+        second_profile
+    )
+    assert str(template_repository).encode() not in second_profile.read_bytes()
+    assert str(first_repository).encode() not in second_profile.read_bytes()
     release_module._activate_repository_packages(second_repository)
     second_analysis = importlib.import_module('robotest_metrics.analysis')
     second_scenario_provenance = importlib.import_module('robotest_scenarios.provenance')
@@ -5669,7 +6300,8 @@ def test_release_evidence_rejects_rebound_phase3_process_contract_forgery(
 ) -> None:
     fixture = _release_fixture(tmp_path)
     repository = Path(fixture['repository'])
-    run_root = Path(fixture['candidate_root']) / 'smoke'
+    candidate_root = Path(fixture['candidate_root'])
+    run_root = candidate_root / 'smoke'
     process_path = run_root / f'processes/{role}.process.json'
     process = json.loads(process_path.read_text(encoding='utf-8'))
     if case == 'command':
@@ -5689,6 +6321,14 @@ def test_release_evidence_rejects_rebound_phase3_process_contract_forgery(
     _canonical_file(process_path, process)
     _rebind_phase3_prerequisites(repository, run_root)
 
+    if role == 'full_stack':
+        with pytest.raises(
+            EvidenceError,
+            match='smoke host profile failed validation: full-stack recorded projection differs',
+        ):
+            _validate_release_fixture(fixture)
+        _rebind_phase3_smoke_profile_outputs(repository, candidate_root)
+
     with pytest.raises(EvidenceError, match=rf'{role} process command, timeout, or outcome'):
         _validate_release_fixture(fixture)
 
@@ -5705,7 +6345,19 @@ def test_release_evidence_rejects_rebound_phase3_partial_retained_stream(
     _canonical_file(process_path, process)
     _rebind_phase3_prerequisites(repository, run_root)
 
-    with pytest.raises(EvidenceError, match='full_stack process stdout fields are invalid'):
+    with pytest.raises(
+        EvidenceError,
+        match='smoke host profile failed validation: full-stack recorded projection differs',
+    ):
+        _validate_release_fixture(fixture)
+    profile_path = _fixture_smoke_profile(fixture)
+    profile = json.loads(profile_path.read_text(encoding='utf-8'))
+    profile['full_stack_process']['sha256'] = phase5_module.file_sha256(process_path)
+    _canonical_file(profile_path, profile, sidecar=True)
+    with pytest.raises(
+        EvidenceError,
+        match='smoke host profile failed validation: full-stack stdout was not retained',
+    ):
         _validate_release_fixture(fixture)
 
 
@@ -5739,16 +6391,18 @@ def test_release_evidence_rejects_coordinated_phase3_launch_signature_forgery(
 ) -> None:
     fixture = _release_fixture(tmp_path)
     repository = Path(fixture['repository'])
-    run_root = Path(fixture['candidate_root']) / 'smoke'
+    candidate_root = Path(fixture['candidate_root'])
+    run_root = candidate_root / 'smoke'
     gate_path = run_root / 'full-stack-final-log-gate.json'
     recorded_gate = json.loads(gate_path.read_text(encoding='utf-8'))
 
     stream_path = run_root / f'processes/full_stack.{stream_name}.log'
-    stream_path.write_bytes(payload)
+    forged_stream = stream_path.read_bytes() + payload
+    stream_path.write_bytes(forged_stream)
     process_path = run_root / 'processes/full_stack.process.json'
     process = json.loads(process_path.read_text(encoding='utf-8'))
-    process[stream_name]['observed_bytes'] = len(payload)
-    process[stream_name]['retained_bytes'] = len(payload)
+    process[stream_name]['observed_bytes'] = len(forged_stream)
+    process[stream_name]['retained_bytes'] = len(forged_stream)
     _canonical_file(process_path, process)
 
     scanner = release_module._load_repository_module(
@@ -5783,6 +6437,12 @@ def test_release_evidence_rejects_coordinated_phase3_launch_signature_forgery(
     _canonical_file(gate_path, replayed, sidecar=True)
     _rebind_phase3_prerequisites(repository, run_root)
 
+    with pytest.raises(
+        EvidenceError,
+        match='smoke host profile failed validation: full-stack recorded projection differs',
+    ):
+        _validate_release_fixture(fixture)
+    _rebind_phase3_smoke_profile_outputs(repository, candidate_root)
     with pytest.raises(EvidenceError, match='differs from clone-local scanner replay'):
         _validate_release_fixture(fixture)
 
@@ -5824,7 +6484,8 @@ def test_release_evidence_rejects_rebound_phase3_process_timeline_forgery(
 ) -> None:
     fixture = _release_fixture(tmp_path)
     repository = Path(fixture['repository'])
-    run_root = Path(fixture['candidate_root']) / 'smoke'
+    candidate_root = Path(fixture['candidate_root'])
+    run_root = candidate_root / 'smoke'
     if case == 'mission_before_graph':
         process_path = run_root / 'processes/mission_runner.process.json'
         process = json.loads(process_path.read_text(encoding='utf-8'))
@@ -5835,6 +6496,14 @@ def test_release_evidence_rejects_rebound_phase3_process_timeline_forgery(
         process['finished_steady_ns'] = 28_500_000_000
     _canonical_file(process_path, process)
     _rebind_phase3_prerequisites(repository, run_root)
+
+    if case == 'stack_ends_before_final_gate':
+        with pytest.raises(
+            EvidenceError,
+            match='smoke host profile failed validation: full-stack recorded projection differs',
+        ):
+            _validate_release_fixture(fixture)
+        _rebind_phase3_smoke_profile_outputs(repository, candidate_root)
 
     with pytest.raises(EvidenceError, match='successful process timeline is invalid'):
         _validate_release_fixture(fixture)
@@ -6762,7 +7431,8 @@ def test_release_contact_aggregator_binding_rejects_tampering(
 
 def test_release_evidence_rejects_unshared_contact_binary_inventory(tmp_path: Path) -> None:
     fixture = _release_fixture(tmp_path)
-    binding_path = Path(fixture['candidate_root']) / 'build-binding.json'
+    candidate_root = Path(fixture['candidate_root'])
+    binding_path = candidate_root / 'build-binding.json'
     binding = json.loads(binding_path.read_text(encoding='utf-8'))
     aggregator = binding['contact_aggregator_binary']
     rebound_inventory_sha256 = 'f' * 64
@@ -6770,6 +7440,17 @@ def test_release_evidence_rejects_unshared_contact_binary_inventory(tmp_path: Pa
     aggregator['build_embedded_source_inventory_sha256'] = rebound_inventory_sha256
     aggregator['installed_embedded_source_inventory_sha256'] = rebound_inventory_sha256
     _canonical_file(binding_path, binding, sidecar=True)
+
+    with pytest.raises(
+        EvidenceError,
+        match='smoke host profile failed validation: profile candidate build_binding differs',
+    ):
+        _validate_release_fixture(fixture)
+
+    _rebind_phase3_smoke_profile_candidate_inputs(
+        fixture,
+        plugin_source_inventory_sha256=rebound_inventory_sha256,
+    )
 
     with pytest.raises(EvidenceError, match='do not share one source inventory'):
         _validate_release_fixture(fixture)
@@ -6826,6 +7507,12 @@ def test_release_evidence_rejects_boolean_phase3_plan_schema(tmp_path: Path) -> 
     plan['schema_version'] = True
     _canonical_file(plan_path, plan, sidecar=True)
 
+    with pytest.raises(
+        EvidenceError,
+        match='smoke host profile failed validation: profile candidate suite_plan differs',
+    ):
+        _validate_release_fixture(fixture)
+    _rebind_phase3_smoke_profile_candidate_inputs(fixture)
     with pytest.raises(EvidenceError, match='suite plan contract changed'):
         _validate_release_fixture(fixture)
 
@@ -6837,6 +7524,12 @@ def test_release_evidence_rejects_boolean_phase3_manifest_count(tmp_path: Path) 
     binding['source']['file_count'] = True
     _canonical_file(binding_path, binding, sidecar=True)
 
+    with pytest.raises(
+        EvidenceError,
+        match='smoke host profile failed validation: profile candidate build_binding differs',
+    ):
+        _validate_release_fixture(fixture)
+    _rebind_phase3_smoke_profile_candidate_inputs(fixture)
     with pytest.raises(EvidenceError, match='counters or aggregate hash do not reconcile'):
         _validate_release_fixture(fixture)
 
@@ -7326,6 +8019,12 @@ def test_release_evidence_rejects_incomplete_phase3_build_binding(
     del binding[field]
     _canonical_file(binding_path, binding, sidecar=True)
 
+    with pytest.raises(
+        EvidenceError,
+        match='smoke host profile failed validation: profile candidate build_binding differs',
+    ):
+        _validate_release_fixture(fixture)
+    _rebind_phase3_smoke_profile_candidate_inputs(fixture)
     with pytest.raises(EvidenceError, match='build binding producer or schema changed'):
         _validate_release_fixture(fixture)
 
@@ -7342,6 +8041,12 @@ def test_release_evidence_rejects_empty_phase3_build_manifest(tmp_path: Path) ->
     }
     _canonical_file(binding_path, binding, sidecar=True)
 
+    with pytest.raises(
+        EvidenceError,
+        match='smoke host profile failed validation: profile candidate build_binding differs',
+    ):
+        _validate_release_fixture(fixture)
+    _rebind_phase3_smoke_profile_candidate_inputs(fixture)
     with pytest.raises(EvidenceError, match='source tree manifest is empty'):
         _validate_release_fixture(fixture)
 
@@ -7374,6 +8079,12 @@ def test_release_evidence_rejects_phase3_plan_partition_forgery(tmp_path: Path) 
     prepared['suite_plan_sha256'] = phase5_module.file_sha256(plan_path)
     _canonical_file(prepared_path, prepared, sidecar=True)
 
+    with pytest.raises(
+        EvidenceError,
+        match='smoke host profile failed validation: profile candidate suite_plan differs',
+    ):
+        _validate_release_fixture(fixture)
+    _rebind_phase3_smoke_profile_candidate_inputs(fixture)
     with pytest.raises(EvidenceError, match='trial order changed'):
         _validate_release_fixture(fixture)
 

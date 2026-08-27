@@ -8,8 +8,8 @@ frame_id: map
 start_pose: {x: 0.0, y: -3.5, yaw: 0.0}
 waypoints:
   - {x: -2.0, y: -3.5, yaw: 0.0}
-  - {x: 0.0, y: 0.0, yaw: 0.0}
-  - {x: 0.0, y: 3.5, yaw: 0.0}
+  - {x: -0.2, y: 0.0, yaw: 0.0}
+  - {x: -0.2, y: 3.5, yaw: 0.0}
 mission_timeout_sim_s: 180.0
 wall_escape_timeout_s: 300.0
 allowed_collision_count: 0
