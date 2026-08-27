@@ -47,11 +47,17 @@ def test_contact_control_arm_protocol_value_and_hash_are_frozen() -> None:
         'request_max_bytes': 4096,
         'request_producer': 'robotest_phase3/benchmark_runner',
         'schema_version': 2,
-        'wait_deadline_policy': 'complete_fixture_steady_wall_deadline_without_reset',
+        'wait_deadline_policy': (
+            'precomputed_operational_deadline_then_reserved_cleanup_without_reset'
+        ),
     }
     assert contact_control_arm_protocol() == protocol
     assert (
         contact_control_arm_protocol_sha256()
-        == 'e2237df774efa356b5a7c0d72dca7f9a13450311d37b26d35af1ff74b1ba8ac3'
+        == '63e00e6a98d74e41fe640f132ea0de9a10ca7364ce4ee0a059d1a5483fc2a38a'
     )
     assert contact_control_configuration()['arm_protocol'] == protocol
+    assert contact_control_configuration()['cleanup_reserve_s'] == 5.0
+    assert contact_control_configuration()['spawn_response_deadline_policy'] == (
+        'one_non_idempotent_request_until_precomputed_operational_deadline'
+    )

@@ -45,6 +45,8 @@ from phase3_orchestration import (
     canonical_json_bytes,
     component_manifest,
     compose_analysis_request,
+    CONTACT_CONTROL_PROCESS_WALL_TIMEOUT_S,
+    CONTACT_CONTROL_READY_WAIT_TIMEOUT_S,
     CONTACT_CONTROL_WALL_TIMEOUT_S,
     CONTACT_DRAIN_NS,
     CPU_AFFINITY,
@@ -1338,11 +1340,11 @@ class BenchmarkRunner:
                     '-r',
                     '__ns:=/robotest',
                 ],
-                wall_timeout_s=45.0,
+                wall_timeout_s=CONTACT_CONTROL_PROCESS_WALL_TIMEOUT_S,
             )
             _wait_for_file(
                 driver_ready,
-                timeout_s=20.0,
+                timeout_s=CONTACT_CONTROL_READY_WAIT_TIMEOUT_S,
                 watched=(launch, collector, driver),
                 stage='positive_driver_ready',
             )

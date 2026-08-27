@@ -80,6 +80,7 @@ CONTROL_FORWARD_MPS = 0.05
 CONTROL_REVERSE_MPS = -0.05
 CONTROL_COMMAND_PERIOD_NS = 50_000_000
 CONTROL_CONTACT_DEADLINE_NS = 12_000_000_000
+CONTROL_CLEANUP_RESERVE_S = 5.0
 CONTROL_STOP_DEADLINE_NS = 100_000_000
 CONTROL_HOLD_NS = 250_000_000
 CONTROL_REVERSE_NS = 1_000_000_000
@@ -88,6 +89,9 @@ CONTROL_WALL_POSE = (0.70, -3.50, 0.40, 0.0)
 CONTROL_ROBOT_START = (0.0, -3.5, 0.0)
 CONTROL_WALL_COLLISION = 'phase3_contact_control_wall::link::collision'
 CONTROL_SOURCE_GRAPH_MISSING_CONFIRM_NS = 100_000_000
+CONTROL_SPAWN_RESPONSE_DEADLINE_POLICY = (
+    'one_non_idempotent_request_until_precomputed_operational_deadline'
+)
 CONTROL_ARM_ACTION = 'start_positive_control_motion'
 CONTROL_ARM_ACK_MAX_BYTES = 4_096
 CONTROL_ARM_ACK_PRODUCER = 'robotest_scenarios/contact_control_driver'
@@ -95,7 +99,9 @@ CONTROL_ARM_FRESH_CLOCK_POLICY = 'strictly_newer_positive_stamp_after_valid_arm'
 CONTROL_ARM_REQUEST_MAX_BYTES = 4_096
 CONTROL_ARM_REQUEST_PRODUCER = 'robotest_phase3/benchmark_runner'
 CONTROL_ARM_SCHEMA_VERSION = 2
-CONTROL_ARM_WAIT_DEADLINE_POLICY = 'complete_fixture_steady_wall_deadline_without_reset'
+CONTROL_ARM_WAIT_DEADLINE_POLICY = (
+    'precomputed_operational_deadline_then_reserved_cleanup_without_reset'
+)
 CONTROL_COMMAND_DELIVERY_PROBE_MAX_LAG_NS = 100_000_000
 CONTROL_COMMAND_DELIVERY_PROBE_POLICY = (
     'exact_two_matches_then_one_untracked_zero_with_partial_ordered_collector_progress_before_arm'

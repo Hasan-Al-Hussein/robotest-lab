@@ -781,6 +781,13 @@ def test_positive_control_runtime_gate_finishes_before_motion_arm() -> None:
     assert "'--arm-file'" in positive_source
     assert "'--armed-file'" in positive_source
     assert "'--command-progress-file'" in positive_source
+    assert 'timeout_s=CONTACT_CONTROL_READY_WAIT_TIMEOUT_S' in positive_source
+    assert 'wall_timeout_s=CONTACT_CONTROL_PROCESS_WALL_TIMEOUT_S' in positive_source
+    assert (
+        runner.CONTACT_CONTROL_WALL_TIMEOUT_S
+        < runner.CONTACT_CONTROL_READY_WAIT_TIMEOUT_S
+        < runner.CONTACT_CONTROL_PROCESS_WALL_TIMEOUT_S
+    )
 
 
 def test_contact_control_arm_paths_must_be_fresh_and_distinct(tmp_path: Path) -> None:

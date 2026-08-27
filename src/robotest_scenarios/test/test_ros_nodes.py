@@ -186,10 +186,7 @@ def test_contact_graph_rejects_invalid_rmw_endpoint_gids(value: str) -> None:
     assert not ContactControlApp._endpoint_gid_is_valid(value)
 
 
-def test_contact_spawn_success_returns_complete_ready_and_result_projection(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def _spawn_test_app(tmp_path: Path, *, run_id: str) -> ContactControlApp:
     manifest = load_coverage_manifest(str(REPOSITORY / 'config' / 'collision-coverage.yaml'))
     app = ContactControlApp(
         manifest=manifest,
@@ -198,13 +195,21 @@ def test_contact_spawn_success_returns_complete_ready_and_result_projection(
         arm_path=tmp_path / 'arm.json',
         armed_path=tmp_path / 'armed.json',
         command_progress_path=tmp_path / 'command-progress.json',
-        run_id='spawn-projection-test',
+        run_id=run_id,
         wall_timeout_s=30.0,
         service_timeout_s=2.0,
         raw_ros_args=[],
     )
     app.wall_asset = tmp_path / 'wall.sdf'
     app.wall_asset_sha256 = 'a' * 64
+    return app
+
+
+def test_contact_spawn_success_returns_complete_ready_and_result_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _spawn_test_app(tmp_path, run_id='spawn-projection-test')
     sequences = iter((41, 42))
     future = SimpleNamespace(
         done=lambda: True,
@@ -244,6 +249,171 @@ def test_contact_spawn_success_returns_complete_ready_and_result_projection(
 
     spawn['attempt_count'] = 999
     assert app.setup_evidence['spawn']['attempt_count'] == 1
+
+
+def test_contact_spawn_waits_for_one_delayed_response_until_operational_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _spawn_test_app(tmp_path, run_id='delayed-spawn-response-test')
+    app.wall_deadline = 30.0
+    clock = SimpleNamespace(now=0.0)
+    call_count = 0
+    sequences = iter((51, 52))
+    future = SimpleNamespace(
+        done=lambda: clock.now >= 3.0,
+        result=lambda: SimpleNamespace(success=True),
+    )
+
+    def call_async(_request: object) -> object:
+        nonlocal call_count
+        call_count += 1
+        return future
+
+    app.node = SimpleNamespace(
+        _next_sequence=lambda: next(sequences),
+        current_sim_stamp_ns=5_000_000_000,
+        spawn_client=SimpleNamespace(call_async=call_async),
+    )
+    monkeypatch.setattr(app, '_wait_service', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(app, '_spin_once', lambda: setattr(clock, 'now', clock.now + 1.1))
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.time.monotonic',
+        lambda: clock.now,
+    )
+
+    spawn = app._spawn_wall()
+
+    assert clock.now > app.service_timeout_s
+    assert call_count == 1
+    assert spawn['success'] is True
+    assert spawn['attempt_count'] == 1
+
+
+def test_contact_spawn_timeout_runs_reserved_exactly_once_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.time.monotonic',
+        lambda: clock.now,
+    )
+    app = _spawn_test_app(tmp_path, run_id='spawn-wall-deadline-test')
+    assert app.wall_deadline == 125.0
+    assert app.complete_wall_deadline == 130.0
+    spawn_call_count = 0
+    delete_call_count = 0
+    future = SimpleNamespace(done=lambda: False)
+
+    def spawn_call_async(_request: object) -> object:
+        nonlocal spawn_call_count
+        spawn_call_count += 1
+        return future
+
+    class FakeNode:
+        def __init__(self) -> None:
+            self.cleanup_started = False
+            self.clock_seen = False
+            self.current_sim_stamp_ns = 5_000_000_000
+            self.delete_client = object()
+            self.post_delete_entity_latest_sim_stamp_ns = None
+            self.post_delete_entity_message_count = 0
+            self.post_delete_wall_pose_count = 0
+            self.sequence = 60
+            self.spawn_client = SimpleNamespace(call_async=spawn_call_async)
+
+        def _next_sequence(self) -> int:
+            self.sequence += 1
+            return self.sequence
+
+        def begin_cleanup(self) -> None:
+            self.cleanup_started = True
+
+        @staticmethod
+        def count_publishers(_topic: str) -> int:
+            return 1
+
+        @staticmethod
+        def destroy_node() -> None:
+            return None
+
+    class FakeExecutor:
+        @staticmethod
+        def add_node(_node: object) -> None:
+            return None
+
+        @staticmethod
+        def remove_node(_node: object) -> None:
+            return None
+
+        @staticmethod
+        def shutdown(*, timeout_sec: float) -> None:
+            assert timeout_sec == 1.0
+
+    node = FakeNode()
+    executor = FakeExecutor()
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.ContactControlNode',
+        lambda _manifest: node,
+    )
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.SingleThreadedExecutor',
+        lambda: executor,
+    )
+    monkeypatch.setattr('robotest_scenarios.contact_control_driver.rclpy.init', lambda **_: None)
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.rclpy.try_shutdown', lambda: None
+    )
+    monkeypatch.setattr(app, '_wait_service', lambda *_args, **_kwargs: None)
+
+    def spin_to_operational_deadline() -> None:
+        clock.now += 5.0
+        app._require_wall_budget()
+
+    def call_delete_once(*_args: object, **_kwargs: object) -> tuple[object, int, int]:
+        nonlocal delete_call_count
+        delete_call_count += 1
+        assert app.cleanup_window_active
+        assert app.wall_deadline == 130.0
+        assert clock.now == 125.0
+        return SimpleNamespace(success=True), 62, node.current_sim_stamp_ns
+
+    def prove_absence(*_args: object, **_kwargs: object) -> None:
+        node.current_sim_stamp_ns += 250_000_000
+        node.post_delete_entity_latest_sim_stamp_ns = node.current_sim_stamp_ns
+        node.post_delete_entity_message_count = 1
+
+    def result(error: object) -> tuple[dict[str, object], int]:
+        assert isinstance(error, InfrastructureError)
+        assert str(error) == 'scenario/spawn_entity response timed out'
+        assert app.cleanup['actor_absent'] is True
+        return {}, 22
+
+    monkeypatch.setattr(app, '_spin_once', spin_to_operational_deadline)
+    monkeypatch.setattr(app, '_prepare', lambda: app._spawn_wall())
+    monkeypatch.setattr(app, '_wait_for_arm', lambda: pytest.fail('arm must not run'))
+    monkeypatch.setattr(app, '_run_control', lambda: pytest.fail('motion must not run'))
+    monkeypatch.setattr(app, '_call_service', call_delete_once)
+    monkeypatch.setattr(app, '_wait_for', prove_absence)
+    monkeypatch.setattr(app, '_result', result)
+    monkeypatch.setattr('robotest_scenarios.contact_control_driver.load_schema', lambda _path: {})
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.write_canonical_json',
+        lambda *_args, **_kwargs: None,
+    )
+
+    assert app.run() == 22
+
+    assert spawn_call_count == 1
+    assert delete_call_count == 1
+    assert node.cleanup_started
+    assert app.spawn_attempt_count == 1
+    assert app.delete_attempt_count == 1
+    assert app.cleanup_window_active
+    assert app.setup_evidence['spawn']['error'] == (
+        'spawn response did not complete before the reserved cleanup window'
+    )
 
 
 def test_contact_arm_waits_for_request_and_strictly_newer_positive_clock(
@@ -573,7 +743,7 @@ def test_contact_arm_fresh_clock_callback_cannot_cross_wall_deadline(tmp_path: P
 
     app.executor = CrossingExecutor()
 
-    with pytest.raises(WallTimeoutError, match='30 s steady-wall escape'):
+    with pytest.raises(WallTimeoutError, match='operational steady-wall deadline elapsed'):
         app._wait_for_arm()
 
     assert app.arm_request is not None
@@ -614,7 +784,7 @@ def test_contact_arm_ack_commit_crossing_deadline_is_retained_without_arming(
         crossing_write,
     )
 
-    with pytest.raises(WallTimeoutError, match='30 s steady-wall escape'):
+    with pytest.raises(WallTimeoutError, match='operational steady-wall deadline elapsed'):
         app._wait_for_arm()
 
     assert app.armed_path.is_file()
@@ -651,7 +821,7 @@ def test_contact_first_nonzero_rechecks_wall_deadline_after_ack(
     assert node.motion_armed
 
     app.wall_deadline = time.monotonic()
-    with pytest.raises(WallTimeoutError, match='30 s steady-wall escape'):
+    with pytest.raises(WallTimeoutError, match='operational steady-wall deadline elapsed'):
         app._drive_until_contact()
 
     assert node.control_started_stamp_ns is None
@@ -669,7 +839,7 @@ def test_contact_wait_predicate_cannot_cross_wall_deadline(tmp_path: Path) -> No
         app.wall_deadline = time.monotonic()
         return True
 
-    with pytest.raises(WallTimeoutError, match='30 s steady-wall escape'):
+    with pytest.raises(WallTimeoutError, match='operational steady-wall deadline elapsed'):
         app._wait_for(crossing_predicate, reason='predicate crossed deadline')
 
     assert predicate_calls == 1
@@ -686,7 +856,7 @@ def test_contact_reverse_rechecks_wall_deadline_before_nonzero(tmp_path: Path) -
     app._node.publish_command = publish_command
     app.wall_deadline = time.monotonic()
 
-    with pytest.raises(WallTimeoutError, match='30 s steady-wall escape'):
+    with pytest.raises(WallTimeoutError, match='operational steady-wall deadline elapsed'):
         app._reverse_and_release()
 
     assert published_commands == []
@@ -720,7 +890,7 @@ def test_contact_repeated_forward_rechecks_deadline_after_spin_postcheck(
     monkeypatch.setattr(node, 'publish_command', publish_command, raising=False)
     monkeypatch.setattr(app, '_spin_once', spin_once)
 
-    with pytest.raises(WallTimeoutError, match='30 s steady-wall escape'):
+    with pytest.raises(WallTimeoutError, match='operational steady-wall deadline elapsed'):
         app._drive_until_contact()
 
     assert node.control_started_stamp_ns == 2_000_000_000
@@ -752,7 +922,7 @@ def test_contact_repeated_reverse_rechecks_deadline_after_spin_postcheck(
     monkeypatch.setattr(node, 'publish_command', publish_command, raising=False)
     monkeypatch.setattr(app, '_spin_once', spin_once)
 
-    with pytest.raises(WallTimeoutError, match='30 s steady-wall escape'):
+    with pytest.raises(WallTimeoutError, match='operational steady-wall deadline elapsed'):
         app._reverse_and_release()
 
     assert published_commands == [(CONTROL_REVERSE_MPS, 'REVERSE')]
@@ -1531,7 +1701,7 @@ def test_contact_cleanup_retains_successful_response_when_quiet_wait_fails(
         armed_path=tmp_path / 'armed.json',
         command_progress_path=tmp_path / 'command-progress.json',
         run_id='cleanup-proof-test',
-        wall_timeout_s=1.0,
+        wall_timeout_s=30.0,
         service_timeout_s=1.0,
         raw_ros_args=[],
     )

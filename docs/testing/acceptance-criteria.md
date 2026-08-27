@@ -125,6 +125,8 @@ hash-bound, and correctly ordered. Missing, stale, oversized, symlinked,
 malformed, noncanonical, wrongly bound, tampered, or out-of-order artifacts fail
 closed. One never-reset **30 steady-wall-second** deadline includes preparation,
 the stationary runtime gate, all pre-arm waits, motion, release, and cleanup.
+The operational boundary is precomputed at **25 s** and the final **5 s** is
+reserved for exactly-once actor deletion and the pose-source absence proof.
 The probe callback simulation stamp must be within an absolute **0.10
 simulation seconds** of its publish stamp; the publish stamp is strictly after
 the arm-observed clock baseline and no later than the ARMED clock stamp. Steady

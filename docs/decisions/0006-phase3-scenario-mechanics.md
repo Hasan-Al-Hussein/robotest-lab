@@ -445,6 +445,15 @@ entity:
   world_pose: {x_m: 0.70, y_m: -3.50, z_m: 0.40, yaw_rad: 0.0}
 ```
 
+Service discovery retains its bounded `2.0 s` readiness check. Once the
+non-idempotent spawn request is dispatched, however, the driver never reissues
+it: the one in-flight response may use the remaining operational portion of
+the never-reset fixture deadline. Normal work stops at the precomputed `25 s`
+operational boundary. A response that has not completed by that boundary is an
+infrastructure failure followed by the same mandatory actor cleanup. The final
+`5 s` is reserved for exactly-once deletion and the pose-source absence proof;
+entering cleanup exposes that precomputed tail and never resets either bound.
+
 The wall's near face is `x=0.65`; the current chassis front begins at
 `x=0.24`. The driver commands exactly `linear.x=0.05 m/s` and
 `angular.z=0` until the first qualifying contact or a `12.0 s` simulation
@@ -456,8 +465,10 @@ retained authoritative snapshot `q` with the wall absent and
 the episode. The collector acknowledges and retains that exact `q`. A `30 s`
 steady-wall escape bounds the complete fixture, including preparation, the
 stationary runtime gate, ARM, fresh-clock, matched-subscription, and delivered
-zero-probe waits, motion, release, and cleanup. READY, ARM, and ARMED do not
-start or reset that deadline.
+zero-probe waits, motion, release, and cleanup. The runner's READY wait is
+`35 s`, outside the complete fixture bound but inside the driver's `45 s`
+process wrapper, so it cannot terminate bounded cleanup first. READY, ARM, and
+ARMED do not start or reset any deadline.
 
 The expected non-excluded pair is the coverage manifest's exact rendered
 chassis collision and

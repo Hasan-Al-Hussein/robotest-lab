@@ -76,6 +76,7 @@ from robotest_scenarios.constants import (
     CONTROL_ARM_REQUEST_MAX_BYTES,
     CONTROL_ARM_REQUEST_PRODUCER,
     CONTROL_ARM_SCHEMA_VERSION,
+    CONTROL_CLEANUP_RESERVE_S,
     CONTROL_COMMAND_DELIVERY_PROBE_MAX_LAG_NS,
     CONTROL_COMMAND_PERIOD_NS,
     CONTROL_COMMAND_PROGRESS_MAX_BYTES,
@@ -950,7 +951,12 @@ class ContactControlApp:
         self.wall_timeout_s = wall_timeout_s
         self.service_timeout_s = service_timeout_s
         self.raw_ros_args = raw_ros_args
-        self.wall_deadline = time.monotonic() + wall_timeout_s
+        if wall_timeout_s <= CONTROL_CLEANUP_RESERVE_S:
+            raise ValidationError('contact-control wall timeout must exceed its cleanup reserve')
+        fixture_started_wall_s = time.monotonic()
+        self.complete_wall_deadline = fixture_started_wall_s + wall_timeout_s
+        self.wall_deadline = self.complete_wall_deadline - CONTROL_CLEANUP_RESERVE_S
+        self.cleanup_window_active = False
         self.node: ContactControlNode | None = None
         self.executor: SingleThreadedExecutor | None = None
         self.wall_asset: Path | None = None
@@ -1251,12 +1257,20 @@ class ContactControlApp:
         return now_ns - self.source_graph_stable_since_ns >= CONTROL_SOURCE_GRAPH_MISSING_CONFIRM_NS
 
     def _require_wall_budget(self) -> None:
-        """Reject work at or beyond the complete-fixture steady-wall deadline."""
+        """Reject work at or beyond the active precomputed wall deadline."""
         if time.monotonic() >= self.wall_deadline:
-            raise WallTimeoutError('contact-control 30 s steady-wall escape elapsed')
+            phase = 'cleanup' if self.cleanup_window_active else 'operational'
+            raise WallTimeoutError(f'contact-control {phase} steady-wall deadline elapsed')
+
+    def _begin_cleanup_window(self) -> None:
+        """Expose the precomputed cleanup tail without resetting the fixture deadline."""
+        if self.cleanup_window_active:
+            raise ProtocolError('contact-control cleanup window may begin exactly once')
+        self.cleanup_window_active = True
+        self.wall_deadline = self.complete_wall_deadline
 
     def _publish_nonzero_command(self, publish: Callable[[], Any]) -> Any:
-        """Recheck the complete-fixture deadline immediately before motion."""
+        """Recheck the operational deadline immediately before motion."""
         self._require_wall_budget()
         return publish()
 
@@ -1403,12 +1417,18 @@ class ContactControlApp:
         except Exception as exc:
             spawn_evidence['error'] = bounded_diagnostic(exc)
             raise InfrastructureError(f'{SPAWN_SERVICE} request could not be sent: {exc}') from exc
-        deadline = min(self.wall_deadline, time.monotonic() + self.service_timeout_s)
-        while not future.done():
-            if time.monotonic() >= deadline:
-                spawn_evidence['error'] = 'spawn response timed out'
-                raise InfrastructureError(f'{SPAWN_SERVICE} response timed out')
-            self._spin_once()
+        try:
+            # This request is non-idempotent and cannot be retried safely after a
+            # delayed response. Keep spinning on the one future until the precomputed
+            # operational deadline; the outer fixture deadline retains its cleanup tail.
+            while not future.done():
+                self._spin_once()
+            self._require_wall_budget()
+        except WallTimeoutError as exc:
+            spawn_evidence['error'] = (
+                'spawn response did not complete before the reserved cleanup window'
+            )
+            raise InfrastructureError(f'{SPAWN_SERVICE} response timed out') from exc
         response = future.result()
         if response is None or not bool(response.success):
             spawn_evidence['success'] = False
@@ -2341,6 +2361,7 @@ class ContactControlApp:
             error = InfrastructureError(f'unhandled contact-control failure: {exc}')
         finally:
             if self.node is not None and self.executor is not None:
+                self._begin_cleanup_window()
                 self.node.begin_cleanup()
                 self._best_effort_zero()
                 try:

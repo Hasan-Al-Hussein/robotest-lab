@@ -1895,7 +1895,9 @@ def _contact_control_arm_protocol_fixture() -> dict[str, object]:
         'request_max_bytes': 4_096,
         'request_producer': 'robotest_phase3/benchmark_runner',
         'schema_version': orchestration.CONTACT_CONTROL_ARM_SCHEMA_VERSION,
-        'wait_deadline_policy': 'complete_fixture_steady_wall_deadline_without_reset',
+        'wait_deadline_policy': (
+            'precomputed_operational_deadline_then_reserved_cleanup_without_reset'
+        ),
     }
 
 

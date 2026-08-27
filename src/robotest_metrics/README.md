@@ -157,7 +157,9 @@ must bind to the probe under the frozen partial steady-time orders and absolute
 100 ms simulation-time bracket. Only then may the driver atomically write its
 ARMED acknowledgement before the first nonzero command. A fail-safe zero is
 the only command allowed before arm. The complete pre-arm wait remains inside
-the original, never-reset 30 s steady-wall fixture deadline.
+the 25 s operational portion of the original, never-reset 30 s steady-wall
+fixture deadline; the final 5 s remains reserved for actor cleanup and its
+absence proof.
 
 Reconciliation requires the distinct retained zero probe first, followed by a
 distinct retained collector observation for every component command

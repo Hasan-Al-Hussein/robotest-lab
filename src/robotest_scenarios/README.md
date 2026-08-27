@@ -72,8 +72,10 @@ interleaved, duplicated, or trailing observations.
 
 Missing, stale, oversized, symlinked, malformed, noncanonical, wrongly bound,
 or hash-mismatched handshake artifacts fail closed, as does any ordering
-violation. The existing 30 s steady-wall deadline bounds the complete fixture,
-including the pre-arm wait, and is never reset by READY, ARM, or ARMED.
+violation. The never-reset 30 s steady-wall deadline reserves its final 5 s for
+cleanup, so preparation, the one non-idempotent spawn response, and every
+pre-arm or motion wait stop at the precomputed 25 s operational boundary.
+READY, ARM, ARMED, and cleanup never reset either bound.
 
 Both executables use relative RoboTest names under their launch namespace.
 The standardized Gazebo `/clock` topic is the single global-name exception.
