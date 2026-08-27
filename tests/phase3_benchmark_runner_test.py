@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,6 +32,10 @@ def _load(name: str, filename: str):
 orchestration = _load('phase3_orchestration', 'phase3_orchestration.py')
 runner = _load('phase3_benchmark_runner', 'phase3_benchmark_runner.py')
 runtime_gate = _load('phase3_runtime_gate', 'phase3_runtime_gate.py')
+metrics_constants = _load(
+    'robotest_metrics_source_constants',
+    '../src/robotest_metrics/robotest_metrics/constants.py',
+)
 
 
 def test_goal_observer_arm_ack_is_validated_before_mission_launch() -> None:
@@ -260,6 +265,122 @@ def test_candidate_gate_freezes_exact_command_and_tf_owners() -> None:
         runtime_gate.CANDIDATE_EXPECTED_COMMAND_SUBSCRIBERS['/robotest/cmd_vel_behavior_unused']
         == set()
     )
+    assert runtime_gate.CANDIDATE_EXPECTED_COMMAND_SUBSCRIBERS['/robotest/cmd_vel'] == {
+        '/robotest/metrics_collector',
+        '/robotest/parameter_bridge',
+    }
+
+
+def test_runtime_gate_freezes_metrics_only_command_history_override() -> None:
+    assert runtime_gate._endpoint_qos_contract(
+        '/robotest/cmd_vel',
+        'publisher',
+        '/robotest/contact_control_driver',
+    ) == ('RELIABLE', 'VOLATILE', 1)
+    assert runtime_gate._endpoint_qos_contract(
+        '/robotest/cmd_vel',
+        'subscriber',
+        '/robotest/parameter_bridge',
+    ) == ('RELIABLE', 'VOLATILE', 1)
+    metrics_contract = runtime_gate._endpoint_qos_contract(
+        '/robotest/cmd_vel',
+        'subscriber',
+        '/robotest/metrics_collector',
+    )
+    assert metrics_contract == (
+        'RELIABLE',
+        'VOLATILE',
+        metrics_constants.COMMAND_QOS_DEPTH,
+    )
+    assert runtime_gate._qos_matches(
+        {
+            'depth': 4_096,
+            'durability': 'VOLATILE',
+            'history': 'KEEP_LAST',
+            'node': '/robotest/metrics_collector',
+            'reliability': 'RELIABLE',
+            'topic_type': 'geometry_msgs/msg/Twist',
+        },
+        metrics_contract,
+    )
+    assert not runtime_gate._qos_matches(
+        {
+            'depth': 1,
+            'durability': 'VOLATILE',
+            'history': 'KEEP_LAST',
+            'node': '/robotest/metrics_collector',
+            'reliability': 'RELIABLE',
+            'topic_type': 'geometry_msgs/msg/Twist',
+        },
+        metrics_contract,
+    )
+
+
+def test_positive_command_ownership_rejects_suffix_spoof_and_wrong_type() -> None:
+    evidence = {
+        'publishers': [
+            {
+                'gid': '01' * 16,
+                'node': '/robotest/contact_control_driver',
+                'topic_type': runtime_gate.COMMAND_MESSAGE_TYPE,
+            }
+        ],
+        'subscribers': [
+            {
+                'gid': '02' * 16,
+                'node': '/robotest/metrics_collector',
+                'topic_type': runtime_gate.COMMAND_MESSAGE_TYPE,
+            },
+            {
+                'gid': '03' * 16,
+                'node': '/robotest/parameter_bridge',
+                'topic_type': runtime_gate.COMMAND_MESSAGE_TYPE,
+            },
+        ],
+    }
+    assert runtime_gate._positive_command_ownership(evidence) == {
+        'publisher': True,
+        'subscribers': True,
+    }
+
+    evidence['publishers'][0]['node'] = '/robotest/nested/contact_control_driver'
+    assert runtime_gate._positive_command_ownership(evidence)['publisher'] is False
+    evidence['publishers'][0]['node'] = '/robotest/contact_control_driver'
+    evidence['publishers'][0]['topic_type'] = 'example_interfaces/msg/String'
+    assert runtime_gate._positive_command_ownership(evidence)['publisher'] is False
+
+
+def test_runtime_gate_applies_command_depth_per_endpoint() -> None:
+    def endpoint(node_name: str, depth: int, gid: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            endpoint_gid=bytes([gid]) * 16,
+            node_name=node_name,
+            node_namespace='/robotest',
+            qos_profile=SimpleNamespace(
+                depth=depth,
+                durability='VOLATILE',
+                history='KEEP_LAST',
+                reliability='RELIABLE',
+            ),
+            topic_type='geometry_msgs/msg/Twist',
+        )
+
+    metrics = endpoint('metrics_collector', 4_096, 1)
+    bridge = endpoint('parameter_bridge', 1, 2)
+    publisher = endpoint('collision_monitor', 1, 3)
+    node = SimpleNamespace(
+        get_publishers_info_by_topic=lambda _topic: [publisher],
+        get_subscriptions_info_by_topic=lambda _topic: [metrics, bridge],
+    )
+
+    evidence = runtime_gate._topic_evidence(node, '/robotest/cmd_vel')
+    assert evidence['publisher_qos_pass'] is True
+    assert evidence['subscriber_qos_pass'] is True
+    assert evidence['expected']['endpoint_depth_overrides'] == [
+        {'depth': 4_096, 'node': '/robotest/metrics_collector', 'side': 'subscriber'}
+    ]
+    metrics.qos_profile.depth = 1
+    assert not runtime_gate._topic_evidence(node, '/robotest/cmd_vel')['subscriber_qos_pass']
 
 
 def test_runtime_qos_unknown_depth_is_inconclusive_not_a_false_mismatch() -> None:

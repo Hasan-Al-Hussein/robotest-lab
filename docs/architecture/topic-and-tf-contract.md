@@ -42,7 +42,7 @@ must compare them with the live endpoints using `ros2 topic info -v`.
 | `/robotest/navigation/plan` | `nav_msgs/msg/Path` | Nav2 planner server | Metrics and visualization | RELIABLE, VOLATILE, KEEP_LAST(5) |
 | `/robotest/cmd_vel_nav` | `geometry_msgs/msg/Twist` | Nav2 controller server only | Velocity smoother | RELIABLE, VOLATILE, KEEP_LAST(1) |
 | `/robotest/cmd_vel_smoothed` | `geometry_msgs/msg/Twist` | Velocity smoother only | Collision monitor | RELIABLE, VOLATILE, KEEP_LAST(1) |
-| `/robotest/cmd_vel` | `geometry_msgs/msg/Twist` | Collision monitor only | Gazebo command bridge and evidence probes | RELIABLE, VOLATILE, KEEP_LAST(1) |
+| `/robotest/cmd_vel` | `geometry_msgs/msg/Twist` | Collision monitor only | Gazebo command bridge and independent metrics observer | RELIABLE, VOLATILE; actuator bridge KEEP_LAST(1), metrics observer KEEP_LAST(4096) |
 | `/robotest/cmd_vel_behavior_unused` | `geometry_msgs/msg/Twist` | Isolated Nav2 behavior-server output | None; this topic is not bridged or connected to an actuator path | RELIABLE, VOLATILE, KEEP_LAST(1) |
 | `/robotest/collision_monitor_state` | `nav2_msgs/msg/CollisionMonitorState` | Collision monitor | Metrics and evidence probes | RELIABLE, VOLATILE, KEEP_LAST(10) |
 | `/robotest/validation/ground_truth` | `nav_msgs/msg/Odometry` | Gazebo model truth -> bridge | Metrics, validation tests, evidence recorder | RELIABLE, VOLATILE, KEEP_LAST(10) |

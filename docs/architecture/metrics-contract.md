@@ -325,6 +325,14 @@ does not match, or any source/rendered/configuration hash differs between the
 control and benchmark candidates. In those cases `collision_count` is null and
 the benchmark fails; a silent mission contact topic cannot be reported as zero.
 
+Actuator-facing `cmd_vel` endpoints remain RELIABLE, VOLATILE, and
+KEEP_LAST(1). The independent metrics observer alone uses a bounded
+KEEP_LAST(4096) reader history equal to its retained command capacity, so a
+short single-thread callback backlog cannot overwrite admissible evidence or
+queue stale commands to the actuator. Qualification still requires a distinct
+collector observation for every component publication within 100 ms; this
+history exception does not relax that latency or completeness rule.
+
 The component and metrics collector are independent observers of the public
 snapshot stream. Their retained traces are reconciled bijectively from the
 component's first snapshot through the exact qualified release snapshot `q`:

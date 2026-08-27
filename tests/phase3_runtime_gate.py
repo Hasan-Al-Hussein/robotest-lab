@@ -22,6 +22,7 @@ from typing import Any
 from phase3_orchestration import atomic_write_json, EvidenceError
 
 MAX_ENDPOINTS = 4096
+COMMAND_MESSAGE_TYPE = 'geometry_msgs/msg/Twist'
 CONTACT_MESSAGE_TYPE = 'ros_gz_interfaces/msg/Contacts'
 MAX_ATTEMPTS = 4096
 MAX_PROC_ENTRIES = 65_536
@@ -111,6 +112,10 @@ QOS_CONTRACTS: dict[str, tuple[str, str, int]] = {
     '/tf_static': ('RELIABLE', 'TRANSIENT_LOCAL', 1),
 }
 
+QOS_DEPTH_OVERRIDES: dict[tuple[str, str, str], int] = {
+    ('/robotest/cmd_vel', 'subscriber', '/robotest/metrics_collector'): 4_096,
+}
+
 CANDIDATE_REQUIRED_NODES = AUTONOMY_NODE_NAMES - {'mission_runner'} | {
     'metrics_collector',
     'contact_stream_gate',
@@ -155,7 +160,10 @@ CANDIDATE_EXPECTED_PUBLISHERS: dict[str, set[str]] = {
 CANDIDATE_EXPECTED_COMMAND_SUBSCRIBERS: dict[str, set[str]] = {
     '/robotest/cmd_vel_nav': {'/robotest/velocity_smoother'},
     '/robotest/cmd_vel_smoothed': {'/robotest/collision_monitor'},
-    '/robotest/cmd_vel': {'/robotest/parameter_bridge'},
+    '/robotest/cmd_vel': {
+        '/robotest/metrics_collector',
+        '/robotest/parameter_bridge',
+    },
     '/robotest/cmd_vel_behavior_unused': set(),
 }
 
@@ -1069,6 +1077,19 @@ def _qos_matches(record: dict[str, Any], expected: tuple[str, str, int]) -> bool
     return _qos_status(record, expected)['policy_contract_pass']
 
 
+def _endpoint_qos_contract(
+    topic: str,
+    side: str,
+    node: str,
+) -> tuple[str, str, int]:
+    reliability, durability, default_depth = QOS_CONTRACTS[topic]
+    return (
+        reliability,
+        durability,
+        QOS_DEPTH_OVERRIDES.get((topic, side, node), default_depth),
+    )
+
+
 def _node_snapshot(node: Any) -> list[str]:
     names = []
     for name, namespace in node.get_node_names_and_namespaces():
@@ -1092,14 +1113,21 @@ def _topic_evidence(node: Any, topic: str) -> dict[str, Any]:
     if len(publishers) + len(subscribers) > MAX_ENDPOINTS:
         raise EvidenceError(f'{topic} endpoint graph exceeds the bound')
     expected = QOS_CONTRACTS[topic]
-    checks = [
-        {
-            **_qos_status(endpoint, expected),
-            'node': endpoint['node'],
-            'side': side,
-        }
-        for side, endpoints in (('publisher', publishers), ('subscriber', subscribers))
-        for endpoint in endpoints
+    checks = []
+    for side, endpoints in (('publisher', publishers), ('subscriber', subscribers)):
+        for endpoint in endpoints:
+            endpoint_expected = _endpoint_qos_contract(topic, side, endpoint['node'])
+            checks.append(
+                {
+                    **_qos_status(endpoint, endpoint_expected),
+                    'node': endpoint['node'],
+                    'side': side,
+                }
+            )
+    endpoint_depth_overrides = [
+        {'depth': depth, 'node': endpoint_node, 'side': side}
+        for (override_topic, side, endpoint_node), depth in sorted(QOS_DEPTH_OVERRIDES.items())
+        if override_topic == topic
     ]
     return {
         'bounded_depth_live_proven': bool(checks)
@@ -1109,17 +1137,24 @@ def _topic_evidence(node: Any, topic: str) -> dict[str, Any]:
         'expected': {
             'depth': expected[2],
             'durability': expected[1],
+            'endpoint_depth_overrides': endpoint_depth_overrides,
             'history': 'KEEP_LAST',
             'reliability': expected[0],
         },
         'publishers': sorted(publishers, key=lambda item: (item['node'], item['topic_type'])),
         'publisher_qos_pass': bool(publishers)
-        and all(_qos_matches(item, expected) for item in publishers),
+        and all(
+            _qos_matches(item, _endpoint_qos_contract(topic, 'publisher', item['node']))
+            for item in publishers
+        ),
         'qos_checks': sorted(checks, key=lambda item: (item['side'], item['node'])),
         'qos_introspection_complete': bool(checks)
         and all(item['introspection_complete'] for item in checks),
         'subscribers': sorted(subscribers, key=lambda item: (item['node'], item['topic_type'])),
-        'subscriber_qos_pass': all(_qos_matches(item, expected) for item in subscribers),
+        'subscriber_qos_pass': all(
+            _qos_matches(item, _endpoint_qos_contract(topic, 'subscriber', item['node']))
+            for item in subscribers
+        ),
     }
 
 
@@ -1223,6 +1258,21 @@ def _candidate_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
     }
 
 
+def _positive_command_ownership(evidence: dict[str, Any]) -> dict[str, bool]:
+    return {
+        'publisher': _exact_endpoint_owners(
+            evidence['publishers'],
+            {'/robotest/contact_control_driver'},
+            expected_type=COMMAND_MESSAGE_TYPE,
+        ),
+        'subscribers': _exact_endpoint_owners(
+            evidence['subscribers'],
+            CANDIDATE_EXPECTED_COMMAND_SUBSCRIBERS['/robotest/cmd_vel'],
+            expected_type=COMMAND_MESSAGE_TYPE,
+        ),
+    }
+
+
 def _positive_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
     nodes = _node_snapshot(node)
     short_names = {value.rsplit('/', 1)[-1] for value in nodes}
@@ -1239,10 +1289,7 @@ def _positive_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
             '/robotest/validation/world_stats',
         )
     }
-    cmd_publishers = relevant['/robotest/cmd_vel']['publishers']
-    cmd_owner_pass = len(cmd_publishers) == 1 and cmd_publishers[0]['node'].endswith(
-        '/contact_control_driver'
-    )
+    cmd_ownership = _positive_command_ownership(relevant['/robotest/cmd_vel'])
     contact_publisher_ownership = {
         topic: _exact_endpoint_owners(
             relevant[topic]['publishers'],
@@ -1293,7 +1340,8 @@ def _positive_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
         evidence['bounded_depth_live_proven'] for evidence in relevant.values()
     )
     passed = (
-        cmd_owner_pass
+        cmd_ownership['publisher']
+        and cmd_ownership['subscribers']
         and all(contact_publisher_ownership.values())
         and all(contact_subscriber_ownership.values())
         and not forbidden_present
@@ -1304,7 +1352,8 @@ def _positive_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
     )
     return passed, {
         'bounded_depth_live_proven_for_all_endpoints': bounded_depth_live_proven,
-        'cmd_vel_owner_pass': cmd_owner_pass,
+        'cmd_vel_owner_pass': cmd_ownership['publisher'],
+        'cmd_vel_subscriber_ownership_pass': cmd_ownership['subscribers'],
         'contact_publisher_ownership': contact_publisher_ownership,
         'contact_subscriber_ownership': contact_subscriber_ownership,
         'exact_static_qos_depth_contract': {

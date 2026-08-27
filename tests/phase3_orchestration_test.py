@@ -1178,6 +1178,32 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         'release_required_through_stamp_ns': 250_000_000,
     }
 
+    missing_repeated_command = copy.deepcopy(result)
+    missing_repeated_command['control']['command_trace'][1]['collector_sequence'] = 3
+    missing_repeated_command['control']['command_trace'].insert(
+        1,
+        {
+            'angular_z': 0.0,
+            'collector_sequence': 2,
+            'linear_x': 0.05,
+            'phase': 'forward',
+            'sim_stamp_ns': 15,
+        },
+    )
+    orchestration.atomic_write_json(result_path, missing_repeated_command, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='complete component subsequence'):
+        orchestration.reconcile_positive_control(
+            workspace=Path(__file__).parents[1],
+            build_binding=positive_build_binding,
+            result_path=result_path,
+            capture_path=capture_path,
+            contact_progress_path=contact_progress_path,
+            manifest_path=manifest_path,
+            collector_configuration_sha256='7' * 64,
+            owned_process_group_shutdown=True,
+            checksum_verified=True,
+        )
+
     result_with_support_suffix = copy.deepcopy(result)
     result_with_support_suffix['control']['contact']['snapshot_records'].append(
         {

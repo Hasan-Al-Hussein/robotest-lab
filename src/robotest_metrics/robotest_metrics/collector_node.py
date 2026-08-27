@@ -49,6 +49,7 @@ from robotest_interfaces.msg import FaultEvent
 from robotest_metrics.artifacts import write_json_atomic
 from robotest_metrics.collector import CollectorCore
 from robotest_metrics.constants import (
+    COMMAND_QOS_DEPTH,
     NAV2_LIFECYCLE_NODES,
     PLAN_POSE_CAPACITY,
 )
@@ -333,7 +334,9 @@ class MetricsCollectorNode(Node):
             Twist,
             'cmd_vel',
             self._on_cmd_vel,
-            _qos(1, reliable=True),
+            # The evidence reader must retain every admissible command while the
+            # actuator-facing bridge remains KEEP_LAST(1).
+            _qos(COMMAND_QOS_DEPTH, reliable=True),
         )
         self._subscribe(
             Contacts,

@@ -21,6 +21,8 @@ import rclpy
 import robotest_metrics.collector_node as collector_node
 from geometry_msgs.msg import Transform, Vector3
 from nav_msgs.msg import Odometry, Path
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, ReliabilityPolicy
+from robotest_metrics.constants import COMMAND_CAPACITY, COMMAND_QOS_DEPTH
 from ros_gz_interfaces.msg import Contact, Contacts, JointWrench
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import LaserScan
@@ -42,6 +44,15 @@ def test_collector_waits_for_post_clock_contact_and_destroys_cleanly(
     node = collector_node.MetricsCollectorNode()
     try:
         assert node.get_name() == 'metrics_collector'
+        command_subscription = next(
+            item for item in node.subscriptions if item.topic_name == '/cmd_vel'
+        )
+        command_qos = command_subscription.qos_profile
+        assert COMMAND_QOS_DEPTH == COMMAND_CAPACITY
+        assert command_qos.history == HistoryPolicy.KEEP_LAST
+        assert command_qos.depth == COMMAND_QOS_DEPTH
+        assert command_qos.reliability == ReliabilityPolicy.RELIABLE
+        assert command_qos.durability == DurabilityPolicy.VOLATILE
         message = Contacts()
         message.header.stamp.sec = 1
         message.contacts = [Contact()]

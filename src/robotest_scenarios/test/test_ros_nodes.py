@@ -23,6 +23,7 @@ import rclpy
 from action_msgs.msg import GoalStatus, GoalStatusArray
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, ReliabilityPolicy
 from robotest_scenarios.constants import ACTION_STATUS_TOPIC
 from robotest_scenarios.contact_control_driver import ContactControlApp, ContactControlNode
 from robotest_scenarios.contact_evidence import load_coverage_manifest
@@ -146,6 +147,11 @@ def test_contact_node_stops_on_exact_manifest_pair() -> None:
     manifest = load_coverage_manifest(str(REPOSITORY / 'config' / 'collision-coverage.yaml'))
     node = ContactControlNode(manifest)
     try:
+        command_qos = node.command_publisher.qos_profile
+        assert command_qos.history == HistoryPolicy.KEEP_LAST
+        assert command_qos.depth == 1
+        assert command_qos.reliability == ReliabilityPolicy.RELIABLE
+        assert command_qos.durability == DurabilityPolicy.VOLATILE
         assert node.resolve_topic_name('cmd_vel') == '/robotest/cmd_vel'
         assert (
             node.resolve_topic_name('validation/contacts') == manifest.public_contact_snapshot_topic
