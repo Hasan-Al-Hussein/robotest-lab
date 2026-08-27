@@ -281,6 +281,7 @@ class BoundedProcess:
                 raise EvidenceError(
                     f'refusing to signal an unowned/reused process group for {self.role}'
                 )
+        kill_deadline: float | None = None
         alive = _group_alive(self.pgid)
         if alive:
             try:
@@ -292,13 +293,16 @@ class BoundedProcess:
                 time.sleep(0.1)
                 alive = _group_alive(self.pgid)
             if alive:
+                kill_deadline = time.monotonic() + PROCESS_KILL_GRACE_S
                 with suppress(ProcessLookupError):
                     os.killpg(self.pgid, signal.SIGKILL)
+        if kill_deadline is None:
+            kill_deadline = time.monotonic() + PROCESS_KILL_GRACE_S
         try:
-            self.returncode = self.process.wait(timeout=PROCESS_KILL_GRACE_S)
+            self.returncode = self.process.wait(timeout=max(0.0, kill_deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             self.returncode = None
-        self._group_confirmed_empty = not _group_alive(self.pgid)
+        self._group_confirmed_empty = _wait_for_group_empty(self.pgid, kill_deadline)
         self._finish()
         return self._group_confirmed_empty
 
@@ -594,6 +598,16 @@ def _group_alive(pgid: int) -> bool:
         return False
     except PermissionError:
         return True
+    return True
+
+
+def _wait_for_group_empty(pgid: int, deadline: float) -> bool:
+    """Observe one signalled process group until it disappears or its deadline expires."""
+    while _group_alive(pgid):
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0.0:
+            return False
+        time.sleep(min(0.1, remaining_s))
     return True
 
 

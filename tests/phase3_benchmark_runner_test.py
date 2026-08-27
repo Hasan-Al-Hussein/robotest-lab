@@ -279,6 +279,109 @@ def test_registry_stops_only_its_owned_group(tmp_path: Path) -> None:
         unrelated.wait(timeout=5.0)
 
 
+def test_bounded_process_stop_observes_delayed_group_disappearance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = SimpleNamespace(now=0.0)
+    killed = SimpleNamespace(value=False, checks=0)
+    signals: list[int] = []
+
+    def group_alive(_pgid: int) -> bool:
+        if not killed.value:
+            return True
+        killed.checks += 1
+        return killed.checks < 3
+
+    def kill_group(_pgid: int, requested_signal: int) -> None:
+        signals.append(requested_signal)
+        if requested_signal == signal.SIGKILL:
+            killed.value = True
+
+    monkeypatch.setattr(runner, '_group_alive', group_alive)
+    monkeypatch.setattr(runner, 'GROUP_TERM_GRACE_S', 0.0)
+    monkeypatch.setattr(runner, 'PROCESS_KILL_GRACE_S', 0.5)
+    monkeypatch.setattr(runner.os, 'getpgid', lambda _pid: 41)
+    monkeypatch.setattr(runner, '_process_start_ticks', lambda _pid: 73)
+    monkeypatch.setattr(runner.os, 'killpg', kill_group)
+    monkeypatch.setattr(runner.time, 'monotonic', lambda: clock.now)
+    monkeypatch.setattr(
+        runner.time, 'sleep', lambda duration: setattr(clock, 'now', clock.now + duration)
+    )
+
+    direct = SimpleNamespace(returncode=None)
+    direct.poll = lambda: direct.returncode
+
+    def wait_direct(*, timeout: float) -> int:
+        assert timeout == runner.PROCESS_KILL_GRACE_S
+        clock.now += 0.2
+        direct.returncode = -signal.SIGTERM
+        return direct.returncode
+
+    direct.wait = wait_direct
+    process = runner.BoundedProcess.__new__(runner.BoundedProcess)
+    process.role = 'delayed_group'
+    process.pid = 41
+    process.pgid = 41
+    process.start_ticks = 73
+    process.process = direct
+    process.returncode = None
+    process._group_confirmed_empty = False
+    process._finish = lambda: None
+
+    assert process.stop() is True
+    assert process._group_confirmed_empty is True
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert killed.checks == 3
+    assert clock.now == pytest.approx(0.4)
+
+
+def test_bounded_process_stop_fails_closed_for_persistent_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = SimpleNamespace(now=0.0)
+    signals: list[int] = []
+
+    monkeypatch.setattr(runner, '_group_alive', lambda _pgid: True)
+    monkeypatch.setattr(runner, 'GROUP_TERM_GRACE_S', 0.0)
+    monkeypatch.setattr(runner, 'PROCESS_KILL_GRACE_S', 0.25)
+    monkeypatch.setattr(runner.os, 'getpgid', lambda _pid: 43)
+    monkeypatch.setattr(runner, '_process_start_ticks', lambda _pid: 79)
+    monkeypatch.setattr(
+        runner.os,
+        'killpg',
+        lambda _pgid, requested_signal: signals.append(requested_signal),
+    )
+    monkeypatch.setattr(runner.time, 'monotonic', lambda: clock.now)
+    monkeypatch.setattr(
+        runner.time, 'sleep', lambda duration: setattr(clock, 'now', clock.now + duration)
+    )
+
+    direct = SimpleNamespace(returncode=None)
+    direct.poll = lambda: direct.returncode
+
+    def wait_direct(*, timeout: float) -> int:
+        assert timeout == runner.PROCESS_KILL_GRACE_S
+        clock.now += 0.1
+        direct.returncode = -signal.SIGTERM
+        return direct.returncode
+
+    direct.wait = wait_direct
+    process = runner.BoundedProcess.__new__(runner.BoundedProcess)
+    process.role = 'persistent_group'
+    process.pid = 43
+    process.pgid = 43
+    process.start_ticks = 79
+    process.process = direct
+    process.returncode = None
+    process._group_confirmed_empty = False
+    process._finish = lambda: None
+
+    assert process.stop() is False
+    assert process._group_confirmed_empty is False
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert clock.now == pytest.approx(runner.PROCESS_KILL_GRACE_S)
+
+
 def test_resource_sampler_spans_before_launch_through_shutdown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
