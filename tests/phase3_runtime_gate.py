@@ -25,6 +25,7 @@ from phase3_orchestration import atomic_write_json, EvidenceError
 MAX_ENDPOINTS = 4096
 COMMAND_MESSAGE_TYPE = 'geometry_msgs/msg/Twist'
 CONTACT_MESSAGE_TYPE = 'ros_gz_interfaces/msg/Contacts'
+CONTACT_TOPICS = ('/robotest/internal/raw_contacts', '/robotest/validation/contacts')
 MAX_ATTEMPTS = 4096
 MAX_PROC_ENTRIES = 65_536
 MAX_PROC_MAPS_BYTES = 8 * 1024 * 1024
@@ -138,7 +139,7 @@ POSITIVE_REQUIRED_NODE_NAMES = {
     'scenario_bridge',
 }
 
-POSITIVE_AUTHORITATIVE_PUBLISHER_CONTRACTS: dict[str, tuple[set[str], str, int]] = {
+AUTHORITATIVE_PUBLISHER_CONTRACTS: dict[str, tuple[set[str], str, int]] = {
     '/clock': ({'/robotest/parameter_bridge'}, 'rosgraph_msgs/msg/Clock', 1),
     '/robotest/validation/ground_truth': (
         {'/robotest/parameter_bridge'},
@@ -1079,6 +1080,36 @@ def _exact_endpoint_owners(
     )
 
 
+def _authoritative_publisher_ownership(
+    topics: Mapping[str, dict[str, Any]],
+) -> dict[str, bool]:
+    """Apply the shared authoritative source identity and cardinality contract."""
+    ownership = {
+        topic: _exact_endpoint_owners(
+            topics[topic]['publishers'],
+            expected_nodes,
+            expected_type=expected_type,
+            expected_cardinality=expected_cardinality,
+        )
+        for topic, (
+            expected_nodes,
+            expected_type,
+            expected_cardinality,
+        ) in AUTHORITATIVE_PUBLISHER_CONTRACTS.items()
+    }
+    authoritative_gids = [
+        endpoint['gid']
+        for topic in AUTHORITATIVE_PUBLISHER_CONTRACTS
+        for endpoint in topics[topic]['publishers']
+    ]
+    duplicate_gids = {gid for gid, count in Counter(authoritative_gids).items() if count > 1}
+    return {
+        topic: accepted
+        and all(endpoint['gid'] not in duplicate_gids for endpoint in topics[topic]['publishers'])
+        for topic, accepted in ownership.items()
+    }
+
+
 def _qos_status(record: dict[str, Any], expected: tuple[str, str, int]) -> dict[str, Any]:
     """Classify live QoS without turning Fast DDS UNKNOWN/0 into a false mismatch."""
     reliability, durability, depth = expected
@@ -1194,15 +1225,16 @@ def _candidate_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
     short_names = {value.rsplit('/', 1)[-1] for value in nodes}
     services = _service_snapshot(node)
     topics = {name: _topic_evidence(node, name) for name in QOS_CONTRACTS}
+    authoritative_publisher_ownership = _authoritative_publisher_ownership(topics)
     publisher_ownership = {
-        topic: _exact_endpoint_owners(
-            topics[topic]['publishers'],
-            expected,
-            expected_type=(
-                CONTACT_MESSAGE_TYPE
-                if topic in {'/robotest/internal/raw_contacts', '/robotest/validation/contacts'}
-                else None
-            ),
+        topic: (
+            authoritative_publisher_ownership[topic]
+            if topic in authoritative_publisher_ownership
+            else _exact_endpoint_owners(
+                topics[topic]['publishers'],
+                expected,
+                expected_type=(CONTACT_MESSAGE_TYPE if topic in CONTACT_TOPICS else None),
+            )
         )
         for topic, expected in CANDIDATE_EXPECTED_PUBLISHERS.items()
     }
@@ -1321,42 +1353,14 @@ def _positive_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
         )
     }
     cmd_ownership = _positive_command_ownership(relevant['/robotest/cmd_vel'])
-    authoritative_publisher_ownership = {
-        topic: _exact_endpoint_owners(
-            relevant[topic]['publishers'],
-            expected_nodes,
-            expected_type=expected_type,
-            expected_cardinality=expected_cardinality,
-        )
-        for topic, (
-            expected_nodes,
-            expected_type,
-            expected_cardinality,
-        ) in POSITIVE_AUTHORITATIVE_PUBLISHER_CONTRACTS.items()
-    }
-    authoritative_gids = [
-        endpoint['gid']
-        for topic in POSITIVE_AUTHORITATIVE_PUBLISHER_CONTRACTS
-        for endpoint in relevant[topic]['publishers']
-    ]
-    duplicate_authoritative_gids = {
-        gid for gid, count in Counter(authoritative_gids).items() if count > 1
-    }
-    authoritative_publisher_ownership = {
-        topic: accepted
-        and all(
-            endpoint['gid'] not in duplicate_authoritative_gids
-            for endpoint in relevant[topic]['publishers']
-        )
-        for topic, accepted in authoritative_publisher_ownership.items()
-    }
+    authoritative_publisher_ownership = _authoritative_publisher_ownership(relevant)
     contact_publisher_ownership = {
         topic: _exact_endpoint_owners(
             relevant[topic]['publishers'],
             CANDIDATE_EXPECTED_PUBLISHERS[topic],
             expected_type=CONTACT_MESSAGE_TYPE,
         )
-        for topic in ('/robotest/internal/raw_contacts', '/robotest/validation/contacts')
+        for topic in CONTACT_TOPICS
     }
     contact_subscriber_ownership = {
         '/robotest/internal/raw_contacts': _exact_endpoint_owners(
@@ -1427,10 +1431,7 @@ def _positive_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
 
 def _contact_stream_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
     nodes = _node_snapshot(node)
-    topics = {
-        name: _topic_evidence(node, name)
-        for name in ('/robotest/internal/raw_contacts', '/robotest/validation/contacts')
-    }
+    topics = {name: _topic_evidence(node, name) for name in CONTACT_TOPICS}
     publisher_ownership = {
         topic: _exact_endpoint_owners(
             topics[topic]['publishers'],

@@ -447,6 +447,7 @@ def test_bridge_matches_the_frozen_data_plane() -> None:
         '/robotest/internal/contact_aggregate'
     )
 
+    assert len(scenario_pose_bridges) == 4
     assert {entry['gz_topic_name'] for entry in scenario_pose_bridges} == {
         '/model/ground_plane/pose',
         '/model/phase3_static_block/pose',
