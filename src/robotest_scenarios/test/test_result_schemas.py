@@ -65,6 +65,33 @@ def test_contact_graph_endpoint_schema_pins_jazzy_gid_width() -> None:
         validate_against_schema(_contact_graph_endpoint('ab' * 24), endpoint_schema)
 
 
+def test_contact_snapshot_schema_accepts_unbounded_integer_delivery_diagnostic() -> None:
+    schema = load_schema(SCHEMA_DIR / 'contact-control-result.schema.json')
+    snapshot_schema = {
+        '$schema': schema['$schema'],
+        '$defs': schema['$defs'],
+        '$ref': '#/$defs/contactSnapshot',
+    }
+    snapshot = {
+        'classified_count': 0,
+        'collector_sequence': 1,
+        'counted_snapshot_records': [],
+        'delivery_clock_offset_ns': 220_000_001,
+        'delivery_clock_stamp_ns': 1_220_000_001,
+        'exact_pair_count': 0,
+        'sim_stamp_ns': 1_000_000_000,
+        'snapshot_record_count': 1,
+    }
+
+    validate_against_schema(snapshot, snapshot_schema)
+    snapshot['delivery_clock_offset_ns'] = -220_000_001
+    validate_against_schema(snapshot, snapshot_schema)
+
+    snapshot['delivery_clock_offset_ns'] = '220000001'
+    with pytest.raises(ArtifactError, match='schema violation'):
+        validate_against_schema(snapshot, snapshot_schema)
+
+
 def test_contact_arm_evidence_schema_requires_complete_passing_proof() -> None:
     schema = load_schema(SCHEMA_DIR / 'contact-control-result.schema.json')
     passing_schema = {

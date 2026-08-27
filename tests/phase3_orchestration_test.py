@@ -16,6 +16,7 @@ from pathlib import Path
 import shutil
 import sys
 from types import SimpleNamespace
+from typing import Any
 
 from jsonschema import Draft202012Validator
 import pytest
@@ -1979,6 +1980,75 @@ def test_validate_contact_control_ready_rejects_unsuccessful_spawn_semantics(
         orchestration.validate_contact_control_ready(ready, expected_run_id='positive')
 
 
+def test_component_contact_boundary_accepts_caught_up_precontrol_skew() -> None:
+    snapshots: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
+    snapshot_inputs = (
+        (1, 2, 500_000_000, 778_000_000),
+        (3, 4, 700_000_000, 800_000_000),
+        (5, 6, 900_000_000, 1_000_000_000),
+        (11, 12, 1_100_000_000, 1_000_000_000),
+    )
+    for summary_sequence, record_sequence, stamp, delivery_clock in snapshot_inputs:
+        records.append(
+            {
+                'collector_sequence': record_sequence,
+                'counterpart_collision': None,
+                'counterpart_model': None,
+                'disposition': 'support_ground_excluded',
+                'normalized_pair': [
+                    'ground::plane::collision',
+                    'robotest::wheel::collision',
+                ],
+                'robot_collision': None,
+                'sim_stamp_ns': stamp,
+                'snapshot_sequence': summary_sequence,
+            }
+        )
+        snapshots.append(
+            {
+                'classified_count': 0,
+                'collector_sequence': summary_sequence,
+                'counted_snapshot_records': [],
+                'delivery_clock_offset_ns': delivery_clock - stamp,
+                'delivery_clock_stamp_ns': delivery_clock,
+                'exact_pair_count': 0,
+                'sim_stamp_ns': stamp,
+                'snapshot_record_count': 1,
+            }
+        )
+    manifest = {
+        'robot_model': 'robotest',
+        'robot_collisions': [
+            {'name': 'robotest::base::collision'},
+            {'name': 'robotest::wheel::collision'},
+        ],
+        'support_pairs': [
+            {
+                'environment_collision': 'ground::plane::collision',
+                'robot_collision': 'robotest::wheel::collision',
+            }
+        ],
+    }
+
+    projection = orchestration._component_contact_projection(
+        {'snapshot_records': records, 'snapshots': snapshots},
+        command_sequences=(10,),
+        expected_pair=('robotest::base::collision', 'wall::link::collision'),
+        first_forward_sequence=10,
+        first_forward_stamp_ns=1_000_000_000,
+        manifest=manifest,
+        qualifying_stamp_ns=1_100_000_000,
+    )
+
+    assert [stamp for stamp, _pairs in projection] == [
+        500_000_000,
+        700_000_000,
+        900_000_000,
+        1_100_000_000,
+    ]
+
+
 def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path) -> None:
     workspace = Path(__file__).parents[1].resolve()
     positive_dir = tmp_path / 'positive-control'
@@ -2412,17 +2482,38 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             'command_trace': [
                 {
                     'angular_z': 0.0,
-                    'collector_sequence': 1,
+                    'collector_sequence': 3,
                     'linear_x': 0.05,
-                    'phase': 'forward',
-                    'sim_stamp_ns': 10,
+                    'phase': 'FORWARD',
+                    'sim_stamp_ns': 60_000_000,
                 },
                 {
                     'angular_z': 0.0,
-                    'collector_sequence': 2,
+                    'collector_sequence': 6,
                     'linear_x': 0.0,
-                    'phase': 'final_zero',
-                    'sim_stamp_ns': 20,
+                    'phase': 'CONTACT_STOP',
+                    'sim_stamp_ns': 110_000_000,
+                },
+                {
+                    'angular_z': 0.0,
+                    'collector_sequence': 7,
+                    'linear_x': 0.0,
+                    'phase': 'HOLD',
+                    'sim_stamp_ns': 150_000_000,
+                },
+                {
+                    'angular_z': 0.0,
+                    'collector_sequence': 8,
+                    'linear_x': -0.05,
+                    'phase': 'REVERSE',
+                    'sim_stamp_ns': 200_000_000,
+                },
+                {
+                    'angular_z': 0.0,
+                    'collector_sequence': 9,
+                    'linear_x': 0.0,
+                    'phase': 'FINAL_ZERO',
+                    'sim_stamp_ns': 250_000_000,
                 },
             ],
             'observed_robot_start': {},
@@ -2452,6 +2543,19 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                 'snapshot_records': [
                     {
                         'collector_sequence': 2,
+                        'counterpart_collision': None,
+                        'counterpart_model': None,
+                        'disposition': 'support_ground_excluded',
+                        'normalized_pair': [
+                            'ground::plane::collision',
+                            'robotest::wheel::collision',
+                        ],
+                        'robot_collision': None,
+                        'sim_stamp_ns': 50_000_000,
+                        'snapshot_sequence': 1,
+                    },
+                    {
+                        'collector_sequence': 5,
                         'counterpart_collision': 'wall::link::collision',
                         'counterpart_model': 'wall',
                         'disposition': 'counted',
@@ -2461,10 +2565,10 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                         ],
                         'robot_collision': 'robotest::base::collision',
                         'sim_stamp_ns': 100_000_000,
-                        'snapshot_sequence': 1,
+                        'snapshot_sequence': 4,
                     },
                     {
-                        'collector_sequence': 4,
+                        'collector_sequence': 11,
                         'counterpart_collision': None,
                         'counterpart_model': None,
                         'disposition': 'support_ground_excluded',
@@ -2474,13 +2578,23 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                         ],
                         'robot_collision': None,
                         'sim_stamp_ns': 300_000_000,
-                        'snapshot_sequence': 3,
+                        'snapshot_sequence': 10,
                     },
                 ],
                 'snapshots': [
                     {
-                        'classified_count': 1,
+                        'classified_count': 0,
                         'collector_sequence': 1,
+                        'counted_snapshot_records': [],
+                        'delivery_clock_offset_ns': 0,
+                        'delivery_clock_stamp_ns': 50_000_000,
+                        'exact_pair_count': 0,
+                        'sim_stamp_ns': 50_000_000,
+                        'snapshot_record_count': 1,
+                    },
+                    {
+                        'classified_count': 1,
+                        'collector_sequence': 4,
                         'counted_snapshot_records': [
                             {
                                 'counterpart_model': 'wall',
@@ -2488,8 +2602,8 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                                     'robotest::base::collision',
                                     'wall::link::collision',
                                 ],
-                                'record_sequence': 2,
-                                'snapshot_sequence': 1,
+                                'record_sequence': 5,
+                                'snapshot_sequence': 4,
                             }
                         ],
                         'delivery_clock_offset_ns': 0,
@@ -2500,7 +2614,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                     },
                     {
                         'classified_count': 0,
-                        'collector_sequence': 3,
+                        'collector_sequence': 10,
                         'counted_snapshot_records': [],
                         'delivery_clock_offset_ns': 200_000_000,
                         'delivery_clock_stamp_ns': 500_000_000,
@@ -2550,18 +2664,48 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                         'angular_z_rad_s': 0.0,
                         'linear_x_m_s': 0.05,
                         'linear_y_m_s': 0.0,
-                        'stamp_ns': 10,
+                        'stamp_ns': 60_000_000,
                     },
                     {
                         'angular_z_rad_s': 0.0,
                         'linear_x_m_s': 0.0,
                         'linear_y_m_s': 0.0,
-                        'stamp_ns': 20,
+                        'stamp_ns': 110_000_000,
+                    },
+                    {
+                        'angular_z_rad_s': 0.0,
+                        'linear_x_m_s': 0.0,
+                        'linear_y_m_s': 0.0,
+                        'stamp_ns': 150_000_000,
+                    },
+                    {
+                        'angular_z_rad_s': 0.0,
+                        'linear_x_m_s': -0.05,
+                        'linear_y_m_s': 0.0,
+                        'stamp_ns': 200_000_000,
+                    },
+                    {
+                        'angular_z_rad_s': 0.0,
+                        'linear_x_m_s': 0.0,
+                        'linear_y_m_s': 0.0,
+                        'stamp_ns': 250_000_000,
                     },
                 ]
             },
             'contacts': {
                 'items': [
+                    {
+                        'contacts': [
+                            {
+                                'collision1': 'robotest::wheel::collision',
+                                'collision2': 'ground::plane::collision',
+                            }
+                        ],
+                        'delivery_clock_offset_ns': 0,
+                        'delivery_clock_stamp_ns': 50_000_000,
+                        'frame_id': '',
+                        'stamp_ns': 50_000_000,
+                    },
                     {
                         'contacts': [
                             {
@@ -2595,7 +2739,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         'latest_retained_stamp_ns': 300_000_000,
         'producer': 'robotest_metrics/metrics_collector',
         'public_topic': '/robotest/validation/contacts',
-        'retained_message_count': 2,
+        'retained_message_count': 3,
         'schema_version': 1,
     }
     orchestration.atomic_write_json(contact_progress_path, contact_progress)
@@ -2617,18 +2761,25 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         == manifest['manifest_sha256']
     )
     assert bound['collector_reconciliation'] == {
-        'captured_command_count': 3,
+        'captured_command_count': 6,
         'command_progress_artifact_sha256': command_progress_sha256,
         'command_progress_observed_steady_ns': 55,
         'command_progress_stamp_ns': 5,
         'captured_exact_pair_count': 1,
         'captured_release_expected_pair_count': 0,
         'captured_release_snapshot_count': 1,
+        'contact_delivery_offset_strict_from_collector_sequence': 3,
         'contact_projection_episode_count': 1,
-        'contact_projection_first_stamp_ns': 100_000_000,
-        'contact_projection_record_count': 2,
+        'contact_projection_first_stamp_ns': 50_000_000,
+        'contact_projection_record_count': 3,
         'contact_projection_sha256': orchestration.canonical_sha256(
             [
+                {
+                    'normalized_pairs': [
+                        ['ground::plane::collision', 'robotest::wheel::collision']
+                    ],
+                    'stamp_ns': 50_000_000,
+                },
                 {
                     'normalized_pairs': [['robotest::base::collision', 'wall::link::collision']],
                     'stamp_ns': 100_000_000,
@@ -2641,11 +2792,11 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
                 },
             ]
         ),
-        'contact_projection_snapshot_count': 2,
+        'contact_projection_snapshot_count': 3,
         'contact_progress_artifact_sha256': orchestration.file_sha256(contact_progress_path),
         'contact_progress_latest_retained_stamp_ns': 300_000_000,
-        'contact_progress_retained_message_count': 2,
-        'component_command_count': 2,
+        'contact_progress_retained_message_count': 3,
+        'component_command_count': 5,
         'component_exact_pair_count': 1,
         'latest_clock_stamp_ns': 600_000_000,
         'release_delivery_clock_offset_ns': 200_000_000,
@@ -2653,6 +2804,142 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         'release_qualified_snapshot_stamp_ns': 300_000_000,
         'release_required_through_stamp_ns': 250_000_000,
     }
+
+    precontrol_skew = copy.deepcopy(result)
+    precontrol_snapshot = precontrol_skew['control']['contact']['snapshots'][0]
+    precontrol_snapshot['delivery_clock_offset_ns'] = -49_000_000
+    precontrol_snapshot['delivery_clock_stamp_ns'] = 1_000_000
+    orchestration.atomic_write_json(result_path, precontrol_skew, sidecar=True)
+    precontrol_bound = orchestration.reconcile_positive_control(
+        workspace=workspace,
+        build_binding=positive_build_binding,
+        result_path=result_path,
+        capture_path=capture_path,
+        contact_progress_path=contact_progress_path,
+        **handshake_paths,
+        manifest_path=manifest_path,
+        collector_configuration_sha256='7' * 64,
+        owned_process_group_shutdown=True,
+        checksum_verified=True,
+    )
+    assert (
+        precontrol_bound['collector_reconciliation'][
+            'contact_delivery_offset_strict_from_collector_sequence'
+        ]
+        == 3
+    )
+
+    active_skew = copy.deepcopy(result)
+    active_snapshot = active_skew['control']['contact']['snapshots'][1]
+    active_snapshot['delivery_clock_offset_ns'] = 221_000_000
+    active_snapshot['delivery_clock_stamp_ns'] = 321_000_000
+    orchestration.atomic_write_json(result_path, active_skew, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='snapshot ordering/liveness'):
+        orchestration.reconcile_positive_control(
+            workspace=workspace,
+            build_binding=positive_build_binding,
+            result_path=result_path,
+            capture_path=capture_path,
+            contact_progress_path=contact_progress_path,
+            **handshake_paths,
+            manifest_path=manifest_path,
+            collector_configuration_sha256='7' * 64,
+            owned_process_group_shutdown=True,
+            checksum_verified=True,
+        )
+
+    summary_before_records = copy.deepcopy(result)
+    forged_summary = summary_before_records['control']['contact']['snapshots'][1]
+    original_summary_sequence = forged_summary['collector_sequence']
+    forged_summary['collector_sequence'] = 2
+    for record in summary_before_records['control']['contact']['snapshot_records']:
+        if record['snapshot_sequence'] == original_summary_sequence:
+            record['snapshot_sequence'] = 2
+    for record in forged_summary['counted_snapshot_records']:
+        record['snapshot_sequence'] = 2
+    orchestration.atomic_write_json(result_path, summary_before_records, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='sequence block is not contiguous'):
+        orchestration.reconcile_positive_control(
+            workspace=workspace,
+            build_binding=positive_build_binding,
+            result_path=result_path,
+            capture_path=capture_path,
+            contact_progress_path=contact_progress_path,
+            **handshake_paths,
+            manifest_path=manifest_path,
+            collector_configuration_sha256='7' * 64,
+            owned_process_group_shutdown=True,
+            checksum_verified=True,
+        )
+
+    straddled_snapshot_block = copy.deepcopy(result)
+    straddled_snapshot_block['control']['command_trace'][0]['collector_sequence'] = 6
+    straddled_snapshot_block['control']['command_trace'][1]['collector_sequence'] = 7
+    straddled_snapshot_block['control']['command_trace'][2]['collector_sequence'] = 8
+    straddled_snapshot_block['control']['command_trace'][3]['collector_sequence'] = 9
+    straddled_snapshot_block['control']['command_trace'][4]['collector_sequence'] = 13
+    forged_summary = straddled_snapshot_block['control']['contact']['snapshots'][1]
+    original_summary_sequence = forged_summary['collector_sequence']
+    forged_summary['collector_sequence'] = 5
+    for record in straddled_snapshot_block['control']['contact']['snapshot_records']:
+        if record['snapshot_sequence'] == original_summary_sequence:
+            record['snapshot_sequence'] = 5
+            record['collector_sequence'] = 6
+    for record in forged_summary['counted_snapshot_records']:
+        record['snapshot_sequence'] = 5
+        record['record_sequence'] = 6
+    orchestration.atomic_write_json(result_path, straddled_snapshot_block, sidecar=True)
+    with pytest.raises(
+        orchestration.EvidenceError,
+        match='block crosses the active-control boundary',
+    ):
+        orchestration.reconcile_positive_control(
+            workspace=workspace,
+            build_binding=positive_build_binding,
+            result_path=result_path,
+            capture_path=capture_path,
+            contact_progress_path=contact_progress_path,
+            **handshake_paths,
+            manifest_path=manifest_path,
+            collector_configuration_sha256='7' * 64,
+            owned_process_group_shutdown=True,
+            checksum_verified=True,
+        )
+
+    moved_snapshot_block = copy.deepcopy(result)
+    moved_snapshot_block['control']['command_trace'][0]['collector_sequence'] = 6
+    moved_snapshot_block['control']['command_trace'][1]['collector_sequence'] = 7
+    moved_snapshot_block['control']['command_trace'][2]['collector_sequence'] = 8
+    moved_snapshot_block['control']['command_trace'][3]['collector_sequence'] = 9
+    moved_snapshot_block['control']['command_trace'][4]['collector_sequence'] = 13
+    forged_summary = moved_snapshot_block['control']['contact']['snapshots'][1]
+    original_summary_sequence = forged_summary['collector_sequence']
+    forged_summary['collector_sequence'] = 3
+    for record in moved_snapshot_block['control']['contact']['snapshot_records']:
+        if record['snapshot_sequence'] == original_summary_sequence:
+            record['snapshot_sequence'] = 3
+            record['collector_sequence'] = 4
+    for record in forged_summary['counted_snapshot_records']:
+        record['snapshot_sequence'] = 3
+        record['record_sequence'] = 4
+    orchestration.atomic_write_json(result_path, moved_snapshot_block, sidecar=True)
+    with pytest.raises(
+        orchestration.EvidenceError,
+        match='chronology crosses the active-control boundary',
+    ):
+        orchestration.reconcile_positive_control(
+            workspace=workspace,
+            build_binding=positive_build_binding,
+            result_path=result_path,
+            capture_path=capture_path,
+            contact_progress_path=contact_progress_path,
+            **handshake_paths,
+            manifest_path=manifest_path,
+            collector_configuration_sha256='7' * 64,
+            owned_process_group_shutdown=True,
+            checksum_verified=True,
+        )
+    orchestration.atomic_write_json(result_path, result, sidecar=True)
 
     missing_probe_capture = copy.deepcopy(capture)
     missing_probe_capture['streams']['cmd_vel']['items'].pop(0)
@@ -3300,15 +3587,31 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     orchestration.atomic_write_json(result_path, result, sidecar=True)
 
     missing_repeated_command = copy.deepcopy(result)
-    missing_repeated_command['control']['command_trace'][1]['collector_sequence'] = 3
+    for command in missing_repeated_command['control']['command_trace']:
+        if command['collector_sequence'] >= 4:
+            command['collector_sequence'] += 1
+    shifted_contact = missing_repeated_command['control']['contact']
+    for summary in shifted_contact['snapshots']:
+        if summary['collector_sequence'] >= 4:
+            summary['collector_sequence'] += 1
+        for counted_record in summary['counted_snapshot_records']:
+            if counted_record['record_sequence'] >= 4:
+                counted_record['record_sequence'] += 1
+            if counted_record['snapshot_sequence'] >= 4:
+                counted_record['snapshot_sequence'] += 1
+    for record in shifted_contact['snapshot_records']:
+        if record['collector_sequence'] >= 4:
+            record['collector_sequence'] += 1
+        if record['snapshot_sequence'] >= 4:
+            record['snapshot_sequence'] += 1
     missing_repeated_command['control']['command_trace'].insert(
         1,
         {
             'angular_z': 0.0,
-            'collector_sequence': 2,
+            'collector_sequence': 4,
             'linear_x': 0.05,
-            'phase': 'forward',
-            'sim_stamp_ns': 15,
+            'phase': 'FORWARD',
+            'sim_stamp_ns': 70_000_000,
         },
     )
     orchestration.atomic_write_json(result_path, missing_repeated_command, sidecar=True)
@@ -3319,7 +3622,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             'angular_z_rad_s': 0.1,
             'linear_x_m_s': 0.05,
             'linear_y_m_s': 0.0,
-            'stamp_ns': 16,
+            'stamp_ns': 71_000_000,
         },
     )
     orchestration.atomic_write_json(capture_path, missing_repeated_capture)
@@ -3341,7 +3644,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     result_with_support_suffix = copy.deepcopy(result)
     result_with_support_suffix['control']['contact']['snapshot_records'].append(
         {
-            'collector_sequence': 6,
+            'collector_sequence': 13,
             'counterpart_collision': None,
             'counterpart_model': None,
             'disposition': 'robot_internal_excluded',
@@ -3351,13 +3654,13 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             ],
             'robot_collision': None,
             'sim_stamp_ns': 500_000_000,
-            'snapshot_sequence': 5,
+            'snapshot_sequence': 12,
         }
     )
     result_with_support_suffix['control']['contact']['snapshots'].append(
         {
             'classified_count': 0,
-            'collector_sequence': 5,
+            'collector_sequence': 12,
             'counted_snapshot_records': [],
             'delivery_clock_offset_ns': 0,
             'delivery_clock_stamp_ns': 500_000_000,
@@ -3384,7 +3687,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     support_suffix_progress = {
         **contact_progress,
         'latest_retained_stamp_ns': 500_000_000,
-        'retained_message_count': 3,
+        'retained_message_count': 4,
     }
     orchestration.atomic_write_json(result_path, result_with_support_suffix, sidecar=True)
     orchestration.atomic_write_json(capture_path, capture_with_support_suffix)
@@ -3402,7 +3705,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         checksum_verified=True,
     )
     assert (
-        support_suffix_bound['collector_reconciliation']['contact_projection_snapshot_count'] == 2
+        support_suffix_bound['collector_reconciliation']['contact_projection_snapshot_count'] == 3
     )
     assert (
         support_suffix_bound['collector_reconciliation'][
@@ -3414,9 +3717,9 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     missing_qualified = copy.deepcopy(result)
     missing_snapshots = missing_qualified['control']['contact']['snapshots']
     missing_records = missing_qualified['control']['contact']['snapshot_records']
-    missing_snapshots[1]['sim_stamp_ns'] = 301_000_000
-    missing_snapshots[1]['delivery_clock_stamp_ns'] = 501_000_000
-    missing_records[1]['sim_stamp_ns'] = 301_000_000
+    missing_snapshots[2]['sim_stamp_ns'] = 301_000_000
+    missing_snapshots[2]['delivery_clock_stamp_ns'] = 501_000_000
+    missing_records[2]['sim_stamp_ns'] = 301_000_000
     orchestration.atomic_write_json(result_path, missing_qualified, sidecar=True)
     orchestration.atomic_write_json(capture_path, capture)
     orchestration.atomic_write_json(contact_progress_path, contact_progress)
@@ -3435,11 +3738,11 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         )
 
     duplicated_qualified = copy.deepcopy(result_with_support_suffix)
-    duplicated_qualified['control']['contact']['snapshots'][2]['sim_stamp_ns'] = 300_000_000
-    duplicated_qualified['control']['contact']['snapshots'][2]['delivery_clock_stamp_ns'] = (
+    duplicated_qualified['control']['contact']['snapshots'][3]['sim_stamp_ns'] = 300_000_000
+    duplicated_qualified['control']['contact']['snapshots'][3]['delivery_clock_stamp_ns'] = (
         300_000_000
     )
-    duplicated_qualified['control']['contact']['snapshot_records'][2]['sim_stamp_ns'] = 300_000_000
+    duplicated_qualified['control']['contact']['snapshot_records'][3]['sim_stamp_ns'] = 300_000_000
     orchestration.atomic_write_json(result_path, duplicated_qualified, sidecar=True)
     with pytest.raises(orchestration.EvidenceError, match='ordering/liveness'):
         orchestration.reconcile_positive_control(
@@ -3456,7 +3759,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
         )
 
     countable_recontact = copy.deepcopy(result_with_support_suffix)
-    countable_recontact_record = countable_recontact['control']['contact']['snapshot_records'][2]
+    countable_recontact_record = countable_recontact['control']['contact']['snapshot_records'][3]
     countable_recontact_record.update(
         {
             'counterpart_collision': 'second_wall::link::collision',
@@ -3489,8 +3792,8 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
     orchestration.atomic_write_json(contact_progress_path, contact_progress)
 
     diagnostic_offset = copy.deepcopy(capture)
-    diagnostic_offset['streams']['contacts']['items'][1]['delivery_clock_stamp_ns'] = 578_000_000
-    diagnostic_offset['streams']['contacts']['items'][1]['delivery_clock_offset_ns'] = 278_000_000
+    diagnostic_offset['streams']['contacts']['items'][2]['delivery_clock_stamp_ns'] = 578_000_000
+    diagnostic_offset['streams']['contacts']['items'][2]['delivery_clock_offset_ns'] = 278_000_000
     orchestration.atomic_write_json(capture_path, diagnostic_offset)
     diagnostic_bound = orchestration.reconcile_positive_control(
         workspace=Path(__file__).parents[1],
@@ -3511,7 +3814,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
 
     inconsistent_offset = copy.deepcopy(diagnostic_offset)
     inconsistent_contact_items = inconsistent_offset['streams']['contacts']['items']
-    inconsistent_contact_items[1]['delivery_clock_offset_ns'] = 278_000_001
+    inconsistent_contact_items[2]['delivery_clock_offset_ns'] = 278_000_001
     orchestration.atomic_write_json(capture_path, inconsistent_offset)
     with pytest.raises(orchestration.EvidenceError, match='offset is inconsistent'):
         orchestration.reconcile_positive_control(
@@ -3529,7 +3832,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
 
     projection_mutations = []
     extra_recontact = copy.deepcopy(capture)
-    extra_recontact['streams']['contacts']['items'][1]['contacts'][0]['collision2'] = (
+    extra_recontact['streams']['contacts']['items'][2]['contacts'][0]['collision2'] = (
         'wall::link::collision'
     )
     projection_mutations.append(extra_recontact)
@@ -3578,7 +3881,7 @@ def test_positive_control_reconciliation_binds_semantic_manifest(tmp_path: Path)
             owned_process_group_shutdown=True,
             checksum_verified=True,
         )
-    count_mismatch = {**contact_progress, 'retained_message_count': 3}
+    count_mismatch = {**contact_progress, 'retained_message_count': 4}
     orchestration.atomic_write_json(contact_progress_path, count_mismatch)
     with pytest.raises(orchestration.EvidenceError, match='capture length'):
         orchestration.reconcile_positive_control(

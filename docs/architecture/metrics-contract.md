@@ -380,6 +380,24 @@ exception does not relax the latency or
 completeness rule. The active stop command must likewise be issued within
 100 ms of the qualifying contact.
 
+Replay derives the active-control boundary from the first `FORWARD` entry in
+the fully validated command trace and its global collector sequence. Snapshot
+callback offsets before that boundary are diagnostic: they may exceed 220 ms
+because they precede any motion-causing command. Their delivery-clock identity,
+strict source-stamp and sequence ordering, and bounded source-stamp gap remain
+mandatory. A snapshot summary and all records produced by that callback form
+one atomic collector-sequence interval: the summary comes first, its record
+sequences are exactly contiguous, successive intervals do not overlap, and an
+interval may not straddle the first `FORWARD` sequence. A wholly pre-`FORWARD`
+interval must also have its cached delivery-clock stamp no later than the first
+`FORWARD` simulation stamp, as required by the producer's monotonic `/clock`
+and single-threaded callback order; delivery-clock stamps cannot regress, and
+an active interval cannot precede that simulation stamp. Every interval at or
+after the first `FORWARD` sequence retains the absolute 220 ms callback-offset
+gate. This boundary is never supplied as a self-asserted boolean, and it does
+not relax the separate first-qualifying contact or qualified-release callback
+bounds.
+
 The component and metrics collector are independent observers of the public
 snapshot stream. Their retained traces are reconciled bijectively from the
 component's first snapshot through the exact qualified release snapshot `q`:

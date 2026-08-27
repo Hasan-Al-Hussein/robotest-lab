@@ -549,8 +549,12 @@ def _reconcile_contact_snapshots(
     records: Sequence[Mapping[str, Any]],
     manifest: Mapping[str, Any],
     expected: tuple[str, str],
+    *,
+    command_sequences: Sequence[int],
+    first_forward_sequence: int,
+    first_forward_stamp_ns: int,
 ) -> tuple[list[dict[str, Any]], dict[int, list[Mapping[str, Any]]]]:
-    """Validate v3 snapshot summaries and recompute presence/absence episodes."""
+    """Validate v3 summaries across the command-derived active-control boundary."""
     if not isinstance(snapshots, list) or not snapshots:
         raise MetricUnavailable('positive-control authoritative contact snapshots are missing')
     records_by_snapshot: dict[int, list[Mapping[str, Any]]] = {}
@@ -561,6 +565,8 @@ def _reconcile_contact_snapshots(
         records_by_snapshot.setdefault(snapshot_sequence, []).append(record)
 
     previous_stamp: int | None = None
+    previous_delivery_clock: int | None = None
+    previous_snapshot_block_end = 0
     previous_sequence = 0
     active: dict[str, dict[str, Any]] = {}
     episodes: list[dict[str, Any]] = []
@@ -601,22 +607,62 @@ def _reconcile_contact_snapshots(
                 previous_stamp is not None and stamp - previous_stamp > _MAX_CONTACT_SNAPSHOT_GAP_NS
             )
             or (previous_stamp is not None and stamp <= previous_stamp)
+            or (previous_delivery_clock is not None and delivery_clock < previous_delivery_clock)
             or delivery_clock - stamp != delivery_offset
-            or abs(delivery_offset) > _MAX_CONTACT_SNAPSHOT_GAP_NS
         ):
             raise MetricUnavailable(
                 'positive-control contact snapshot ordering/liveness is invalid'
             )
         previous_sequence = sequence
         previous_stamp = stamp
+        previous_delivery_clock = delivery_clock
         seen_summary_sequences.add(sequence)
         snapshot_records = records_by_snapshot.get(sequence, [])
-        if any(
-            record.get('sim_stamp_ns') != stamp
-            or require_int(record.get('collector_sequence'), 'snapshot record sequence') <= sequence
+        snapshot_record_sequences = [
+            require_int(record.get('collector_sequence'), 'snapshot record sequence')
             for record in snapshot_records
-        ):
+        ]
+        if not 1 <= len(snapshot_record_sequences) <= 16:
+            raise MetricUnavailable('positive-control contact snapshot summary does not reconcile')
+        if any(record.get('sim_stamp_ns') != stamp for record in snapshot_records):
             raise MetricUnavailable('positive-control snapshot record linkage is invalid')
+        if snapshot_record_sequences != list(
+            range(sequence + 1, sequence + 1 + len(snapshot_record_sequences))
+        ):
+            raise MetricUnavailable(
+                'positive-control snapshot record sequence block is not contiguous'
+            )
+        snapshot_block_end = snapshot_record_sequences[-1]
+        if sequence <= previous_snapshot_block_end:
+            raise MetricUnavailable(
+                'positive-control snapshot sequence blocks overlap or are not ordered'
+            )
+        if sequence < first_forward_sequence <= snapshot_record_sequences[-1]:
+            raise MetricUnavailable(
+                'positive-control snapshot record block crosses the active-control boundary'
+            )
+        if any(
+            sequence <= command_sequence <= snapshot_block_end
+            for command_sequence in command_sequences
+        ):
+            raise MetricUnavailable(
+                'positive-control command sequence intersects a contact snapshot block'
+            )
+        precontrol_snapshot = snapshot_block_end < first_forward_sequence
+        if precontrol_snapshot and delivery_clock > first_forward_stamp_ns:
+            raise MetricUnavailable(
+                'positive-control pre-control snapshot chronology '
+                'crosses the active-control boundary'
+            )
+        if not precontrol_snapshot and delivery_clock < first_forward_stamp_ns:
+            raise MetricUnavailable(
+                'positive-control active snapshot chronology precedes the active-control boundary'
+            )
+        if not precontrol_snapshot and abs(delivery_offset) > _MAX_CONTACT_SNAPSHOT_GAP_NS:
+            raise MetricUnavailable(
+                'positive-control contact snapshot ordering/liveness is invalid'
+            )
+        previous_snapshot_block_end = snapshot_block_end
         counted_records = [
             record for record in snapshot_records if record.get('disposition') == 'counted'
         ]
@@ -635,8 +681,7 @@ def _reconcile_contact_snapshots(
             for record in counted_records
         ]
         if (
-            not 1 <= len(snapshot_records) <= 16
-            or require_int(summary.get('snapshot_record_count'), 'snapshot_record_count')
+            require_int(summary.get('snapshot_record_count'), 'snapshot_record_count')
             != len(snapshot_records)
             or require_int(summary.get('classified_count'), 'classified_count')
             != len(counted_records)
@@ -686,14 +731,8 @@ def _reconcile_contact_snapshots(
 
 def _validate_command_trace(
     commands: Any,
-    *,
-    control_started_stamp: int,
-    first_contact_sequence: int,
-    qualifying_snapshot_max_record_sequence: int,
-    stop_command_stamp: int,
-    reverse_start_stamp: int,
-    final_zero_stamp: int,
-) -> None:
+) -> tuple[list[Mapping[str, Any]], int]:
+    """Validate command structure and return the first FORWARD sequence boundary."""
     if not isinstance(commands, list) or len(commands) < 4:
         raise MetricUnavailable('positive-control command trace is incomplete')
     expected_values = {
@@ -704,6 +743,7 @@ def _validate_command_trace(
         'REVERSE': -0.05,
     }
     phases: list[str] = []
+    validated_commands: list[Mapping[str, Any]] = []
     previous_order: tuple[int, int] | None = None
     previous_sequence: int | None = None
     for index, command in enumerate(commands):
@@ -746,18 +786,39 @@ def _validate_command_trace(
         ):
             raise MetricUnavailable('positive-control command phase/value contract changed')
         phases.append(phase)
+        validated_commands.append(command)
     phase_rank = {'FORWARD': 0, 'CONTACT_STOP': 1, 'HOLD': 2, 'REVERSE': 3, 'FINAL_ZERO': 4}
-    hold_commands = [command for command in commands if command['phase'] == 'HOLD']
-    stop_command = next(command for command in commands if command['phase'] == 'CONTACT_STOP')
     if (
         [phase_rank[phase] for phase in phases] != sorted(phase_rank[phase] for phase in phases)
         or phases[0] != 'FORWARD'
         or phases[-1] != 'FINAL_ZERO'
         or phases.count('CONTACT_STOP') != 1
         or phases.count('FINAL_ZERO') != 1
-        or not hold_commands
+        or 'HOLD' not in phases
         or 'REVERSE' not in phases
-        or commands[0]['sim_stamp_ns'] != control_started_stamp
+    ):
+        raise MetricUnavailable('positive-control command anchors do not reconcile')
+    first_forward_sequence = require_int(
+        validated_commands[0].get('collector_sequence'),
+        'positive_control.command_trace[0].collector_sequence',
+    )
+    return validated_commands, first_forward_sequence
+
+
+def _validate_command_anchors(
+    commands: Sequence[Mapping[str, Any]],
+    *,
+    control_started_stamp: int,
+    qualifying_snapshot_max_record_sequence: int,
+    stop_command_stamp: int,
+    reverse_start_stamp: int,
+    final_zero_stamp: int,
+) -> None:
+    """Bind a structurally validated command trace to contact and timeline evidence."""
+    hold_commands = [command for command in commands if command['phase'] == 'HOLD']
+    stop_command = next(command for command in commands if command['phase'] == 'CONTACT_STOP')
+    if (
+        commands[0]['sim_stamp_ns'] != control_started_stamp
         or stop_command['sim_stamp_ns'] != stop_command_stamp
         or stop_command['collector_sequence'] != qualifying_snapshot_max_record_sequence + 1
         or next(item['sim_stamp_ns'] for item in commands if item['phase'] == 'REVERSE')
@@ -1025,6 +1086,7 @@ def _positive_control_evidence(
     control = positive_control.get('control')
     if not isinstance(control, Mapping):
         raise MetricUnavailable('positive-control control evidence is missing')
+    commands, first_forward_sequence = _validate_command_trace(control.get('command_trace'))
     command_progress_sha256 = _validate_contact_control_arm(
         control,
         expected_run_id=identity['run_id'],
@@ -1235,7 +1297,13 @@ def _positive_control_evidence(
         contact.get('snapshot_records'), manifest, expected
     )
     computed_episodes, _records_by_snapshot = _reconcile_contact_snapshots(
-        contact.get('snapshots'), contact['snapshot_records'], manifest, expected
+        contact.get('snapshots'),
+        contact['snapshot_records'],
+        manifest,
+        expected,
+        command_sequences=tuple(command['collector_sequence'] for command in commands),
+        first_forward_sequence=first_forward_sequence,
+        first_forward_stamp_ns=commands[0]['sim_stamp_ns'],
     )
     exact_count = require_int(
         contact.get('exact_pair_snapshot_record_count'),
@@ -1491,11 +1559,9 @@ def _positive_control_evidence(
         or release_end_count <= release_start_count
     ):
         raise MetricUnavailable('positive-control timeline does not match the frozen driver')
-    commands = control.get('command_trace')
-    _validate_command_trace(
+    _validate_command_anchors(
         commands,
         control_started_stamp=control_started_stamp,
-        first_contact_sequence=first_contact_sequence,
         qualifying_snapshot_max_record_sequence=qualifying_snapshot_max_record_sequence,
         stop_command_stamp=stop_command_stamp,
         reverse_start_stamp=reverse_start_stamp,

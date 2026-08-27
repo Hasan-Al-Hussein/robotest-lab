@@ -3517,6 +3517,18 @@ def _phase3_evidence(
         'src/robotest_scenarios/schema/contact-control-result.schema.json',
         'Phase 3 positive-control result',
     )
+    positive_control_trace = _list(
+        _mapping(
+            positive_control.get('control'),
+            'Phase 3 positive-control control',
+        ).get('command_trace'),
+        'Phase 3 positive-control command trace',
+    )
+    _require(positive_control_trace, 'Phase 3 positive-control command trace is empty')
+    first_component_command = _mapping(
+        positive_control_trace[0],
+        'Phase 3 positive-control first component command',
+    )
     _require(
         set(positive_binding)
         == {
@@ -3589,6 +3601,7 @@ def _phase3_evidence(
             'command_progress_artifact_sha256',
             'command_progress_observed_steady_ns',
             'command_progress_stamp_ns',
+            'contact_delivery_offset_strict_from_collector_sequence',
             'contact_projection_episode_count',
             'contact_projection_first_stamp_ns',
             'contact_projection_record_count',
@@ -3640,6 +3653,9 @@ def _phase3_evidence(
         == collector_reconciliation['component_command_count'] + 1
         and collector_reconciliation['captured_exact_pair_count']
         == collector_reconciliation['component_exact_pair_count']
+        and collector_reconciliation['contact_delivery_offset_strict_from_collector_sequence']
+        == first_component_command.get('collector_sequence')
+        and first_component_command.get('phase') == 'FORWARD'
         and collector_reconciliation['contact_projection_episode_count'] == 1
         and collector_reconciliation['contact_projection_snapshot_count'] > 0
         and collector_reconciliation['contact_projection_record_count']

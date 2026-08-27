@@ -1214,12 +1214,73 @@ def test_contact_node_stop_latency_100ms_boundary(
         rclpy.try_shutdown()
 
 
-def test_contact_node_rejects_snapshot_delivery_after_220ms() -> None:
+def test_contact_node_retains_prepare_skew_but_readiness_waits_for_catch_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _init_ros()
     manifest = load_coverage_manifest(str(REPOSITORY / 'config' / 'collision-coverage.yaml'))
     node = ContactControlNode(manifest)
     try:
         node._on_clock(_clock(1_220_000_001))
+        wheel = next(name for name in manifest.robot_collisions if 'left_wheel' in name)
+        support = Contact()
+        support.collision1.name = wheel
+        support.collision2.name = 'ground_plane::ground_link::ground_collision'
+        delayed = Contacts()
+        delayed.header.stamp.sec = 1
+        delayed.contacts = [support]
+
+        node._on_contacts(delayed)
+
+        assert node.contact_snapshots.invalid_count == 0
+        assert node.contact_snapshots.accepted_count == 1
+        assert node.contact_snapshots.items[-1]['delivery_clock_offset_ns'] == 220_000_001
+
+        ready_client = SimpleNamespace(service_is_ready=lambda: True)
+        node.latest_ground_truth = {'sim_stamp_ns': 1_220_000_001}
+        node.spawn_client = ready_client
+        node.delete_client = ready_client
+        monkeypatch.setattr(node, 'count_publishers', lambda _topic: 1)
+        app = object.__new__(ContactControlApp)
+        app.node = node
+        app.manifest = manifest
+        app._graph_state = lambda: (1, [])
+        app._contact_graph_snapshot = lambda: {}
+        app._contact_graph_is_exact = lambda _snapshot: True
+
+        assert not app._base_prerequisites()
+
+        caught_up = Contacts()
+        caught_up.header.stamp.sec = 1
+        caught_up.header.stamp.nanosec = 10_000_000
+        caught_up.contacts = [support]
+        node._on_contacts(caught_up)
+
+        assert app._base_prerequisites()
+        assert node.contact_snapshots.accepted_count == 2
+        assert node.contact_snapshots.items[-1]['delivery_clock_offset_ns'] == 210_000_001
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+@pytest.mark.parametrize(
+    ('phase', 'motion_active'),
+    [('FORWARD', True), ('RELEASE', False)],
+)
+def test_contact_node_rejects_snapshot_delivery_after_220ms_once_control_started(
+    phase: str,
+    motion_active: bool,
+) -> None:
+    _init_ros()
+    manifest = load_coverage_manifest(str(REPOSITORY / 'config' / 'collision-coverage.yaml'))
+    node = ContactControlNode(manifest)
+    try:
+        node._on_clock(_clock(1_220_000_001))
+        node.arm_motion()
+        node.start_forward()
+        node.phase = phase
+        node.motion_active = motion_active
         wheel = next(name for name in manifest.robot_collisions if 'left_wheel' in name)
         support = Contact()
         support.collision1.name = wheel
@@ -1232,6 +1293,59 @@ def test_contact_node_rejects_snapshot_delivery_after_220ms() -> None:
     finally:
         node.destroy_node()
         rclpy.try_shutdown()
+
+
+def test_contact_prepare_revalidates_base_prerequisites_immediately_before_ready() -> None:
+    app = object.__new__(ContactControlApp)
+    app.setup_evidence = {
+        'observed_robot_start': None,
+        'observed_wall': None,
+    }
+    app.graph_gate_active = False
+    events: list[str] = []
+
+    def base_prerequisites() -> bool:
+        return True
+
+    def startup_graph_is_stable() -> bool:
+        return True
+
+    def wait_for(predicate: object, *, reason: str) -> None:
+        del reason
+        if predicate is base_prerequisites:
+            events.append('wait_base')
+        elif predicate is startup_graph_is_stable:
+            events.append('wait_graph_stable')
+        else:
+            raise AssertionError('unexpected preparation predicate')
+
+    app._resolve_wall_asset = lambda: events.append('resolve')
+    app._base_prerequisites = base_prerequisites
+    app._startup_graph_is_stable = startup_graph_is_stable
+    app._wait_for = wait_for
+    app._spawn_wall = lambda: events.append('spawn') or {'success': True}
+    app._observe_wall = lambda _spawn: events.append('observe_wall') or {'stamp_ns': 1}
+    app._verify_robot_start = lambda: events.append('verify_start') or {'sim_stamp_ns': 1}
+
+    def write_ready(_spawn: object, _observed_wall: object) -> None:
+        assert app.setup_evidence['observed_wall'] == {'stamp_ns': 1}
+        assert app.setup_evidence['observed_robot_start'] == {'sim_stamp_ns': 1}
+        events.append('write_ready')
+
+    app._write_ready = write_ready
+
+    app._prepare()
+
+    assert events == [
+        'resolve',
+        'wait_base',
+        'wait_graph_stable',
+        'spawn',
+        'observe_wall',
+        'verify_start',
+        'wait_base',
+        'write_ready',
+    ]
 
 
 def test_contact_node_rejects_public_frame_and_snapshot_gap() -> None:

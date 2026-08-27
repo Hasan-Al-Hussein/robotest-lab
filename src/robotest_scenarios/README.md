@@ -35,8 +35,14 @@ ros2 run robotest_scenarios contact_control_driver \
 The driver completes preparation and emits READY only after a positive `/clock`
 sample and a later authoritative contact snapshot have both been observed.
 Contact callbacks that arrive before the first positive `/clock` are counted as
-a discarded pre-evidence prefix; post-clock snapshots retain the full active
-safety checks. READY also requires graph prerequisites to pass for 100 ms. One
+a discarded pre-evidence prefix. During stationary preparation, post-clock
+snapshots retain strict source-stamp advancement and gap checks while their
+delivery-clock offset remains diagnostic; readiness stays false until the
+latest accepted snapshot is within the unchanged 220 ms `/clock` bracket.
+After observing the spawned wall and robot start, the driver explicitly reruns
+those base prerequisites immediately before writing READY. Once control starts,
+an absolute delivery-clock offset above 220 ms is fatal through active motion
+and release. READY also requires graph prerequisites to pass for 100 ms. One
 missing observation-source publisher query is treated as a graph discovery
 diagnostic; the driver fails when the same source is missing in another
 observation at least 100 ms later. Command ownership, forbidden nodes, and

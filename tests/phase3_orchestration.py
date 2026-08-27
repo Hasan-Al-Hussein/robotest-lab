@@ -3539,6 +3539,27 @@ _COMPONENT_CONTACT_RECORD_FIELDS = {
     'sim_stamp_ns',
     'snapshot_sequence',
 }
+_COMPONENT_COMMAND_FIELDS = {
+    'angular_z',
+    'collector_sequence',
+    'linear_x',
+    'phase',
+    'sim_stamp_ns',
+}
+_COMPONENT_COMMAND_LINEAR_X = {
+    'CONTACT_STOP': 0.0,
+    'FINAL_ZERO': 0.0,
+    'FORWARD': 0.05,
+    'HOLD': 0.0,
+    'REVERSE': -0.05,
+}
+_COMPONENT_COMMAND_PHASE_RANK = {
+    'FORWARD': 0,
+    'CONTACT_STOP': 1,
+    'HOLD': 2,
+    'REVERSE': 3,
+    'FINAL_ZERO': 4,
+}
 
 
 def _scoped_contact_name(value: Any, label: str) -> str:
@@ -3558,10 +3579,76 @@ def _normalized_pair(value: Any, label: str) -> tuple[str, str]:
     return pair
 
 
+def _component_command_trace(
+    control: Mapping[str, Any],
+) -> tuple[list[Mapping[str, Any]], int]:
+    """Validate the successful trace and return its first FORWARD sequence."""
+    values = control.get('command_trace')
+    if not isinstance(values, list) or len(values) < 4:
+        raise EvidenceError('positive-control component command trace is incomplete')
+    commands: list[Mapping[str, Any]] = []
+    phases: list[str] = []
+    previous_order: tuple[int, int] | None = None
+    previous_sequence: int | None = None
+    for index, raw_command in enumerate(values):
+        command = _require_mapping(raw_command, f'positive_control.command_trace[{index}]')
+        if set(command) != _COMPONENT_COMMAND_FIELDS:
+            raise EvidenceError('positive-control component command trace shape changed')
+        stamp = _require_int(
+            command.get('sim_stamp_ns'),
+            f'positive_control.command_trace[{index}].sim_stamp_ns',
+            minimum=1,
+        )
+        sequence = _require_int(
+            command.get('collector_sequence'),
+            f'positive_control.command_trace[{index}].collector_sequence',
+            minimum=1,
+        )
+        order = (stamp, sequence)
+        if (previous_order is not None and order <= previous_order) or (
+            previous_sequence is not None and sequence <= previous_sequence
+        ):
+            raise EvidenceError('positive-control component command trace is not ordered')
+        phase = command.get('phase')
+        if (
+            phase not in _COMPONENT_COMMAND_LINEAR_X
+            or _require_number(
+                command.get('linear_x'),
+                f'positive_control.command_trace[{index}].linear_x',
+            )
+            != _COMPONENT_COMMAND_LINEAR_X[phase]
+            or _require_number(
+                command.get('angular_z'),
+                f'positive_control.command_trace[{index}].angular_z',
+            )
+            != 0.0
+        ):
+            raise EvidenceError('positive-control component command phase/value contract changed')
+        commands.append(command)
+        phases.append(phase)
+        previous_order = order
+        previous_sequence = sequence
+    if (
+        [_COMPONENT_COMMAND_PHASE_RANK[phase] for phase in phases]
+        != sorted(_COMPONENT_COMMAND_PHASE_RANK[phase] for phase in phases)
+        or phases[0] != 'FORWARD'
+        or phases[-1] != 'FINAL_ZERO'
+        or phases.count('CONTACT_STOP') != 1
+        or phases.count('FINAL_ZERO') != 1
+        or 'HOLD' not in phases
+        or 'REVERSE' not in phases
+    ):
+        raise EvidenceError('positive-control component command anchors do not reconcile')
+    return commands, commands[0]['collector_sequence']
+
+
 def _component_contact_projection(
     contact: Mapping[str, Any],
     *,
+    command_sequences: Sequence[int],
     expected_pair: tuple[str, str],
+    first_forward_sequence: int,
+    first_forward_stamp_ns: int,
     manifest: Mapping[str, Any],
     qualifying_stamp_ns: int,
 ) -> list[tuple[int, tuple[tuple[str, str], ...]]]:
@@ -3573,6 +3660,7 @@ def _component_contact_projection(
         raise EvidenceError('positive-control authoritative contact records are missing')
 
     records_by_summary: dict[int, list[tuple[str, str]]] = {}
+    record_sequences_by_summary: dict[int, list[int]] = {}
     record_stamps_by_summary: dict[int, set[int]] = {}
     previous_record_sequence = 0
     for index, raw_record in enumerate(records):
@@ -3604,10 +3692,13 @@ def _component_contact_projection(
         if list(pair) != record.get('normalized_pair'):
             raise EvidenceError('positive-control snapshot record pair is not normalized')
         records_by_summary.setdefault(summary_sequence, []).append(pair)
+        record_sequences_by_summary.setdefault(summary_sequence, []).append(record_sequence)
         record_stamps_by_summary.setdefault(summary_sequence, set()).add(record_stamp)
 
     projection: list[tuple[int, tuple[tuple[str, str], ...]]] = []
     seen_summaries: set[int] = set()
+    previous_delivery_clock: int | None = None
+    previous_snapshot_block_end = 0
     previous_summary_sequence = 0
     previous_stamp: int | None = None
     for index, raw_summary in enumerate(summaries):
@@ -3637,11 +3728,12 @@ def _component_contact_projection(
             summary_sequence <= previous_summary_sequence
             or (previous_stamp is not None and stamp <= previous_stamp)
             or (previous_stamp is not None and stamp - previous_stamp > CONTACT_MAX_CLOCK_LAG_NS)
+            or (previous_delivery_clock is not None and delivery_clock < previous_delivery_clock)
             or delivery_clock - stamp != delivery_offset
-            or abs(delivery_offset) > CONTACT_MAX_CLOCK_LAG_NS
         ):
             raise EvidenceError('positive-control snapshot ordering/liveness is invalid')
         snapshot_pairs = records_by_summary.get(summary_sequence, [])
+        snapshot_record_sequences = record_sequences_by_summary.get(summary_sequence, [])
         if not 1 <= len(snapshot_pairs) <= 16 or _require_int(
             summary.get('snapshot_record_count'),
             f'positive_control.snapshots[{index}].snapshot_record_count',
@@ -3650,6 +3742,41 @@ def _component_contact_projection(
             raise EvidenceError('positive-control snapshot record count does not reconcile')
         if record_stamps_by_summary.get(summary_sequence) != {stamp}:
             raise EvidenceError('positive-control snapshot record stamp linkage changed')
+        if snapshot_record_sequences != list(
+            range(
+                summary_sequence + 1,
+                summary_sequence + 1 + len(snapshot_record_sequences),
+            )
+        ):
+            raise EvidenceError('positive-control record sequence block is not contiguous')
+        snapshot_block_end = snapshot_record_sequences[-1]
+        if summary_sequence <= previous_snapshot_block_end:
+            raise EvidenceError(
+                'positive-control snapshot sequence blocks overlap or are not ordered'
+            )
+        if summary_sequence < first_forward_sequence <= snapshot_block_end:
+            raise EvidenceError(
+                'positive-control snapshot record block crosses the active-control boundary'
+            )
+        if any(
+            summary_sequence <= command_sequence <= snapshot_block_end
+            for command_sequence in command_sequences
+        ):
+            raise EvidenceError(
+                'positive-control command sequence intersects a contact snapshot block'
+            )
+        precontrol_snapshot = snapshot_block_end < first_forward_sequence
+        if precontrol_snapshot and delivery_clock > first_forward_stamp_ns:
+            raise EvidenceError(
+                'positive-control pre-control snapshot chronology '
+                'crosses the active-control boundary'
+            )
+        if not precontrol_snapshot and delivery_clock < first_forward_stamp_ns:
+            raise EvidenceError(
+                'positive-control active snapshot chronology precedes the active-control boundary'
+            )
+        if not precontrol_snapshot and abs(delivery_offset) > CONTACT_MAX_CLOCK_LAG_NS:
+            raise EvidenceError('positive-control snapshot ordering/liveness is invalid')
         exact_count = sum(pair == expected_pair for pair in snapshot_pairs)
         if (
             _require_int(
@@ -3661,6 +3788,8 @@ def _component_contact_projection(
         ):
             raise EvidenceError('positive-control snapshot exact-pair count does not reconcile')
         seen_summaries.add(summary_sequence)
+        previous_delivery_clock = delivery_clock
+        previous_snapshot_block_end = snapshot_block_end
         previous_summary_sequence = summary_sequence
         previous_stamp = stamp
         projection.append((stamp, tuple(sorted(snapshot_pairs))))
@@ -4319,6 +4448,7 @@ def reconcile_positive_control(
     if not isinstance(captured_contacts, list) or not isinstance(captured_commands, list):
         raise EvidenceError('positive-control capture streams are malformed')
     control = _require_mapping(result.get('control'), 'positive_control.control')
+    component_commands, first_forward_sequence = _component_command_trace(control)
     contact = _require_mapping(control.get('contact'), 'positive_control.control.contact')
     expected_pair = contact.get('expected_pair')
     if (
@@ -4330,7 +4460,10 @@ def reconcile_positive_control(
     normalized_expected = _normalized_pair(expected_pair, 'positive-control expected pair')
     component_projection = _component_contact_projection(
         contact,
+        command_sequences=tuple(command['collector_sequence'] for command in component_commands),
         expected_pair=normalized_expected,
+        first_forward_sequence=first_forward_sequence,
+        first_forward_stamp_ns=component_commands[0]['sim_stamp_ns'],
         manifest=manifest,
         qualifying_stamp_ns=qualifying_contact_snapshot_stamp_ns,
     )
@@ -4516,9 +4649,6 @@ def reconcile_positive_control(
         raise EvidenceError(
             'collector counterpart episodes do not exactly reconcile with the driver'
         )
-    component_commands = control.get('command_trace')
-    if not isinstance(component_commands, list) or not component_commands:
-        raise EvidenceError('positive-control component command trace is missing')
     captured_command_projection = [
         (
             _require_int(item.get('stamp_ns'), 'captured command stamp', minimum=1),
@@ -4622,6 +4752,7 @@ def reconcile_positive_control(
             'captured_release_expected_pair_count': release_expected_pair_count,
             'captured_release_snapshot_count': len(release_messages),
             'contact_projection_episode_count': len(captured_episodes),
+            'contact_delivery_offset_strict_from_collector_sequence': first_forward_sequence,
             'contact_projection_first_stamp_ns': component_projection[0][0],
             'contact_projection_record_count': sum(
                 len(pairs) for _stamp, pairs in component_projection

@@ -467,14 +467,23 @@ exactly one de-duplicated counterpart episode must be observed, named, closed,
 and reconciled from snapshot presence/absence. The test also requires public
 source gaps and an explicitly caught-up final clock bracket within `0.22 s`.
 Passive collector callback offsets are retained as noncausal diagnostics; the
-active driver's own callback-time bound remains fail-closed. Exact graph
+component replay also treats offsets on snapshots whose `collector_sequence`
+precedes the first exact `FORWARD` command as diagnostic, even above `0.22 s`.
+The validated command trace supplies that boundary. Each callback's summary
+and exact contiguous records form a non-overlapping sequence interval that may
+not straddle it; a wholly earlier interval's cached delivery-clock stamp cannot
+exceed the first `FORWARD` simulation stamp. Delivery-clock stamps cannot
+regress, and an active interval cannot precede that stamp. Every interval at
+or after the boundary retains the absolute `0.22 s` callback-time bound.
+Source gap and order, record linkage, component/capture bijection,
+qualifying-contact, release, and final clock-bracket checks remain fail-closed. Exact graph
 endpoint cardinality/GID continuity, the final command being zero, false
 collector overflows, actor deletion, and termination of both owned process
-groups are also required. The captured command stream begins with the distinct
-delivered zero probe and then contains exactly one observation for every
-component command publication within `0.10 s`; its cardinality is exactly the
-component trace length plus one, with no unmatched record. The active contact
-stop retains the same `0.10 s` maximum response bound.
+groups are also required. The captured command stream begins with the distinct delivered
+zero probe and then contains exactly one observation for every component
+command publication within `0.10 s`; its cardinality is exactly the component
+trace length plus one, with no unmatched record. The active contact stop retains
+the same `0.10 s` maximum response bound.
 
 The coverage manifest, not this one chassis contact alone, must enumerate and
 bind every rendered robot collision geometry. A chassis-only production

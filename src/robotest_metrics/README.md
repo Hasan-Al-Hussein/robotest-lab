@@ -128,6 +128,21 @@ coverage manifest, rendered SDF, robot description, world, and collector
 hashes. External checksum, collector reconciliation, and owned-process-group
 shutdown gates are mandatory.
 
+Snapshot delivery-clock offsets are causal gates only from the first validated
+`FORWARD` command sequence onward. Earlier callback offsets are diagnostic and
+may exceed 0.22 s because no motion-causing command precedes them. Replay
+derives that boundary from the structurally validated command trace; it is not
+a self-asserted flag. Every summary still requires exact delivery-clock
+arithmetic, strictly increasing source stamps and collector sequences, and the
+bounded source-stamp gap. Each summary and its exact contiguous record sequence
+form one atomic interval that cannot overlap another interval or straddle the
+first `FORWARD`. A wholly pre-`FORWARD` interval's cached delivery-clock stamp
+must be no later than the first `FORWARD` simulation stamp; delivery-clock
+stamps cannot regress, and an active interval cannot precede that stamp. At and
+after that sequence, every interval retains the absolute 0.22 s delivery-offset
+limit. The first qualifying contact and qualified release keep their
+independent strict callback bounds.
+
 The positive-control command trace begins only after a fail-closed stationary
 handshake. The driver prepares, writes READY, and keeps spinning without
 nonzero motion while the runner completes and semantically verifies the

@@ -750,9 +750,7 @@
             }
           }
         },
-        "delivery_clock_offset_ns": {
-          "type": "integer", "minimum": -220000000, "maximum": 220000000
-        },
+        "delivery_clock_offset_ns": {"type": "integer"},
         "delivery_clock_stamp_ns": {"type": "integer", "minimum": 0},
         "exact_pair_count": {"type": "integer", "minimum": 0, "maximum": 16},
         "sim_stamp_ns": {"type": "integer", "minimum": 1},

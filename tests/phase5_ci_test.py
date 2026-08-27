@@ -7670,6 +7670,146 @@ def test_release_evidence_treats_passive_release_clock_offset_as_diagnostic() ->
     assert not release_module._passive_release_clock_offset_is_consistent(reconciliation)
 
 
+def test_phase5_clone_local_recomposition_accepts_precontrol_contact_delivery_skew(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    result_path = candidate_root / 'positive-control/contact-control-result.json'
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    control = result['control']
+    first_forward_sequence = control['command_trace'][0]['collector_sequence']
+    precontrol_snapshot = next(
+        snapshot
+        for snapshot in control['contact']['snapshots']
+        if snapshot['collector_sequence'] < first_forward_sequence
+    )
+    precontrol_snapshot['delivery_clock_offset_ns'] = -300_000_000
+    precontrol_snapshot['delivery_clock_stamp_ns'] = (
+        precontrol_snapshot['sim_stamp_ns'] - 300_000_000
+    )
+    _canonical_file(result_path, result, sidecar=True)
+    _rebind_phase3_positive_raw(candidate_root, repository)
+
+    binding = json.loads(
+        (candidate_root / 'positive-control/positive-binding.json').read_text(encoding='utf-8')
+    )
+    assert (
+        binding['collector_reconciliation'][
+            'contact_delivery_offset_strict_from_collector_sequence'
+        ]
+        == first_forward_sequence
+    )
+    assert (
+        binding['positive_control']['control']['contact']['snapshots'][0][
+            'delivery_clock_offset_ns'
+        ]
+        == -300_000_000
+    )
+
+
+def test_release_evidence_rejects_rebound_active_contact_delivery_skew(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    result_path = candidate_root / 'positive-control/contact-control-result.json'
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    control = result['control']
+    first_forward_sequence = control['command_trace'][0]['collector_sequence']
+    active_snapshot = next(
+        snapshot
+        for snapshot in control['contact']['snapshots']
+        if snapshot['collector_sequence'] >= first_forward_sequence
+    )
+    active_snapshot['delivery_clock_offset_ns'] = 221_000_000
+    active_snapshot['delivery_clock_stamp_ns'] = active_snapshot['sim_stamp_ns'] + 221_000_000
+    _canonical_file(result_path, result, sidecar=True)
+    _refresh_phase3_positive_component_manifest_from_repository(
+        candidate_root,
+        repository,
+    )
+
+    with pytest.raises(EvidenceError, match='positive-control recomposition failed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_active_snapshot_resequenced_before_forward(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    result_path = candidate_root / 'positive-control/contact-control-result.json'
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    control = result['control']
+    contact = control['contact']
+    first_forward_sequence = control['command_trace'][0]['collector_sequence']
+    active_snapshot = next(
+        snapshot
+        for snapshot in contact['snapshots']
+        if snapshot['collector_sequence'] >= first_forward_sequence
+    )
+    original_snapshot_sequence = active_snapshot['collector_sequence']
+    forged_snapshot_sequence = first_forward_sequence - 1
+    active_snapshot['collector_sequence'] = forged_snapshot_sequence
+    active_snapshot['delivery_clock_offset_ns'] = 221_000_000
+    active_snapshot['delivery_clock_stamp_ns'] = active_snapshot['sim_stamp_ns'] + 221_000_000
+    for record in contact['snapshot_records']:
+        if record['snapshot_sequence'] == original_snapshot_sequence:
+            record['snapshot_sequence'] = forged_snapshot_sequence
+    for record in active_snapshot['counted_snapshot_records']:
+        record['snapshot_sequence'] = forged_snapshot_sequence
+    _canonical_file(result_path, result, sidecar=True)
+    _refresh_phase3_positive_component_manifest_from_repository(
+        candidate_root,
+        repository,
+    )
+
+    with pytest.raises(EvidenceError, match='positive-control recomposition failed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_cascaded_active_skew_boundary_forgery(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    positive_directory = candidate_root / 'positive-control'
+    result_path = positive_directory / 'contact-control-result.json'
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    control = result['control']
+    original_boundary = control['command_trace'][0]['collector_sequence']
+    active_snapshot = next(
+        snapshot
+        for snapshot in control['contact']['snapshots']
+        if snapshot['collector_sequence'] >= original_boundary
+    )
+    active_snapshot['delivery_clock_offset_ns'] = 221_000_000
+    active_snapshot['delivery_clock_stamp_ns'] = active_snapshot['sim_stamp_ns'] + 221_000_000
+    forged_boundary = active_snapshot['collector_sequence'] + 1
+    control['command_trace'][0]['collector_sequence'] = forged_boundary
+    _canonical_file(result_path, result, sidecar=True)
+
+    binding_path = positive_directory / 'positive-binding.json'
+    binding = json.loads(binding_path.read_text(encoding='utf-8'))
+    binding['positive_control'] = copy.deepcopy(result)
+    binding['collector_reconciliation'][
+        'contact_delivery_offset_strict_from_collector_sequence'
+    ] = forged_boundary
+    _refresh_phase3_positive_binding(candidate_root, binding)
+    _refresh_phase3_positive_component_manifest_from_repository(
+        candidate_root,
+        repository,
+    )
+
+    with pytest.raises(EvidenceError, match='Phase 3 collision qualification failed'):
+        _validate_release_fixture(fixture)
+
+
 def test_release_evidence_rejects_missing_collision_coverage_sha(tmp_path: Path) -> None:
     fixture = _release_fixture(tmp_path)
     candidate_root = Path(fixture['candidate_root'])

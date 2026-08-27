@@ -95,6 +95,180 @@ def test_positive_control_is_hash_bound_and_must_pass() -> None:
         validate_collision_qualification(manifest, failed, binding)
 
 
+def test_positive_control_precontrol_callback_skew_is_diagnostic() -> None:
+    manifest, positive, binding = collision_fixture()
+    snapshots = positive['control']['contact']['snapshots']
+    first_forward_sequence = positive['control']['command_trace'][0]['collector_sequence']
+    precontrol_snapshot = snapshots[0]
+    assert precontrol_snapshot['collector_sequence'] < first_forward_sequence
+    precontrol_snapshot['delivery_clock_offset_ns'] = -278_000_000
+    precontrol_snapshot['delivery_clock_stamp_ns'] = (
+        precontrol_snapshot['sim_stamp_ns'] + precontrol_snapshot['delivery_clock_offset_ns']
+    )
+    positive['quality']['public_contact_snapshot_heartbeat']['future_delivery_count'] = 1
+    binding['positive_control_json_sha256'] = canonical_sha256(positive)
+
+    assert validate_collision_qualification(manifest, positive, binding)['status'] == 'PASS'
+
+
+def test_contact_snapshot_boundary_accepts_caught_up_precontrol_skew() -> None:
+    snapshots: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
+    snapshot_inputs = (
+        (1, 2, 500_000_000, 778_000_000),
+        (3, 4, 700_000_000, 800_000_000),
+        (5, 6, 900_000_000, 1_000_000_000),
+        (11, 12, 1_100_000_000, 1_000_000_000),
+    )
+    for summary_sequence, record_sequence, stamp, delivery_clock in snapshot_inputs:
+        records.append(
+            {
+                'collector_sequence': record_sequence,
+                'disposition': 'support_ground_excluded',
+                'normalized_pair': [
+                    'ground::plane::collision',
+                    'robotest::wheel::collision',
+                ],
+                'sim_stamp_ns': stamp,
+                'snapshot_sequence': summary_sequence,
+            }
+        )
+        snapshots.append(
+            {
+                'classified_count': 0,
+                'collector_sequence': summary_sequence,
+                'counted_snapshot_records': [],
+                'delivery_clock_offset_ns': delivery_clock - stamp,
+                'delivery_clock_stamp_ns': delivery_clock,
+                'exact_pair_count': 0,
+                'sim_stamp_ns': stamp,
+                'snapshot_record_count': 1,
+            }
+        )
+
+    episodes, records_by_snapshot = collision_module._reconcile_contact_snapshots(
+        snapshots,
+        records,
+        {},
+        ('robotest::base::collision', 'wall::link::collision'),
+        command_sequences=(10,),
+        first_forward_sequence=10,
+        first_forward_stamp_ns=1_000_000_000,
+    )
+
+    assert episodes == []
+    assert sorted(records_by_snapshot) == [1, 3, 5, 11]
+
+
+def test_positive_control_active_callback_skew_fails_closed() -> None:
+    manifest, positive, binding = collision_fixture()
+    snapshots = positive['control']['contact']['snapshots']
+    first_forward_sequence = positive['control']['command_trace'][0]['collector_sequence']
+    active_snapshot = next(
+        snapshot
+        for snapshot in snapshots
+        if snapshot['collector_sequence'] >= first_forward_sequence
+        and snapshot['exact_pair_count'] == 0
+    )
+    active_snapshot['delivery_clock_offset_ns'] = 278_000_000
+    active_snapshot['delivery_clock_stamp_ns'] = (
+        active_snapshot['sim_stamp_ns'] + active_snapshot['delivery_clock_offset_ns']
+    )
+    binding['positive_control_json_sha256'] = canonical_sha256(positive)
+
+    with pytest.raises(MetricUnavailable, match='snapshot ordering/liveness'):
+        validate_collision_qualification(manifest, positive, binding)
+
+
+def test_positive_control_active_snapshot_summary_cannot_cross_forward_records() -> None:
+    manifest, positive, binding = collision_fixture()
+    contact = positive['control']['contact']
+    first_forward_sequence = positive['control']['command_trace'][0]['collector_sequence']
+    active_snapshot = next(
+        snapshot for snapshot in contact['snapshots'] if snapshot['exact_pair_count'] == 1
+    )
+    original_sequence = active_snapshot['collector_sequence']
+    forged_sequence = first_forward_sequence - 1
+    active_snapshot['collector_sequence'] = forged_sequence
+    active_snapshot['delivery_clock_offset_ns'] = 278_000_000
+    active_snapshot['delivery_clock_stamp_ns'] = (
+        active_snapshot['sim_stamp_ns'] + active_snapshot['delivery_clock_offset_ns']
+    )
+    for record in contact['snapshot_records']:
+        if record['snapshot_sequence'] == original_sequence:
+            record['snapshot_sequence'] = forged_sequence
+    for record in active_snapshot['counted_snapshot_records']:
+        record['snapshot_sequence'] = forged_sequence
+    binding['positive_control_json_sha256'] = canonical_sha256(positive)
+
+    with pytest.raises(MetricUnavailable, match='sequence block is not contiguous'):
+        validate_collision_qualification(manifest, positive, binding)
+
+
+def test_positive_control_atomic_snapshot_block_cannot_straddle_forward() -> None:
+    manifest, positive, binding = collision_fixture()
+    contact = positive['control']['contact']
+    first_forward_sequence = positive['control']['command_trace'][0]['collector_sequence']
+    active_snapshot = next(
+        snapshot for snapshot in contact['snapshots'] if snapshot['exact_pair_count'] == 1
+    )
+    original_sequence = active_snapshot['collector_sequence']
+    linked_records = [
+        record
+        for record in contact['snapshot_records']
+        if record['snapshot_sequence'] == original_sequence
+    ]
+    old_to_new_record_sequence = {
+        record['collector_sequence']: first_forward_sequence + index
+        for index, record in enumerate(linked_records)
+    }
+    active_snapshot['collector_sequence'] = first_forward_sequence - 1
+    for record in linked_records:
+        record['snapshot_sequence'] = first_forward_sequence - 1
+        record['collector_sequence'] = old_to_new_record_sequence[record['collector_sequence']]
+    for record in active_snapshot['counted_snapshot_records']:
+        record['snapshot_sequence'] = first_forward_sequence - 1
+        record['record_sequence'] = old_to_new_record_sequence[record['record_sequence']]
+    binding['positive_control_json_sha256'] = canonical_sha256(positive)
+
+    with pytest.raises(MetricUnavailable, match='block crosses the active-control boundary'):
+        validate_collision_qualification(manifest, positive, binding)
+
+
+def test_positive_control_active_snapshot_block_cannot_move_wholly_before_forward() -> None:
+    manifest, positive, binding = collision_fixture()
+    contact = positive['control']['contact']
+    precontrol_snapshot = contact['snapshots'][0]
+    active_snapshot = next(
+        snapshot for snapshot in contact['snapshots'] if snapshot['exact_pair_count'] == 1
+    )
+    for snapshot, summary_sequence, record_sequences in (
+        (precontrol_snapshot, 1, (2,)),
+        (active_snapshot, 4, (5, 6)),
+    ):
+        original_sequence = snapshot['collector_sequence']
+        linked_records = [
+            record
+            for record in contact['snapshot_records']
+            if record['snapshot_sequence'] == original_sequence
+        ]
+        old_to_new_record_sequence = {
+            record['collector_sequence']: new_sequence
+            for record, new_sequence in zip(linked_records, record_sequences, strict=True)
+        }
+        snapshot['collector_sequence'] = summary_sequence
+        for record in linked_records:
+            record['snapshot_sequence'] = summary_sequence
+            record['collector_sequence'] = old_to_new_record_sequence[record['collector_sequence']]
+        for record in snapshot['counted_snapshot_records']:
+            record['snapshot_sequence'] = summary_sequence
+            record['record_sequence'] = old_to_new_record_sequence[record['record_sequence']]
+    binding['positive_control_json_sha256'] = canonical_sha256(positive)
+
+    with pytest.raises(MetricUnavailable, match='chronology crosses the active-control boundary'):
+        validate_collision_qualification(manifest, positive, binding)
+
+
 def _rehash_arm_acknowledgment(positive: dict[str, Any]) -> None:
     arm = positive['control']['arm']
     arm['acknowledgment_sha256'] = canonical_sha256(arm['acknowledgment'])
@@ -466,8 +640,8 @@ def test_positive_control_default_wall_asset_ignores_evidence_path_redirection(
         ),
         (
             lambda positive, _manifest: positive['control']['command_trace'][1].__setitem__(
-                'collector_sequence',
-                positive['control']['contact']['first_qualifying_contact']['collector_sequence'],
+                'sim_stamp_ns',
+                positive['control']['command_trace'][1]['sim_stamp_ns'] + 1,
             ),
             'command anchors',
         ),
@@ -483,7 +657,7 @@ def test_positive_control_default_wall_asset_ignores_evidence_path_redirection(
                 ).__setitem__('collector_sequence', 6),
                 positive['control']['command_trace'][1].__setitem__('collector_sequence', 7),
             ),
-            'contact record ordering',
+            'command trace is not ordered',
         ),
     ],
 )

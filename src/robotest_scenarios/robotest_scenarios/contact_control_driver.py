@@ -527,7 +527,10 @@ class ContactControlNode(Node):
             )
         stamp_ns = stamp_to_ns(message.header.stamp, positive=True)
         delivery_clock_offset_ns = self.current_sim_stamp_ns - stamp_ns
-        if abs(delivery_clock_offset_ns) > self.manifest.contact_snapshot_max_clock_lag_ns:
+        if (
+            self.control_started_stamp_ns is not None
+            and abs(delivery_clock_offset_ns) > self.manifest.contact_snapshot_max_clock_lag_ns
+        ):
             self.contact_snapshots.reject_invalid()
             raise ProtocolError('authoritative contact snapshot delivery skew exceeded 220 ms')
         if delivery_clock_offset_ns < 0:
@@ -1830,6 +1833,10 @@ class ContactControlApp:
         self.observed_start = self._verify_robot_start()
         self.setup_evidence['observed_wall'] = observed_wall
         self.setup_evidence['observed_robot_start'] = self.observed_start
+        self._wait_for(
+            self._base_prerequisites,
+            reason='contact-control prerequisites did not remain ready after fixture setup',
+        )
         self._write_ready(spawn, observed_wall)
 
     @staticmethod

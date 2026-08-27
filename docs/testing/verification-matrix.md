@@ -145,6 +145,19 @@ process-liveness, and ordering evidence must all reconcile; missing, tampered,
 or out-of-order evidence fails closed. The existing 30 s complete-fixture
 deadline includes every pre-arm wait and is never reset.
 
+P3-03 component replay validates the exact successful command trace and derives
+the delivery-skew enforcement boundary from its first `FORWARD`
+`collector_sequence`. Snapshot delivery offsets before that boundary are
+arithmetic-consistent diagnostics and may exceed 0.22 simulation seconds;
+each summary and its exact contiguous records form a non-overlapping atomic
+sequence interval that may not straddle the boundary, and a wholly earlier
+interval's cached delivery-clock stamp may not exceed the first `FORWARD`
+simulation stamp. Delivery-clock stamps cannot regress, and an active interval
+cannot precede that stamp. Offsets at or after the boundary remain bounded to
+an absolute 0.22 simulation seconds. Source-stamp gaps/order, normalized
+record linkage, component/capture bijection, qualifying contact, release, and
+final clock-bracket checks remain unchanged.
+
 | Criterion | Proof method | Expected result and evidence | Failure signal | Recovery trigger |
 | --- | --- | --- | --- | --- |
 | P3-01 Fault protocol and transforms | GTest plus cross-language known-answer hash fixtures for canonical schedules, RESET/PREPARED/ARMED transitions, boundaries, idempotency, counts, dropout, drift, queues, and reset | Python/C++ canonical bytes and SHA-256 match; preload is inert; exact UUID/T0/hash/generation arm precedes the first fault by >=0.50 s; half-open intervals, event counts, left-composed SE(2), odom/TF identity, and bounded QoS pass | Wall-time dependence, hash mismatch, partial state, conflicting replay accepted, off-by-one interval, odom/TF mismatch, nondeterminism, or pre-arm effect | Isolate pure logic and interface contract; no simulation run until unit and service fixtures pass |
