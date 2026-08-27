@@ -104,6 +104,17 @@ therefore requires zero goal-capable clients. After mission launch it requires
 exactly `/robotest/mission_runner`; any missing, mistyped, or additional goal
 client remains a gate failure.
 
+Neither gate may pass on the first contract-satisfying discovery snapshot. All
+non-probe node identities plus the normalized public typed topics, services,
+actions, action endpoints, duplicate names, and query errors must remain
+unchanged for 5.0 steady-wall seconds across at least two observations, within
+the existing watched-process deadline. Replay also requires the pre-mission
+node inventory to match the immediately preceding runtime gate, identical
+typed topic and action inventories across the two quiet snapshots, and the
+exact `/robotest/phase3_goal_observer` to `/robotest/mission_runner` node and
+standard-service transition. Scenario 4 additionally permits only the
+source-bound `/robotest/lifecycle_sampler` transition.
+
 ## Fault-control interfaces
 
 The Phase 3 interface package owns:

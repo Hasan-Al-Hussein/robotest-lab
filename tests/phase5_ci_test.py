@@ -2366,6 +2366,7 @@ def _phase3_graph_document(
     orchestration: object,
     *,
     mission_client: bool,
+    mission_auxiliary_nodes: set[str],
     persistent_nodes: set[str],
     watch_pid: int,
 ) -> dict:
@@ -2392,30 +2393,21 @@ def _phase3_graph_document(
         contracts['topics']['/robotest/validation/contacts']
     ]
     services = {name: [type_name] for name, type_name in contracts['services'].items()}
-    if mission_client:
-        services.update(
-            {
-                '/robotest/mission_runner/describe_parameters': [
-                    'rcl_interfaces/srv/DescribeParameters'
-                ],
-                '/robotest/mission_runner/get_parameter_types': [
-                    'rcl_interfaces/srv/GetParameterTypes'
-                ],
-                '/robotest/mission_runner/get_parameters': ['rcl_interfaces/srv/GetParameters'],
-                '/robotest/mission_runner/list_parameters': ['rcl_interfaces/srv/ListParameters'],
-                '/robotest/mission_runner/set_parameters': ['rcl_interfaces/srv/SetParameters'],
-                '/robotest/mission_runner/set_parameters_atomically': [
-                    'rcl_interfaces/srv/SetParametersAtomically'
-                ],
-            }
-        )
+    transitioned_nodes = (
+        {orchestration.PHASE3_GRAPH_MISSION_CLIENT_NODE, *mission_auxiliary_nodes}
+        if mission_client
+        else {orchestration.PHASE3_GRAPH_GOAL_OBSERVER_NODE}
+    )
+    for node in transitioned_nodes:
+        services.update(orchestration._phase3_standard_rclpy_services(node))
     actions = {name: [type_name] for name, type_name in contracts['actions'].items()}
+    stable_nodes = persistent_nodes - {orchestration.PHASE3_GRAPH_GOAL_OBSERVER_NODE}
     node_names = sorted(
         {
-            *persistent_nodes,
+            *stable_nodes,
             *passive_clients,
             orchestration.PHASE3_GRAPH_ACTION_SERVER_NODE,
-            *([orchestration.PHASE3_GRAPH_MISSION_CLIENT_NODE] if mission_client else []),
+            *transitioned_nodes,
             orchestration.PHASE3_GRAPH_PARTICIPANT,
         }
     )
@@ -2465,17 +2457,21 @@ def _phase3_graph_document(
     )
     return {
         'action_ownership_mismatches': [],
-        'attempt_count': 2,
+        'attempt_count': orchestration.PHASE3_GRAPH_MINIMUM_OBSERVATIONS,
         'contracts': contracts,
         'duplicate_node_names': [],
-        'elapsed_wall_seconds': 0.25,
+        'elapsed_wall_seconds': orchestration.PHASE3_GRAPH_QUIET_WINDOW_S,
         'failure': None,
         'failure_kind': None,
         'limits': {
             'maximum_graph_names': orchestration.PHASE3_GRAPH_MAXIMUM_GRAPH_NAMES,
             'maximum_graph_nodes': orchestration.PHASE3_GRAPH_MAXIMUM_GRAPH_NODES,
             'maximum_types_per_name': orchestration.PHASE3_GRAPH_MAXIMUM_TYPES_PER_NAME,
-            'wall_timeout_seconds': orchestration.PHASE3_GRAPH_WALL_TIMEOUT_S,
+            'wall_timeout_seconds': (
+                orchestration.PHASE3_GRAPH_MISSION_WALL_TIMEOUT_S
+                if mission_client
+                else orchestration.PHASE3_GRAPH_WALL_TIMEOUT_S
+            ),
         },
         'missing_actions': [],
         'missing_services': [],
@@ -2509,6 +2505,7 @@ def _phase3_graph_document(
 def _write_phase3_graph_evidence(
     run_root: Path,
     *,
+    mission_auxiliary_nodes: set[str],
     orchestration: object,
     mission_client: bool,
     persistent_nodes: set[str],
@@ -2519,6 +2516,7 @@ def _write_phase3_graph_evidence(
     document = _phase3_graph_document(
         orchestration,
         mission_client=mission_client,
+        mission_auxiliary_nodes=mission_auxiliary_nodes,
         persistent_nodes=persistent_nodes,
         watch_pid=watch_pid,
     )
@@ -2540,6 +2538,49 @@ def _write_phase3_graph_evidence(
     )
 
 
+def _rewrite_phase3_graph_fixture(
+    run_root: Path,
+    orchestration: object,
+    graph: dict,
+    *,
+    mission_client: bool,
+    projections: tuple[str, ...] = (),
+) -> None:
+    """Rewrite a graph document and selected exact text projections for tamper tests."""
+    prefix = 'mission-' if mission_client else ''
+    (run_root / f'{prefix}graph.json').write_bytes(orchestration._phase3_graph_json_bytes(graph))
+    for projection in projections:
+        if projection == 'nodes':
+            payload = ''.join(f'{name}\n' for name in graph['observed']['node_names'])
+        else:
+            payload = orchestration._phase3_graph_text(graph['observed'][projection])
+        (run_root / f'{prefix}{projection}.txt').write_text(payload, encoding='utf-8')
+
+
+def _add_phase3_graph_node(
+    graph: dict,
+    fully_qualified_name: str,
+    *,
+    hidden: bool = False,
+) -> None:
+    """Add one internally reconciled node to a graph tamper document."""
+    namespace, name = fully_qualified_name.rsplit('/', 1)
+    graph['observed']['node_identities'].append(
+        {
+            'fully_qualified_name': fully_qualified_name,
+            'hidden': hidden,
+            'is_probe_participant': False,
+            'name': name,
+            'namespace': namespace,
+        }
+    )
+    graph['observed']['node_identities'].sort(key=lambda item: (item['name'], item['namespace']))
+    if not hidden:
+        graph['observed']['node_names'].append(fully_qualified_name)
+        graph['observed']['node_names'].sort()
+    graph['node_name_counts'][fully_qualified_name] = 1
+
+
 def _write_phase3_graph_prerequisites(
     repository: Path,
     run_root: Path,
@@ -2556,6 +2597,7 @@ def _write_phase3_graph_prerequisites(
     persistent_nodes = {
         f'/robotest/{name}' for name in runtime_gate_source.CANDIDATE_REQUIRED_NODES
     }
+    mission_auxiliary_nodes = {'/robotest/lifecycle_sampler'} if plan['scenario_id'] == 4 else set()
     ros_domain_id = plan['ros_domain_id']
     pre_watch_pid = 40_000 + ros_domain_id
     mission_watch_pid = 41_000 + ros_domain_id
@@ -2574,23 +2616,23 @@ def _write_phase3_graph_prerequisites(
     if plan['scenario_id'] == 4:
         role_pids['lifecycle_sampler'] = 90_000 + ros_domain_id
     timelines = {
-        'domain_preflight': (100_000, 200_000),
-        'partition_preflight': (300_000, 400_000),
-        'full_stack': (500_000, 17_000_000),
-        'startup_gate': (600_000, 700_000),
-        'lifecycle_gate': (800_000, 900_000),
-        'metrics_collector': (1_000_000, 15_000_000),
-        'scenario_controller': (1_100_000, 10_000_000),
-        'goal_observer': (1_200_000, 2_500_000),
-        'runtime_gate': (1_300_000, 1_400_000),
-        'graph_gate': (1_500_000, 1_600_000),
-        'mission_runner': (2_000_000, 9_000_000),
-        'lifecycle_sampler': (2_600_000, 16_000_000),
-        'mission_graph_gate': (3_000_000, 3_100_000),
-        'contact_drain': (11_000_000, 12_000_000),
-        'contact_stream_final_gate': (13_000_000, 14_000_000),
-        'domain_cleanup': (18_000_000, 18_500_000),
-        'partition_cleanup': (19_000_000, 19_500_000),
+        'domain_preflight': (100_000_000, 200_000_000),
+        'partition_preflight': (300_000_000, 400_000_000),
+        'full_stack': (500_000_000, 33_000_000_000),
+        'startup_gate': (600_000_000, 700_000_000),
+        'lifecycle_gate': (800_000_000, 900_000_000),
+        'metrics_collector': (1_000_000_000, 31_000_000_000),
+        'scenario_controller': (1_100_000_000, 26_000_000_000),
+        'goal_observer': (1_200_000_000, 8_500_000_000),
+        'runtime_gate': (1_300_000_000, 1_400_000_000),
+        'graph_gate': (1_500_000_000, 7_000_000_000),
+        'mission_runner': (8_000_000_000, 25_000_000_000),
+        'lifecycle_sampler': (8_600_000_000, 32_000_000_000),
+        'mission_graph_gate': (9_000_000_000, 14_500_000_000),
+        'contact_drain': (27_000_000_000, 28_000_000_000),
+        'contact_stream_final_gate': (29_000_000_000, 30_000_000_000),
+        'domain_cleanup': (34_000_000_000, 34_500_000_000),
+        'partition_cleanup': (35_000_000_000, 35_500_000_000),
     }
     process_stubs = {role: {'pid': pid} for role, pid in role_pids.items()}
     contracts = release_module._phase3_process_contracts(
@@ -2622,6 +2664,7 @@ def _write_phase3_graph_prerequisites(
         )
     pre_binding = _write_phase3_graph_evidence(
         run_root,
+        mission_auxiliary_nodes=mission_auxiliary_nodes,
         orchestration=orchestration,
         mission_client=False,
         persistent_nodes=persistent_nodes,
@@ -2629,6 +2672,7 @@ def _write_phase3_graph_prerequisites(
     )
     mission_binding = _write_phase3_graph_evidence(
         run_root,
+        mission_auxiliary_nodes=mission_auxiliary_nodes,
         orchestration=orchestration,
         mission_client=True,
         persistent_nodes=persistent_nodes,
@@ -5613,6 +5657,8 @@ def test_release_evidence_rejects_phase3_manifest_missing_graph_projection(
         ('full_stack', 'timeout'),
         ('mission_runner', 'command'),
         ('mission_runner', 'timeout'),
+        ('mission_graph_gate', 'internal_timeout'),
+        ('mission_graph_gate', 'outer_timeout'),
         ('runtime_gate', 'command'),
     ],
 )
@@ -5630,6 +5676,13 @@ def test_release_evidence_rejects_rebound_phase3_process_contract_forgery(
         command = list(process['command'])
         command[0] = 'forged-executable'
         _rewrite_process_command(process, command)
+    elif case == 'internal_timeout':
+        wall_timeout_index = process['command'].index('--wall-timeout') + 1
+        process['command'][wall_timeout_index] = '90'
+        process['wrapped_command'][4 + wall_timeout_index] = '90'
+    elif case == 'outer_timeout':
+        process['wall_timeout_s'] = 100.0
+        process['wrapped_command'][3] = '100.000s'
     else:
         process['wall_timeout_s'] += 1.0
         process['wrapped_command'][3] = f'{process["wall_timeout_s"]:.3f}s'
@@ -5775,11 +5828,11 @@ def test_release_evidence_rejects_rebound_phase3_process_timeline_forgery(
     if case == 'mission_before_graph':
         process_path = run_root / 'processes/mission_runner.process.json'
         process = json.loads(process_path.read_text(encoding='utf-8'))
-        process['started_steady_ns'] = 1_550_000
+        process['started_steady_ns'] = 6_500_000_000
     else:
         process_path = run_root / 'processes/full_stack.process.json'
         process = json.loads(process_path.read_text(encoding='utf-8'))
-        process['finished_steady_ns'] = 13_500_000
+        process['finished_steady_ns'] = 28_500_000_000
     _canonical_file(process_path, process)
     _rebind_phase3_prerequisites(repository, run_root)
 
@@ -6159,7 +6212,7 @@ def test_release_evidence_rejects_rebound_phase3_candidate_node_snapshot_forgery
     _canonical_file(gate_path, gate, sidecar=True)
     _rebind_phase3_smoke_runtime_gate(repository, candidate_root, run_root)
 
-    with pytest.raises(EvidenceError, match='node snapshot differs from the validated graph'):
+    with pytest.raises(EvidenceError, match='runtime-gate/graph node replay failed'):
         _validate_release_fixture(fixture)
 
 
@@ -6343,6 +6396,193 @@ def test_release_evidence_rejects_rebound_phase3_graph_text_tamper(tmp_path: Pat
     _rebind_phase3_prerequisites(repository, run_root)
 
     with pytest.raises(EvidenceError, match='does not match the graph JSON projection'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ('prefix', 'field', 'value'),
+    [
+        ('', 'elapsed_wall_seconds', 4.999),
+        ('mission-', 'attempt_count', 1),
+    ],
+)
+def test_release_evidence_rejects_rebound_phase3_graph_quiet_window_forgery(
+    tmp_path: Path,
+    prefix: str,
+    field: str,
+    value: int | float,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 quiet-window graph forgery fixture',
+    )
+    graph_path = run_root / f'{prefix}graph.json'
+    graph = json.loads(graph_path.read_text(encoding='utf-8'))
+    graph[field] = value
+    _rewrite_phase3_graph_fixture(
+        run_root,
+        orchestration,
+        graph,
+        mission_client=bool(prefix),
+    )
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='graph artifact replay failed'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ('projection', 'name', 'types'),
+    [
+        ('topics', '/robotest/forged_mission_topic', ['std_msgs/msg/String']),
+        (
+            'actions',
+            '/robotest/forged_mission_action',
+            ['nav2_msgs/action/NavigateToPose'],
+        ),
+    ],
+)
+def test_release_evidence_rejects_rebound_phase3_mission_graph_growth(
+    tmp_path: Path,
+    projection: str,
+    name: str,
+    types: list[str],
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 mission graph growth forgery fixture',
+    )
+    graph_path = run_root / 'mission-graph.json'
+    graph = json.loads(graph_path.read_text(encoding='utf-8'))
+    graph['observed'][projection][name] = types
+    _rewrite_phase3_graph_fixture(
+        run_root,
+        orchestration,
+        graph,
+        mission_client=True,
+        projections=(projection,),
+    )
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='graph pair replay failed'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        'unauthorized_node',
+        'unauthorized_service',
+        'wrong_transition_service_type',
+        'transition_prefix_confusion',
+    ],
+)
+def test_release_evidence_rejects_rebound_phase3_graph_transition_forgery(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 graph transition forgery fixture',
+    )
+    graph_path = run_root / 'mission-graph.json'
+    graph = json.loads(graph_path.read_text(encoding='utf-8'))
+    projections: tuple[str, ...]
+    if case == 'unauthorized_node':
+        _add_phase3_graph_node(graph, '/robotest/mission_runner_helper')
+        projections = ('nodes',)
+    elif case == 'unauthorized_service':
+        graph['observed']['services']['/robotest/unrelated/get_parameters'] = [
+            'rcl_interfaces/srv/GetParameters'
+        ]
+        projections = ('services',)
+    elif case == 'wrong_transition_service_type':
+        graph['observed']['services']['/robotest/mission_runner/get_parameters'] = [
+            'rcl_interfaces/srv/SetParameters'
+        ]
+        projections = ('services',)
+    else:
+        graph['observed']['services']['/robotest/mission_runner_helper/get_parameters'] = [
+            'rcl_interfaces/srv/GetParameters'
+        ]
+        projections = ('services',)
+    _rewrite_phase3_graph_fixture(
+        run_root,
+        orchestration,
+        graph,
+        mission_client=True,
+        projections=projections,
+    )
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='graph pair replay failed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase3_mission_only_hidden_node(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 hidden-node graph forgery fixture',
+    )
+    graph_path = run_root / 'mission-graph.json'
+    graph = json.loads(graph_path.read_text(encoding='utf-8'))
+    _add_phase3_graph_node(
+        graph,
+        '/robotest/_mission_only_hidden_node',
+        hidden=True,
+    )
+    _rewrite_phase3_graph_fixture(
+        run_root,
+        orchestration,
+        graph,
+        mission_client=True,
+    )
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='graph pair replay failed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase3_graph_duration_contradiction(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 graph duration forgery fixture',
+    )
+    process_path = run_root / 'processes/graph_gate.process.json'
+    process = json.loads(process_path.read_text(encoding='utf-8'))
+    process['finished_steady_ns'] = process['started_steady_ns'] + int(
+        (orchestration.PHASE3_GRAPH_QUIET_WINDOW_S - 0.25) * 1_000_000_000
+    )
+    _canonical_file(process_path, process)
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(
+        EvidenceError, match='graph elapsed time exceeds its owned process duration'
+    ):
         _validate_release_fixture(fixture)
 
 

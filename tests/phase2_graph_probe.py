@@ -15,6 +15,7 @@ import math
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -40,9 +41,12 @@ PROBE_NODE_NAME = 'phase2_graph_probe'
 PROBE_NAMESPACE = '/robotest/evidence'
 SCHEMA_VERSION = 2
 SPIN_QUANTUM_S = 0.05
+GRAPH_QUIET_WINDOW_S = 5.0
+GRAPH_QUIET_MIN_OBSERVATIONS = 2
 MAXIMUM_GRAPH_NAMES = 4096
 MAXIMUM_TYPES_PER_NAME = 16
 MAXIMUM_GRAPH_NODES = 1024
+MAXIMUM_PROC_STAT_BYTES = 4096
 ACTION_SEND_GOAL_SERVICE_SUFFIX = '/_action/send_goal'
 ACTION_SEND_GOAL_TYPE_SUFFIX = '_SendGoal'
 
@@ -182,15 +186,58 @@ def atomic_write_text(path: Path, content: str) -> None:
         pending_path.unlink(missing_ok=True)
 
 
-def watched_process_alive(pid: int) -> bool:
-    """Return whether a positive PID still identifies a live process."""
+def parse_proc_stat(content: bytes) -> tuple[str, int] | None:
+    """Return Linux process state/start ticks from one bounded proc stat record."""
+    if not content or len(content) > MAXIMUM_PROC_STAT_BYTES:
+        return None
+    try:
+        record = content.decode('ascii', errors='strict').strip()
+    except UnicodeDecodeError:
+        return None
+    command_end = record.rfind(') ')
+    if command_end <= 0:
+        return None
+    fields_start = command_end + 2
+    fields = record[fields_start:].split()
+    if len(fields) <= 19 or len(fields[0]) != 1:
+        return None
+    try:
+        start_ticks = int(fields[19], 10)
+    except ValueError:
+        return None
+    if start_ticks <= 0:
+        return None
+    return fields[0], start_ticks
+
+
+def watched_process_start_ticks(pid: int) -> int | None:
+    """Return start ticks only while a positive PID names a non-zombie process."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return False
+        return None
     except PermissionError:
-        return True
-    return True
+        pass
+    try:
+        with (Path('/proc') / str(pid) / 'stat').open('rb') as stream:
+            content = stream.read(MAXIMUM_PROC_STAT_BYTES + 1)
+    except OSError:
+        return None
+    parsed = parse_proc_stat(content)
+    if parsed is None:
+        return None
+    state, start_ticks = parsed
+    return None if state in {'X', 'Z'} else start_ticks
+
+
+def watched_process_alive(pid: int, expected_start_ticks: int | None = None) -> bool:
+    """Return whether a PID is live and still identifies the latched process."""
+    start_ticks = watched_process_start_ticks(pid)
+    return start_ticks is not None and (
+        expected_start_ticks is None or start_ticks == expected_start_ticks
+    )
 
 
 def is_hidden_graph_name(name: str) -> bool:
@@ -414,6 +461,99 @@ def graph_text(snapshot: dict[str, list[str]]) -> str:
     return ''.join(f'{name} [{", ".join(types)}]\n' for name, types in sorted(snapshot.items()))
 
 
+def canonical_observation_state(result: dict[str, Any]) -> bytes:
+    """Return collision-free canonical bytes for all per-attempt graph evidence."""
+    state = {
+        'action_ownership_mismatches': result['action_ownership_mismatches'],
+        'duplicate_node_names': result['duplicate_node_names'],
+        'missing_actions': result['missing_actions'],
+        'missing_services': result['missing_services'],
+        'missing_topics': result['missing_topics'],
+        'node_name_counts': result['node_name_counts'],
+        'observed': result['observed'],
+        'query_errors': result['query_errors'],
+        'results': result['results'],
+        'type_mismatches': result['type_mismatches'],
+    }
+    return json.dumps(
+        state,
+        allow_nan=False,
+        separators=(',', ':'),
+        sort_keys=True,
+    ).encode('utf-8')
+
+
+def advance_quiet_window(
+    candidate_state: bytes | None,
+    observed_at: float,
+    quiet_state: bytes | None,
+    quiet_started: float | None,
+    quiet_observations: int,
+) -> tuple[bytes | None, float | None, int, bool]:
+    """Advance or reset one bounded unchanged-observation window."""
+    if candidate_state is None:
+        return None, None, 0, False
+    if quiet_state != candidate_state or quiet_started is None:
+        return candidate_state, observed_at, 1, False
+    observations = quiet_observations + 1
+    ready = (
+        observations >= GRAPH_QUIET_MIN_OBSERVATIONS
+        and observed_at - quiet_started >= GRAPH_QUIET_WINDOW_S
+    )
+    return quiet_state, quiet_started, observations, ready
+
+
+def _record_graph_deadline_failure(
+    result: dict[str, Any],
+    wall_timeout: float,
+    valid_candidate_seen: bool,
+) -> None:
+    """Record the most specific fail-closed graph-deadline outcome."""
+    if result['duplicate_node_names']:
+        result['failure_kind'] = 'duplicate_node_names'
+        result['failure'] = 'duplicate node names remained at the graph deadline: ' + ', '.join(
+            result['duplicate_node_names']
+        )
+    elif valid_candidate_seen:
+        result['failure_kind'] = 'graph_not_stable'
+        result['failure'] = (
+            'graph contracts became valid but the complete observation did not remain '
+            f'unchanged for {GRAPH_QUIET_WINDOW_S:.3f} monotonic seconds within '
+            f'{wall_timeout:.3f} monotonic seconds'
+        )
+    else:
+        result['failure_kind'] = 'wall_timeout'
+        result['failure'] = (
+            f'graph contracts did not converge within {wall_timeout:.3f} monotonic seconds'
+        )
+
+
+def graph_authority_failed(
+    result: dict[str, Any],
+    *,
+    watch_pid: int | None,
+    watch_alive: bool,
+    ros_context_ok: bool,
+    observed_at: float,
+    deadline: float,
+    wall_timeout: float,
+    valid_candidate_seen: bool,
+) -> bool:
+    """Apply watch, ROS-context, and deadline precedence before graph acceptance."""
+    if watch_pid is not None and not watch_alive:
+        result['failure_kind'] = 'watch_pid_exited'
+        result['failure'] = f'watched process {watch_pid} exited before graph readiness'
+        return True
+    if not ros_context_ok:
+        result['failure_kind'] = 'rclpy_shutdown'
+        result['failure'] = 'rclpy context shut down before graph readiness'
+        return True
+    if observed_at >= deadline:
+        _record_graph_deadline_failure(result, wall_timeout, valid_candidate_seen)
+        return True
+    return False
+
+
 def initial_result(
     topic_contracts: dict[str, str],
     service_contracts: dict[str, str],
@@ -492,15 +632,30 @@ def probe_graph(
     result['participant'] = probe.get_fully_qualified_name()
     started = time.monotonic()
     deadline = started + wall_timeout
+    watch_start_ticks = watched_process_start_ticks(watch_pid) if watch_pid is not None else None
+
+    def watch_alive() -> bool:
+        return watch_pid is None or (
+            watch_start_ticks is not None and watched_process_alive(watch_pid, watch_start_ticks)
+        )
+
+    quiet_state: bytes | None = None
+    quiet_started: float | None = None
+    quiet_observations = 0
+    valid_candidate_seen = False
 
     while True:
-        if watch_pid is not None and not watched_process_alive(watch_pid):
-            result['failure_kind'] = 'watch_pid_exited'
-            result['failure'] = f'watched process {watch_pid} exited before graph readiness'
-            break
-        if not rclpy.ok():
-            result['failure_kind'] = 'rclpy_shutdown'
-            result['failure'] = 'rclpy context shut down before graph readiness'
+        observed_at = time.monotonic()
+        if graph_authority_failed(
+            result,
+            watch_pid=watch_pid,
+            watch_alive=watch_alive(),
+            ros_context_ok=rclpy.ok(),
+            observed_at=observed_at,
+            deadline=deadline,
+            wall_timeout=wall_timeout,
+            valid_candidate_seen=valid_candidate_seen,
+        ):
             break
 
         topics = normalize_snapshot(probe.get_topic_names_and_types(no_demangle=False))
@@ -564,35 +719,74 @@ def probe_graph(
         }
         result['action_ownership_mismatches'] = ownership_mismatches
         result['query_errors'] = query_errors
-        if (
-            not missing_topics
-            and not missing_services
-            and not missing_actions
-            and not topic_mismatches
-            and not service_mismatches
-            and not action_mismatches
-            and not ownership_mismatches
-            and not duplicate_node_names
-            and not query_errors
+        candidate_valid = not (
+            missing_topics
+            or missing_services
+            or missing_actions
+            or topic_mismatches
+            or service_mismatches
+            or action_mismatches
+            or ownership_mismatches
+            or duplicate_node_names
+            or query_errors
+        )
+        observed_at = time.monotonic()
+        if graph_authority_failed(
+            result,
+            watch_pid=watch_pid,
+            watch_alive=watch_alive(),
+            ros_context_ok=rclpy.ok(),
+            observed_at=observed_at,
+            deadline=deadline,
+            wall_timeout=wall_timeout,
+            valid_candidate_seen=valid_candidate_seen or candidate_valid,
         ):
+            break
+
+        candidate_state = canonical_observation_state(result) if candidate_valid else None
+        if candidate_valid:
+            valid_candidate_seen = True
+        quiet_state, quiet_started, quiet_observations, quiet_ready = advance_quiet_window(
+            candidate_state,
+            observed_at,
+            quiet_state,
+            quiet_started,
+            quiet_observations,
+        )
+        if quiet_ready:
+            observed_at = time.monotonic()
+            if graph_authority_failed(
+                result,
+                watch_pid=watch_pid,
+                watch_alive=watch_alive(),
+                ros_context_ok=rclpy.ok(),
+                observed_at=observed_at,
+                deadline=deadline,
+                wall_timeout=wall_timeout,
+                valid_candidate_seen=True,
+            ):
+                break
             result['verdict'] = 'PASS'
             break
 
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.0:
-            if result['duplicate_node_names']:
-                result['failure_kind'] = 'duplicate_node_names'
-                result['failure'] = (
-                    'duplicate node names remained at the graph deadline: '
-                    + ', '.join(result['duplicate_node_names'])
-                )
-            else:
-                result['failure_kind'] = 'wall_timeout'
-                result['failure'] = (
-                    f'graph contracts did not converge within {wall_timeout:.3f} monotonic seconds'
-                )
+        observed_at = time.monotonic()
+        if graph_authority_failed(
+            result,
+            watch_pid=watch_pid,
+            watch_alive=watch_alive(),
+            ros_context_ok=rclpy.ok(),
+            observed_at=observed_at,
+            deadline=deadline,
+            wall_timeout=wall_timeout,
+            valid_candidate_seen=valid_candidate_seen,
+        ):
             break
-        executor.spin_once(timeout_sec=min(SPIN_QUANTUM_S, remaining))
+        remaining = deadline - observed_at
+        spin_timeout = min(SPIN_QUANTUM_S, remaining)
+        if quiet_started is not None:
+            quiet_remaining = quiet_started + GRAPH_QUIET_WINDOW_S - observed_at
+            spin_timeout = min(spin_timeout, max(0.0, quiet_remaining))
+        executor.spin_once(timeout_sec=spin_timeout)
 
     result['elapsed_wall_seconds'] = round(time.monotonic() - started, 9)
     return result
@@ -675,6 +869,44 @@ def run_live_probe(
 
 def run_self_test() -> int:
     """Exercise pure parsing, exact matching, bounds, and serialization."""
+    proc_fields = ['S', *(['0'] * 18), '12345']
+    assert parse_proc_stat(
+        f'321 (worker ) with spaces) {" ".join(proc_fields)}\n'.encode('ascii')
+    ) == ('S', 12345)
+    for malformed_stat in (
+        b'',
+        b'321 no-command-boundary S 0 0 0',
+        b'321 (worker) SS 0 0 0',
+        b'321 (worker) S 0 0 0',
+        b'321 (worker) S ' + (b'0 ' * 18) + b'not-an-integer',
+        b'x' * (MAXIMUM_PROC_STAT_BYTES + 1),
+    ):
+        assert parse_proc_stat(malformed_stat) is None
+    current_start_ticks = watched_process_start_ticks(os.getpid())
+    assert current_start_ticks is not None
+    assert watched_process_alive(os.getpid(), current_start_ticks)
+    assert not watched_process_alive(os.getpid(), current_start_ticks + 1)
+    assert not watched_process_alive(2**31 - 1)
+
+    child = subprocess.Popen(['/bin/true'])
+    child_pid = child.pid
+    try:
+        zombie_deadline = time.monotonic() + 1.0
+        while time.monotonic() < zombie_deadline:
+            try:
+                content = (Path('/proc') / str(child_pid) / 'stat').read_bytes()
+            except FileNotFoundError:
+                content = b''
+            parsed = parse_proc_stat(content)
+            if parsed is not None and parsed[0] == 'Z':
+                break
+            time.sleep(0.005)
+        else:
+            raise AssertionError('unreaped self-test child did not become a zombie')
+        assert not watched_process_alive(child_pid)
+    finally:
+        child.wait(timeout=1.0)
+
     assert parse_contract('/robotest/scan=sensor_msgs/msg/LaserScan', 'msg') == (
         '/robotest/scan',
         'sensor_msgs/msg/LaserScan',
@@ -790,6 +1022,114 @@ def run_self_test() -> int:
         pass
     else:
         raise AssertionError('strict JSON serializer accepted NaN')
+
+    quiet_result = initial_result({}, {}, {}, {}, {}, 90.0, None)
+    baseline_state = canonical_observation_state(quiet_result)
+    reordered_result = dict(reversed(list(quiet_result.items())))
+    assert canonical_observation_state(reordered_result) == baseline_state
+    quiet_state, quiet_started, quiet_observations, quiet_ready = advance_quiet_window(
+        baseline_state, 100.0, None, None, 0
+    )
+    assert quiet_started == 100.0 and quiet_observations == 1 and not quiet_ready
+    quiet_state, quiet_started, quiet_observations, quiet_ready = advance_quiet_window(
+        baseline_state,
+        104.999,
+        quiet_state,
+        quiet_started,
+        quiet_observations,
+    )
+    assert not quiet_ready
+    quiet_state, quiet_started, quiet_observations, quiet_ready = advance_quiet_window(
+        baseline_state,
+        105.0,
+        quiet_state,
+        quiet_started,
+        quiet_observations,
+    )
+    assert quiet_ready
+
+    mutated_result = json.loads(serialize_result(quiet_result))
+    mutated_result['observed']['topics']['/changed'] = ['std_msgs/msg/String']
+    mutated_state = canonical_observation_state(mutated_result)
+    assert mutated_state != baseline_state
+    quiet_state, quiet_started, quiet_observations, quiet_ready = advance_quiet_window(
+        mutated_state,
+        105.0,
+        baseline_state,
+        100.0,
+        2,
+    )
+    assert (
+        quiet_state == mutated_state
+        and quiet_started == 105.0
+        and quiet_observations == 1
+        and not quiet_ready
+    )
+    quiet_state, quiet_started, quiet_observations, quiet_ready = advance_quiet_window(
+        None,
+        109.999,
+        quiet_state,
+        quiet_started,
+        quiet_observations,
+    )
+    assert quiet_state is None and quiet_started is None and quiet_observations == 0
+    assert not quiet_ready
+    quiet_state, quiet_started, quiet_observations, quiet_ready = advance_quiet_window(
+        baseline_state,
+        110.0,
+        quiet_state,
+        quiet_started,
+        quiet_observations,
+    )
+    assert quiet_started == 110.0 and quiet_observations == 1 and not quiet_ready
+
+    authority_result = initial_result({}, {}, {}, {}, {}, 90.0, None)
+    assert not graph_authority_failed(
+        authority_result,
+        watch_pid=None,
+        watch_alive=False,
+        ros_context_ok=True,
+        observed_at=9.999,
+        deadline=10.0,
+        wall_timeout=90.0,
+        valid_candidate_seen=True,
+    )
+    assert graph_authority_failed(
+        authority_result,
+        watch_pid=None,
+        watch_alive=False,
+        ros_context_ok=True,
+        observed_at=10.0,
+        deadline=10.0,
+        wall_timeout=90.0,
+        valid_candidate_seen=True,
+    )
+    assert authority_result['verdict'] == 'FAIL'
+    assert authority_result['failure_kind'] == 'graph_not_stable'
+    watch_result = initial_result({}, {}, {}, {}, {}, 90.0, 123)
+    assert graph_authority_failed(
+        watch_result,
+        watch_pid=123,
+        watch_alive=False,
+        ros_context_ok=False,
+        observed_at=10.0,
+        deadline=10.0,
+        wall_timeout=90.0,
+        valid_candidate_seen=True,
+    )
+    assert watch_result['failure_kind'] == 'watch_pid_exited'
+    shutdown_result = initial_result({}, {}, {}, {}, {}, 90.0, None)
+    assert graph_authority_failed(
+        shutdown_result,
+        watch_pid=None,
+        watch_alive=True,
+        ros_context_ok=False,
+        observed_at=9.999,
+        deadline=10.0,
+        wall_timeout=90.0,
+        valid_candidate_seen=True,
+    )
+    assert shutdown_result['failure_kind'] == 'rclpy_shutdown'
     print('phase2_graph_probe self-test PASS')
     return EXIT_PASS
 
@@ -863,7 +1203,7 @@ def run_live_smoke_test() -> int:
             {action_name: 'nav2_msgs/action/FollowWaypoints'},
             {action_name: [client.get_fully_qualified_name()]},
             {action_name: [server.get_fully_qualified_name()]},
-            5.0,
+            GRAPH_QUIET_WINDOW_S + 5.0,
             None,
         )
         assert publisher is not None and service is not None

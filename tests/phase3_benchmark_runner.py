@@ -57,6 +57,9 @@ from phase3_orchestration import (
     make_orchestrator_evidence,
     make_trial_context,
     phase3_graph_contracts,
+    PHASE3_GRAPH_LIFECYCLE_SAMPLER_NODE,
+    PHASE3_GRAPH_MISSION_WALL_TIMEOUT_S,
+    PHASE3_GRAPH_WALL_TIMEOUT_S,
     positive_control_qualified_snapshot_stamp,
     PRODUCER,
     reconcile_contact_gate_reobservation,
@@ -72,6 +75,7 @@ from phase3_orchestration import (
     validate_contact_progress,
     validate_phase3_graph_artifacts,
     validate_phase3_graph_pair,
+    validate_phase3_runtime_graph_node_join,
     validate_positive_runtime_gate_artifacts,
     verify_component_manifest,
     verify_json_sidecar,
@@ -1041,6 +1045,9 @@ def _graph_probe_command(
     mission_client: bool,
 ) -> list[str]:
     contracts = phase3_graph_contracts(mission_client)
+    graph_wall_timeout_s = (
+        PHASE3_GRAPH_MISSION_WALL_TIMEOUT_S if mission_client else PHASE3_GRAPH_WALL_TIMEOUT_S
+    )
     prefix = 'mission-' if mission_client else ''
     command = ['python3', str(workspace / 'tests/phase2_graph_probe.py')]
     for name, type_name in contracts['topics'].items():
@@ -1070,7 +1077,7 @@ def _graph_probe_command(
             '--watch-pid',
             str(watch_pid),
             '--wall-timeout',
-            '90',
+            f'{graph_wall_timeout_s:g}',
         ]
     )
     return command
@@ -1839,6 +1846,24 @@ class BenchmarkRunner:
                         'watch_pid': launch.pid,
                     },
                 ) from exc
+            try:
+                runtime_gate_path = run_dir / 'runtime-gate.json'
+                runtime_gate_document = load_canonical_json(runtime_gate_path)
+                verify_json_sidecar(runtime_gate_path)
+                validate_phase3_runtime_graph_node_join(
+                    runtime_gate_document,
+                    graph_binding,
+                )
+            except EvidenceError as exc:
+                raise StageFailure(
+                    'graph_gate',
+                    'inconsistent_runtime_graph',
+                    str(exc),
+                    evidence={
+                        'graph_path': str(run_dir / 'graph.json'),
+                        'runtime_gate_path': str(run_dir / 'runtime-gate.json'),
+                    },
+                ) from exc
             atomic_write_bytes(observer_arm, b'arm-next-new-goal\n', 256)
             _wait_for_file(
                 observer_armed,
@@ -1962,7 +1987,13 @@ class BenchmarkRunner:
                     },
                 ) from exc
             try:
-                validate_phase3_graph_pair(graph_binding, mission_graph_binding)
+                validate_phase3_graph_pair(
+                    graph_binding,
+                    mission_graph_binding,
+                    expected_mission_auxiliary_nodes=(
+                        [PHASE3_GRAPH_LIFECYCLE_SAMPLER_NODE] if plan['scenario_id'] == 4 else []
+                    ),
+                )
             except EvidenceError as exc:
                 raise StageFailure(
                     'mission_graph_gate',

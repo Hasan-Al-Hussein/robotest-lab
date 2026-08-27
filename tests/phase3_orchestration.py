@@ -3,7 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: I001
 
-"""Pure, bounded evidence utilities for the Phase 3 benchmark orchestrator.
+"""
+Pure, bounded evidence utilities for the Phase 3 benchmark orchestrator.
 
 This module deliberately has no ROS imports.  The shell verifier and benchmark
 runner use it for immutable suite planning, provenance manifests, trial
@@ -50,15 +51,45 @@ STRING_MAX_BYTES = 4096
 PHASE3_GRAPH_SCHEMA_VERSION = 2
 PHASE3_GRAPH_ARTIFACT_MAX_BYTES = 8 * 1024 * 1024
 PHASE3_GRAPH_WALL_TIMEOUT_S = 90.0
+PHASE3_GRAPH_MISSION_WALL_TIMEOUT_S = 20.0
 PHASE3_GRAPH_MAXIMUM_GRAPH_NAMES = 4096
 PHASE3_GRAPH_MAXIMUM_GRAPH_NODES = 1024
 PHASE3_GRAPH_MAXIMUM_TYPES_PER_NAME = 16
 PHASE3_GRAPH_MAXIMUM_ATTEMPTS = 2048
+PHASE3_GRAPH_QUIET_WINDOW_S = 5.0
+PHASE3_GRAPH_MINIMUM_OBSERVATIONS = 2
 PHASE3_GRAPH_PARTICIPANT = '/robotest/evidence/phase2_graph_probe'
 PHASE3_GRAPH_ACTION_NAME = '/robotest/follow_waypoints'
 PHASE3_GRAPH_ACTION_TYPE = 'nav2_msgs/action/FollowWaypoints'
 PHASE3_GRAPH_ACTION_SERVER_NODE = '/robotest/waypoint_follower'
+PHASE3_GRAPH_GOAL_OBSERVER_NODE = '/robotest/phase3_goal_observer'
+PHASE3_GRAPH_LIFECYCLE_SAMPLER_NODE = '/robotest/lifecycle_sampler'
 PHASE3_GRAPH_MISSION_CLIENT_NODE = '/robotest/mission_runner'
+PHASE3_GRAPH_RUNTIME_GATE_NODE = '/robotest/evidence/phase3_runtime_gate'
+PHASE3_GRAPH_STANDARD_RCLPY_SERVICES = {
+    'describe_parameters': 'rcl_interfaces/srv/DescribeParameters',
+    'get_parameter_types': 'rcl_interfaces/srv/GetParameterTypes',
+    'get_parameters': 'rcl_interfaces/srv/GetParameters',
+    'get_type_description': 'type_description_interfaces/srv/GetTypeDescription',
+    'list_parameters': 'rcl_interfaces/srv/ListParameters',
+    'set_parameters': 'rcl_interfaces/srv/SetParameters',
+    'set_parameters_atomically': 'rcl_interfaces/srv/SetParametersAtomically',
+}
+PHASE3_GRAPH_BINDING_KEYS = {
+    'actions_text_sha256',
+    'expected_action_client_nodes',
+    'graph_json_sha256',
+    'nodes_text_sha256',
+    'observed_actions',
+    'observed_all_node_names',
+    'observed_node_names',
+    'observed_services',
+    'observed_topics',
+    'probe_schema_version',
+    'services_text_sha256',
+    'topics_text_sha256',
+    'watch_pid',
+}
 PHASE3_GRAPH_TOPIC_CONTRACTS = {
     '/clock': 'rosgraph_msgs/msg/Clock',
     '/tf': 'tf2_msgs/msg/TFMessage',
@@ -849,6 +880,15 @@ def _phase3_graph_name(value: Any, label: str) -> str:
     return name
 
 
+def _validated_phase3_graph_node_names(value: Any, label: str) -> list[str]:
+    if not isinstance(value, list) or len(value) > PHASE3_GRAPH_MAXIMUM_GRAPH_NODES:
+        raise EvidenceError(f'{label} is not a bounded node-name list')
+    names = [_phase3_graph_name(item, f'{label} node') for item in value]
+    if names != sorted(set(names)):
+        raise EvidenceError(f'{label} must be sorted and unique')
+    return names
+
+
 def _phase3_graph_type(value: Any, expected_kind: str, label: str) -> str:
     type_name = require_bounded_string(value, label)
     match = PHASE3_GRAPH_TYPE_PATTERN.fullmatch(type_name)
@@ -880,6 +920,22 @@ def _validated_phase3_graph_snapshot(
             raise EvidenceError(f'{label}.{name} type set is not sorted and unique')
         validated[name] = types
     return dict(sorted(validated.items()))
+
+
+def _phase3_standard_rclpy_services(node_name: str) -> dict[str, list[str]]:
+    node = _phase3_graph_name(node_name, 'Phase 3 rclpy service node')
+    return {
+        f'{node}/{suffix}': [type_name]
+        for suffix, type_name in PHASE3_GRAPH_STANDARD_RCLPY_SERVICES.items()
+    }
+
+
+def _phase3_node_services(
+    services: Mapping[str, list[str]],
+    node_name: str,
+) -> dict[str, list[str]]:
+    prefix = f'{node_name}/'
+    return {name: types for name, types in services.items() if name.startswith(prefix)}
 
 
 def _validated_phase3_action_endpoints(value: Any, label: str) -> dict[str, dict[str, list[str]]]:
@@ -990,14 +1046,10 @@ def _validated_phase3_node_inventory(
         not isinstance(name, str) for name in duplicate_node_names
     ):
         raise EvidenceError('Phase 3 graph duplicate-node projection is invalid')
-    raw_public_names = observed.get('node_names')
-    if not isinstance(raw_public_names, list) or any(
-        not isinstance(name, str) for name in raw_public_names
-    ):
-        raise EvidenceError('Phase 3 graph public-node projection is invalid')
-    validated_public_names = [
-        _phase3_graph_name(name, 'Phase 3 graph public node') for name in raw_public_names
-    ]
+    validated_public_names = _validated_phase3_graph_node_names(
+        observed.get('node_names'),
+        'Phase 3 graph public-node projection',
+    )
     expected_public_names = sorted(
         item['fully_qualified_name']
         for item in identities
@@ -1110,6 +1162,9 @@ def validate_phase3_graph_artifacts(
 ) -> dict[str, Any]:
     """Recompute one Phase 3 graph PASS and bind all five producer artifacts."""
     contracts = phase3_graph_contracts(mission_client)
+    expected_wall_timeout = (
+        PHASE3_GRAPH_MISSION_WALL_TIMEOUT_S if mission_client else PHASE3_GRAPH_WALL_TIMEOUT_S
+    )
     watch_pid = _require_int(expected_watch_pid, 'expected graph watch PID', minimum=1)
     prefix = 'mission-' if mission_client else ''
     graph_path = run_dir / f'{prefix}graph.json'
@@ -1126,14 +1181,16 @@ def validate_phase3_graph_artifacts(
     if _require_int(graph.get('watch_pid'), 'Phase 3 graph watch_pid', minimum=1) != watch_pid:
         raise EvidenceError('Phase 3 graph watch_pid does not match its owned process')
     attempt_count = _require_int(
-        graph.get('attempt_count'), 'Phase 3 graph attempt_count', minimum=1
+        graph.get('attempt_count'),
+        'Phase 3 graph attempt_count',
+        minimum=PHASE3_GRAPH_MINIMUM_OBSERVATIONS,
     )
     elapsed = _require_number(
         graph.get('elapsed_wall_seconds'),
         'Phase 3 graph elapsed_wall_seconds',
-        minimum=0.0,
+        minimum=PHASE3_GRAPH_QUIET_WINDOW_S,
     )
-    if attempt_count > PHASE3_GRAPH_MAXIMUM_ATTEMPTS or elapsed > PHASE3_GRAPH_WALL_TIMEOUT_S:
+    if attempt_count > PHASE3_GRAPH_MAXIMUM_ATTEMPTS or elapsed > expected_wall_timeout:
         raise EvidenceError('Phase 3 graph convergence evidence is unbounded')
     limits = _require_mapping(graph.get('limits'), 'Phase 3 graph limits')
     if set(limits) != {
@@ -1165,7 +1222,7 @@ def validate_phase3_graph_artifacts(
         'maximum_graph_names': PHASE3_GRAPH_MAXIMUM_GRAPH_NAMES,
         'maximum_graph_nodes': PHASE3_GRAPH_MAXIMUM_GRAPH_NODES,
         'maximum_types_per_name': PHASE3_GRAPH_MAXIMUM_TYPES_PER_NAME,
-        'wall_timeout_seconds': PHASE3_GRAPH_WALL_TIMEOUT_S,
+        'wall_timeout_seconds': expected_wall_timeout,
     }:
         raise EvidenceError('Phase 3 graph limits differ from the frozen probe contract')
 
@@ -1192,6 +1249,7 @@ def validate_phase3_graph_artifacts(
         observed.get('action_servers'), 'Phase 3 observed action servers'
     )
     known_nodes = _validated_phase3_node_inventory(graph, observed)
+    all_node_names = sorted(known_nodes - {PHASE3_GRAPH_PARTICIPANT})
     if set(action_clients) - set(contracts['actions']):
         raise EvidenceError('Phase 3 goal-capable client projection contains an undeclared action')
     for endpoint_projection in (action_clients, action_client_participants, action_servers):
@@ -1266,6 +1324,14 @@ def validate_phase3_graph_artifacts(
             nodes_text,
             f'Phase 3 {prefix}nodes text',
         ),
+        'observed_actions': actions,
+        'observed_all_node_names': all_node_names,
+        'observed_node_names': _validated_phase3_graph_node_names(
+            observed.get('node_names'),
+            f'Phase 3 {prefix}observed node names',
+        ),
+        'observed_services': services,
+        'observed_topics': topics,
         'probe_schema_version': PHASE3_GRAPH_SCHEMA_VERSION,
         'services_text_sha256': _validate_phase3_graph_text(
             run_dir / f'{prefix}services.txt',
@@ -1282,41 +1348,43 @@ def validate_phase3_graph_artifacts(
     return binding
 
 
-def validate_phase3_graph_pair(
-    pre_mission_value: Mapping[str, Any],
-    mission_value: Mapping[str, Any],
-) -> bool:
-    """Require one coherent stationary-to-mission graph evidence transition."""
-    pre_mission = _require_mapping(pre_mission_value, 'pre-mission graph binding')
-    mission = _require_mapping(mission_value, 'mission graph binding')
-    expected_keys = {
-        'actions_text_sha256',
-        'expected_action_client_nodes',
-        'graph_json_sha256',
-        'nodes_text_sha256',
-        'probe_schema_version',
-        'services_text_sha256',
-        'topics_text_sha256',
-        'watch_pid',
-    }
-    if set(pre_mission) != expected_keys or set(mission) != expected_keys:
-        raise EvidenceError('Phase 3 graph pair binding fields are invalid')
-    if (
-        _require_int(pre_mission.get('probe_schema_version'), 'pre-mission graph schema')
-        != PHASE3_GRAPH_SCHEMA_VERSION
-        or _require_int(mission.get('probe_schema_version'), 'mission graph schema')
-        != PHASE3_GRAPH_SCHEMA_VERSION
-        or pre_mission.get('expected_action_client_nodes') != []
-        or mission.get('expected_action_client_nodes') != [PHASE3_GRAPH_MISSION_CLIENT_NODE]
-    ):
-        raise EvidenceError('Phase 3 graph pair action-client transition is invalid')
-    pre_watch_pid = _require_int(
-        pre_mission.get('watch_pid'), 'pre-mission graph watch PID', minimum=1
+def _validated_phase3_graph_binding(value: Any, label: str) -> dict[str, Any]:
+    binding = _require_mapping(value, label)
+    if set(binding) != PHASE3_GRAPH_BINDING_KEYS:
+        raise EvidenceError(f'{label} fields are invalid')
+    schema_version = _require_int(binding.get('probe_schema_version'), f'{label} schema')
+    if schema_version != PHASE3_GRAPH_SCHEMA_VERSION:
+        raise EvidenceError(f'{label} schema is invalid')
+    expected_clients = _validated_phase3_graph_node_names(
+        binding.get('expected_action_client_nodes'),
+        f'{label} expected action clients',
     )
-    mission_watch = mission.get('watch_pid')
-    mission_watch_pid = _require_int(mission_watch, 'mission graph watch PID', minimum=1)
-    if pre_watch_pid == mission_watch_pid:
-        raise EvidenceError('Phase 3 graph pair must watch distinct owned processes')
+    watch_pid = _require_int(binding.get('watch_pid'), f'{label} watch PID', minimum=1)
+    nodes = _validated_phase3_graph_node_names(
+        binding.get('observed_node_names'),
+        f'{label} observed nodes',
+    )
+    all_nodes = _validated_phase3_graph_node_names(
+        binding.get('observed_all_node_names'),
+        f'{label} observed all nodes',
+    )
+    if PHASE3_GRAPH_PARTICIPANT in all_nodes or not set(nodes).issubset(all_nodes):
+        raise EvidenceError(f'{label} public/all-node projections are inconsistent')
+    topics = _validated_phase3_graph_snapshot(
+        binding.get('observed_topics'),
+        expected_kind='msg',
+        label=f'{label} observed topics',
+    )
+    services = _validated_phase3_graph_snapshot(
+        binding.get('observed_services'),
+        expected_kind='srv',
+        label=f'{label} observed services',
+    )
+    actions = _validated_phase3_graph_snapshot(
+        binding.get('observed_actions'),
+        expected_kind='action',
+        label=f'{label} observed actions',
+    )
     sha_fields = {
         'actions_text_sha256',
         'graph_json_sha256',
@@ -1324,19 +1392,167 @@ def validate_phase3_graph_pair(
         'services_text_sha256',
         'topics_text_sha256',
     }
-    for label, binding in (('pre-mission', pre_mission), ('mission', mission)):
-        for field in sha_fields:
-            require_sha256(binding.get(field), f'{label} graph {field}')
+    hashes = {
+        field: require_sha256(
+            binding.get(field),
+            f'{label} {field}',
+        )
+        for field in sha_fields
+    }
+    projection_hashes = {
+        'actions_text_sha256': hashlib.sha256(
+            _phase3_graph_text(actions).encode('utf-8')
+        ).hexdigest(),
+        'nodes_text_sha256': hashlib.sha256(
+            ''.join(f'{name}\n' for name in nodes).encode('utf-8')
+        ).hexdigest(),
+        'services_text_sha256': hashlib.sha256(
+            _phase3_graph_text(services).encode('utf-8')
+        ).hexdigest(),
+        'topics_text_sha256': hashlib.sha256(
+            _phase3_graph_text(topics).encode('utf-8')
+        ).hexdigest(),
+    }
+    if any(hashes[field] != digest for field, digest in projection_hashes.items()):
+        raise EvidenceError(f'{label} in-memory projections are not hash-bound')
+    return {
+        **hashes,
+        'expected_action_client_nodes': expected_clients,
+        'observed_actions': actions,
+        'observed_all_node_names': all_nodes,
+        'observed_node_names': nodes,
+        'observed_services': services,
+        'observed_topics': topics,
+        'probe_schema_version': schema_version,
+        'watch_pid': watch_pid,
+    }
+
+
+def validate_phase3_runtime_graph_node_join(
+    runtime_gate_value: Mapping[str, Any],
+    graph_binding_value: Mapping[str, Any],
+) -> bool:
+    """Require the quiet pre-mission graph to contain every runtime-gate node."""
+    runtime_gate = _require_mapping(runtime_gate_value, 'Phase 3 runtime gate')
+    if (
+        runtime_gate.get('producer') != 'robotest_phase3/runtime_gate'
+        or _require_int(runtime_gate.get('schema_version'), 'Phase 3 runtime gate schema') != 1
+        or runtime_gate.get('mode') != 'candidate'
+        or runtime_gate.get('verdict') != 'PASS'
+    ):
+        raise EvidenceError('Phase 3 runtime gate envelope is invalid')
+    runtime_nodes = _validated_phase3_graph_node_names(
+        runtime_gate.get('nodes'),
+        'Phase 3 runtime-gate nodes',
+    )
+    if PHASE3_GRAPH_RUNTIME_GATE_NODE not in runtime_nodes:
+        raise EvidenceError('Phase 3 runtime-gate node is absent from its own node snapshot')
+    graph = _validated_phase3_graph_binding(
+        graph_binding_value,
+        'pre-mission graph binding',
+    )
+    if graph['expected_action_client_nodes'] != []:
+        raise EvidenceError('runtime-node join requires a pre-mission graph binding')
+    expected_graph_nodes = [
+        name for name in runtime_nodes if name != PHASE3_GRAPH_RUNTIME_GATE_NODE
+    ]
+    if graph['observed_all_node_names'] != expected_graph_nodes:
+        raise EvidenceError('pre-mission graph nodes do not match the runtime-gate node snapshot')
+    return True
+
+
+def _validated_phase3_mission_auxiliary_nodes(value: Any) -> list[str]:
+    if value is None:
+        return []
+    nodes = _validated_phase3_graph_node_names(
+        value,
+        'expected mission auxiliary nodes',
+    )
+    if nodes not in ([], [PHASE3_GRAPH_LIFECYCLE_SAMPLER_NODE]):
+        raise EvidenceError('expected mission auxiliary nodes are not an allowed exact set')
+    return nodes
+
+
+def validate_phase3_graph_pair(
+    pre_mission_value: Mapping[str, Any],
+    mission_value: Mapping[str, Any],
+    *,
+    expected_mission_auxiliary_nodes: list[str] | None = None,
+) -> bool:
+    """Require one exact stationary-to-mission graph evidence transition."""
+    pre_mission = _validated_phase3_graph_binding(
+        pre_mission_value,
+        'pre-mission graph binding',
+    )
+    mission = _validated_phase3_graph_binding(mission_value, 'mission graph binding')
+    auxiliary_nodes = _validated_phase3_mission_auxiliary_nodes(expected_mission_auxiliary_nodes)
+    if pre_mission['expected_action_client_nodes'] != [] or mission[
+        'expected_action_client_nodes'
+    ] != [PHASE3_GRAPH_MISSION_CLIENT_NODE]:
+        raise EvidenceError('Phase 3 graph pair action-client transition is invalid')
+    if pre_mission['watch_pid'] == mission['watch_pid']:
+        raise EvidenceError('Phase 3 graph pair must watch distinct owned processes')
+
     distinct_fields = {
         'graph_json_sha256',
         'nodes_text_sha256',
         'services_text_sha256',
     }
-    stable_fields = {'actions_text_sha256', 'topics_text_sha256'}
-    if any(pre_mission[field] == mission[field] for field in distinct_fields) or any(
-        pre_mission[field] != mission[field] for field in stable_fields
+    if any(pre_mission[field] == mission[field] for field in distinct_fields):
+        raise EvidenceError('pre-mission and mission graph projections are not distinct')
+    for field in ('actions_text_sha256', 'topics_text_sha256'):
+        if pre_mission[field] != mission[field]:
+            raise EvidenceError('pre-mission and mission graph stable hashes differ')
+    for field in ('observed_actions', 'observed_topics'):
+        if pre_mission[field] != mission[field]:
+            raise EvidenceError('pre-mission and mission typed graph mappings differ')
+
+    transitioned_mission_nodes = [PHASE3_GRAPH_MISSION_CLIENT_NODE, *auxiliary_nodes]
+    for field, label in (
+        ('observed_all_node_names', 'all-node'),
+        ('observed_node_names', 'public-node'),
     ):
-        raise EvidenceError('pre-mission and mission graph projections are not a coherent pair')
+        pre_nodes = pre_mission[field]
+        mission_nodes = mission[field]
+        if (
+            PHASE3_GRAPH_GOAL_OBSERVER_NODE not in pre_nodes
+            or PHASE3_GRAPH_MISSION_CLIENT_NODE in pre_nodes
+            or any(node in pre_nodes for node in auxiliary_nodes)
+            or PHASE3_GRAPH_GOAL_OBSERVER_NODE in mission_nodes
+        ):
+            raise EvidenceError(f'Phase 3 graph pair {label} roles are invalid')
+        expected_mission_nodes = sorted(
+            (set(pre_nodes) - {PHASE3_GRAPH_GOAL_OBSERVER_NODE}) | set(transitioned_mission_nodes)
+        )
+        if mission_nodes != expected_mission_nodes:
+            raise EvidenceError(f'Phase 3 graph pair {label} transition is invalid')
+
+    pre_services = pre_mission['observed_services']
+    mission_services = mission['observed_services']
+    expected_observer_services = _phase3_standard_rclpy_services(PHASE3_GRAPH_GOAL_OBSERVER_NODE)
+    if _phase3_node_services(
+        pre_services, PHASE3_GRAPH_GOAL_OBSERVER_NODE
+    ) != expected_observer_services or _phase3_node_services(
+        mission_services, PHASE3_GRAPH_GOAL_OBSERVER_NODE
+    ):
+        raise EvidenceError('Phase 3 graph pair goal-observer services are invalid')
+    for node in transitioned_mission_nodes:
+        if _phase3_node_services(pre_services, node) or _phase3_node_services(
+            mission_services, node
+        ) != _phase3_standard_rclpy_services(node):
+            raise EvidenceError('Phase 3 graph pair mission-node services are invalid')
+
+    transitioned_nodes = {PHASE3_GRAPH_GOAL_OBSERVER_NODE, *transitioned_mission_nodes}
+
+    def unchanged_services(services: Mapping[str, list[str]]) -> dict[str, list[str]]:
+        return {
+            name: types
+            for name, types in services.items()
+            if not any(name.startswith(f'{node}/') for node in transitioned_nodes)
+        }
+
+    if unchanged_services(pre_services) != unchanged_services(mission_services):
+        raise EvidenceError('Phase 3 graph pair non-transition services differ')
     return True
 
 

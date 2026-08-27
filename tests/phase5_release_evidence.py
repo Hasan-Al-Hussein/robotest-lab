@@ -1311,6 +1311,11 @@ def _phase3_graph_probe_command(
 ) -> list[str]:
     """Rebuild the frozen graph-probe argv for one campaign gate."""
     contracts = orchestration.phase3_graph_contracts(mission_client)
+    graph_wall_timeout_s = (
+        orchestration.PHASE3_GRAPH_MISSION_WALL_TIMEOUT_S
+        if mission_client
+        else orchestration.PHASE3_GRAPH_WALL_TIMEOUT_S
+    )
     prefix = 'mission-' if mission_client else ''
     command = ['python3', str(repository / 'tests/phase2_graph_probe.py')]
     for name, type_name in contracts['topics'].items():
@@ -1340,7 +1345,7 @@ def _phase3_graph_probe_command(
             '--watch-pid',
             str(watch_pid),
             '--wall-timeout',
-            '90',
+            f'{graph_wall_timeout_s:g}',
         ]
     )
     return command
@@ -2633,6 +2638,21 @@ def _validate_phase3_graph_prerequisites(
         raise EvidenceError(f'Phase 3 graph artifact replay failed: {exc}') from exc
 
     pre_graph_document = orchestration._load_phase3_graph_json(run_root / 'graph.json')
+    mission_graph_document = orchestration._load_phase3_graph_json(run_root / 'mission-graph.json')
+    for role, graph_document in (
+        ('graph_gate', pre_graph_document),
+        ('mission_graph_gate', mission_graph_document),
+    ):
+        elapsed_wall_seconds = graph_document.get('elapsed_wall_seconds')
+        process = process_records[role]
+        process_duration_seconds = (
+            process['finished_steady_ns'] - process['started_steady_ns']
+        ) / 1_000_000_000
+        _require(
+            _finite_number(elapsed_wall_seconds)
+            and 0.0 <= elapsed_wall_seconds <= process_duration_seconds,
+            f'Phase 3 {role} graph elapsed time exceeds its owned process duration',
+        )
     pre_graph_observed = _mapping(
         pre_graph_document.get('observed'),
         'Phase 3 validated pre-mission graph observations',
@@ -2663,10 +2683,10 @@ def _validate_phase3_graph_prerequisites(
         is ('/robotest/faults/load_schedule' not in pre_graph_services),
         'Phase 3 candidate runtime-gate service claims differ from the validated graph',
     )
-    _require(
-        set(initial_nodes) - {'/robotest/evidence/phase3_runtime_gate'} == pre_graph_nodes,
-        'Phase 3 candidate runtime-gate node snapshot differs from the validated graph',
-    )
+    try:
+        orchestration.validate_phase3_runtime_graph_node_join(initial_gate, pre_binding)
+    except Exception as exc:
+        raise EvidenceError(f'Phase 3 runtime-gate/graph node replay failed: {exc}') from exc
     for gate_label, gate_topics in (
         ('candidate', initial_topics),
         ('final contact-stream', final_topics),
@@ -2704,7 +2724,13 @@ def _validate_phase3_graph_prerequisites(
                 f'Phase 3 {prefix}{relative} is not bound by the prerequisite manifest',
             )
     try:
-        orchestration.validate_phase3_graph_pair(pre_binding, mission_binding)
+        orchestration.validate_phase3_graph_pair(
+            pre_binding,
+            mission_binding,
+            expected_mission_auxiliary_nodes=(
+                ['/robotest/lifecycle_sampler'] if expected_plan.get('scenario_id') == 4 else []
+            ),
+        )
     except Exception as exc:
         raise EvidenceError(f'Phase 3 graph pair replay failed: {exc}') from exc
 

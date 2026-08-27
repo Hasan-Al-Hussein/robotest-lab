@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import ast
 import copy
+import hashlib
 import importlib.util
 from itertools import pairwise
 import json
@@ -153,6 +155,7 @@ def _write_phase3_graph_fixture(
     *,
     mission_client: bool,
     watch_pid: int,
+    mission_auxiliary_nodes: tuple[str, ...] = (),
 ) -> dict:
     contracts = orchestration.phase3_graph_contracts(mission_client)
     action_name = orchestration.PHASE3_GRAPH_ACTION_NAME
@@ -167,11 +170,19 @@ def _write_phase3_graph_fixture(
         action_name: {node: [action_type] for node in sorted(participant_nodes)}
     }
     observed_servers = {action_name: {node: [action_type] for node in server_nodes}}
+    assert mission_client or not mission_auxiliary_nodes
+    phase_nodes = (
+        [*client_nodes, *mission_auxiliary_nodes]
+        if mission_client
+        else [orchestration.PHASE3_GRAPH_GOAL_OBSERVER_NODE]
+    )
     node_names = sorted(
         {
+            '/robotest/amcl',
+            '/robotest/controller_server',
             '/robotest/metrics_collector',
             '/robotest/waypoint_follower',
-            *client_nodes,
+            *phase_nodes,
         }
     )
     raw_identities = [
@@ -190,25 +201,14 @@ def _write_phase3_graph_fixture(
         }
         for name, namespace in sorted(raw_identities)
     ]
-    topics = {name: [type_name] for name, type_name in contracts['topics'].items()}
+    topics = {
+        **{name: [type_name] for name, type_name in contracts['topics'].items()},
+        '/parameter_events': ['rcl_interfaces/msg/ParameterEvent'],
+        '/robotest/bond': ['bond/msg/Status'],
+    }
     services = {name: [type_name] for name, type_name in contracts['services'].items()}
-    if mission_client:
-        services.update(
-            {
-                '/robotest/mission_runner/describe_parameters': [
-                    'rcl_interfaces/srv/DescribeParameters'
-                ],
-                '/robotest/mission_runner/get_parameter_types': [
-                    'rcl_interfaces/srv/GetParameterTypes'
-                ],
-                '/robotest/mission_runner/get_parameters': ['rcl_interfaces/srv/GetParameters'],
-                '/robotest/mission_runner/list_parameters': ['rcl_interfaces/srv/ListParameters'],
-                '/robotest/mission_runner/set_parameters': ['rcl_interfaces/srv/SetParameters'],
-                '/robotest/mission_runner/set_parameters_atomically': [
-                    'rcl_interfaces/srv/SetParametersAtomically'
-                ],
-            }
-        )
+    for node_name in node_names:
+        services.update(orchestration._phase3_standard_rclpy_services(node_name))
     actions = {name: [type_name] for name, type_name in contracts['actions'].items()}
     ownership_result = {
         'client_type_mismatches': {},
@@ -236,14 +236,18 @@ def _write_phase3_graph_fixture(
         'attempt_count': 2,
         'contracts': contracts,
         'duplicate_node_names': [],
-        'elapsed_wall_seconds': 0.25,
+        'elapsed_wall_seconds': orchestration.PHASE3_GRAPH_QUIET_WINDOW_S,
         'failure': None,
         'failure_kind': None,
         'limits': {
             'maximum_graph_names': orchestration.PHASE3_GRAPH_MAXIMUM_GRAPH_NAMES,
             'maximum_graph_nodes': orchestration.PHASE3_GRAPH_MAXIMUM_GRAPH_NODES,
             'maximum_types_per_name': orchestration.PHASE3_GRAPH_MAXIMUM_TYPES_PER_NAME,
-            'wall_timeout_seconds': orchestration.PHASE3_GRAPH_WALL_TIMEOUT_S,
+            'wall_timeout_seconds': (
+                orchestration.PHASE3_GRAPH_MISSION_WALL_TIMEOUT_S
+                if mission_client
+                else orchestration.PHASE3_GRAPH_WALL_TIMEOUT_S
+            ),
         },
         'missing_actions': [],
         'missing_services': [],
@@ -289,6 +293,21 @@ def _rewrite_phase3_graph(run_dir: Path, graph: dict, *, mission_client: bool) -
     )
 
 
+def _rebind_phase3_graph_projections(binding: dict) -> None:
+    binding['actions_text_sha256'] = hashlib.sha256(
+        _phase3_graph_text(binding['observed_actions']).encode('utf-8')
+    ).hexdigest()
+    binding['nodes_text_sha256'] = hashlib.sha256(
+        ''.join(f'{name}\n' for name in binding['observed_node_names']).encode('utf-8')
+    ).hexdigest()
+    binding['services_text_sha256'] = hashlib.sha256(
+        _phase3_graph_text(binding['observed_services']).encode('utf-8')
+    ).hexdigest()
+    binding['topics_text_sha256'] = hashlib.sha256(
+        _phase3_graph_text(binding['observed_topics']).encode('utf-8')
+    ).hexdigest()
+
+
 @pytest.mark.parametrize('mission_client', (False, True))
 def test_phase3_graph_validator_binds_exact_pass_artifacts(
     tmp_path: Path,
@@ -308,21 +327,22 @@ def test_phase3_graph_validator_binds_exact_pass_artifacts(
     )
 
     prefix = 'mission-' if mission_client else ''
-    assert set(binding) == {
-        'actions_text_sha256',
-        'expected_action_client_nodes',
-        'graph_json_sha256',
-        'nodes_text_sha256',
-        'probe_schema_version',
-        'services_text_sha256',
-        'topics_text_sha256',
-        'watch_pid',
-    }
+    assert set(binding) == orchestration.PHASE3_GRAPH_BINDING_KEYS
     assert binding['expected_action_client_nodes'] == (
         ['/robotest/mission_runner'] if mission_client else []
     )
     assert binding['probe_schema_version'] == 2
     assert binding['watch_pid'] == watch_pid
+    graph = json.loads((tmp_path / f'{prefix}graph.json').read_text(encoding='utf-8'))
+    expected_all_nodes = sorted(
+        identity['fully_qualified_name']
+        for identity in graph['observed']['node_identities']
+        if not identity['is_probe_participant']
+    )
+    assert binding['observed_all_node_names'] == expected_all_nodes
+    assert binding['observed_node_names'] == graph['observed']['node_names']
+    for projection in ('actions', 'services', 'topics'):
+        assert binding[f'observed_{projection}'] == graph['observed'][projection]
     for label in ('graph.json', 'nodes.txt', 'topics.txt', 'services.txt', 'actions.txt'):
         field = {
             'graph.json': 'graph_json_sha256',
@@ -332,6 +352,83 @@ def test_phase3_graph_validator_binds_exact_pass_artifacts(
             'actions.txt': 'actions_text_sha256',
         }[label]
         assert binding[field] == orchestration.file_sha256(tmp_path / f'{prefix}{label}')
+
+
+def test_phase3_graph_consumer_constants_match_probe_source_contract() -> None:
+    probe_source = Path(__file__).with_name('phase2_graph_probe.py').read_text(encoding='utf-8')
+    assignments = {
+        node.targets[0].id: ast.literal_eval(node.value)
+        for node in ast.parse(probe_source).body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id in {'GRAPH_QUIET_MIN_OBSERVATIONS', 'GRAPH_QUIET_WINDOW_S'}
+    }
+
+    assert assignments == {
+        'GRAPH_QUIET_MIN_OBSERVATIONS': orchestration.PHASE3_GRAPH_MINIMUM_OBSERVATIONS,
+        'GRAPH_QUIET_WINDOW_S': orchestration.PHASE3_GRAPH_QUIET_WINDOW_S,
+    }
+
+
+@pytest.mark.parametrize(
+    ('attempt_count', 'elapsed_wall_seconds', 'error'),
+    (
+        (1, orchestration.PHASE3_GRAPH_QUIET_WINDOW_S, 'attempt_count'),
+        (2, 4.999, 'elapsed_wall_seconds'),
+    ),
+)
+def test_phase3_graph_validator_rejects_insufficient_quiet_evidence(
+    tmp_path: Path,
+    attempt_count: int,
+    elapsed_wall_seconds: float,
+    error: str,
+) -> None:
+    graph = _write_phase3_graph_fixture(
+        tmp_path,
+        mission_client=False,
+        watch_pid=101,
+    )
+    graph['attempt_count'] = attempt_count
+    graph['elapsed_wall_seconds'] = elapsed_wall_seconds
+    _rewrite_phase3_graph(tmp_path, graph, mission_client=False)
+
+    with pytest.raises(orchestration.EvidenceError, match=error):
+        orchestration.validate_phase3_graph_artifacts(
+            tmp_path,
+            mission_client=False,
+            expected_watch_pid=101,
+        )
+
+
+@pytest.mark.parametrize(
+    ('elapsed_wall_seconds', 'wall_timeout_seconds', 'error'),
+    (
+        (20.001, orchestration.PHASE3_GRAPH_MISSION_WALL_TIMEOUT_S, 'unbounded'),
+        (5.0, orchestration.PHASE3_GRAPH_WALL_TIMEOUT_S, 'limits differ'),
+    ),
+)
+def test_phase3_graph_validator_enforces_mission_specific_timeout(
+    tmp_path: Path,
+    elapsed_wall_seconds: float,
+    wall_timeout_seconds: float,
+    error: str,
+) -> None:
+    graph = _write_phase3_graph_fixture(
+        tmp_path,
+        mission_client=True,
+        watch_pid=202,
+    )
+    graph['elapsed_wall_seconds'] = elapsed_wall_seconds
+    graph['limits']['wall_timeout_seconds'] = wall_timeout_seconds
+    _rewrite_phase3_graph(tmp_path, graph, mission_client=True)
+
+    with pytest.raises(orchestration.EvidenceError, match=error):
+        orchestration.validate_phase3_graph_artifacts(
+            tmp_path,
+            mission_client=True,
+            expected_watch_pid=202,
+        )
 
 
 def test_phase3_graph_validator_does_not_promote_passive_participant(
@@ -368,11 +465,21 @@ def test_phase3_graph_validator_does_not_promote_passive_participant(
         )
 
 
-def test_phase3_graph_bindings_identify_distinct_and_stable_projections(
+@pytest.mark.parametrize(
+    'mission_auxiliary_nodes',
+    ((), (orchestration.PHASE3_GRAPH_LIFECYCLE_SAMPLER_NODE,)),
+)
+def test_phase3_graph_pair_accepts_exact_production_shaped_transition(
     tmp_path: Path,
+    mission_auxiliary_nodes: tuple[str, ...],
 ) -> None:
     _write_phase3_graph_fixture(tmp_path, mission_client=False, watch_pid=101)
-    _write_phase3_graph_fixture(tmp_path, mission_client=True, watch_pid=202)
+    _write_phase3_graph_fixture(
+        tmp_path,
+        mission_client=True,
+        watch_pid=202,
+        mission_auxiliary_nodes=mission_auxiliary_nodes,
+    )
 
     pre_mission = orchestration.validate_phase3_graph_artifacts(
         tmp_path,
@@ -385,7 +492,14 @@ def test_phase3_graph_bindings_identify_distinct_and_stable_projections(
         expected_watch_pid=202,
     )
 
-    assert orchestration.validate_phase3_graph_pair(pre_mission, mission) is True
+    assert (
+        orchestration.validate_phase3_graph_pair(
+            pre_mission,
+            mission,
+            expected_mission_auxiliary_nodes=list(mission_auxiliary_nodes),
+        )
+        is True
+    )
     assert pre_mission['graph_json_sha256'] != mission['graph_json_sha256']
     assert pre_mission['nodes_text_sha256'] != mission['nodes_text_sha256']
     assert pre_mission['services_text_sha256'] != mission['services_text_sha256']
@@ -395,10 +509,231 @@ def test_phase3_graph_bindings_identify_distinct_and_stable_projections(
     ):
         assert pre_mission[field] == mission[field]
 
-    forged_mission = copy.deepcopy(mission)
-    forged_mission['services_text_sha256'] = pre_mission['services_text_sha256']
-    with pytest.raises(orchestration.EvidenceError, match='coherent pair'):
-        orchestration.validate_phase3_graph_pair(pre_mission, forged_mission)
+
+def _valid_phase3_graph_pair(tmp_path: Path) -> tuple[dict, dict]:
+    _write_phase3_graph_fixture(tmp_path, mission_client=False, watch_pid=101)
+    _write_phase3_graph_fixture(tmp_path, mission_client=True, watch_pid=202)
+    return (
+        orchestration.validate_phase3_graph_artifacts(
+            tmp_path,
+            mission_client=False,
+            expected_watch_pid=101,
+        ),
+        orchestration.validate_phase3_graph_artifacts(
+            tmp_path,
+            mission_client=True,
+            expected_watch_pid=202,
+        ),
+    )
+
+
+def test_phase3_graph_pair_rejects_hidden_mission_node_growth(tmp_path: Path) -> None:
+    _write_phase3_graph_fixture(tmp_path, mission_client=False, watch_pid=101)
+    mission_graph = _write_phase3_graph_fixture(
+        tmp_path,
+        mission_client=True,
+        watch_pid=202,
+    )
+    hidden_node = '/robotest/_rogue'
+    mission_graph['observed']['node_identities'].append(
+        {
+            'fully_qualified_name': hidden_node,
+            'hidden': True,
+            'is_probe_participant': False,
+            'name': '_rogue',
+            'namespace': '/robotest',
+        }
+    )
+    mission_graph['observed']['node_identities'].sort(
+        key=lambda identity: (identity['name'], identity['namespace'])
+    )
+    mission_graph['node_name_counts'][hidden_node] = 1
+    _rewrite_phase3_graph(tmp_path, mission_graph, mission_client=True)
+
+    pre_mission = orchestration.validate_phase3_graph_artifacts(
+        tmp_path,
+        mission_client=False,
+        expected_watch_pid=101,
+    )
+    mission = orchestration.validate_phase3_graph_artifacts(
+        tmp_path,
+        mission_client=True,
+        expected_watch_pid=202,
+    )
+    assert hidden_node not in mission['observed_node_names']
+    assert hidden_node in mission['observed_all_node_names']
+
+    with pytest.raises(orchestration.EvidenceError, match='all-node transition'):
+        orchestration.validate_phase3_graph_pair(pre_mission, mission)
+
+
+def test_phase3_graph_pair_rejects_node_disappearance(tmp_path: Path) -> None:
+    pre_mission, mission = _valid_phase3_graph_pair(tmp_path)
+    mission['observed_node_names'].remove('/robotest/metrics_collector')
+    _rebind_phase3_graph_projections(mission)
+
+    with pytest.raises(orchestration.EvidenceError, match='node transition'):
+        orchestration.validate_phase3_graph_pair(pre_mission, mission)
+
+
+@pytest.mark.parametrize(
+    ('case', 'error'),
+    (
+        ('same_watch_pid', 'distinct owned processes'),
+        ('wrong_pre_client', 'action-client transition'),
+        ('wrong_mission_client', 'action-client transition'),
+        ('extra_mission_node', 'node transition'),
+    ),
+)
+def test_phase3_graph_pair_rejects_hostile_identity_transition(
+    tmp_path: Path,
+    case: str,
+    error: str,
+) -> None:
+    pre_mission, mission = _valid_phase3_graph_pair(tmp_path)
+    if case == 'same_watch_pid':
+        mission['watch_pid'] = pre_mission['watch_pid']
+    elif case == 'wrong_pre_client':
+        pre_mission['expected_action_client_nodes'] = ['/robotest/rogue_client']
+    elif case == 'wrong_mission_client':
+        mission['expected_action_client_nodes'] = []
+    else:
+        mission['observed_node_names'].append('/robotest/rogue_node')
+        mission['observed_node_names'].sort()
+        mission['observed_all_node_names'].append('/robotest/rogue_node')
+        mission['observed_all_node_names'].sort()
+        _rebind_phase3_graph_projections(mission)
+
+    with pytest.raises(orchestration.EvidenceError, match=error):
+        orchestration.validate_phase3_graph_pair(pre_mission, mission)
+
+
+@pytest.mark.parametrize('projection', ('topics', 'actions'))
+def test_phase3_graph_pair_rejects_typed_stable_projection_disappearance(
+    tmp_path: Path,
+    projection: str,
+) -> None:
+    pre_mission, mission = _valid_phase3_graph_pair(tmp_path)
+    mission[f'observed_{projection}'].pop(next(iter(mission[f'observed_{projection}'])))
+    _rebind_phase3_graph_projections(mission)
+
+    with pytest.raises(orchestration.EvidenceError, match='stable hashes'):
+        orchestration.validate_phase3_graph_pair(pre_mission, mission)
+
+
+@pytest.mark.parametrize(
+    ('projection', 'replacement_type'),
+    (
+        ('topics', 'std_msgs/msg/String'),
+        ('actions', 'example_interfaces/action/Fibonacci'),
+    ),
+)
+def test_phase3_graph_pair_rejects_typed_stable_projection_type_mutation(
+    tmp_path: Path,
+    projection: str,
+    replacement_type: str,
+) -> None:
+    pre_mission, mission = _valid_phase3_graph_pair(tmp_path)
+    first_name = next(iter(mission[f'observed_{projection}']))
+    mission[f'observed_{projection}'][first_name] = [replacement_type]
+    _rebind_phase3_graph_projections(mission)
+
+    with pytest.raises(orchestration.EvidenceError, match='stable hashes'):
+        orchestration.validate_phase3_graph_pair(pre_mission, mission)
+
+
+@pytest.mark.parametrize(
+    ('side', 'service_name', 'replacement_name', 'replacement_type', 'error'),
+    (
+        (
+            'pre',
+            '/robotest/phase3_goal_observer/get_parameters',
+            None,
+            None,
+            'goal-observer services',
+        ),
+        (
+            'pre',
+            '/robotest/phase3_goal_observer/get_parameters',
+            None,
+            'std_srvs/srv/Trigger',
+            'goal-observer services',
+        ),
+        (
+            'mission',
+            '/robotest/mission_runner/get_parameters',
+            None,
+            None,
+            'mission-node services',
+        ),
+        (
+            'pre',
+            '/robotest/phase3_goal_observer/get_parameters',
+            '/robotest/phase3_goal_observer_extra/get_parameters',
+            None,
+            'goal-observer services',
+        ),
+        (
+            'mission',
+            '/robotest/metrics_collector/get_parameters',
+            None,
+            None,
+            'non-transition services',
+        ),
+    ),
+)
+def test_phase3_graph_pair_rejects_hostile_service_transition(
+    tmp_path: Path,
+    side: str,
+    service_name: str,
+    replacement_name: str | None,
+    replacement_type: str | None,
+    error: str,
+) -> None:
+    pre_mission, mission = _valid_phase3_graph_pair(tmp_path)
+    binding = pre_mission if side == 'pre' else mission
+    original_types = binding['observed_services'].pop(service_name)
+    if replacement_name is not None:
+        binding['observed_services'][replacement_name] = original_types
+    elif replacement_type is not None:
+        binding['observed_services'][service_name] = [replacement_type]
+    binding['observed_services'] = dict(sorted(binding['observed_services'].items()))
+    _rebind_phase3_graph_projections(binding)
+
+    with pytest.raises(orchestration.EvidenceError, match=error):
+        orchestration.validate_phase3_graph_pair(pre_mission, mission)
+
+
+def test_phase3_graph_pair_rejects_unallowed_auxiliary_node(tmp_path: Path) -> None:
+    pre_mission, mission = _valid_phase3_graph_pair(tmp_path)
+
+    with pytest.raises(orchestration.EvidenceError, match='allowed exact set'):
+        orchestration.validate_phase3_graph_pair(
+            pre_mission,
+            mission,
+            expected_mission_auxiliary_nodes=['/robotest/arbitrary_sampler'],
+        )
+
+
+def test_phase3_runtime_graph_node_join_is_exact(tmp_path: Path) -> None:
+    pre_mission, _mission = _valid_phase3_graph_pair(tmp_path)
+    runtime_gate = {
+        'mode': 'candidate',
+        'nodes': sorted(
+            [
+                *pre_mission['observed_node_names'],
+                orchestration.PHASE3_GRAPH_RUNTIME_GATE_NODE,
+            ]
+        ),
+        'producer': 'robotest_phase3/runtime_gate',
+        'schema_version': 1,
+        'verdict': 'PASS',
+    }
+
+    assert orchestration.validate_phase3_runtime_graph_node_join(runtime_gate, pre_mission)
+    runtime_gate['nodes'].remove('/robotest/controller_server')
+    with pytest.raises(orchestration.EvidenceError, match='do not match'):
+        orchestration.validate_phase3_runtime_graph_node_join(runtime_gate, pre_mission)
 
 
 @pytest.mark.parametrize(

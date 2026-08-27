@@ -110,11 +110,14 @@ def test_final_launch_log_gate_combines_closed_streams_and_replays_exactly(
     assert evidence['scanned_utc'] == scanned_utc
     assert evidence['launch_log_path'] == str(combined)
     assert evidence['launch_log_sha256'] == orchestration.file_sha256(combined)
-    assert startup_gate.scan_final_launch_log(
-        combined,
-        evidence['launch_stopped_utc'],
-        scanned_utc=evidence['scanned_utc'],
-    ) == evidence
+    assert (
+        startup_gate.scan_final_launch_log(
+            combined,
+            evidence['launch_stopped_utc'],
+            scanned_utc=evidence['scanned_utc'],
+        )
+        == evidence
+    )
 
 
 @pytest.mark.parametrize('stream', ('stdout', 'stderr'))
@@ -343,6 +346,8 @@ def test_graph_probe_binds_exact_goal_capable_action_clients(tmp_path: Path) -> 
     assert flag_values(with_mission, '--action-client') == [
         '/robotest/follow_waypoints=/robotest/mission_runner',
     ]
+    assert flag_values(pre_mission, '--wall-timeout') == ['90']
+    assert flag_values(with_mission, '--wall-timeout') == ['20']
     assert pre_contracts['topics'] == mission_contracts['topics']
     assert pre_contracts['services'] == mission_contracts['services']
 
@@ -356,21 +361,32 @@ def test_graph_artifacts_are_validated_before_each_trial_can_advance() -> None:
     graph_validation = trial_source.index(
         'graph_binding = validate_phase3_graph_artifacts(', graph_run
     )
-    observer_arm = trial_source.index('atomic_write_bytes(observer_arm,', graph_validation)
+    runtime_node_join = trial_source.index(
+        'validate_phase3_runtime_graph_node_join(', graph_validation
+    )
+    observer_arm = trial_source.index('atomic_write_bytes(observer_arm,', runtime_node_join)
     mission_graph_run = trial_source.index("'mission_graph_gate',", observer_arm)
+    mission_graph_timeout = trial_source.index('wall_timeout_s=30.0,', mission_graph_run)
     mission_graph_validation = trial_source.index(
         'mission_graph_binding = validate_phase3_graph_artifacts(', mission_graph_run
     )
     pair_validation = trial_source.index(
-        'validate_phase3_graph_pair(graph_binding, mission_graph_binding)',
+        'validate_phase3_graph_pair(',
         mission_graph_validation,
     )
+    auxiliary_contract = trial_source.index('expected_mission_auxiliary_nodes=(', pair_validation)
     pair_check = trial_source.index("'inconsistent_graph_pair'", mission_graph_validation)
     mission_wait = trial_source.index('mission_status = mission.wait(', pair_check)
 
-    assert graph_run < graph_validation < observer_arm
+    assert graph_run < graph_validation < runtime_node_join < observer_arm
     assert (
-        mission_graph_run < mission_graph_validation < pair_validation < pair_check < mission_wait
+        mission_graph_run
+        < mission_graph_timeout
+        < mission_graph_validation
+        < pair_validation
+        < auxiliary_contract
+        < pair_check
+        < mission_wait
     )
 
 
