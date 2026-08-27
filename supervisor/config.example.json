@@ -21,7 +21,10 @@
       "name": "robotest-stack",
       "argv": ["/usr/libexec/robotest-supervisor/start-robotest-stack"],
       "working_directory": "/opt/robotest-lab",
-      "environment": {"ROS_DOMAIN_ID": "42"},
+      "environment": {
+        "ROBOTEST_RUNTIME_STATE_DIRECTORY": "/var/lib/robotest-supervisor",
+        "ROS_DOMAIN_ID": "42"
+      },
       "required": true,
       "heartbeat_file": "/var/lib/robotest-supervisor/robotest-stack.heartbeat"
     }

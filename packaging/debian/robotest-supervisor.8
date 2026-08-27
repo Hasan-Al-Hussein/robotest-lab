@@ -1,4 +1,4 @@
-.TH ROBOTEST-SUPERVISOR 8 "August 2026" "robotest-supervisor 0.1.0" "System Administration"
+.TH ROBOTEST-SUPERVISOR 8 "August 2026" "robotest-supervisor 0.1.1" "System Administration"
 .SH NAME
 robotest-supervisor \- bounded local process supervisor for RoboTest Lab
 .SH SYNOPSIS
@@ -19,6 +19,29 @@ The HTTP interface is read-only and binds exactly to 127.0.0.1. It exposes
 and
 .BR /metrics .
 There is no remote process-control endpoint.
+.SH PACKAGED RUNTIME CONTRACT
+The packaged stack child sets
+.B ROBOTEST_RUNTIME_STATE_DIRECTORY
+to the same canonical absolute directory as the configuration
+.B state_directory
+and publishes its heartbeat at
+.IR state_directory /robotest-stack.heartbeat.
+The startup wrapper derives
+.IR state_directory /lifecycle-startup-result.json
+from the same value. It accepts only an existing writable, non-symbolic-link
+directory at or below
+.IR /var/lib/robotest-supervisor ,
+and rejects non-canonical paths and unsafe pre-existing derived files before
+reading the ROS overlay.
+.PP
+The systemd unit confines the supervisor to CPUs 0 through 5. The wrapper also
+uses
+.BR taskset (1)
+with
+.B ROBOTEST_CPUSET
+as a child-level defense. The wrapper publishes heartbeats from a separately
+owned worker while it performs one bounded, signal-aware reap of the ROS launch
+child. Cleanup also bounds and reaps an unresponsive heartbeat worker.
 .SH OPTIONS
 .TP
 .BI \-config " path"
@@ -39,5 +62,14 @@ Prefix-retained structured lifecycle events.
 .TP
 .I /var/lib/robotest-supervisor/status.json
 Atomically replaced current status.
+.TP
+.I /var/lib/robotest-supervisor/robotest-stack.heartbeat
+Packaged stack heartbeat. Run-scoped configurations use the same basename
+under their configured state directory.
+.TP
+.I /var/lib/robotest-supervisor/lifecycle-startup-result.json
+Validated lifecycle startup result used to gate heartbeat publication. A
+run-scoped wrapper uses the same basename under its runtime state directory.
 .SH SEE ALSO
-.BR systemd.service (5)
+.BR systemd.service (5),
+.BR taskset (1)

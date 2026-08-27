@@ -7,8 +7,411 @@ robotest-supervisor \
   -config /etc/robotest-supervisor/config.json \
   | grep -Fx 'configuration valid'
 python3 -m json.tool /etc/robotest-supervisor/config.json >/dev/null
+python3 - /etc/robotest-supervisor/config.json <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+state_directory = value['state_directory']
+children = value['children']
+if len(children) != 1:
+    raise SystemExit('installed config must contain exactly one child')
+child = children[0]
+if child['environment'].get('ROBOTEST_RUNTIME_STATE_DIRECTORY') != state_directory:
+    raise SystemExit('runtime state environment does not match state_directory')
+if child.get('heartbeat_file') != f'{state_directory}/robotest-stack.heartbeat':
+    raise SystemExit('heartbeat_file does not match the runtime state contract')
+PY
 test -x /usr/libexec/robotest-supervisor/start-robotest-stack
 test -f /usr/lib/systemd/system/robotest-supervisor.service
 grep -Fx 'ConditionPathExists=/opt/robotest-lab/install/setup.bash' \
   /usr/lib/systemd/system/robotest-supervisor.service
+grep -Fx 'CPUAffinity=0-5' \
+  /usr/lib/systemd/system/robotest-supervisor.service
 systemd-analyze verify /usr/lib/systemd/system/robotest-supervisor.service
+
+wrapper_log=$(mktemp)
+cleanup() {
+  rm -f -- "${wrapper_log}"
+}
+trap cleanup 0 1 2 15
+
+expect_wrapper_rejection() {
+  expected_message=$1
+  runtime_directory=$2
+  if ROBOTEST_RUNTIME_STATE_DIRECTORY="${runtime_directory}" \
+    /usr/libexec/robotest-supervisor/start-robotest-stack \
+    >"${wrapper_log}" 2>&1; then
+    printf 'wrapper accepted invalid runtime directory: %s\n' "${runtime_directory}" >&2
+    return 1
+  else
+    wrapper_status=$?
+  fi
+  test "${wrapper_status}" -eq 64
+  grep -F "${expected_message}" "${wrapper_log}" >/dev/null
+}
+
+expect_wrapper_rejection \
+  'path must be /var/lib/robotest-supervisor or one of its descendants' \
+  /tmp
+expect_wrapper_rejection \
+  'path must be canonical' \
+  /var/lib/robotest-supervisor/../robotest-supervisor
+
+python3 - /usr/libexec/robotest-supervisor/start-robotest-stack <<'PY'
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+
+
+LAUNCHER = r'''#!/usr/bin/python3
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+startup_result = Path(sys.argv[1])
+heartbeat = startup_result.with_name('robotest-stack.heartbeat')
+mode = os.environ['ROBOTEST_FIXTURE_MODE']
+Path(os.environ['ROBOTEST_FIXTURE_LAUNCH_PID_FILE']).write_text(
+    f'{os.getpid()}\n', encoding='utf-8'
+)
+if mode != 'natural':
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+value = {
+    'schema_version': 1,
+    'verdict': 'PASS',
+    'accepted': True,
+    'exit_code': 0,
+    'service_name': '/robotest/lifecycle_manager_navigation/manage_nodes',
+    'command': 0,
+    'elapsed_wall_sec': 0.25,
+    'discovery_grace_sec': 4.0,
+    'service_timeout_sec': 20.0,
+    'response_timeout_sec': 60.0,
+    'watch_pid': 123 if mode == 'forged' else None,
+    'failure_kind': None,
+    'failure_message': None,
+    'started_utc': '2026-08-27T08:00:00Z',
+    'completed_utc': '2026-08-27T08:00:01Z',
+}
+if mode == 'symlink':
+    heartbeat.symlink_to(os.environ['ROBOTEST_FIXTURE_SYMLINK_TARGET'])
+pending = startup_result.with_name(f'.{startup_result.name}.pending')
+pending.write_text(json.dumps(value, allow_nan=False) + '\n', encoding='utf-8')
+pending.chmod(0o600)
+pending.replace(startup_result)
+
+if mode in {'forged', 'symlink'}:
+    while True:
+        time.sleep(0.1)
+
+deadline = time.monotonic() + 3.0
+while not heartbeat.exists():
+    if time.monotonic() >= deadline:
+        raise SystemExit(91)
+    time.sleep(0.02)
+Path(os.environ['ROBOTEST_FIXTURE_HEARTBEAT_SEEN']).write_text('seen\n', encoding='utf-8')
+if mode == 'natural':
+    raise SystemExit(7)
+if mode == 'worker_stopped':
+    time.sleep(0.5)
+    raise SystemExit(7)
+if mode == 'stopped':
+    os.kill(os.getpid(), signal.SIGSTOP)
+while True:
+    time.sleep(0.1)
+'''
+
+
+def replace_once(value: str, old: str, new: str) -> str:
+    if value.count(old) != 1:
+        raise AssertionError(f'wrapper fixture token count changed for {old!r}')
+    return value.replace(old, new, 1)
+
+
+def wait_until(predicate, message: str, timeout: float = 4.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError(message)
+
+
+def process_state(pid: int) -> str | None:
+    try:
+        payload = Path(f'/proc/{pid}/stat').read_text(encoding='utf-8')
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+    closing = payload.rfind(')')
+    if closing < 0:
+        return None
+    return payload[closing + 2 :].split()[0]
+
+
+def process_group_members(process_group: int) -> list[int]:
+    members: list[int] = []
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            payload = (entry / 'stat').read_text(encoding='utf-8')
+            closing = payload.rfind(')')
+            fields = payload[closing + 2 :].split()
+            if closing >= 0 and int(fields[2]) == process_group:
+                members.append(int(entry.name))
+        except (FileNotFoundError, IndexError, PermissionError, ProcessLookupError, ValueError):
+            continue
+    return sorted(members)
+
+
+def assert_group_reaped(process_group: int) -> None:
+    wait_until(
+        lambda: not process_group_members(process_group),
+        f'fixture process group {process_group} survived wrapper exit',
+    )
+
+
+source_path = Path(sys.argv[1])
+source = source_path.read_text(encoding='utf-8')
+if 'kill -0' in source:
+    raise AssertionError('wrapper must not use kill -0 as liveness authority')
+if source.count('reap_owned_job "${launch_pid}"') != 1:
+    raise AssertionError('wrapper must enter exactly one launch-child reap path')
+if 'done < <(jobs -p)' not in source:
+    raise AssertionError('wrapper ownership check must include stopped jobs')
+if 'taskset -c "${cpuset}" ros2 launch robotest_navigation phase2.launch.py' not in source:
+    raise AssertionError('wrapper lost the taskset defense')
+
+with tempfile.TemporaryDirectory(prefix='robotest-wrapper-fixture.') as temporary:
+    root = Path(temporary)
+    state_base = root / 'state-base'
+    state_base.mkdir()
+    overlay = root / 'overlay-setup.bash'
+    overlay.write_text('\n', encoding='utf-8')
+    launcher = root / 'fixture-launcher'
+    launcher.write_text(textwrap.dedent(LAUNCHER), encoding='utf-8')
+    launcher.chmod(0o700)
+
+    transformed = source
+    transformed = replace_once(
+        transformed,
+        'readonly overlay_setup=/opt/robotest-lab/install/setup.bash',
+        f'readonly overlay_setup={shlex.quote(str(overlay))}',
+    )
+    transformed = replace_once(
+        transformed,
+        'readonly runtime_state_base=/var/lib/robotest-supervisor',
+        f'readonly runtime_state_base={shlex.quote(str(state_base))}',
+    )
+    transformed = replace_once(
+        transformed,
+        'readonly startup_timeout_seconds=110',
+        'readonly startup_timeout_seconds=3',
+    )
+    transformed = replace_once(
+        transformed,
+        'readonly cleanup_grace_seconds=5',
+        'readonly cleanup_grace_seconds=0.25',
+    )
+    transformed = replace_once(
+        transformed,
+        'source /opt/ros/jazzy/setup.bash',
+        'source /dev/null',
+    )
+    transformed = replace_once(
+        transformed,
+        "trap 'request_shutdown 70' USR2\n\nif ((shutdown_status != 0)); then",
+        "trap 'request_shutdown 70' USR2\n"
+        "if [[ ${ROBOTEST_FIXTURE_MODE} == prelaunch ]]; then\n"
+        "  kill -TERM \"${wrapper_pid}\"\n"
+        "fi\n\n"
+        "if ((shutdown_status != 0)); then",
+    )
+    launch_start = transformed.index(
+        'taskset -c "${cpuset}" ros2 launch robotest_navigation phase2.launch.py'
+    )
+    launch_end_marker = '  lifecycle_startup_result_path:="${startup_result}" &'
+    launch_end = transformed.index(launch_end_marker, launch_start) + len(launch_end_marker)
+    transformed = (
+        transformed[:launch_start]
+        + '"${ROBOTEST_FIXTURE_LAUNCHER}" "${startup_result}" &'
+        + transformed[launch_end:]
+    )
+    transformed = replace_once(
+        transformed,
+        'launch_pid=$!\n',
+        'launch_pid=$!\n'
+        'printf \'%s\\n\' "${launch_pid}" > "${ROBOTEST_FIXTURE_WRAPPER_LAUNCH_PID}"\n',
+    )
+    transformed = replace_once(
+        transformed,
+        '  heartbeat_worker_pid=$!\n',
+        '  heartbeat_worker_pid=$!\n'
+        '  printf \'%s\\n\' "${heartbeat_worker_pid}" > "${ROBOTEST_FIXTURE_WORKER_PID}"\n',
+    )
+    transformed = replace_once(
+        transformed,
+        '    wait "${owned_pid}"\n',
+        '    printf \'%s\\n\' "${owned_pid}" >> "${ROBOTEST_FIXTURE_WAIT_LOG}"\n'
+        '    wait "${owned_pid}"\n',
+    )
+    wrapper = root / 'wrapper'
+    wrapper.write_text(transformed, encoding='utf-8')
+    wrapper.chmod(0o700)
+
+    def run_case(mode: str) -> tuple[int, float, Path, list[int], int]:
+        case = root / mode
+        case.mkdir()
+        state_directory = state_base / mode
+        state_directory.mkdir()
+        wait_log = case / 'wait.log'
+        launch_pid_file = case / 'launch.pid'
+        wrapper_launch_pid_file = case / 'wrapper-launch.pid'
+        worker_pid_file = case / 'worker.pid'
+        heartbeat_seen = case / 'heartbeat-seen'
+        symlink_target = case / 'symlink-target'
+        symlink_target.write_text('sentinel\n', encoding='utf-8')
+        target_before = symlink_target.stat().st_mtime_ns
+        environment = dict(os.environ)
+        environment.update(
+            {
+                'ROBOTEST_RUNTIME_STATE_DIRECTORY': str(state_directory),
+                'ROBOTEST_FIXTURE_LAUNCHER': str(launcher),
+                'ROBOTEST_FIXTURE_MODE': mode,
+                'ROBOTEST_FIXTURE_LAUNCH_PID_FILE': str(launch_pid_file),
+                'ROBOTEST_FIXTURE_WRAPPER_LAUNCH_PID': str(wrapper_launch_pid_file),
+                'ROBOTEST_FIXTURE_WORKER_PID': str(worker_pid_file),
+                'ROBOTEST_FIXTURE_WAIT_LOG': str(wait_log),
+                'ROBOTEST_FIXTURE_HEARTBEAT_SEEN': str(heartbeat_seen),
+                'ROBOTEST_FIXTURE_SYMLINK_TARGET': str(symlink_target),
+            }
+        )
+        process = subprocess.Popen(
+            [str(wrapper)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        elapsed = 0.0
+        try:
+            if mode in {'term', 'stopped'}:
+                wait_until(heartbeat_seen.exists, f'{mode} fixture produced no heartbeat')
+                wait_until(launch_pid_file.exists, f'{mode} fixture published no launch PID')
+                if mode == 'stopped':
+                    launch_pid = int(launch_pid_file.read_text(encoding='utf-8'))
+                    wait_until(
+                        lambda: process_state(launch_pid) == 'T',
+                        'stopped fixture launch did not enter state T',
+                    )
+                started = time.monotonic()
+                process.terminate()
+                stdout, stderr = process.communicate(timeout=5.0)
+                elapsed = time.monotonic() - started
+            elif mode == 'worker_stopped':
+                wait_until(heartbeat_seen.exists, 'worker-stopped fixture produced no heartbeat')
+                wait_until(worker_pid_file.exists, 'worker-stopped fixture published no worker PID')
+                worker_pid = int(worker_pid_file.read_text(encoding='utf-8'))
+                os.kill(worker_pid, signal.SIGSTOP)
+                wait_until(
+                    lambda: process_state(worker_pid) == 'T',
+                    'heartbeat worker did not enter state T',
+                )
+                stdout, stderr = process.communicate(timeout=5.0)
+            else:
+                stdout, stderr = process.communicate(timeout=5.0)
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=2.0)
+            raise
+        if stdout:
+            raise AssertionError(f'{mode} fixture wrote unexpected stdout: {stdout!r}')
+        if mode == 'prelaunch':
+            assert_group_reaped(process.pid)
+            if process.returncode != 143:
+                raise AssertionError(
+                    f'pre-launch TERM did not stop before launch: {process.returncode}: {stderr}'
+                )
+            if launch_pid_file.exists() or wrapper_launch_pid_file.exists() or worker_pid_file.exists():
+                raise AssertionError('pre-launch TERM still created an owned child')
+            return process.returncode, elapsed, state_directory, [], 0
+        if not wrapper_launch_pid_file.exists() or not worker_pid_file.exists():
+            raise AssertionError(f'{mode} fixture did not publish owned process identities: {stderr!r}')
+        launch_pid = int(wrapper_launch_pid_file.read_text(encoding='utf-8'))
+        if launch_pid != int(launch_pid_file.read_text(encoding='utf-8')):
+            raise AssertionError(f'{mode} fixture launch identity drifted')
+        worker_pid = int(worker_pid_file.read_text(encoding='utf-8'))
+        waits = [int(line) for line in wait_log.read_text(encoding='utf-8').splitlines()]
+        assert_group_reaped(process.pid)
+        if worker_pid not in waits:
+            raise AssertionError(f'{mode} fixture worker was not reaped: {waits}')
+        heartbeat = state_directory / 'robotest-stack.heartbeat'
+        startup_result = state_directory / 'lifecycle-startup-result.json'
+        if not startup_result.is_file():
+            raise AssertionError(f'{mode} fixture did not use the derived startup-result path')
+        if mode == 'natural':
+            if process.returncode != 7 or not heartbeat_seen.exists():
+                raise AssertionError(f'natural exit was not propagated: {process.returncode}: {stderr}')
+            metadata = heartbeat.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise AssertionError('positive fixture heartbeat is not a regular file')
+            if waits.count(launch_pid) != 1:
+                raise AssertionError(f'natural launch was not waited exactly once: {waits}')
+        elif mode in {'term', 'stopped'}:
+            if process.returncode != 143 or not 0.15 <= elapsed < 3.0:
+                raise AssertionError(
+                    f'{mode} cleanup was not bounded TERM-to-KILL: '
+                    f'status={process.returncode}, elapsed={elapsed}, stderr={stderr!r}'
+                )
+            if waits.count(launch_pid) < 2:
+                raise AssertionError(f'{mode} wait was not retried after its trap: {waits}')
+        elif mode == 'worker_stopped':
+            if process.returncode != 7 or waits.count(worker_pid) < 2:
+                raise AssertionError(
+                    f'stopped worker was not bounded and reaped: '
+                    f'status={process.returncode}, waits={waits}, stderr={stderr!r}'
+                )
+        elif mode == 'forged':
+            if process.returncode != 70 or heartbeat.exists():
+                raise AssertionError(f'forged PASS reached readiness: {process.returncode}: {stderr}')
+        elif mode == 'symlink':
+            if process.returncode != 70 or not heartbeat.is_symlink():
+                raise AssertionError(f'heartbeat symlink was accepted: {process.returncode}: {stderr}')
+            if symlink_target.read_text(encoding='utf-8') != 'sentinel\n':
+                raise AssertionError('heartbeat publication changed the symlink target')
+            if symlink_target.stat().st_mtime_ns != target_before:
+                raise AssertionError('heartbeat publication touched the symlink target')
+        return process.returncode, elapsed, state_directory, waits, launch_pid
+
+    for fixture_mode in (
+        'prelaunch',
+        'natural',
+        'term',
+        'stopped',
+        'worker_stopped',
+        'forged',
+        'symlink',
+    ):
+        run_case(fixture_mode)
+PY

@@ -41,10 +41,78 @@ func validConfig(root string) Config {
 	}
 }
 
+func validPackagedStackConfig(root string) Config {
+	cfg := validConfig(root)
+	cfg.Children[0].Argv = []string{packagedStackExecutable}
+	cfg.Children[0].Environment = map[string]string{
+		runtimeStateDirectoryEnv: cfg.StateDirectory,
+	}
+	cfg.Children[0].HeartbeatFile = filepath.Join(
+		cfg.StateDirectory,
+		packagedStackHeartbeatFileName,
+	)
+	return cfg
+}
+
 func TestValidConfig(t *testing.T) {
 	t.Parallel()
 	if err := validConfig(t.TempDir()).Validate(); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
+	}
+}
+
+func TestValidPackagedStackRuntimeContract(t *testing.T) {
+	t.Parallel()
+	if err := validPackagedStackConfig(t.TempDir()).Validate(); err != nil {
+		t.Fatalf("valid packaged stack config rejected: %v", err)
+	}
+}
+
+func TestPackagedStackRuntimeContractRejectsDrift(t *testing.T) {
+	t.Parallel()
+	tests := map[string]struct {
+		mutate  func(*Config)
+		message string
+	}{
+		"missing-runtime-state-environment": {
+			mutate: func(cfg *Config) {
+				delete(cfg.Children[0].Environment, runtimeStateDirectoryEnv)
+			},
+			message: "environment ROBOTEST_RUNTIME_STATE_DIRECTORY must be present and exactly match state_directory",
+		},
+		"different-runtime-state-environment": {
+			mutate: func(cfg *Config) {
+				cfg.Children[0].Environment[runtimeStateDirectoryEnv] = filepath.Join(cfg.StateDirectory, "run")
+			},
+			message: "environment ROBOTEST_RUNTIME_STATE_DIRECTORY must be present and exactly match state_directory",
+		},
+		"missing-heartbeat": {
+			mutate: func(cfg *Config) {
+				cfg.Children[0].HeartbeatFile = ""
+			},
+			message: "heartbeat_file for /usr/libexec/robotest-supervisor/start-robotest-stack must be exactly",
+		},
+		"different-heartbeat": {
+			mutate: func(cfg *Config) {
+				cfg.Children[0].HeartbeatFile = filepath.Join(cfg.StateDirectory, "other.heartbeat")
+			},
+			message: "heartbeat_file for /usr/libexec/robotest-supervisor/start-robotest-stack must be exactly",
+		},
+	}
+	for name, test := range tests {
+		name, test := name, test
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cfg := validPackagedStackConfig(t.TempDir())
+			test.mutate(&cfg)
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("invalid packaged stack config was accepted")
+			}
+			if !strings.Contains(err.Error(), test.message) {
+				t.Fatalf("unexpected validation error %q; want substring %q", err, test.message)
+			}
+		})
 	}
 }
 

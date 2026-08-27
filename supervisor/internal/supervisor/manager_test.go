@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -49,6 +50,242 @@ func managerConfig(root string, argv []string, heartbeat string) config.Config {
 }
 
 func quietLogger() *slog.Logger { return slog.New(slog.NewJSONHandler(io.Discard, nil)) }
+
+type fakeProcess struct {
+	wait        chan error
+	waitSent    bool
+	groupExists bool
+}
+
+type fakeProcessSignal struct {
+	pgid   int
+	signal syscall.Signal
+}
+
+type fakeProcessSystem struct {
+	mu              sync.Mutex
+	nextPID         int
+	processes       map[int]*fakeProcess
+	starts          []int
+	signals         []fakeProcessSignal
+	keepGroupOnTERM bool
+	keepGroupOnKILL bool
+	reapOnTERM      bool
+	reapOnKILL      bool
+	termErr         error
+	killErr         error
+	probeErr        error
+	probeStates     []bool
+	startHook       func()
+	startHooks      map[string]func()
+	startErr        error
+}
+
+func newFakeProcessSystem() *fakeProcessSystem {
+	return &fakeProcessSystem{
+		nextPID:    4100,
+		processes:  make(map[int]*fakeProcess),
+		reapOnTERM: true,
+		reapOnKILL: true,
+	}
+}
+
+func (system *fakeProcessSystem) Start(spec config.Child) (startedProcess, error) {
+	if system.startHook != nil {
+		system.startHook()
+	}
+	if hook := system.startHooks[spec.Name]; hook != nil {
+		hook()
+	}
+	if system.startErr != nil {
+		return startedProcess{}, system.startErr
+	}
+	system.mu.Lock()
+	defer system.mu.Unlock()
+	system.nextPID++
+	pid := system.nextPID
+	process := &fakeProcess{wait: make(chan error, 1), groupExists: true}
+	system.processes[pid] = process
+	system.starts = append(system.starts, pid)
+	return startedProcess{pid: pid, wait: process.wait}, nil
+}
+
+func (system *fakeProcessSystem) SignalProcessGroup(pgid int, signal syscall.Signal) error {
+	system.mu.Lock()
+	defer system.mu.Unlock()
+	system.signals = append(system.signals, fakeProcessSignal{pgid: pgid, signal: signal})
+	process, found := system.processes[pgid]
+	if !found || !process.groupExists {
+		return syscall.ESRCH
+	}
+
+	var signalErr error
+	var keepGroup, reap bool
+	switch signal {
+	case syscall.SIGTERM:
+		signalErr = system.termErr
+		keepGroup = system.keepGroupOnTERM
+		reap = system.reapOnTERM
+	case syscall.SIGKILL:
+		signalErr = system.killErr
+		keepGroup = system.keepGroupOnKILL
+		reap = system.reapOnKILL
+	}
+	if signalErr != nil {
+		return signalErr
+	}
+	if !keepGroup {
+		process.groupExists = false
+	}
+	if reap && !process.waitSent {
+		process.waitSent = true
+		process.wait <- errors.New("fake child terminated")
+		close(process.wait)
+	}
+	return nil
+}
+
+func (system *fakeProcessSystem) ProcessGroupExists(pgid int) (bool, error) {
+	system.mu.Lock()
+	defer system.mu.Unlock()
+	if system.probeErr != nil {
+		return true, system.probeErr
+	}
+	if len(system.probeStates) > 0 {
+		exists := system.probeStates[0]
+		system.probeStates = system.probeStates[1:]
+		return exists, nil
+	}
+	process, found := system.processes[pgid]
+	return found && process.groupExists, nil
+}
+
+func (system *fakeProcessSystem) exitLeader(pgid int, waitErr error) {
+	system.mu.Lock()
+	defer system.mu.Unlock()
+	process := system.processes[pgid]
+	if process == nil || process.waitSent {
+		return
+	}
+	process.waitSent = true
+	process.wait <- waitErr
+	close(process.wait)
+}
+
+func (system *fakeProcessSystem) startPIDs() []int {
+	system.mu.Lock()
+	defer system.mu.Unlock()
+	return append([]int(nil), system.starts...)
+}
+
+func (system *fakeProcessSystem) observedSignals() []fakeProcessSignal {
+	system.mu.Lock()
+	defer system.mu.Unlock()
+	return append([]fakeProcessSignal(nil), system.signals...)
+}
+
+type armedNowHookClock struct {
+	Clock
+	mu        sync.Mutex
+	remaining int
+	hook      func()
+}
+
+func (clock *armedNowHookClock) Now() time.Time {
+	now := clock.Clock.Now()
+	clock.mu.Lock()
+	trigger := false
+	if clock.remaining > 0 {
+		clock.remaining--
+		trigger = clock.remaining == 0
+	}
+	hook := clock.hook
+	clock.mu.Unlock()
+	if trigger && hook != nil {
+		hook()
+	}
+	return now
+}
+
+func (clock *armedNowHookClock) arm() {
+	clock.armNth(1)
+}
+
+func (clock *armedNowHookClock) armNth(n int) {
+	clock.mu.Lock()
+	clock.remaining = n
+	clock.mu.Unlock()
+}
+
+func loadManagerEvents(t *testing.T, root string) []Event {
+	t.Helper()
+	payload, err := os.ReadFile(filepath.Join(root, "state", "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(payload)), "\n")
+	events := make([]Event, 0, len(lines))
+	for _, line := range lines {
+		var event Event
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, event)
+	}
+	return events
+}
+
+func countManagerEvents(events []Event, kind string) int {
+	count := 0
+	for _, event := range events {
+		if event.Kind == kind {
+			count++
+		}
+	}
+	return count
+}
+
+func managerEventSequence(root, kind string) (uint64, bool) {
+	payload, err := os.ReadFile(filepath.Join(root, "state", "events.jsonl"))
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(payload)), "\n") {
+		var event Event
+		if json.Unmarshal([]byte(line), &event) != nil {
+			return 0, false
+		}
+		if event.Kind == kind {
+			return event.Sequence, true
+		}
+	}
+	return 0, false
+}
+
+func assertNoRecoveryTransitionAfterShutdown(t *testing.T, events []Event) {
+	t.Helper()
+	var shutdownSequence uint64
+	for _, event := range events {
+		if event.Kind == "shutdown_requested" {
+			shutdownSequence = event.Sequence
+			break
+		}
+	}
+	if shutdownSequence == 0 {
+		t.Fatal("shutdown_requested event is missing")
+	}
+	protected := map[string]bool{
+		"child_started":     true,
+		"failure_detected":  true,
+		"restart_scheduled": true,
+		"restart_exhausted": true,
+	}
+	for _, event := range events {
+		if event.Sequence > shutdownSequence && protected[event.Kind] {
+			t.Fatalf("%s event sequence %d followed shutdown sequence %d", event.Kind, event.Sequence, shutdownSequence)
+		}
+	}
+}
 
 func waitUntil(t *testing.T, timeout time.Duration, predicate func() bool) {
 	t.Helper()
@@ -244,9 +481,9 @@ func TestStartupTimeoutReturnsZeroContinuousReadiness(t *testing.T) {
 	clock := newFakeClock(time.Now())
 	manager.SetClock(clock)
 	runtime := manager.children["stack"]
-	startedAt, pgid, wait, err := manager.startChild(runtime, false)
-	if err != nil {
-		t.Fatal(err)
+	startedAt, pgid, wait, committed, err := manager.startChild(context.Background(), runtime, false)
+	if err != nil || !committed {
+		t.Fatalf("startChild() = committed %t, error %v", committed, err)
 	}
 	type monitorResult struct {
 		kind            string
@@ -255,10 +492,14 @@ func TestStartupTimeoutReturnsZeroContinuousReadiness(t *testing.T) {
 	}
 	result := make(chan monitorResult, 1)
 	go func() {
-		kind, continuousReady, stop := manager.monitorStartedChild(
+		observed := manager.monitorStartedChild(
 			context.Background(), runtime, startedAt, pgid, wait,
 		)
-		result <- monitorResult{kind: kind, continuousReady: continuousReady, stop: stop}
+		result <- monitorResult{
+			kind:            observed.failureKind,
+			continuousReady: observed.continuousReady,
+			stop:            observed.stop,
+		}
 	}()
 	waitForFakeTimer(t, clock)
 	clock.Advance(111 * time.Second)
@@ -284,9 +525,9 @@ func TestUnexpectedExitReturnsSixtySecondsContinuousReadiness(t *testing.T) {
 	clock := newFakeClock(time.Now())
 	manager.SetClock(clock)
 	runtime := manager.children["stack"]
-	startedAt, pgid, wait, err := manager.startChild(runtime, false)
-	if err != nil {
-		t.Fatal(err)
+	startedAt, pgid, wait, committed, err := manager.startChild(context.Background(), runtime, false)
+	if err != nil || !committed {
+		t.Fatalf("startChild() = committed %t, error %v", committed, err)
 	}
 	type monitorResult struct {
 		kind            string
@@ -294,10 +535,13 @@ func TestUnexpectedExitReturnsSixtySecondsContinuousReadiness(t *testing.T) {
 	}
 	result := make(chan monitorResult, 1)
 	go func() {
-		kind, continuousReady, _ := manager.monitorStartedChild(
+		observed := manager.monitorStartedChild(
 			context.Background(), runtime, startedAt, pgid, wait,
 		)
-		result <- monitorResult{kind: kind, continuousReady: continuousReady}
+		result <- monitorResult{
+			kind:            observed.failureKind,
+			continuousReady: observed.continuousReady,
+		}
 	}()
 	waitForFakeTimer(t, clock)
 	clock.Advance(60 * time.Second)
@@ -328,7 +572,7 @@ func TestUnexpectedExitClearsPublishedProcessIdentity(t *testing.T) {
 	go func() { done <- manager.Run(ctx) }()
 	waitUntil(t, time.Second, func() bool {
 		child := manager.Snapshot().Children[0]
-		return child.LastFailureKind == "unexpected_exit"
+		return child.LastFailureKind == "unexpected_exit" && child.PID == 0 && child.PGID == 0
 	})
 	child := manager.Snapshot().Children[0]
 	if child.Running || child.PID != 0 || child.PGID != 0 || child.LastExitCode == nil || *child.LastExitCode != 7 {
@@ -415,21 +659,827 @@ func TestCancellationTiedWithLeaderExitStillCleansCapturedProcessGroup(t *testin
 		t.Fatal(err)
 	}
 	runtime := manager.children["stack"]
-	startedAt, pgid, wait, err := manager.startChild(runtime, false)
-	if err != nil {
-		t.Fatal(err)
+	startedAt, pgid, wait, committed, err := manager.startChild(context.Background(), runtime, false)
+	if err != nil || !committed {
+		t.Fatalf("startChild() = committed %t, error %v", committed, err)
 	}
 	waitUntil(t, 2*time.Second, func() bool {
 		return len(wait) == 1 && processGroupExists(pgid)
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, _, stop := manager.monitorStartedChild(ctx, runtime, startedAt, pgid, wait)
-	if !stop {
+	result := manager.monitorStartedChild(ctx, runtime, startedAt, pgid, wait)
+	if !result.stop {
 		t.Fatal("canceled monitor requested a restart")
 	}
 	if processGroupExists(pgid) {
 		t.Fatalf("captured process group %d survived the Wait/cancel tie", pgid)
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCancellationDuringStartFailureDoesNotPublishFailureOrRestart(t *testing.T) {
+	root := t.TempDir()
+	manager, err := New(managerConfig(root, []string{"/bin/true"}, ""), quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	system := newFakeProcessSystem()
+	system.startHook = cancel
+	system.startErr = errors.New("fake start failed after cancellation")
+	manager.system = system
+
+	done := make(chan error, 1)
+	go func() { done <- manager.Run(ctx) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not honor cancellation from the start hook")
+	}
+	child := manager.Snapshot().Children[0]
+	if child.LastFailureKind != "" || child.CircuitOpen || child.Running || child.PID != 0 || child.PGID != 0 {
+		t.Fatalf("canceled start failure mutated child state: %#v", child)
+	}
+	if failures := manager.children["stack"].tracker.failures; len(failures) != 0 {
+		t.Fatalf("canceled start failure mutated restart tracker: %v", failures)
+	}
+	events := loadManagerEvents(t, root)
+	if countManagerEvents(events, "failure_detected") != 0 ||
+		countManagerEvents(events, "restart_scheduled") != 0 ||
+		countManagerEvents(events, "restart_exhausted") != 0 {
+		t.Fatalf("canceled start failure published recovery events: %#v", events)
+	}
+	if starts := system.startPIDs(); len(starts) != 0 {
+		t.Fatalf("failed start unexpectedly created a process: %v", starts)
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBlockedStartReturningAfterShutdownIsReapedWithoutLifecycleCommit(t *testing.T) {
+	root := t.TempDir()
+	manager, err := New(managerConfig(root, []string{"/bin/true"}, ""), quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	startEntered := make(chan struct{})
+	releaseStart := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseStart:
+		default:
+			close(releaseStart)
+		}
+	}()
+	system := newFakeProcessSystem()
+	system.startHook = func() {
+		close(startEntered)
+		<-releaseStart
+	}
+	manager.system = system
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- manager.Run(ctx) }()
+	select {
+	case <-startEntered:
+	case <-time.After(time.Second):
+		t.Fatal("fake Start did not reach its blocking hook")
+	}
+	cancel()
+	waitUntil(t, time.Second, func() bool {
+		_, found := managerEventSequence(root, "shutdown_requested")
+		return found
+	})
+	close(releaseStart)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not reap the uncommitted process returned by Start")
+	}
+
+	events := loadManagerEvents(t, root)
+	if countManagerEvents(events, "child_started") != 0 ||
+		countManagerEvents(events, "failure_detected") != 0 ||
+		countManagerEvents(events, "restart_scheduled") != 0 ||
+		countManagerEvents(events, "restart_exhausted") != 0 {
+		t.Fatalf("blocked post-shutdown Start committed a lifecycle transition: %#v", events)
+	}
+	assertNoRecoveryTransitionAfterShutdown(t, events)
+	if starts := system.startPIDs(); len(starts) != 1 {
+		t.Fatalf("physical starts = %v, want one uncommitted process", starts)
+	}
+	signals := system.observedSignals()
+	if len(signals) != 1 || signals[0].signal != syscall.SIGTERM {
+		t.Fatalf("uncommitted process cleanup signals = %#v", signals)
+	}
+	child := manager.Snapshot().Children[0]
+	if child.Running || child.PID != 0 || child.PGID != 0 || child.LastFailureKind != "" {
+		t.Fatalf("uncommitted process leaked published state: %#v", child)
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCancellationFromHeartbeatClockStopsWithoutFailureOrRestart(t *testing.T) {
+	root := t.TempDir()
+	heartbeat := filepath.Join(root, "state", "never-created.heartbeat")
+	manager, err := New(managerConfig(root, []string{"/bin/true"}, heartbeat), quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyClock := newFakeClock(time.Now())
+	ctx, cancel := context.WithCancel(context.Background())
+	nowEntered := make(chan struct{})
+	releaseNow := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseNow:
+		default:
+			close(releaseNow)
+		}
+	}()
+	hookedClock := &armedNowHookClock{
+		Clock: policyClock,
+		hook: func() {
+			cancel()
+			close(nowEntered)
+			<-releaseNow
+		},
+	}
+	system := newFakeProcessSystem()
+	manager.SetClock(hookedClock)
+	manager.system = system
+
+	done := make(chan error, 1)
+	go func() { done <- manager.Run(ctx) }()
+	waitUntil(t, time.Second, func() bool { return len(system.startPIDs()) == 1 })
+	waitForFakeTimer(t, policyClock)
+	hookedClock.arm()
+	policyClock.Advance(111 * time.Second)
+	select {
+	case <-nowEntered:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat branch did not reach the armed clock hook")
+	}
+	waitUntil(t, time.Second, func() bool {
+		_, found := managerEventSequence(root, "shutdown_requested")
+		return found
+	})
+	close(releaseNow)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat-triggered cancellation did not stop the manager")
+	}
+	child := manager.Snapshot().Children[0]
+	if child.LastFailureKind != "" || child.CircuitOpen || child.Running || child.PID != 0 || child.PGID != 0 {
+		t.Fatalf("heartbeat cancellation was misclassified as failure: %#v", child)
+	}
+	if failures := manager.children["stack"].tracker.failures; len(failures) != 0 {
+		t.Fatalf("heartbeat cancellation mutated restart tracker: %v", failures)
+	}
+	events := loadManagerEvents(t, root)
+	if countManagerEvents(events, "failure_detected") != 0 ||
+		countManagerEvents(events, "restart_scheduled") != 0 ||
+		countManagerEvents(events, "restart_exhausted") != 0 {
+		t.Fatalf("heartbeat cancellation published recovery events: %#v", events)
+	}
+	if countManagerEvents(events, "child_stop_requested") != 1 ||
+		countManagerEvents(events, "child_stopped") != 1 {
+		t.Fatalf("heartbeat cancellation did not perform exactly one cleanup: %#v", events)
+	}
+	assertNoRecoveryTransitionAfterShutdown(t, events)
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAlreadyCanceledRestartWaitDoesNotMutateTrackerOrEvents(t *testing.T) {
+	root := t.TempDir()
+	manager, err := New(managerConfig(root, []string{"/bin/true"}, ""), quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := manager.children["stack"]
+	entriesBefore, droppedBefore := manager.store.counts()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	restart := manager.waitForRestart(ctx, runtime, time.Minute)
+	if restart.committed || restart.restart {
+		t.Fatal("already-canceled restart wait requested a replacement")
+	}
+	if len(runtime.tracker.failures) != 0 {
+		t.Fatalf("already-canceled restart wait mutated tracker: %v", runtime.tracker.failures)
+	}
+	entriesAfter, droppedAfter := manager.store.counts()
+	if entriesAfter != entriesBefore || droppedAfter != droppedBefore {
+		t.Fatalf(
+			"already-canceled restart wait mutated event store: before=(%d,%d) after=(%d,%d)",
+			entriesBefore,
+			droppedBefore,
+			entriesAfter,
+			droppedAfter,
+		)
+	}
+	if runtime.state.CircuitOpen {
+		t.Fatal("already-canceled restart wait opened the restart circuit")
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNthNowCancellationLinearizesFailureAndRestartTransitions(t *testing.T) {
+	tests := []struct {
+		name          string
+		transition    string
+		nthNow        int
+		wantCommitted bool
+		wantEvent     string
+	}{
+		{name: "failure-before-gate", transition: "failure", nthNow: 1, wantEvent: "failure_detected"},
+		{
+			name:          "failure-after-gate",
+			transition:    "failure",
+			nthNow:        2,
+			wantCommitted: true,
+			wantEvent:     "failure_detected",
+		},
+		{name: "restart-before-gate", transition: "restart", nthNow: 1, wantEvent: "restart_scheduled"},
+		{
+			name:          "restart-after-gate",
+			transition:    "restart",
+			nthNow:        2,
+			wantCommitted: true,
+			wantEvent:     "restart_scheduled",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			manager, err := New(managerConfig(root, []string{"/bin/true"}, ""), quietLogger())
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			clock := &armedNowHookClock{Clock: newFakeClock(time.Now()), hook: cancel}
+			manager.SetClock(clock)
+			shutdownDone := make(chan struct{})
+			go func() {
+				<-ctx.Done()
+				manager.beginShutdown()
+				close(shutdownDone)
+			}()
+			clock.armNth(test.nthNow)
+
+			committed := false
+			runtime := manager.children["stack"]
+			switch test.transition {
+			case "failure":
+				committed = manager.markFailure(
+					ctx,
+					runtime,
+					"test_failure",
+					nil,
+					errors.New("test failure"),
+					true,
+				)
+			case "restart":
+				result := manager.waitForRestart(ctx, runtime, 0)
+				committed = result.committed
+				if result.restart {
+					t.Fatal("canceled restart transition requested a replacement")
+				}
+			default:
+				t.Fatalf("unknown transition %q", test.transition)
+			}
+			select {
+			case <-shutdownDone:
+			case <-time.After(time.Second):
+				t.Fatal("shutdown transition did not finish")
+			}
+			if committed != test.wantCommitted {
+				t.Fatalf("committed = %t, want %t", committed, test.wantCommitted)
+			}
+			events := loadManagerEvents(t, root)
+			count := countManagerEvents(events, test.wantEvent)
+			if test.wantCommitted && count != 1 {
+				t.Fatalf("committed transition event count = %d, want 1: %#v", count, events)
+			}
+			if !test.wantCommitted && count != 0 {
+				t.Fatalf("rejected transition event count = %d, want 0: %#v", count, events)
+			}
+			if test.wantCommitted {
+				transitionSequence, _ := managerEventSequence(root, test.wantEvent)
+				shutdownSequence, _ := managerEventSequence(root, "shutdown_requested")
+				if transitionSequence == 0 || transitionSequence >= shutdownSequence {
+					t.Fatalf(
+						"linearized sequence order = transition %d, shutdown %d",
+						transitionSequence,
+						shutdownSequence,
+					)
+				}
+			}
+			if test.transition == "failure" {
+				wantKind := ""
+				if test.wantCommitted {
+					wantKind = "test_failure"
+				}
+				if runtime.state.LastFailureKind != wantKind {
+					t.Fatalf("LastFailureKind = %q, want %q", runtime.state.LastFailureKind, wantKind)
+				}
+			} else {
+				wantFailures := 0
+				if test.wantCommitted {
+					wantFailures = 1
+				}
+				if len(runtime.tracker.failures) != wantFailures {
+					t.Fatalf("restart tracker failures = %v, want length %d", runtime.tracker.failures, wantFailures)
+				}
+			}
+			assertNoRecoveryTransitionAfterShutdown(t, events)
+			if err := manager.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestTwoChildTransitionContentionOrdersCommitBeforeShutdown(t *testing.T) {
+	root := t.TempDir()
+	cfg := managerConfig(root, []string{"/bin/true"}, "")
+	alpha := cfg.Children[0]
+	alpha.Name = "alpha"
+	beta := alpha
+	beta.Name = "beta"
+	cfg.Children = []config.Child{alpha, beta}
+	manager, err := New(cfg, quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	transitionEntered := make(chan struct{})
+	releaseTransition := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseTransition:
+		default:
+			close(releaseTransition)
+		}
+	}()
+	clock := &armedNowHookClock{
+		Clock: newFakeClock(time.Now()),
+		hook: func() {
+			close(transitionEntered)
+			<-releaseTransition
+		},
+	}
+	system := newFakeProcessSystem()
+	system.startHooks = map[string]func(){"alpha": clock.arm}
+	manager.SetClock(clock)
+	manager.system = system
+	ctx, cancel := context.WithCancel(context.Background())
+
+	type startOutcome struct {
+		pgid      int
+		wait      <-chan error
+		committed bool
+		err       error
+	}
+	start := func(runtime *childRuntime) <-chan startOutcome {
+		result := make(chan startOutcome, 1)
+		go func() {
+			_, pgid, wait, committed, err := manager.startChild(ctx, runtime, false)
+			result <- startOutcome{pgid: pgid, wait: wait, committed: committed, err: err}
+		}()
+		return result
+	}
+	alphaResult := start(manager.children["alpha"])
+	select {
+	case <-transitionEntered:
+	case <-time.After(time.Second):
+		t.Fatal("alpha transition did not block inside child_started persistence")
+	}
+	betaResult := start(manager.children["beta"])
+	waitUntil(t, time.Second, func() bool { return len(system.startPIDs()) == 2 })
+	shutdownDone := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+		manager.beginShutdown()
+		close(shutdownDone)
+	}()
+	cancel()
+	close(releaseTransition)
+
+	var alphaOutcome, betaOutcome startOutcome
+	select {
+	case alphaOutcome = <-alphaResult:
+	case <-time.After(time.Second):
+		t.Fatal("alpha transition did not finish")
+	}
+	select {
+	case betaOutcome = <-betaResult:
+	case <-time.After(time.Second):
+		t.Fatal("beta transition did not finish")
+	}
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown transition did not finish after child contention")
+	}
+	if alphaOutcome.err != nil || !alphaOutcome.committed {
+		t.Fatalf("alpha start outcome = %#v, want committed", alphaOutcome)
+	}
+	if betaOutcome.err != nil || betaOutcome.committed {
+		t.Fatalf("beta start outcome = %#v, want rejected", betaOutcome)
+	}
+
+	manager.stopStartedChild(manager.children["alpha"], alphaOutcome.pgid, alphaOutcome.wait, 0)
+	manager.cleanupUncommittedStartedChild(manager.children["beta"], betaOutcome.pgid, betaOutcome.wait)
+	events := loadManagerEvents(t, root)
+	if countManagerEvents(events, "child_started") != 1 {
+		t.Fatalf("child_started count = %d, want 1: %#v", countManagerEvents(events, "child_started"), events)
+	}
+	var alphaSequence, shutdownSequence uint64
+	for _, event := range events {
+		switch {
+		case event.Kind == "child_started" && event.Child == "alpha":
+			alphaSequence = event.Sequence
+		case event.Kind == "child_started" && event.Child == "beta":
+			t.Fatalf("beta committed after cancellation: %#v", event)
+		case event.Kind == "shutdown_requested":
+			shutdownSequence = event.Sequence
+		}
+	}
+	if alphaSequence == 0 || shutdownSequence == 0 || alphaSequence >= shutdownSequence {
+		t.Fatalf("contention order = alpha %d, shutdown %d", alphaSequence, shutdownSequence)
+	}
+	assertNoRecoveryTransitionAfterShutdown(t, events)
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStaleHeartbeatStopsOldGroupThenRestartsOnceAfterFrozenBackoff(t *testing.T) {
+	root := t.TempDir()
+	heartbeat := filepath.Join(root, "state", "stack.heartbeat")
+	manager, err := New(managerConfig(root, []string{"/bin/true"}, heartbeat), quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := newFakeClock(time.Now().Add(-time.Minute).Truncate(time.Millisecond))
+	system := newFakeProcessSystem()
+	manager.SetClock(clock)
+	manager.system = system
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- manager.Run(ctx) }()
+	waitUntil(t, time.Second, func() bool { return len(system.startPIDs()) == 1 })
+	firstPID := system.startPIDs()[0]
+	if err := os.WriteFile(heartbeat, []byte("fresh\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	firstHeartbeat := clock.Now()
+	if err := os.Chtimes(heartbeat, firstHeartbeat, firstHeartbeat); err != nil {
+		t.Fatal(err)
+	}
+	waitForFakeTimer(t, clock)
+	clock.Advance(500 * time.Millisecond)
+	waitUntil(t, time.Second, func() bool { return manager.Snapshot().Ready })
+
+	waitForFakeTimer(t, clock)
+	clock.Advance(2500 * time.Millisecond)
+	waitUntil(t, time.Second, func() bool {
+		child := manager.Snapshot().Children[0]
+		return child.LastFailureKind == "heartbeat_stale" && child.PID == 0 && child.PGID == 0
+	})
+	waitForFakeTimer(t, clock)
+	if got := system.startPIDs(); len(got) != 1 || got[0] != firstPID {
+		t.Fatalf("replacement started before backoff: %v", got)
+	}
+	clock.Advance(999 * time.Millisecond)
+	if got := system.startPIDs(); len(got) != 1 {
+		t.Fatalf("replacement started before 1000ms elapsed: %v", got)
+	}
+	clock.Advance(time.Millisecond)
+	waitUntil(t, time.Second, func() bool { return len(system.startPIDs()) == 2 })
+	secondPID := system.startPIDs()[1]
+	if secondPID == firstPID {
+		t.Fatal("replacement reused the old fake process identity")
+	}
+	secondHeartbeat := clock.Now()
+	if err := os.Chtimes(heartbeat, secondHeartbeat, secondHeartbeat); err != nil {
+		t.Fatal(err)
+	}
+	waitForFakeTimer(t, clock)
+	clock.Advance(500 * time.Millisecond)
+	waitUntil(t, time.Second, func() bool {
+		snapshot := manager.Snapshot()
+		return snapshot.Ready && snapshot.Children[0].RestartCount == 1
+	})
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("manager did not stop after recovered replacement")
+	}
+	events := loadManagerEvents(t, root)
+	if countManagerEvents(events, "failure_detected") != 1 ||
+		countManagerEvents(events, "restart_scheduled") != 1 ||
+		countManagerEvents(events, "child_started") != 2 {
+		t.Fatalf("unexpected recovery event counts: %#v", events)
+	}
+	var restart Event
+	for _, event := range events {
+		if event.Kind == "restart_scheduled" {
+			restart = event
+		}
+	}
+	if restart.RestartAttempt != 1 || restart.BackoffMS != 1000 {
+		t.Fatalf("restart schedule = %#v, want attempt 1 after 1000ms", restart)
+	}
+	signals := system.observedSignals()
+	if len(signals) != 2 || signals[0] != (fakeProcessSignal{pgid: firstPID, signal: syscall.SIGTERM}) ||
+		signals[1] != (fakeProcessSignal{pgid: secondPID, signal: syscall.SIGTERM}) {
+		t.Fatalf("process-group stop signals = %#v", signals)
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCleanupIncompleteOpensStickyCircuitAndNeverRestarts(t *testing.T) {
+	root := t.TempDir()
+	heartbeat := filepath.Join(root, "state", "never-created.heartbeat")
+	manager, err := New(managerConfig(root, []string{"/bin/true"}, heartbeat), quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := newFakeClock(time.Now())
+	system := newFakeProcessSystem()
+	system.keepGroupOnTERM = true
+	system.keepGroupOnKILL = true
+	manager.SetClock(clock)
+	manager.system = system
+	manager.cleanup = cleanupPolicy{
+		terminationGrace: 5 * time.Millisecond,
+		killGrace:        5 * time.Millisecond,
+		pollInterval:     time.Millisecond,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- manager.Run(ctx) }()
+	waitUntil(t, time.Second, func() bool { return len(system.startPIDs()) == 1 })
+	originalPGID := system.startPIDs()[0]
+	waitForFakeTimer(t, clock)
+	clock.Advance(111 * time.Second)
+	waitUntil(t, time.Second, func() bool {
+		child := manager.Snapshot().Children[0]
+		return child.CircuitOpen && child.LastFailureKind == cleanupFailureKind
+	})
+	child := manager.Snapshot().Children[0]
+	if child.Running || child.PID != 0 || child.PGID != originalPGID || manager.Snapshot().Ready {
+		t.Fatalf("cleanup-incomplete snapshot = %#v", child)
+	}
+	clock.Advance(time.Hour)
+	if starts := system.startPIDs(); len(starts) != 1 {
+		t.Fatalf("cleanup-incomplete child was replaced: %v", starts)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned before external cancellation: %v", err)
+	default:
+	}
+	events := loadManagerEvents(t, root)
+	if countManagerEvents(events, "failure_detected") != 1 ||
+		countManagerEvents(events, "restart_scheduled") != 0 ||
+		countManagerEvents(events, "child_group_cleanup_incomplete") != 1 {
+		t.Fatalf("cleanup failure event counts are not fail-closed: %#v", events)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, errProcessGroupCleanupIncomplete) {
+			t.Fatalf("Run error = %v, want cleanup sentinel", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return the cleanup sentinel after cancellation")
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCleanupBoundsMissingLeaderWaitAfterGroupDisappears(t *testing.T) {
+	root := t.TempDir()
+	manager, err := New(managerConfig(root, []string{"/bin/true"}, ""), quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	system := newFakeProcessSystem()
+	system.reapOnTERM = false
+	system.reapOnKILL = false
+	manager.system = system
+	manager.cleanup = cleanupPolicy{
+		terminationGrace: 8 * time.Millisecond,
+		killGrace:        8 * time.Millisecond,
+		pollInterval:     time.Millisecond,
+	}
+	runtime := manager.children["stack"]
+	_, pgid, wait, committed, err := manager.startChild(context.Background(), runtime, false)
+	if err != nil || !committed {
+		t.Fatalf("startChild() = committed %t, error %v", committed, err)
+	}
+
+	started := time.Now()
+	cleanup := manager.cleanupProcessGroup(
+		context.Background(), runtime.spec.Name, pgid, wait, false, nil, cleanupRequested,
+	)
+	elapsed := time.Since(started)
+	if cleanup.complete() || cleanup.leaderReaped || !cleanup.groupEmpty || cleanup.err == nil {
+		t.Fatalf("missing-wait cleanup result = %#v", cleanup)
+	}
+	if elapsed > 250*time.Millisecond {
+		t.Fatalf("missing leader wait exceeded its real-time bound: %s", elapsed)
+	}
+	signals := system.observedSignals()
+	if len(signals) != 2 || signals[0].signal != syscall.SIGTERM || signals[1].signal != syscall.SIGKILL {
+		t.Fatalf("bounded cleanup signals = %#v", signals)
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCleanupEscalatesToKillThenProvesReapAndEmpty(t *testing.T) {
+	root := t.TempDir()
+	manager, err := New(managerConfig(root, []string{"/bin/true"}, ""), quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	system := newFakeProcessSystem()
+	system.keepGroupOnTERM = true
+	system.reapOnTERM = false
+	manager.system = system
+	manager.cleanup = cleanupPolicy{
+		terminationGrace: 5 * time.Millisecond,
+		killGrace:        5 * time.Millisecond,
+		pollInterval:     time.Millisecond,
+	}
+	runtime := manager.children["stack"]
+	_, pgid, wait, committed, err := manager.startChild(context.Background(), runtime, false)
+	if err != nil || !committed {
+		t.Fatalf("startChild() = committed %t, error %v", committed, err)
+	}
+
+	cleanup := manager.cleanupProcessGroup(
+		context.Background(), runtime.spec.Name, pgid, wait, false, nil, cleanupRequested,
+	)
+	if !cleanup.complete() {
+		t.Fatalf("SIGKILL cleanup did not prove leader and group exit: %#v", cleanup)
+	}
+	signals := system.observedSignals()
+	if len(signals) != 2 || signals[0].signal != syscall.SIGTERM || signals[1].signal != syscall.SIGKILL {
+		t.Fatalf("escalated cleanup signals = %#v", signals)
+	}
+	manager.markStopped(runtime, exitCode(cleanup.waitErr))
+	child := manager.Snapshot().Children[0]
+	if child.Running || child.PID != 0 || child.PGID != 0 || child.CircuitOpen {
+		t.Fatalf("successfully escalated cleanup state = %#v", child)
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCleanupSignalFailureKeepsCircuitOpenAfterResourcesDisappear(t *testing.T) {
+	root := t.TempDir()
+	manager, err := New(managerConfig(root, []string{"/bin/true"}, ""), quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	system := newFakeProcessSystem()
+	system.termErr = syscall.EPERM
+	manager.system = system
+	manager.cleanup = cleanupPolicy{
+		terminationGrace: 5 * time.Millisecond,
+		killGrace:        5 * time.Millisecond,
+		pollInterval:     time.Millisecond,
+	}
+	runtime := manager.children["stack"]
+	_, pgid, wait, committed, err := manager.startChild(context.Background(), runtime, false)
+	if err != nil || !committed {
+		t.Fatalf("startChild() = committed %t, error %v", committed, err)
+	}
+
+	cleanup := manager.cleanupProcessGroup(
+		context.Background(), runtime.spec.Name, pgid, wait, false, nil, cleanupRequested,
+	)
+	if cleanup.complete() || !cleanup.leaderReaped || !cleanup.groupEmpty || !errors.Is(cleanup.err, syscall.EPERM) {
+		t.Fatalf("signal-failure cleanup result = %#v", cleanup)
+	}
+	manager.markCleanupIncomplete(runtime, pgid, cleanup)
+	child := manager.Snapshot().Children[0]
+	if !child.CircuitOpen || child.LastFailureKind != cleanupFailureKind || child.PID != 0 || child.PGID != pgid {
+		t.Fatalf("signal-failure circuit state = %#v", child)
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWaitEmptyCancellationPerformsFinalKernelProbe(t *testing.T) {
+	root := t.TempDir()
+	manager, err := New(managerConfig(root, []string{"/bin/true"}, ""), quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	system := newFakeProcessSystem()
+	system.probeStates = []bool{true, false}
+	manager.system = system
+	manager.cleanup.pollInterval = time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	started := time.Now()
+	result := manager.waitEmpty(
+		ctx,
+		9001,
+		nil,
+		cleanupResult{leaderReaped: true},
+		time.Second,
+	)
+	if !result.leaderReaped || !result.groupEmpty || !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("canceled wait result = %#v", result)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("canceled wait ignored cancellation for %s", elapsed)
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResidualCleanupFailureRetainsGroupAndOpensCircuit(t *testing.T) {
+	root := t.TempDir()
+	manager, err := New(managerConfig(root, []string{"/bin/true"}, ""), quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	system := newFakeProcessSystem()
+	system.keepGroupOnTERM = true
+	system.keepGroupOnKILL = true
+	manager.system = system
+	manager.cleanup = cleanupPolicy{
+		terminationGrace: 5 * time.Millisecond,
+		killGrace:        5 * time.Millisecond,
+		pollInterval:     time.Millisecond,
+	}
+	runtime := manager.children["stack"]
+	startedAt, pgid, wait, committed, err := manager.startChild(context.Background(), runtime, false)
+	if err != nil || !committed {
+		t.Fatalf("startChild() = committed %t, error %v", committed, err)
+	}
+	system.exitLeader(pgid, errors.New("fake leader exited"))
+	result := manager.monitorStartedChild(context.Background(), runtime, startedAt, pgid, wait)
+	if !result.stop || result.failureKind != "" || result.cleanupErr == nil {
+		t.Fatalf("residual cleanup monitor result = %#v", result)
+	}
+	child := manager.Snapshot().Children[0]
+	if !child.CircuitOpen || child.LastFailureKind != cleanupFailureKind ||
+		child.PID != 0 || child.PGID != pgid || child.Running {
+		t.Fatalf("residual cleanup state = %#v", child)
+	}
+	if !errors.Is(manager.terminalError(), errProcessGroupCleanupIncomplete) {
+		t.Fatalf("terminal error = %v, want cleanup sentinel", manager.terminalError())
+	}
+	events := loadManagerEvents(t, root)
+	if countManagerEvents(events, "failure_detected") != 1 ||
+		countManagerEvents(events, "residual_process_group_detected") != 1 ||
+		countManagerEvents(events, "residual_process_group_kill_escalated") != 1 ||
+		countManagerEvents(events, "child_group_cleanup_incomplete") != 1 ||
+		countManagerEvents(events, "restart_scheduled") != 0 {
+		t.Fatalf("residual cleanup events = %#v", events)
 	}
 	if err := manager.Close(); err != nil {
 		t.Fatal(err)

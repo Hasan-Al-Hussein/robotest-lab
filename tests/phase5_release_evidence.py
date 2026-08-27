@@ -13,12 +13,11 @@ import importlib.util
 import io
 import json
 import math
-import os
 import re
 import shlex
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -272,12 +271,15 @@ PHASE4_CHECKS = {
     'interrupted_mission_pair_is_consistent',
     'interrupted_mission_was_bounded',
     'mission_was_active_before_injection',
+    'lifecycle_startup_result_is_exact',
     'observed_recovery_is_bounded',
     'only_one_systemd_owned_ros_service',
     'original_process_group_empty_within_5s',
     'package_artifacts_match_lifecycle',
     'package_lifecycle_passed',
     'package_source_binding_passed',
+    'package_source_rebuild_is_exact',
+    'post_observation_shutdown_is_exact',
     'published_process_groups_are_bound',
     'readiness_false_event_present',
     'readiness_false_throughout_unavailable_interval',
@@ -287,9 +289,11 @@ PHASE4_CHECKS = {
     'replacement_process_group_is_new',
     'restored_status_is_exactly_ready',
     'run_scoped_supervisor_config_is_exact',
+    'runtime_cpu_affinity_is_limited',
     'runtime_staging_is_bound',
     'source_snapshot_unchanged_and_self_consistent',
     'supervisor_main_pid_stable',
+    'supervisor_status_snapshots_are_exact',
     'systemd_did_not_restart_supervisor',
     'unique_runtime_isolation',
 }
@@ -335,23 +339,80 @@ PHASE4_REQUIRED_RAW = {
     'followup-mission.json',
     'followup-result.csv',
     'followup-result.json',
+    'initial-status.json',
     'installed-package-state.json',
     'interrupted-outcome.json',
+    'isolation.json',
+    'lifecycle-startup-result.json',
+    'original-group-empty.json',
     'overlay-install-manifest.json',
     'overlay-provenance.json',
     'overlay-source-manifest.json',
     'package-binding.json',
     'package-integrity.json',
     'package-lifecycle.json',
+    'package-source-rebuild.json',
     'ready-restored-status.json',
+    'runtime-affinity-initial.json',
+    'runtime-affinity-restored.json',
     'runtime-staging.json',
     'service-final.json',
     'source-snapshot-after.json',
     'source-snapshot-before.json',
     'supervisor-config.json',
+    'supervisor-config-check.txt',
     'supervisor-events.jsonl',
     'supervisor-events.meta.json',
+    'supervisor-status-final.json',
+    'systemd-dropin.conf',
+    'systemd-owners-initial.json',
+    'systemd-owners-restored.json',
     'timeline.jsonl',
+}
+PHASE4_AFFINITY_KEYS = {
+    'captured_utc',
+    'controller_count',
+    'controller_pid',
+    'expected_cpuset',
+    'main_pid',
+    'managed_child_pgid',
+    'managed_child_pid',
+    'phase',
+    'process_count',
+    'processes',
+    'schema_version',
+    'snapshot_stable',
+    'unit',
+    'unit_cgroup',
+    'verdict',
+}
+PHASE4_AFFINITY_PROCESS_KEYS = {
+    'cgroup',
+    'cpus_allowed',
+    'cpus_allowed_list',
+    'executable',
+    'pgid',
+    'pid',
+    'ppid',
+    'role',
+    'start_time_ticks',
+}
+PHASE4_LIFECYCLE_STARTUP_KEYS = {
+    'accepted',
+    'command',
+    'completed_utc',
+    'discovery_grace_sec',
+    'elapsed_wall_sec',
+    'exit_code',
+    'failure_kind',
+    'failure_message',
+    'response_timeout_sec',
+    'schema_version',
+    'service_name',
+    'service_timeout_sec',
+    'started_utc',
+    'verdict',
+    'watch_pid',
 }
 REMOTE_PROOF_SCOPE = 'Read-only GitHub verification for one exact pushed commit SHA'
 EVIDENCE_DOCUMENT_ROOTS = ('docs/results/phase-3/', 'docs/results/phase-4/')
@@ -4118,6 +4179,288 @@ def _phase4_csv_bytes(result: Mapping[str, Any]) -> bytes:
     return stream.getvalue().encode()
 
 
+def _canonical_cpu_list(cpu_ids: Sequence[int]) -> str:
+    _require(cpu_ids, 'CPU ID list is empty')
+    ranges: list[str] = []
+    start = previous = cpu_ids[0]
+    for cpu_id in cpu_ids[1:]:
+        if cpu_id == previous + 1:
+            previous = cpu_id
+            continue
+        ranges.append(str(start) if start == previous else f'{start}-{previous}')
+        start = previous = cpu_id
+    ranges.append(str(start) if start == previous else f'{start}-{previous}')
+    return ','.join(ranges)
+
+
+def _phase4_cpu_ids(value: object, label: str) -> list[int]:
+    _require(
+        isinstance(value, str)
+        and value
+        and len(value) <= 1024
+        and re.fullmatch(r'\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*', value) is not None,
+        f'{label} is invalid',
+    )
+    cpu_ids: list[int] = []
+    for component in value.split(','):
+        bounds = component.split('-', 1)
+        start = int(bounds[0])
+        end = int(bounds[-1])
+        _require(0 <= start <= end <= 4095, f'{label} contains an invalid range')
+        cpu_ids.extend(range(start, end + 1))
+    _require(
+        cpu_ids == sorted(set(cpu_ids)) and value == _canonical_cpu_list(cpu_ids),
+        f'{label} is not canonical',
+    )
+    return cpu_ids
+
+
+def _phase4_cpu_mask_ids(value: object, label: str) -> list[int]:
+    _require(
+        isinstance(value, str)
+        and len(value) <= 1024
+        and re.fullmatch(r'[0-9a-f]{8}(?:,[0-9a-f]{8})*', value) is not None,
+        f'{label} is invalid',
+    )
+    mask = int(value.replace(',', ''), 16)
+    _require(mask.bit_length() <= 4096, f'{label} exceeds the CPU ID bound')
+    cpu_ids = [cpu_id for cpu_id in range(mask.bit_length()) if mask & (1 << cpu_id)]
+    _require(cpu_ids, f'{label} is empty')
+    return cpu_ids
+
+
+def _phase4_affinity_evidence(
+    path: Path,
+    label: str,
+    *,
+    phase: str,
+    main_pid: int,
+    managed_child_pid: int,
+    managed_child_pgid: int,
+    controller_target: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], datetime]:
+    value = _load_canonical_json(path, label, maximum_bytes=PHASE4_JSON_MAX_BYTES)
+    _require(set(value) == PHASE4_AFFINITY_KEYS, f'{label} schema changed')
+    expected_cpu_ids = list(range(6))
+    _require(
+        _exact_integer(value.get('schema_version'))
+        and value.get('schema_version') == 1
+        and value.get('phase') == phase
+        and value.get('unit') == 'robotest-supervisor.service'
+        and value.get('unit_cgroup') == '/system.slice/robotest-supervisor.service'
+        and value.get('expected_cpuset') == '0-5'
+        and value.get('main_pid') == main_pid
+        and value.get('managed_child_pid') == managed_child_pid
+        and value.get('managed_child_pgid') == managed_child_pgid
+        and _exact_integer(value.get('controller_pid'))
+        and value.get('controller_pid') > 1
+        and _exact_integer(value.get('controller_count'))
+        and value.get('controller_count') == 1
+        and value.get('snapshot_stable') is True
+        and value.get('verdict') == 'PASS',
+        f'{label} identity or unit affinity changed',
+    )
+    process_values = _list(value.get('processes'), f'{label} processes')
+    _require(process_values, f'{label} process set is empty')
+    processes: list[dict[str, Any]] = []
+    for index, process_value in enumerate(process_values):
+        process = _mapping(process_value, f'{label} process {index}')
+        _require(
+            set(process) == PHASE4_AFFINITY_PROCESS_KEYS,
+            f'{label} process {index} schema changed',
+        )
+        pid = process.get('pid')
+        ppid = process.get('ppid')
+        pgid = process.get('pgid')
+        start_ticks = process.get('start_time_ticks')
+        executable = process.get('executable')
+        role = process.get('role')
+        cgroup = _list(process.get('cgroup'), f'{label} process {pid} cgroup')
+        raw_cpu_mask = process.get('cpus_allowed')
+        raw_cpu_list = process.get('cpus_allowed_list')
+        allowed_cpu_ids = _phase4_cpu_ids(raw_cpu_list, f'{label} process {pid} CPU list')
+        mask_cpu_ids = _phase4_cpu_mask_ids(raw_cpu_mask, f'{label} process {pid} CPU mask')
+        cgroup_parts = [line.split(':', 2) for line in cgroup if isinstance(line, str)]
+        cgroup_paths = [parts[-1] for parts in cgroup_parts]
+        _require(
+            _exact_integer(pid)
+            and pid > 1
+            and _exact_integer(ppid)
+            and ppid >= 0
+            and _exact_integer(pgid)
+            and pgid > 1
+            and _exact_integer(start_ticks)
+            and start_ticks > 0
+            and isinstance(executable, str)
+            and Path(executable).is_absolute()
+            and role in {'controller', 'managed_child', 'supervisor_main', 'unit_descendant'}
+            and len(cgroup_parts) == len(cgroup)
+            and all(len(parts) == 3 for parts in cgroup_parts)
+            and value['unit_cgroup'] in cgroup_paths
+            and allowed_cpu_ids == mask_cpu_ids
+            and set(allowed_cpu_ids) <= set(expected_cpu_ids),
+            f'{label} process {pid} identity, cgroup, or CPU mask is invalid',
+        )
+        processes.append(process)
+    process_ids = [process['pid'] for process in processes]
+    _require(
+        process_ids == sorted(set(process_ids))
+        and _exact_integer(value.get('process_count'))
+        and value.get('process_count') == len(processes),
+        f'{label} process count or ordering is invalid',
+    )
+    by_pid = {process['pid']: process for process in processes}
+    _require(
+        main_pid in by_pid
+        and managed_child_pid in by_pid
+        and by_pid[managed_child_pid]['pgid'] == managed_child_pgid,
+        f'{label} omits the supervisor or managed child identity',
+    )
+    for pid in process_ids:
+        if pid == main_pid:
+            continue
+        current = pid
+        visited: set[int] = set()
+        while current != main_pid:
+            _require(
+                current in by_pid and current not in visited,
+                f'{label} process {pid} does not descend from MainPID',
+            )
+            visited.add(current)
+            current = by_pid[current]['ppid']
+    _require(
+        value['controller_pid'] in by_pid
+        and by_pid[value['controller_pid']].get('role') == 'controller'
+        and Path(by_pid[value['controller_pid']]['executable']).name == 'controller_server'
+        and sum(process.get('role') == 'supervisor_main' for process in processes) == 1
+        and sum(process.get('role') == 'managed_child' for process in processes) == 1
+        and sum(process.get('role') == 'controller' for process in processes) == 1
+        and by_pid[main_pid].get('role') == 'supervisor_main'
+        and by_pid[managed_child_pid].get('role') == 'managed_child',
+        f'{label} controller identity is not unique and exact',
+    )
+    if controller_target is not None:
+        controller = by_pid[value['controller_pid']]
+        _require(
+            controller.get('pid') == controller_target.get('pid')
+            and controller.get('ppid') == controller_target.get('ppid')
+            and controller.get('pgid') == controller_target.get('pgid')
+            and controller.get('start_time_ticks') == controller_target.get('start_time_ticks')
+            and controller.get('executable') == controller_target.get('executable')
+            and _exact_json_equal(controller.get('cgroup'), controller_target.get('cgroup')),
+            f'{label} controller differs from the injected target',
+        )
+    captured_utc = _utc_timestamp(value.get('captured_utc'), f'{label} captured_utc')
+    return value, captured_utc
+
+
+def _phase4_lifecycle_startup(
+    path: Path,
+    *,
+    context_started_utc: datetime,
+    initial_affinity_utc: datetime,
+) -> dict[str, Any]:
+    value = _load_canonical_json(
+        path,
+        'Phase 4 lifecycle startup result',
+        maximum_bytes=PHASE4_JSON_MAX_BYTES,
+    )
+    _require(
+        set(value) == PHASE4_LIFECYCLE_STARTUP_KEYS,
+        'Phase 4 lifecycle startup result schema changed',
+    )
+    _require(
+        _exact_integer(value.get('schema_version'))
+        and value.get('schema_version') == 1
+        and value.get('verdict') == 'PASS'
+        and value.get('accepted') is True
+        and _exact_integer(value.get('exit_code'))
+        and value.get('exit_code') == 0
+        and value.get('service_name') == '/robotest/lifecycle_manager_navigation/manage_nodes'
+        and _exact_integer(value.get('command'))
+        and value.get('command') == 0
+        and value.get('discovery_grace_sec') == 4.0
+        and value.get('service_timeout_sec') == 20.0
+        and value.get('response_timeout_sec') == 60.0
+        and _finite_number(value.get('elapsed_wall_sec'))
+        and 0 <= value['elapsed_wall_sec'] <= 110.0
+        and value.get('watch_pid') is None
+        and value.get('failure_kind') is None
+        and value.get('failure_message') is None,
+        'Phase 4 lifecycle startup result is not canonical PASS',
+    )
+    started_utc = _utc_timestamp(value.get('started_utc'), 'Phase 4 lifecycle started_utc')
+    completed_utc = _utc_timestamp(value.get('completed_utc'), 'Phase 4 lifecycle completed_utc')
+    _require(
+        context_started_utc <= started_utc <= completed_utc <= initial_affinity_utc,
+        'Phase 4 lifecycle timestamps are outside the initial-ready bracket',
+    )
+    return value
+
+
+def _phase4_supervisor_config(
+    run_directory: Path,
+    *,
+    run_id: str,
+    isolation: Mapping[str, Any],
+) -> dict[str, Any]:
+    config = _load_canonical_json(
+        run_directory / 'supervisor-config.json',
+        'Phase 4 supervisor config',
+        maximum_bytes=PHASE4_JSON_MAX_BYTES,
+    )
+    state_directory = f'/var/lib/robotest-supervisor/{run_id}'
+    expected = {
+        'schema_version': 1,
+        'listen_address': '127.0.0.1:9080',
+        'state_directory': state_directory,
+        'heartbeat_poll_ms': 500,
+        'heartbeat_stale_ms': 2000,
+        'heartbeat_startup_timeout_ms': 110000,
+        'termination_grace_ms': 5000,
+        'shutdown_timeout_ms': 15000,
+        'maximum_event_entries': 4096,
+        'maximum_event_bytes': 8388608,
+        'restart': {
+            'initial_backoff_ms': 1000,
+            'maximum_backoff_ms': 8000,
+            'maximum_attempts': 4,
+            'window_ms': 60000,
+            'stable_reset_ms': 60000,
+        },
+        'children': [
+            {
+                'name': 'robotest-stack',
+                'argv': ['/usr/libexec/robotest-supervisor/start-robotest-stack'],
+                'working_directory': '/opt/robotest-lab',
+                'environment': {
+                    'GZ_PARTITION': isolation.get('gz_partition'),
+                    'RCUTILS_LOGGING_BUFFERED_STREAM': '1',
+                    'ROBOTEST_CPUSET': '0-5',
+                    'ROBOTEST_NAMESPACE': 'robotest',
+                    'ROBOTEST_RUNTIME_STATE_DIRECTORY': state_directory,
+                    'ROS_DOMAIN_ID': str(isolation.get('ros_domain_id')),
+                },
+                'required': True,
+                'heartbeat_file': f'{state_directory}/robotest-stack.heartbeat',
+            }
+        ],
+    }
+    _require(
+        _exact_json_equal(config, expected),
+        'Phase 4 run-scoped supervisor config is not exact',
+    )
+    check_path = _regular_file(
+        run_directory / 'supervisor-config-check.txt',
+        'Phase 4 supervisor config check',
+    )
+    _require(
+        check_path.read_bytes() == b'configuration valid\n',
+        'Phase 4 supervisor config check did not pass exactly',
+    )
+    return config
+
+
 def _phase4_evidence(repository: Path, run_directory: Path, scenario6_path: Path) -> dict[str, Any]:
     run_directory = _resolved_directory(run_directory, 'Phase 4 run directory')
     expected_root = _repository_directory(
@@ -4136,6 +4479,10 @@ def _phase4_evidence(repository: Path, run_directory: Path, scenario6_path: Path
         'Scenario 6 evidence is not inside the selected Phase 4 run',
     )
     manifest = _validate_exact_manifest(run_directory)
+    _require(
+        set(manifest) >= PHASE4_REQUIRED_RAW,
+        'Scenario 6 raw evidence hash coverage is not exact',
+    )
     result = _load_canonical_json(
         expected_result,
         'Scenario 6 result',
@@ -4312,6 +4659,42 @@ def _phase4_evidence(repository: Path, run_directory: Path, scenario6_path: Path
         and 0 <= measurements['observed_ready_restore_after_503_wall_s'] <= 30.0,
         'Scenario 6 PASS measurements violate frozen bounds',
     )
+    controller_target = _load_canonical_json(
+        run_directory / 'controller-target.json',
+        'Phase 4 controller target',
+        maximum_bytes=PHASE4_JSON_MAX_BYTES,
+    )
+    _initial_affinity, initial_affinity_utc = _phase4_affinity_evidence(
+        run_directory / 'runtime-affinity-initial.json',
+        'Phase 4 initial runtime affinity',
+        phase='initial',
+        main_pid=measurements['supervisor_main_pid'],
+        managed_child_pid=measurements['original_child_pid'],
+        managed_child_pgid=measurements['original_child_pgid'],
+        controller_target=controller_target,
+    )
+    _restored_affinity, restored_affinity_utc = _phase4_affinity_evidence(
+        run_directory / 'runtime-affinity-restored.json',
+        'Phase 4 restored runtime affinity',
+        phase='restored',
+        main_pid=measurements['supervisor_main_pid'],
+        managed_child_pid=measurements['replacement_child_pid'],
+        managed_child_pgid=measurements['replacement_child_pgid'],
+    )
+    _require(
+        started_utc <= initial_affinity_utc <= restored_affinity_utc <= completed_utc,
+        'Phase 4 runtime affinity captures are outside the run bracket',
+    )
+    _phase4_lifecycle_startup(
+        run_directory / 'lifecycle-startup-result.json',
+        context_started_utc=started_utc,
+        initial_affinity_utc=initial_affinity_utc,
+    )
+    _phase4_supervisor_config(
+        run_directory,
+        run_id=run_directory.name,
+        isolation=isolation,
+    )
     _require(
         _exact_integer(verdict.get('failure_count'))
         and _exact_json_equal(
@@ -4408,53 +4791,193 @@ def _phase4_evidence(repository: Path, run_directory: Path, scenario6_path: Path
     }
 
 
+def _git_invocation(repository: Path, arguments: list[str]) -> tuple[list[str], dict[str, str]]:
+    git_directory = repository / '.git'
+    _require(
+        git_directory.is_dir() and not git_directory.is_symlink(),
+        'repository Git directory is missing or linked',
+    )
+    git_info = git_directory / 'info'
+    grafts_path = git_info / 'grafts'
+    _require(
+        not grafts_path.exists() and not grafts_path.is_symlink(),
+        'repository Git graft metadata is present',
+    )
+    attributes_path = git_info / 'attributes'
+    _require(
+        not attributes_path.exists() and not attributes_path.is_symlink(),
+        'repository Git local attributes are present',
+    )
+    exclude_path = git_info / 'exclude'
+    if exclude_path.exists() or exclude_path.is_symlink():
+        _require(
+            exclude_path.is_file() and not exclude_path.is_symlink(),
+            'repository Git local excludes are invalid',
+        )
+        _require(
+            exclude_path.stat().st_size <= 16_384,
+            'repository Git local excludes are oversized',
+        )
+        exclude_payload = exclude_path.read_bytes()
+        _require(
+            b'\r' not in exclude_payload
+            and (not exclude_payload or exclude_payload.endswith(b'\n')),
+            'repository Git local excludes are noncanonical',
+        )
+        try:
+            exclude_lines = exclude_payload.decode('utf-8').splitlines()
+        except UnicodeDecodeError as exc:
+            raise EvidenceError('repository Git local excludes are not UTF-8') from exc
+        _require(
+            all(not line or line.startswith('#') for line in exclude_lines),
+            'repository Git local excludes contain active rules',
+        )
+    command = [
+        'git',
+        '-C',
+        str(repository),
+        f'--git-dir={git_directory}',
+        f'--work-tree={repository}',
+        '-c',
+        f'safe.directory={repository}',
+        '-c',
+        'core.fsmonitor=false',
+        '-c',
+        'core.hooksPath=/dev/null',
+        '-c',
+        'core.attributesFile=/dev/null',
+        '-c',
+        'core.bare=false',
+        '-c',
+        'core.excludesFile=/dev/null',
+        '-c',
+        'core.fileMode=true',
+        '-c',
+        'submodule.recurse=false',
+        *arguments,
+    ]
+    environment = {
+        'PATH': '/usr/bin:/bin',
+        'LANG': 'C',
+        'HOME': '/nonexistent',
+        'GIT_CONFIG_NOSYSTEM': '1',
+        'GIT_CONFIG_GLOBAL': '/dev/null',
+        'GIT_ATTR_NOSYSTEM': '1',
+        'GIT_NO_LAZY_FETCH': '1',
+        'GIT_OPTIONAL_LOCKS': '0',
+        'GIT_NO_REPLACE_OBJECTS': '1',
+        'GIT_TERMINAL_PROMPT': '0',
+    }
+    return command, environment
+
+
 def _git(repository: Path, arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    command, environment = _git_invocation(repository, arguments)
     return subprocess.run(
-        [
-            'git',
-            '-c',
-            'core.fsmonitor=false',
-            '-c',
-            'submodule.recurse=false',
-            '-C',
-            str(repository),
-            *arguments,
-        ],
+        command,
         capture_output=True,
         check=False,
-        env=os.environ
-        | {
-            'GIT_NO_LAZY_FETCH': '1',
-            'GIT_OPTIONAL_LOCKS': '0',
-            'GIT_TERMINAL_PROMPT': '0',
-        },
+        env=environment,
         text=True,
         timeout=30,
     )
 
 
 def _git_bytes(repository: Path, arguments: list[str]) -> subprocess.CompletedProcess[bytes]:
+    command, environment = _git_invocation(repository, arguments)
     return subprocess.run(
-        [
-            'git',
-            '-c',
-            'core.fsmonitor=false',
-            '-c',
-            'submodule.recurse=false',
-            '-C',
-            str(repository),
-            *arguments,
-        ],
+        command,
         capture_output=True,
         check=False,
-        env=os.environ
-        | {
-            'GIT_NO_LAZY_FETCH': '1',
-            'GIT_OPTIONAL_LOCKS': '0',
-            'GIT_TERMINAL_PROMPT': '0',
-        },
+        env=environment,
         timeout=30,
     )
+
+
+def _git_ignore_is_from_tracked_root(repository: Path, relative: str) -> bool:
+    ignored = _git(repository, ['check-ignore', '-v', '--', relative])
+    if ignored.returncode != 0 or not ignored.stdout.endswith('\n'):
+        return False
+    lines = ignored.stdout.splitlines()
+    if len(lines) != 1 or '\t' not in lines[0]:
+        return False
+    provenance, ignored_path = lines[0].split('\t', 1)
+    fields = provenance.split(':', 2)
+    if (
+        len(fields) != 3
+        or fields[0] != '.gitignore'
+        or not fields[1].isdigit()
+        or int(fields[1]) < 1
+        or not fields[2]
+        or ignored_path != relative
+    ):
+        return False
+    ignore_path = repository / '.gitignore'
+    if ignore_path.is_symlink() or not ignore_path.is_file():
+        return False
+    tracked = _git(repository, ['ls-files', '--error-unmatch', '--', '.gitignore'])
+    worktree_diff = _git(repository, ['diff', '--quiet', '--', '.gitignore'])
+    index_diff = _git(repository, ['diff', '--cached', '--quiet', '--', '.gitignore'])
+    return tracked.returncode == 0 and worktree_diff.returncode == 0 and index_diff.returncode == 0
+
+
+def _ignored_source_path_is_allowed(relative: str) -> bool:
+    parts = Path(relative).parts
+    if relative == 'config/release-claims.json':
+        return True
+    if parts and parts[0] in {'config', 'scenarios', 'src'}:
+        return any(part in {'.pytest_cache', '__pycache__'} for part in parts[1:])
+    if parts[:2] in {('packaging', 'debian'), ('supervisor', 'cmd')} or parts[:2] == (
+        'supervisor',
+        'internal',
+    ):
+        return False
+    if parts[:2] == ('docs', 'results'):
+        return True
+    return any(
+        part
+        in {
+            '.mypy_cache',
+            '.pytest_cache',
+            '__pycache__',
+            'artifacts',
+            'build',
+            'install',
+            'log',
+        }
+        for part in parts[1:]
+    )
+
+
+def _validate_ignored_source_paths(repository: Path) -> None:
+    roots = ('config', 'docs', 'packaging', 'scenarios', 'scripts', 'src', 'supervisor', 'tests')
+    ignored = _git(
+        repository,
+        [
+            'ls-files',
+            '-z',
+            '--others',
+            '--ignored',
+            '--exclude-standard',
+            '--',
+            *roots,
+        ],
+    )
+    _require(ignored.returncode == 0, 'cannot inspect ignored candidate source paths')
+    _require(
+        not ignored.stdout or ignored.stdout.endswith('\0'),
+        'ignored candidate source path output is incomplete',
+    )
+    paths = ignored.stdout.split('\0')[:-1] if ignored.stdout else []
+    _require(
+        paths == sorted(set(paths)),
+        'ignored candidate source paths are not sorted and unique',
+    )
+    for relative in paths:
+        _require(
+            _ignored_source_path_is_allowed(relative),
+            f'ignored untracked source input is forbidden: {relative}',
+        )
 
 
 def _validate_one_file_checksum(source: Path, label: str) -> tuple[Path, Path]:
@@ -4905,9 +5428,10 @@ def _phase5_evidence_commit_remote(
     ]
     for relative in relative_paths:
         _require(
-            _git(repository, ['check-ignore', '-q', '--', relative]).returncode == 0
+            _git_ignore_is_from_tracked_root(repository, relative)
             and _git(repository, ['ls-files', '--error-unmatch', '--', relative]).returncode != 0,
-            f'evidence-commit remote proof is not ignored raw evidence: {relative}',
+            'evidence-commit remote proof is not ignored by the tracked root '
+            f'.gitignore: {relative}',
         )
     return {
         'evidence_commit_git_sha': evidence_sha,
@@ -4932,6 +5456,15 @@ def validate_release_evidence(
 ) -> dict[str, Any]:
     """Validate exact selected evidence without running or discovering acceptance work."""
     repository = _resolved_directory(repository, 'repository')
+    replace_refs = _git(
+        repository,
+        ['for-each-ref', '--format=%(refname)', 'refs/replace/'],
+    )
+    _require(
+        replace_refs.returncode == 0 and replace_refs.stdout == '',
+        'repository contains Git replacement refs',
+    )
+    _validate_ignored_source_paths(repository)
     _activate_repository_packages(repository)
     local = _local_aggregate_evidence(repository, local_aggregate)
     phase3 = _phase3_evidence(repository, phase3_candidate_root, phase3_aggregate)

@@ -26,6 +26,7 @@
         "RCUTILS_LOGGING_BUFFERED_STREAM": "1",
         "ROBOTEST_CPUSET": "0-5",
         "ROBOTEST_NAMESPACE": "robotest",
+        "ROBOTEST_RUNTIME_STATE_DIRECTORY": "/var/lib/robotest-supervisor",
         "ROS_DOMAIN_ID": "42"
       },
       "required": true,

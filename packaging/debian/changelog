@@ -1,3 +1,11 @@
+robotest-supervisor (0.1.1) noble; urgency=medium
+
+  * Bind the packaged child heartbeat and startup result to its validated
+    runtime state directory.
+  * Add bounded wrapper cleanup and service-level CPU affinity enforcement.
+
+ -- Hasan Ahmed <200383997+Hasan-Al-Hussein@users.noreply.github.com>  Thu, 27 Aug 2026 12:00:00 +0400
+
 robotest-supervisor (0.1.0) noble; urgency=medium
 
   * Initial local package for the bounded RoboTest Lab process supervisor.

@@ -99,6 +99,7 @@ json.dump(
     sys.stdout,
     ensure_ascii=False,
     separators=(",", ":"),
+    sort_keys=True,
 )
 sys.stdout.write("\n")
 PY

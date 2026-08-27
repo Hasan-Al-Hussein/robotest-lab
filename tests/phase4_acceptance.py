@@ -14,6 +14,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import ctypes
+import errno
 import grp
 import hashlib
 import json
@@ -21,6 +23,9 @@ import math
 import os
 import pwd
 import re
+import secrets
+import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -29,7 +34,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from itertools import pairwise
 from pathlib import Path
@@ -48,6 +53,9 @@ MAX_SOURCE_FILES = 20000
 MAX_PACKAGE_BYTES = 512 * 1024 * 1024
 MAX_GRAPH_ENDPOINTS = 4096
 MAX_GRAPH_TYPES_PER_ENDPOINT = 16
+MAX_PUBLICATION_FILE_BYTES = 64 * 1024 * 1024
+MAX_PUBLICATION_TOTAL_BYTES = 512 * 1024 * 1024
+MAX_PUBLICATION_DEPTH = 8
 READY_FAILURE_TARGET_S = 3.0
 PROCESS_GROUP_EXIT_TARGET_S = 5.0
 RECOVERY_TARGET_S = 30.0
@@ -63,7 +71,226 @@ SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
 RUN_ID_RE = re.compile(r'^phase4-[0-9]{8}T[0-9]{6}Z-[0-9]+$')
 PARTITION_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_]{0,127}$')
 UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+CPU_MASK_RE = re.compile(r'^[0-9a-f]{8}(?:,[0-9a-f]{8})*$')
+CPU_LIST_RE = re.compile(r'^[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*$')
 _DEFAULT_API = object()
+
+EXPECTED_CPUSET = '0-5'
+EXPECTED_UNIT_CGROUP = f'/system.slice/{EXPECTED_UNIT}'
+EXPECTED_RUNTIME_STATE_ROOT = '/var/lib/robotest-supervisor'
+RUNTIME_STATE_ENVIRONMENT = 'ROBOTEST_RUNTIME_STATE_DIRECTORY'
+HEARTBEAT_NAME = 'robotest-stack.heartbeat'
+STARTUP_RESULT_NAME = 'lifecycle-startup-result.json'
+SUPERVISOR_CONFIG_CHECK = b'configuration valid\n'
+LIVE_EVIDENCE_ROOT = Path('/run/robotest-phase4-verifier')
+PUBLIC_EVIDENCE_RELATIVE_ROOT = Path('artifacts/evidence/phase4/runs')
+LIVE_EVIDENCE_MARKER = '.phase4-live-owned'
+LIFECYCLE_STARTUP_RESULT_KEYS = frozenset(
+    {
+        'accepted',
+        'command',
+        'completed_utc',
+        'discovery_grace_sec',
+        'elapsed_wall_sec',
+        'exit_code',
+        'failure_kind',
+        'failure_message',
+        'response_timeout_sec',
+        'schema_version',
+        'service_name',
+        'service_timeout_sec',
+        'started_utc',
+        'verdict',
+        'watch_pid',
+    }
+)
+RUNTIME_AFFINITY_KEYS = frozenset(
+    {
+        'captured_utc',
+        'controller_count',
+        'controller_pid',
+        'expected_cpuset',
+        'main_pid',
+        'managed_child_pgid',
+        'managed_child_pid',
+        'phase',
+        'process_count',
+        'processes',
+        'schema_version',
+        'snapshot_stable',
+        'unit',
+        'unit_cgroup',
+        'verdict',
+    }
+)
+RUNTIME_AFFINITY_PROCESS_KEYS = frozenset(
+    {
+        'cgroup',
+        'cpus_allowed',
+        'cpus_allowed_list',
+        'executable',
+        'pgid',
+        'pid',
+        'ppid',
+        'role',
+        'start_time_ticks',
+    }
+)
+SUPERVISOR_STATUS_KEYS = frozenset(
+    {
+        'children',
+        'dropped_events',
+        'event_count',
+        'healthy',
+        'persistence_healthy',
+        'ready',
+        'schema_version',
+        'shutting_down',
+        'supervisor_utc',
+    }
+)
+SUPERVISOR_CHILD_REQUIRED_KEYS = frozenset(
+    {
+        'circuit_open',
+        'heartbeat_age_ms',
+        'heartbeat_fresh',
+        'name',
+        'pgid',
+        'pid',
+        'required',
+        'restart_count',
+        'running',
+    }
+)
+SUPERVISOR_CHILD_OPTIONAL_KEYS = frozenset(
+    {
+        'last_exit_code',
+        'last_failure_kind',
+        'last_failure_utc',
+        'last_ready_utc',
+        'started_utc',
+    }
+)
+SYSTEMD_OWNERS_KEYS = frozenset(
+    {
+        'captured_utc',
+        'gz_partition',
+        'ros_domain_id',
+        'schema_version',
+        'unit_count',
+        'units',
+        'verdict',
+    }
+)
+PROCESS_GROUP_EVIDENCE_KEYS = frozenset(
+    {'captured_utc', 'member_count', 'members', 'pgid', 'schema_version'}
+)
+SERVICE_FINAL_KEYS = frozenset(
+    {
+        'active_before_stop',
+        'captured_utc',
+        'enabled_before_stop',
+        'main_pid_before_stop',
+        'nrestarts_before_stop',
+        'schema_version',
+    }
+)
+CONTEXT_KEYS = frozenset(
+    {
+        'active_overlay_target',
+        'baseline_package',
+        'cpuset',
+        'isolation',
+        'lifecycle_evidence',
+        'package_directory',
+        'run_id',
+        'schema_version',
+        'source_git_commit',
+        'source_git_dirty',
+        'started_utc',
+        'upgrade_package',
+    }
+)
+CONTEXT_FILE_DESCRIPTOR_KEYS = frozenset({'path', 'sha256'})
+ISOLATION_KEYS = frozenset(
+    {
+        'domain_was_unused',
+        'gz_partition',
+        'inspected_processes',
+        'partition_was_unused',
+        'ros_domain_id',
+        'run_id',
+        'schema_version',
+        'unreadable_process_environments',
+    }
+)
+EVENT_META_KEYS = frozenset(
+    {'dropped_events', 'last_attempted_sequence', 'saturated', 'schema_version'}
+)
+TIMELINE_KEYS = frozenset(
+    {'details', 'kind', 'monotonic_ns', 'schema_version', 'sequence', 'timestamp_utc'}
+)
+HTTP_TIMELINE_DETAIL_KEYS = frozenset({'body', 'body_sha256', 'http_status', 'url'})
+TIMELINE_DETAIL_KEYS = {
+    'active_goal_probe_started': frozenset({'pgid', 'pid'}),
+    'cleanup_complete': frozenset(),
+    'failure_injected': frozenset(
+        {'event_sequence_before', 'mission_pid', 'original_pgid', 'target_pid'}
+    ),
+    'followup_finished': frozenset({'exit_code'}),
+    'followup_started': frozenset({'pgid', 'pid'}),
+    'health_probe': HTTP_TIMELINE_DETAIL_KEYS,
+    'initial_ready': frozenset(
+        {
+            'child_pgid',
+            'child_pid',
+            'main_pid',
+            'systemd_nrestarts',
+            'systemd_owned_ros_service_count',
+        }
+    ),
+    'interrupted_mission_finished': frozenset(
+        {'exit_code', 'process_group_empty', 'terminated_by_harness'}
+    ),
+    'mission_started': frozenset({'pgid', 'pid'}),
+    'original_group_empty': frozenset({'member_count'}),
+    'ready_probe': HTTP_TIMELINE_DETAIL_KEYS,
+    'ready_restored': frozenset(
+        {
+            'child_pgid',
+            'child_pid',
+            'event_sequence_after_recovery',
+            'http_status',
+            'main_pid',
+            'systemd_nrestarts',
+            'systemd_owned_ros_service_count',
+        }
+    ),
+    'ready_unavailable': frozenset({'http_status'}),
+    'service_stopped': frozenset({'event_sequence_before_stop'}),
+    'startup_health_probe': HTTP_TIMELINE_DETAIL_KEYS,
+    'startup_ready_probe': HTTP_TIMELINE_DETAIL_KEYS,
+}
+CONTROLLER_TARGET_KEYS = frozenset(
+    {
+        'cgroup',
+        'cmdline',
+        'cmdline_sha256',
+        'comm',
+        'executable',
+        'gz_partition',
+        'lineage',
+        'pgid',
+        'pid',
+        'ppid',
+        'root_pid',
+        'ros_domain_id',
+        'start_time_ticks',
+        'state',
+        'unit',
+    }
+)
+CONTROLLER_LINEAGE_KEYS = frozenset({'pid', 'ppid', 'start_time_ticks'})
 
 ACTIVE_GOAL_CLIENT_EVIDENCE_KEYS = frozenset(
     {
@@ -227,6 +454,21 @@ BASELINE_SIDECAR_KEYS = frozenset(
 )
 BASELINE_FINAL_PACKAGE_KEYS = frozenset({'name', 'sha256', 'version'})
 BASELINE_FIXTURE_PACKAGE_KEYS = frozenset({'listen_address', 'name', 'sha256', 'version'})
+SOURCE_MANIFEST_KEYS = frozenset({'files', 'schema_version'})
+SOURCE_MANIFEST_FILE_KEYS = frozenset({'mode', 'path', 'sha256', 'size_bytes'})
+PACKAGE_BINDING_KEYS = frozenset(
+    {
+        'candidate_manifest',
+        'candidate_manifest_sha256',
+        'extra_paths',
+        'file_count',
+        'mismatched_paths',
+        'missing_paths',
+        'repository_manifest_sha256',
+        'schema_version',
+        'verdict',
+    }
+)
 PACKAGE_INTEGRITY_KEYS = frozenset(
     {
         'baseline_package_sha256',
@@ -243,6 +485,47 @@ PACKAGE_INTEGRITY_KEYS = frozenset(
         'verdict',
     }
 )
+PACKAGE_SOURCE_REBUILD_KEYS = frozenset(
+    {
+        'build_script_sha256',
+        'byte_equal',
+        'completed_utc',
+        'rebuilt_artifacts',
+        'schema_version',
+        'selected_artifacts',
+        'source_version',
+        'verdict',
+    }
+)
+PACKAGE_SOURCE_REBUILD_ARTIFACT_KEYS = frozenset({'kind', 'name', 'sha256', 'size_bytes'})
+PACKAGE_SOURCE_REBUILD_EQUALITY_KEYS = frozenset(
+    {'binary_package', 'debug_package', 'source_manifest'}
+)
+OVERLAY_PROVENANCE_KEYS = frozenset(
+    {
+        'active_path',
+        'build_command',
+        'created_utc',
+        'git_commit',
+        'git_dirty',
+        'install_manifest_sha256',
+        'packages',
+        'release_id',
+        'schema_version',
+        'source_manifest_sha256',
+        'source_workspace',
+    }
+)
+OVERLAY_PACKAGES = [
+    'robotest_description',
+    'robotest_faults',
+    'robotest_interfaces',
+    'robotest_metrics',
+    'robotest_missions',
+    'robotest_navigation',
+    'robotest_scenarios',
+    'robotest_sim',
+]
 CLEANUP_KEYS = frozenset(
     {
         'captured_utc',
@@ -454,6 +737,21 @@ def _exact_keys(value: Mapping[str, Any], expected: frozenset[str], name: str) -
         raise EvidenceError(f'{name} schema mismatch; missing={missing}, extra={extra}')
 
 
+def _type_exact_json_equal(actual: Any, expected: Any) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return set(actual) == set(expected) and all(
+            _type_exact_json_equal(actual[key], expected[key]) for key in expected
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _type_exact_json_equal(left, right)
+            for left, right in zip(actual, expected, strict=True)
+        )
+    return bool(actual == expected)
+
+
 def normalize_graph_endpoint_entries(value: Any, name: str) -> list[list[Any]]:
     """Return a bounded, deterministic graph endpoint snapshot."""
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
@@ -575,6 +873,77 @@ def _run_command(
 def _package_field(package: Path, field: str) -> str:
     output = _run_command(['dpkg-deb', '--field', str(package), field]).stdout.strip()
     return _string(output, f'{package.name} {field}', maximum=256)
+
+
+def repository_changelog_version(repository: Path) -> str:
+    """Return the exact current robotest-supervisor Debian source version."""
+    changelog = repository.resolve(strict=True) / 'packaging/debian/changelog'
+    payload = _read_bounded_bytes(changelog, MAX_TEXT_BYTES)
+    if not payload.endswith(b'\n'):
+        raise EvidenceError('Debian changelog has an incomplete final line')
+    try:
+        first_line = payload.decode('utf-8').splitlines()[0]
+    except (UnicodeDecodeError, IndexError) as exc:
+        raise EvidenceError('Debian changelog has no UTF-8 header') from exc
+    match = re.fullmatch(
+        r'robotest-supervisor \(([^()\s]+)\) '
+        r'[a-z0-9][a-z0-9+.-]*; urgency=(?:low|medium|high|critical|emergency)',
+        first_line,
+    )
+    if match is None:
+        raise EvidenceError('Debian changelog has a noncanonical first header')
+    version = match.group(1)
+    _run_command(['dpkg', '--validate-version', version])
+    return version
+
+
+def _deb822_fields(path: Path) -> dict[str, str]:
+    payload = _read_bounded_bytes(path, MAX_TEXT_BYTES)
+    if not payload.endswith(b'\n'):
+        raise EvidenceError(f'{path.name} has an incomplete final line')
+    try:
+        lines = payload.decode('utf-8').splitlines()
+    except UnicodeDecodeError as exc:
+        raise EvidenceError(f'{path.name} is not UTF-8') from exc
+    fields: dict[str, str] = {}
+    current = ''
+    for line_number, line in enumerate(lines, 1):
+        if not line:
+            continue
+        if line.startswith((' ', '\t')):
+            if not current:
+                raise EvidenceError(f'{path.name}:{line_number} has an orphan continuation')
+            fields[current] += f'\n{line[1:]}'
+            continue
+        match = re.fullmatch(r'([A-Za-z0-9][A-Za-z0-9-]*):(?: (.*))?', line)
+        if match is None:
+            raise EvidenceError(f'{path.name}:{line_number} is not canonical deb822')
+        current = match.group(1)
+        if current in fields:
+            raise EvidenceError(f'{path.name} repeats the {current} field')
+        fields[current] = match.group(2) or ''
+    return fields
+
+
+def _validate_generated_package_metadata(
+    path: Path,
+    *,
+    version: str,
+    architecture: str,
+) -> None:
+    fields = _deb822_fields(path)
+    for name in ('Architecture', 'Binary', 'Source', 'Version'):
+        if name not in fields:
+            raise EvidenceError(f'{path.name} is missing the {name} field')
+    binaries = sorted(filter(None, re.split(r'[,\s]+', fields['Binary'])))
+    if fields['Source'] != 'robotest-supervisor':
+        raise EvidenceError(f'{path.name} has the wrong Source field')
+    if fields['Version'] != version:
+        raise EvidenceError(f'{path.name} has the wrong Version field')
+    if fields['Architecture'].split() != [architecture]:
+        raise EvidenceError(f'{path.name} has the wrong Architecture field')
+    if binaries != ['robotest-supervisor', 'robotest-supervisor-dbgsym']:
+        raise EvidenceError(f'{path.name} has the wrong Binary field')
 
 
 def package_artifact_descriptor(package: Path) -> dict[str, str]:
@@ -708,6 +1077,7 @@ def verify_package_candidate(
     package_directory: Path,
     upgrade_package: Path,
     baseline_package: Path,
+    repository: Path,
 ) -> dict[str, Any]:
     """Independently reconcile both builds, repro evidence, and baseline provenance."""
     if package_directory.is_symlink():
@@ -715,12 +1085,48 @@ def verify_package_candidate(
     package_directory = package_directory.resolve(strict=True)
     if not package_directory.is_dir():
         raise EvidenceError(f'package directory is invalid: {package_directory}')
+    upgrade_package = upgrade_package.resolve(strict=True)
+    baseline_package = baseline_package.resolve(strict=True)
+    source_version = repository_changelog_version(repository)
+    upgrade = package_artifact_descriptor(upgrade_package)
+    if upgrade['version'] != source_version:
+        raise EvidenceError(
+            'selected upgrade version does not match the repository Debian changelog'
+        )
+    architecture = upgrade['architecture']
+    binary_name = f'robotest-supervisor_{source_version}_{architecture}.deb'
+    debug_name = f'robotest-supervisor-dbgsym_{source_version}_{architecture}.ddeb'
+    buildinfo_name = f'robotest-supervisor_{source_version}_{architecture}.buildinfo'
+    changes_name = f'robotest-supervisor_{source_version}_{architecture}.changes'
+    expected_build_names = {
+        'SHA256SUMS',
+        'SOURCE-MANIFEST.json',
+        binary_name,
+        buildinfo_name,
+        changes_name,
+        debug_name,
+    }
     build_a = _package_build_files(package_directory / 'build-a')
     build_b = _package_build_files(package_directory / 'build-b')
     if set(build_a) != set(build_b):
         raise EvidenceError('build-a and build-b file sets differ')
+    if set(build_a) != expected_build_names:
+        raise EvidenceError('package build filenames do not match source version and architecture')
+    if upgrade_package != build_a[binary_name].resolve(strict=True):
+        raise EvidenceError('selected upgrade package is not the exact build-a binary')
     _validate_local_sha256sums(package_directory / 'build-a', build_a)
     _validate_local_sha256sums(package_directory / 'build-b', build_b)
+    for build in (build_a, build_b):
+        _validate_generated_package_metadata(
+            build[buildinfo_name],
+            version=source_version,
+            architecture=architecture,
+        )
+        _validate_generated_package_metadata(
+            build[changes_name],
+            version=source_version,
+            architecture=architecture,
+        )
 
     reproducibility_path = package_directory / 'reproducibility.json'
     reproducibility = _mapping(load_json(reproducibility_path), 'package reproducibility evidence')
@@ -763,18 +1169,7 @@ def verify_package_candidate(
     names = [_string(record.get('name'), 'repro file name', maximum=255) for record in records]
     if names != sorted(names) or len(names) != len(set(names)) or set(names) != set(build_a):
         raise EvidenceError('reproducibility file list is not the exact sorted build set')
-    binary_names = [name for name in names if name.endswith('.deb') and not name.endswith('.ddeb')]
-    debug_names = [name for name in names if name.endswith('.ddeb')]
-    buildinfo_names = [name for name in names if name.endswith('.buildinfo')]
-    changes_names = [name for name in names if name.endswith('.changes')]
-    if not (
-        len(names) == 6
-        and len(binary_names) == 1
-        and len(debug_names) == 1
-        and len(buildinfo_names) == 1
-        and len(changes_names) == 1
-        and {'SHA256SUMS', 'SOURCE-MANIFEST.json'} <= set(names)
-    ):
+    if set(names) != expected_build_names:
         raise EvidenceError('package build artifact set is not exact')
 
     for record, name in zip(records, names, strict=True):
@@ -808,18 +1203,11 @@ def verify_package_candidate(
         if dict(record) != expected_record:
             raise EvidenceError(f'reproducibility evidence does not reconcile {name}')
 
-    binary_name = binary_names[0]
-    debug_name = debug_names[0]
     source_name = 'SOURCE-MANIFEST.json'
     for name in (binary_name, debug_name, source_name):
         if file_sha256(build_a[name]) != file_sha256(build_b[name]):
             raise EvidenceError(f'required byte-identical artifact differs: {name}')
 
-    upgrade_package = upgrade_package.resolve(strict=True)
-    baseline_package = baseline_package.resolve(strict=True)
-    if upgrade_package != build_a[binary_name].resolve(strict=True):
-        raise EvidenceError('selected upgrade package is not the build-a binary')
-    upgrade = package_artifact_descriptor(upgrade_package)
     baseline = package_artifact_descriptor(baseline_package)
     sidecar_path = Path(f'{baseline_package}.fixture.json')
     if sidecar_path.is_symlink():
@@ -867,6 +1255,156 @@ def verify_package_candidate(
     }
     _exact_keys(report, PACKAGE_INTEGRITY_KEYS, 'package integrity report')
     return report
+
+
+def _rebuild_artifact_record(kind: str, path: Path) -> dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise EvidenceError(f'rebuild artifact is not a regular file: {path}')
+    return {
+        'kind': kind,
+        'name': path.name,
+        'sha256': file_sha256(path),
+        'size_bytes': path.stat().st_size,
+    }
+
+
+def package_source_rebuild_attestation(
+    repository: Path,
+    package_directory: Path,
+    upgrade_package: Path,
+    rebuilt_directory: Path,
+) -> dict[str, Any]:
+    """Compare a fresh controlled source rebuild to the selected build-a bytes."""
+    repository = repository.resolve(strict=True)
+    package_directory = package_directory.resolve(strict=True)
+    rebuilt_directory = rebuilt_directory.resolve(strict=True)
+    upgrade = package_artifact_descriptor(upgrade_package)
+    source_version = repository_changelog_version(repository)
+    if upgrade['version'] != source_version:
+        raise EvidenceError('rebuild source version does not match the selected upgrade')
+    architecture = upgrade['architecture']
+    names = {
+        'binary_package': f'robotest-supervisor_{source_version}_{architecture}.deb',
+        'debug_package': f'robotest-supervisor-dbgsym_{source_version}_{architecture}.ddeb',
+        'source_manifest': 'SOURCE-MANIFEST.json',
+    }
+    selected_root = package_directory / 'build-a'
+    selected = [
+        _rebuild_artifact_record(kind, selected_root / name) for kind, name in names.items()
+    ]
+    rebuilt = [
+        _rebuild_artifact_record(kind, rebuilt_directory / name) for kind, name in names.items()
+    ]
+    byte_equal = {
+        kind: _read_bounded_bytes(selected_root / name, MAX_PACKAGE_BYTES)
+        == _read_bounded_bytes(rebuilt_directory / name, MAX_PACKAGE_BYTES)
+        for kind, name in names.items()
+    }
+    if not all(byte_equal.values()):
+        raise EvidenceError('fresh package source rebuild differs from the selected artifacts')
+    report = {
+        'build_script_sha256': file_sha256(repository / 'scripts/build_debian_package.sh'),
+        'byte_equal': byte_equal,
+        'completed_utc': utc_now(),
+        'rebuilt_artifacts': rebuilt,
+        'schema_version': 1,
+        'selected_artifacts': selected,
+        'source_version': source_version,
+        'verdict': 'PASS',
+    }
+    _exact_keys(report, PACKAGE_SOURCE_REBUILD_KEYS, 'package source rebuild')
+    return report
+
+
+def import_package_source_rebuild_attestation(
+    repository: Path,
+    package_directory: Path,
+    upgrade_package: Path,
+    rebuilt_directory: Path,
+    worker_attestation_path: Path,
+) -> dict[str, Any]:
+    """Replay an unprivileged rebuild and preserve its validated completion time."""
+    worker_payload = _read_bounded_bytes(worker_attestation_path, MAX_JSON_BYTES)
+    worker = _mapping(load_json(worker_attestation_path), 'worker rebuild attestation')
+    if worker_payload != canonical_json_bytes(worker):
+        raise EvidenceError('worker rebuild attestation is not canonical JSON')
+    completed_utc = _utc_timestamp(
+        worker.get('completed_utc'), 'worker rebuild attestation.completed_utc'
+    )
+    replay = package_source_rebuild_attestation(
+        repository,
+        package_directory,
+        upgrade_package,
+        rebuilt_directory,
+    )
+    replay['completed_utc'] = completed_utc
+    if not _type_exact_json_equal(worker, replay):
+        raise EvidenceError('worker rebuild attestation differs from the root replay')
+    return replay
+
+
+def package_source_rebuild_is_exact(
+    value: Mapping[str, Any],
+    repository: Path,
+    package_directory: Path,
+    upgrade_package: Path,
+) -> bool:
+    """Replay every retained source-rebuild attestation join."""
+    try:
+        _exact_keys(value, PACKAGE_SOURCE_REBUILD_KEYS, 'package source rebuild')
+        if _integer(value.get('schema_version'), 'package source rebuild schema_version') != 1:
+            return False
+        if value.get('verdict') != 'PASS':
+            return False
+        _utc_timestamp(value.get('completed_utc'), 'package source rebuild completed_utc')
+        repository = repository.resolve(strict=True)
+        source_version = repository_changelog_version(repository)
+        upgrade = package_artifact_descriptor(upgrade_package)
+        if value.get('source_version') != source_version or upgrade['version'] != source_version:
+            return False
+        if value.get('build_script_sha256') != file_sha256(
+            repository / 'scripts/build_debian_package.sh'
+        ):
+            return False
+        architecture = upgrade['architecture']
+        selected_root = package_directory.resolve(strict=True) / 'build-a'
+        names = {
+            'binary_package': f'robotest-supervisor_{source_version}_{architecture}.deb',
+            'debug_package': f'robotest-supervisor-dbgsym_{source_version}_{architecture}.ddeb',
+            'source_manifest': 'SOURCE-MANIFEST.json',
+        }
+        expected_selected = [
+            _rebuild_artifact_record(kind, selected_root / name) for kind, name in names.items()
+        ]
+        selected = _mapping_list(
+            value.get('selected_artifacts'), 'package source rebuild selected_artifacts'
+        )
+        rebuilt = _mapping_list(
+            value.get('rebuilt_artifacts'), 'package source rebuild rebuilt_artifacts'
+        )
+        for label, records in (('selected', selected), ('rebuilt', rebuilt)):
+            for index, record in enumerate(records):
+                _exact_keys(
+                    record,
+                    PACKAGE_SOURCE_REBUILD_ARTIFACT_KEYS,
+                    f'package source rebuild {label}[{index}]',
+                )
+        equality = _mapping(value.get('byte_equal'), 'package source rebuild byte_equal')
+        _exact_keys(equality, PACKAGE_SOURCE_REBUILD_EQUALITY_KEYS, 'rebuild byte_equal')
+        return (
+            _type_exact_json_equal(selected, expected_selected)
+            and _type_exact_json_equal(rebuilt, expected_selected)
+            and _type_exact_json_equal(
+                equality,
+                {
+                    'binary_package': True,
+                    'debug_package': True,
+                    'source_manifest': True,
+                },
+            )
+        )
+    except (EvidenceError, OSError, RuntimeError):
+        return False
 
 
 def _validate_lifecycle_package(
@@ -1442,9 +1980,534 @@ def _process_details(pid: int, proc_root: Path = Path('/proc')) -> dict[str, Any
     }
 
 
+def validate_controller_target_document(
+    target: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    """Validate the exact retained controller identity and root-to-target lineage."""
+    _exact_keys(target, CONTROLLER_TARGET_KEYS, 'controller target')
+    for field in ('pid', 'pgid', 'root_pid', 'start_time_ticks'):
+        _integer(target.get(field), f'controller target.{field}', minimum=1)
+    _integer(target.get('ppid'), 'controller target.ppid', minimum=0)
+    for field in ('comm', 'executable', 'gz_partition', 'ros_domain_id', 'state', 'unit'):
+        _string(target.get(field), f'controller target.{field}')
+    _sha256(target.get('cmdline_sha256'), 'controller target.cmdline_sha256')
+    cmdline = target.get('cmdline')
+    cgroup = target.get('cgroup')
+    if not isinstance(cmdline, list) or not cmdline or len(cmdline) > 4096:
+        raise EvidenceError('controller target.cmdline must be a nonempty bounded list')
+    if not isinstance(cgroup, list) or not cgroup or len(cgroup) > 1024:
+        raise EvidenceError('controller target.cgroup must be a nonempty bounded list')
+    for index, value in enumerate(cmdline):
+        _string(value, f'controller target.cmdline[{index}]')
+    for index, value in enumerate(cgroup):
+        _string(value, f'controller target.cgroup[{index}]')
+    lineage = _mapping_list(target.get('lineage'), 'controller target.lineage')
+    if len(lineage) < 2 or len(lineage) > MAX_PROCESS_COUNT:
+        raise EvidenceError('controller target.lineage must be a bounded root-to-target path')
+    lineage_pids: list[int] = []
+    for index, row in enumerate(lineage):
+        name = f'controller target.lineage[{index}]'
+        _exact_keys(row, CONTROLLER_LINEAGE_KEYS, name)
+        lineage_pids.append(_integer(row.get('pid'), f'{name}.pid', minimum=1))
+        _integer(row.get('ppid'), f'{name}.ppid', minimum=0)
+        _integer(row.get('start_time_ticks'), f'{name}.start_time_ticks', minimum=1)
+    if len(lineage_pids) != len(set(lineage_pids)):
+        raise EvidenceError('controller target.lineage repeats a PID')
+    if any(
+        lineage[index].get('ppid') != lineage[index - 1].get('pid')
+        for index in range(1, len(lineage))
+    ):
+        raise EvidenceError('controller target.lineage is not parent-contiguous')
+    if (
+        lineage[0].get('pid') != target.get('root_pid')
+        or lineage[-1].get('pid') != target.get('pid')
+        or lineage[-1].get('ppid') != target.get('ppid')
+        or lineage[-1].get('start_time_ticks') != target.get('start_time_ticks')
+    ):
+        raise EvidenceError('controller target.lineage endpoints do not match the identity')
+    return lineage
+
+
 def _in_unit_cgroup(lines: Sequence[str], unit: str) -> bool:
     suffix = f'/system.slice/{unit}'
-    return any(line.endswith(suffix) for line in lines)
+    return any(line.rpartition(':')[2] == suffix for line in lines)
+
+
+def _parse_cpu_list(value: Any, name: str) -> frozenset[int]:
+    text = _string(value, name, maximum=4096)
+    if CPU_LIST_RE.fullmatch(text) is None:
+        raise EvidenceError(f'{name} is not a canonical Linux CPU list')
+    cpus: set[int] = set()
+    previous = -1
+    for item in text.split(','):
+        bounds = item.split('-', 1)
+        start = int(bounds[0])
+        end = int(bounds[-1])
+        if end < start or start <= previous or end > 4095:
+            raise EvidenceError(f'{name} is not strictly ordered and bounded')
+        cpus.update(range(start, end + 1))
+        previous = end
+    if not cpus:
+        raise EvidenceError(f'{name} is empty')
+    canonical: list[str] = []
+    ordered = sorted(cpus)
+    start = previous = ordered[0]
+    for cpu in ordered[1:]:
+        if cpu == previous + 1:
+            previous = cpu
+            continue
+        canonical.append(str(start) if start == previous else f'{start}-{previous}')
+        start = previous = cpu
+    canonical.append(str(start) if start == previous else f'{start}-{previous}')
+    if text != ','.join(canonical):
+        raise EvidenceError(f'{name} is not canonical')
+    return frozenset(cpus)
+
+
+def _parse_cpu_mask(value: Any, name: str) -> frozenset[int]:
+    text = _string(value, name, maximum=4096)
+    if CPU_MASK_RE.fullmatch(text) is None:
+        raise EvidenceError(f'{name} is not a Linux hexadecimal CPU mask')
+    mask = int(text.replace(',', ''), 16)
+    if mask.bit_length() > 4096:
+        raise EvidenceError(f'{name} exceeds the CPU ID bound')
+    if mask <= 0:
+        raise EvidenceError(f'{name} must enable at least one CPU')
+    return frozenset(index for index in range(mask.bit_length()) if mask & (1 << index))
+
+
+def _proc_affinity(path: Path) -> tuple[str, str, frozenset[int]]:
+    status = str(_read_proc_file(path / 'status'))
+    fields: dict[str, str] = {}
+    for line in status.splitlines():
+        key, separator, value = line.partition(':')
+        if separator and key in {'Pid', 'PPid', 'Cpus_allowed', 'Cpus_allowed_list'}:
+            fields[key] = value.strip()
+    expected = {'Pid', 'PPid', 'Cpus_allowed', 'Cpus_allowed_list'}
+    if set(fields) != expected:
+        raise EvidenceError(f'process status affinity schema is incomplete: {path}')
+    mask = fields['Cpus_allowed'].lower()
+    cpu_list = fields['Cpus_allowed_list']
+    mask_cpus = _parse_cpu_mask(mask, f'{path}.Cpus_allowed')
+    list_cpus = _parse_cpu_list(cpu_list, f'{path}.Cpus_allowed_list')
+    if mask_cpus != list_cpus:
+        raise EvidenceError(f'CPU mask/list disagree for process {path.parent.name}')
+    return mask, cpu_list, list_cpus
+
+
+def _unit_process_pids(
+    table: Mapping[int, Mapping[str, Any]],
+    unit: str,
+    proc_root: Path,
+) -> set[int]:
+    result: set[int] = set()
+    for pid in sorted(table):
+        try:
+            lines = str(_read_proc_file(proc_root / str(pid) / 'cgroup')).splitlines()
+        except (EvidenceError, FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if _in_unit_cgroup(lines, unit):
+            result.add(pid)
+    return result
+
+
+def _runtime_affinity_process(
+    pid: int,
+    role: str,
+    expected_cpus: frozenset[int],
+    *,
+    unit: str,
+    proc_root: Path,
+) -> dict[str, Any]:
+    first = _process_details(pid, proc_root)
+    first_mask, first_list, first_cpus = _proc_affinity(proc_root / str(pid))
+    second = _process_details(pid, proc_root)
+    second_mask, second_list, second_cpus = _proc_affinity(proc_root / str(pid))
+    stable_fields = ('pid', 'ppid', 'pgid', 'start_time_ticks', 'executable', 'cgroup')
+    if any(first.get(field) != second.get(field) for field in stable_fields):
+        raise EvidenceError(f'process identity changed during affinity capture: PID {pid}')
+    if (first_mask, first_list, first_cpus) != (second_mask, second_list, second_cpus):
+        raise EvidenceError(f'CPU affinity changed during capture: PID {pid}')
+    if first.get('state') == 'Z':
+        raise EvidenceError(f'zombie process is present in the unit cgroup: PID {pid}')
+    if not _in_unit_cgroup(first['cgroup'], unit):
+        raise EvidenceError(f'process left the exact unit cgroup during capture: PID {pid}')
+    if not first_cpus.issubset(expected_cpus):
+        raise EvidenceError(f'process affinity exceeds the expected cpuset: PID {pid}')
+    return {
+        'role': role,
+        'pid': first['pid'],
+        'ppid': first['ppid'],
+        'pgid': first['pgid'],
+        'start_time_ticks': first['start_time_ticks'],
+        'executable': first['executable'],
+        'cgroup': first['cgroup'],
+        'cpus_allowed': first_mask,
+        'cpus_allowed_list': first_list,
+    }
+
+
+def capture_runtime_affinity(
+    main_pid: int,
+    managed_child_pid: int,
+    managed_child_pgid: int,
+    ros_domain_id: int,
+    gz_partition: str,
+    phase: str,
+    *,
+    unit: str = EXPECTED_UNIT,
+    expected_cpuset: str = EXPECTED_CPUSET,
+    proc_root: Path = Path('/proc'),
+) -> dict[str, Any]:
+    """Capture one stable, exact service-cgroup CPU-affinity snapshot."""
+    if phase not in {'initial', 'restored'}:
+        raise EvidenceError('runtime affinity phase must be initial or restored')
+    for value, name in (
+        (main_pid, 'main PID'),
+        (managed_child_pid, 'managed child PID'),
+        (managed_child_pgid, 'managed child PGID'),
+    ):
+        _integer(value, name, minimum=2)
+    if managed_child_pid != managed_child_pgid:
+        raise EvidenceError('managed child PID and PGID must be identical')
+    expected_cpus = _parse_cpu_list(expected_cpuset, 'expected cpuset')
+    table_before = process_table(proc_root)
+    descendants_before = descendant_pids(table_before, main_pid)
+    unit_pids_before = _unit_process_pids(table_before, unit, proc_root)
+    if descendants_before != unit_pids_before:
+        raise EvidenceError('MainPID descendants do not equal the exact unit-cgroup process set')
+    if managed_child_pid not in descendants_before:
+        raise EvidenceError('managed child is not a MainPID descendant in the unit cgroup')
+    managed = table_before[managed_child_pid]
+    if managed.get('pgid') != managed_child_pgid or managed.get('state') == 'Z':
+        raise EvidenceError('managed child process-group identity is invalid')
+
+    controller = find_exact_controller(
+        managed_child_pid,
+        managed_child_pgid,
+        ros_domain_id,
+        gz_partition,
+        unit=unit,
+        proc_root=proc_root,
+    )
+    controller_pid = _integer(controller.get('pid'), 'controller PID', minimum=2)
+    records: list[dict[str, Any]] = []
+    for pid in sorted(unit_pids_before):
+        if pid == main_pid:
+            role = 'supervisor_main'
+        elif pid == managed_child_pid:
+            role = 'managed_child'
+        elif pid == controller_pid:
+            role = 'controller'
+        else:
+            role = 'unit_descendant'
+        records.append(
+            _runtime_affinity_process(
+                pid,
+                role,
+                expected_cpus,
+                unit=unit,
+                proc_root=proc_root,
+            )
+        )
+
+    table_after = process_table(proc_root)
+    descendants_after = descendant_pids(table_after, main_pid)
+    unit_pids_after = _unit_process_pids(table_after, unit, proc_root)
+    if descendants_after != descendants_before or unit_pids_after != unit_pids_before:
+        raise EvidenceError('unit-cgroup process membership changed during affinity capture')
+    for record in records:
+        current = table_after.get(record['pid'])
+        if current is None or any(
+            current.get(field) != record[field]
+            for field in ('pid', 'ppid', 'pgid', 'start_time_ticks')
+        ):
+            raise EvidenceError('process identity changed after affinity capture')
+
+    return {
+        'schema_version': SCHEMA_VERSION,
+        'captured_utc': utc_now(),
+        'phase': phase,
+        'unit': unit,
+        'unit_cgroup': f'/system.slice/{unit}',
+        'expected_cpuset': expected_cpuset,
+        'main_pid': main_pid,
+        'managed_child_pid': managed_child_pid,
+        'managed_child_pgid': managed_child_pgid,
+        'controller_pid': controller_pid,
+        'controller_count': 1,
+        'process_count': len(records),
+        'snapshot_stable': True,
+        'processes': records,
+        'verdict': 'PASS',
+    }
+
+
+def validate_runtime_affinity_evidence(
+    value: Mapping[str, Any],
+    *,
+    phase: str,
+    main_pid: int,
+    managed_child_pid: int,
+    managed_child_pgid: int,
+    expected_cpuset: str = EXPECTED_CPUSET,
+    unit: str = EXPECTED_UNIT,
+) -> dict[str, Any]:
+    """Validate one retained affinity snapshot and return its exact role join."""
+    _exact_keys(value, RUNTIME_AFFINITY_KEYS, f'{phase} runtime affinity')
+    captured_utc = _utc_timestamp(value.get('captured_utc'), f'{phase} affinity captured_utc')
+    if value.get('phase') != phase:
+        raise EvidenceError(f'{phase} affinity phase does not match its evidence role')
+    if value.get('unit') != unit or value.get('unit_cgroup') != f'/system.slice/{unit}':
+        raise EvidenceError(f'{phase} affinity unit cgroup is not exact')
+    if value.get('expected_cpuset') != expected_cpuset:
+        raise EvidenceError(f'{phase} affinity expected cpuset changed')
+    expected_cpus = _parse_cpu_list(expected_cpuset, f'{phase} expected cpuset')
+    if value.get('snapshot_stable') is not True or value.get('verdict') != 'PASS':
+        raise EvidenceError(f'{phase} affinity snapshot was not captured stable and PASS')
+    if value.get('main_pid') != main_pid:
+        raise EvidenceError(f'{phase} affinity MainPID does not reconcile')
+    if value.get('managed_child_pid') != managed_child_pid:
+        raise EvidenceError(f'{phase} affinity managed child PID does not reconcile')
+    if value.get('managed_child_pgid') != managed_child_pgid:
+        raise EvidenceError(f'{phase} affinity managed child PGID does not reconcile')
+    if managed_child_pid != managed_child_pgid:
+        raise EvidenceError(f'{phase} managed child PID/PGID is not an owned group')
+
+    raw_processes = value.get('processes')
+    if isinstance(raw_processes, (str, bytes)) or not isinstance(raw_processes, Sequence):
+        raise EvidenceError(f'{phase} affinity processes must be a sequence')
+    if not 3 <= len(raw_processes) <= MAX_PROCESS_COUNT:
+        raise EvidenceError(f'{phase} affinity process count is outside the bound')
+    if value.get('process_count') != len(raw_processes):
+        raise EvidenceError(f'{phase} affinity process_count does not reconcile')
+    if value.get('controller_count') != 1:
+        raise EvidenceError(f'{phase} affinity controller_count must be exactly one')
+
+    roles: dict[str, list[Mapping[str, Any]]] = {
+        'supervisor_main': [],
+        'managed_child': [],
+        'controller': [],
+        'unit_descendant': [],
+    }
+    processes: list[Mapping[str, Any]] = []
+    pids: list[int] = []
+    affinity_limited = True
+    for index, raw_process in enumerate(raw_processes):
+        process = _mapping(raw_process, f'{phase} affinity processes[{index}]')
+        _exact_keys(
+            process,
+            RUNTIME_AFFINITY_PROCESS_KEYS,
+            f'{phase} affinity processes[{index}]',
+        )
+        role = _string(process.get('role'), f'{phase} affinity role')
+        if role not in roles:
+            raise EvidenceError(f'{phase} affinity process has an unsupported role: {role}')
+        pid = _integer(process.get('pid'), f'{phase} affinity PID', minimum=2)
+        _integer(process.get('ppid'), f'{phase} affinity PPID', minimum=0)
+        _integer(process.get('pgid'), f'{phase} affinity PGID', minimum=1)
+        _integer(
+            process.get('start_time_ticks'),
+            f'{phase} affinity start_time_ticks',
+            minimum=1,
+        )
+        executable = _string(process.get('executable'), f'{phase} affinity executable')
+        if not Path(executable).is_absolute():
+            raise EvidenceError(f'{phase} affinity executable is not absolute')
+        raw_cgroup = process.get('cgroup')
+        if isinstance(raw_cgroup, (str, bytes)) or not isinstance(raw_cgroup, Sequence):
+            raise EvidenceError(f'{phase} affinity cgroup must be a raw line sequence')
+        cgroup = [_string(item, f'{phase} affinity cgroup line') for item in raw_cgroup]
+        if not cgroup or not _in_unit_cgroup(cgroup, unit):
+            raise EvidenceError(f'{phase} affinity process is outside the exact unit cgroup')
+        mask_cpus = _parse_cpu_mask(process.get('cpus_allowed'), f'{phase} affinity Cpus_allowed')
+        list_cpus = _parse_cpu_list(
+            process.get('cpus_allowed_list'), f'{phase} affinity Cpus_allowed_list'
+        )
+        if mask_cpus != list_cpus:
+            raise EvidenceError(f'{phase} affinity CPU mask/list do not reconcile')
+        affinity_limited = affinity_limited and list_cpus.issubset(expected_cpus)
+        roles[role].append(process)
+        processes.append(process)
+        pids.append(pid)
+
+    if pids != sorted(pids) or len(set(pids)) != len(pids):
+        raise EvidenceError(f'{phase} affinity process PIDs are not sorted and unique')
+    for role in ('supervisor_main', 'managed_child', 'controller'):
+        if len(roles[role]) != 1:
+            raise EvidenceError(f'{phase} affinity must contain exactly one {role}')
+    main = roles['supervisor_main'][0]
+    child = roles['managed_child'][0]
+    controller = roles['controller'][0]
+    if main.get('pid') != main_pid:
+        raise EvidenceError(f'{phase} affinity main role does not match MainPID')
+    if child.get('pid') != managed_child_pid or child.get('pgid') != managed_child_pgid:
+        raise EvidenceError(f'{phase} affinity child role does not match managed identity')
+    if child.get('ppid') != main_pid:
+        raise EvidenceError(f'{phase} managed child is not a direct MainPID child')
+    if controller.get('pid') != value.get('controller_pid'):
+        raise EvidenceError(f'{phase} affinity controller PID does not reconcile')
+    if controller.get('pgid') != managed_child_pgid:
+        raise EvidenceError(f'{phase} affinity controller left the managed group')
+    if Path(str(controller.get('executable'))).name != 'controller_server':
+        raise EvidenceError(f'{phase} affinity controller executable is not exact')
+    by_pid = {process['pid']: process for process in processes}
+    for process in processes:
+        pid = process['pid']
+        if pid == main_pid:
+            continue
+        if process.get('pgid') != managed_child_pgid:
+            raise EvidenceError(f'{phase} affinity process left the managed group')
+        current = pid
+        visited: set[int] = set()
+        while current != main_pid:
+            if current in visited or current not in by_pid:
+                raise EvidenceError(f'{phase} affinity process {pid} does not descend from MainPID')
+            visited.add(current)
+            current = by_pid[current]['ppid']
+    return {
+        'limited': affinity_limited,
+        'captured_utc': datetime.fromisoformat(captured_utc.replace('Z', '+00:00')),
+        'main': main,
+        'child': child,
+        'controller': controller,
+        'processes': processes,
+    }
+
+
+def validate_supervisor_status(value: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+    """Validate one exact supervisor snapshot and return its only child."""
+    _exact_keys(value, SUPERVISOR_STATUS_KEYS, name)
+    if _integer(value.get('schema_version'), f'{name}.schema_version') != 1:
+        raise EvidenceError(f'{name}.schema_version must be 1')
+    _utc_timestamp(value.get('supervisor_utc'), f'{name}.supervisor_utc')
+    for field in ('healthy', 'persistence_healthy', 'ready', 'shutting_down'):
+        _boolean(value.get(field), f'{name}.{field}')
+    _integer(value.get('event_count'), f'{name}.event_count', minimum=0)
+    _integer(value.get('dropped_events'), f'{name}.dropped_events', minimum=0)
+    children = _mapping_list(value.get('children'), f'{name}.children')
+    if len(children) != 1:
+        raise EvidenceError(f'{name} must contain exactly one child')
+    child = children[0]
+    keys = set(child)
+    if not keys >= SUPERVISOR_CHILD_REQUIRED_KEYS or not keys <= (
+        SUPERVISOR_CHILD_REQUIRED_KEYS | SUPERVISOR_CHILD_OPTIONAL_KEYS
+    ):
+        raise EvidenceError(f'{name}.children[0] has an invalid schema')
+    if child.get('name') != EXPECTED_CHILD:
+        raise EvidenceError(f'{name} child name is not exact')
+    for field in ('required', 'running', 'heartbeat_fresh', 'circuit_open'):
+        _boolean(child.get(field), f'{name}.child.{field}')
+    for field in ('pid', 'pgid', 'restart_count'):
+        _integer(child.get(field), f'{name}.child.{field}', minimum=0)
+    heartbeat_age = child.get('heartbeat_age_ms')
+    if heartbeat_age is not None:
+        _integer(heartbeat_age, f'{name}.child.heartbeat_age_ms', minimum=0)
+    if 'last_exit_code' in child:
+        _integer(child.get('last_exit_code'), f'{name}.child.last_exit_code')
+    for field in ('last_failure_utc', 'last_ready_utc', 'started_utc'):
+        if field in child:
+            _utc_timestamp(child.get(field), f'{name}.child.{field}')
+    if 'last_failure_kind' in child:
+        _string(child.get('last_failure_kind'), f'{name}.child.last_failure_kind')
+    return child
+
+
+def validate_systemd_owners(
+    value: Mapping[str, Any],
+    *,
+    ros_domain_id: int,
+    gz_partition: str,
+    expected_pids: list[int],
+    name: str,
+) -> None:
+    _exact_keys(value, SYSTEMD_OWNERS_KEYS, name)
+    if _integer(value.get('schema_version'), f'{name}.schema_version') != 1:
+        raise EvidenceError(f'{name}.schema_version must be 1')
+    _utc_timestamp(value.get('captured_utc'), f'{name}.captured_utc')
+    units = _mapping(value.get('units'), f'{name}.units')
+    expected_units = {EXPECTED_UNIT: sorted(expected_pids)}
+    expected = {
+        'captured_utc': value.get('captured_utc'),
+        'gz_partition': gz_partition,
+        'ros_domain_id': ros_domain_id,
+        'schema_version': 1,
+        'unit_count': 1,
+        'units': expected_units,
+        'verdict': 'PASS',
+    }
+    if not _type_exact_json_equal(value, expected) or not units[EXPECTED_UNIT]:
+        raise EvidenceError(f'{name} does not match the exact isolated unit PID set')
+
+
+def validate_stable_runtime_ownership_capture(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    affinity: Mapping[str, Any],
+) -> None:
+    """Require an unchanged owner scan bracketing one affinity snapshot."""
+    for name, value in (('owners before', before), ('owners after', after)):
+        _exact_keys(value, SYSTEMD_OWNERS_KEYS, name)
+        if _integer(value.get('schema_version'), f'{name}.schema_version') != 1:
+            raise EvidenceError(f'{name}.schema_version must be 1')
+        _utc_timestamp(value.get('captured_utc'), f'{name}.captured_utc')
+    before_projection = {key: value for key, value in before.items() if key != 'captured_utc'}
+    after_projection = {key: value for key, value in after.items() if key != 'captured_utc'}
+    if not _type_exact_json_equal(before_projection, after_projection):
+        raise EvidenceError('systemd owner set changed across affinity capture')
+    units = _mapping(after.get('units'), 'stable systemd owner units')
+    expected_pids = sorted(
+        _integer(process.get('pid'), 'stable affinity PID', minimum=1)
+        for process in _mapping_list(affinity.get('processes'), 'stable affinity processes')
+        if process.get('role') != 'supervisor_main'
+    )
+    if (
+        after.get('verdict') != 'PASS'
+        or after.get('unit_count') != 1
+        or not _type_exact_json_equal(units, {EXPECTED_UNIT: expected_pids})
+    ):
+        raise EvidenceError('stable systemd owner set does not match affinity descendants')
+
+
+def lifecycle_startup_result_is_exact(value: Mapping[str, Any]) -> bool:
+    """Return whether the retained launch-owned lifecycle STARTUP result is exact."""
+    _exact_keys(value, LIFECYCLE_STARTUP_RESULT_KEYS, 'lifecycle startup result')
+    schema_version = _integer(value.get('schema_version'), 'startup schema_version')
+    verdict = _string(value.get('verdict'), 'startup verdict')
+    accepted = _boolean(value.get('accepted'), 'startup accepted')
+    exit_code = _integer(value.get('exit_code'), 'startup exit_code')
+    service_name = _string(value.get('service_name'), 'startup service_name')
+    command = _integer(value.get('command'), 'startup command')
+    discovery_grace = _number(
+        value.get('discovery_grace_sec'), 'startup discovery_grace_sec', minimum=0.0
+    )
+    service_timeout = _number(
+        value.get('service_timeout_sec'), 'startup service_timeout_sec', minimum=0.0
+    )
+    response_timeout = _number(
+        value.get('response_timeout_sec'), 'startup response_timeout_sec', minimum=0.0
+    )
+    started = _utc_timestamp(value.get('started_utc'), 'startup result started_utc')
+    completed = _utc_timestamp(value.get('completed_utc'), 'startup result completed_utc')
+    started_at = datetime.fromisoformat(started.replace('Z', '+00:00'))
+    completed_at = datetime.fromisoformat(completed.replace('Z', '+00:00'))
+    elapsed = _number(value.get('elapsed_wall_sec'), 'startup elapsed_wall_sec', minimum=0.0)
+    return (
+        schema_version == 1
+        and verdict == 'PASS'
+        and accepted is True
+        and exit_code == 0
+        and service_name == '/robotest/lifecycle_manager_navigation/manage_nodes'
+        and command == 0
+        and 0.0 <= elapsed <= 110.0
+        and discovery_grace == 4.0
+        and service_timeout == 20.0
+        and response_timeout == 60.0
+        and value.get('watch_pid') is None
+        and value.get('failure_kind') is None
+        and value.get('failure_message') is None
+        and completed_at >= started_at
+    )
 
 
 def find_exact_controller(
@@ -1685,6 +2748,89 @@ def allocated_isolation(run_id: str, proc_root: Path = Path('/proc')) -> dict[st
     }
 
 
+def expected_supervisor_config(
+    state_directory: str,
+    ros_domain_id: int,
+    gz_partition: str,
+) -> dict[str, Any]:
+    """Return the one complete type-exact packaged supervisor configuration."""
+    return {
+        'schema_version': 1,
+        'listen_address': '127.0.0.1:9080',
+        'state_directory': state_directory,
+        'heartbeat_poll_ms': 500,
+        'heartbeat_stale_ms': 2000,
+        'heartbeat_startup_timeout_ms': 110000,
+        'termination_grace_ms': 5000,
+        'shutdown_timeout_ms': 15000,
+        'maximum_event_entries': 4096,
+        'maximum_event_bytes': 8388608,
+        'restart': {
+            'initial_backoff_ms': 1000,
+            'maximum_backoff_ms': 8000,
+            'maximum_attempts': 4,
+            'window_ms': 60000,
+            'stable_reset_ms': 60000,
+        },
+        'children': [
+            {
+                'name': EXPECTED_CHILD,
+                'argv': ['/usr/libexec/robotest-supervisor/start-robotest-stack'],
+                'working_directory': '/opt/robotest-lab',
+                'environment': {
+                    'GZ_PARTITION': gz_partition,
+                    'RCUTILS_LOGGING_BUFFERED_STREAM': '1',
+                    'ROBOTEST_CPUSET': EXPECTED_CPUSET,
+                    'ROBOTEST_NAMESPACE': 'robotest',
+                    RUNTIME_STATE_ENVIRONMENT: state_directory,
+                    'ROS_DOMAIN_ID': str(ros_domain_id),
+                },
+                'required': True,
+                'heartbeat_file': f'{state_directory}/{HEARTBEAT_NAME}',
+            }
+        ],
+    }
+
+
+def render_overlay_stage_script(
+    template_path: Path,
+    output_path: Path,
+    project_root: Path,
+    evidence_directory: Path,
+) -> None:
+    """Render the overlay helper with its only writable evidence path under /run."""
+    for path, label in (
+        (project_root, 'overlay project root'),
+        (evidence_directory, 'overlay evidence directory'),
+        (output_path, 'overlay helper output'),
+    ):
+        if not path.is_absolute() or '..' in path.parts:
+            raise EvidenceError(f'{label} must be a canonical absolute path')
+    if project_root.resolve(strict=True) != project_root:
+        raise EvidenceError('overlay project root must not traverse symbolic links')
+    payload = _read_bounded_bytes(template_path, MAX_TEXT_BYTES)
+    try:
+        text = payload.decode('utf-8')
+    except UnicodeDecodeError as exc:
+        raise EvidenceError('overlay helper template is not UTF-8') from exc
+    replacements = {
+        'SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"': (
+            f'SCRIPT_DIR={shlex.quote(str(project_root / "scripts"))}'
+        ),
+        'PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"': (
+            f'PROJECT_ROOT={shlex.quote(str(project_root))}'
+        ),
+        'readonly EVIDENCE_DIR="${PROJECT_ROOT}/artifacts/evidence/phase4"': (
+            f'readonly EVIDENCE_DIR={shlex.quote(str(evidence_directory))}'
+        ),
+    }
+    for original, replacement in replacements.items():
+        if text.count(original) != 1:
+            raise EvidenceError(f'overlay helper assignment changed: {original}')
+        text = text.replace(original, replacement, 1)
+    _atomic_write(output_path, text.encode('utf-8'), mode=0o700)
+
+
 def render_supervisor_config(
     template_path: Path,
     output_path: Path,
@@ -1694,57 +2840,32 @@ def render_supervisor_config(
 ) -> dict[str, Any]:
     """Render only run-scoped isolation/state values into the frozen config."""
     value = _mapping(load_json(template_path), 'supervisor template')
-    frozen = {
-        'listen_address': '127.0.0.1:9080',
-        'heartbeat_poll_ms': 500,
-        'heartbeat_stale_ms': 2000,
-        'heartbeat_startup_timeout_ms': 110000,
-        'termination_grace_ms': 5000,
-        'shutdown_timeout_ms': 15000,
-    }
-    for key, expected in frozen.items():
-        if value.get(key) != expected:
-            raise EvidenceError(f'package config changed frozen {key}: {value.get(key)!r}')
-    restart = _mapping(value.get('restart'), 'supervisor template.restart')
-    expected_restart = {
-        'initial_backoff_ms': 1000,
-        'maximum_backoff_ms': 8000,
-        'maximum_attempts': 4,
-        'window_ms': 60000,
-        'stable_reset_ms': 60000,
-    }
-    if dict(restart) != expected_restart:
-        raise EvidenceError('package config changed the frozen restart policy')
-    children = value.get('children')
-    if not isinstance(children, list) or len(children) != 1:
-        raise EvidenceError('package config must contain exactly one managed child')
-    child = _mapping(children[0], 'supervisor template child')
+    expected_template = expected_supervisor_config(
+        EXPECTED_RUNTIME_STATE_ROOT,
+        42,
+        'robotest_supervised',
+    )
+    if not _type_exact_json_equal(value, expected_template):
+        raise EvidenceError('package config changed the complete frozen contract')
+    state_path = Path(state_directory)
     if (
-        child.get('name') != EXPECTED_CHILD
-        or child.get('argv') != ['/usr/libexec/robotest-supervisor/start-robotest-stack']
-        or child.get('working_directory') != '/opt/robotest-lab'
-        or child.get('required') is not True
-        or child.get('heartbeat_file') != '/var/lib/robotest-supervisor/robotest-stack.heartbeat'
+        state_path.as_posix() != state_directory
+        or state_path.parent.as_posix() != EXPECTED_RUNTIME_STATE_ROOT
+        or RUN_ID_RE.fullmatch(state_path.name) is None
     ):
-        raise EvidenceError('package config changed the managed-child contract')
-    if not state_directory.startswith('/var/lib/robotest-supervisor/phase4-'):
         raise EvidenceError('run state directory is outside the Phase 4-owned prefix')
     if not 1 <= ros_domain_id <= 232:
         raise EvidenceError('ROS domain ID is outside the DDS range')
     if PARTITION_RE.fullmatch(gz_partition) is None:
         raise EvidenceError('Gazebo partition is invalid')
-    rendered = json.loads(json.dumps(value))
-    rendered['state_directory'] = state_directory
-    environment = rendered['children'][0]['environment']
-    environment['ROS_DOMAIN_ID'] = str(ros_domain_id)
-    environment['GZ_PARTITION'] = gz_partition
+    rendered = expected_supervisor_config(state_directory, ros_domain_id, gz_partition)
     atomic_write_json(output_path, rendered, mode=0o640)
     return rendered
 
 
-def render_followup_mission(output_path: Path) -> dict[str, Any]:
-    """Write the one-goal fresh recovery mission as immutable canonical JSON."""
-    mission = {
+def expected_followup_mission() -> dict[str, Any]:
+    """Return the one exact fresh one-waypoint recovery mission."""
+    return {
         'schema_version': 1,
         'mission_name': 'phase4_recovery_followup',
         'mission_seed': 42,
@@ -1760,6 +2881,11 @@ def render_followup_mission(output_path: Path) -> dict[str, Any]:
         'expected_outcome': 'succeeded',
         'retries': 0,
     }
+
+
+def render_followup_mission(output_path: Path) -> dict[str, Any]:
+    """Write the one-goal fresh recovery mission as immutable canonical JSON."""
+    mission = expected_followup_mission()
     atomic_write_json(output_path, mission)
     return mission
 
@@ -1809,6 +2935,162 @@ def repository_package_manifest(repository: Path) -> dict[str, Any]:
     return {'schema_version': 1, 'files': sorted(entries, key=lambda item: item['path'])}
 
 
+def runtime_source_manifest(repository: Path) -> dict[str, Any]:
+    """Replay the runtime overlay source-manifest algorithm exactly."""
+    repository = repository.resolve(strict=True)
+    entries: list[dict[str, Any]] = []
+    for name in ('config', 'scenarios', 'src'):
+        runtime_root = repository / name
+        if runtime_root.is_symlink() or not runtime_root.is_dir():
+            raise EvidenceError(f'missing regular runtime source directory: {runtime_root}')
+        for directory, directory_names, file_names in os.walk(runtime_root, followlinks=False):
+            directory_path = Path(directory)
+            for directory_name in directory_names:
+                candidate = directory_path / directory_name
+                if candidate.is_symlink():
+                    raise EvidenceError(
+                        f'runtime source contains a symbolic-link directory: {candidate}'
+                    )
+            directory_names[:] = sorted(
+                directory_name
+                for directory_name in directory_names
+                if directory_name not in {'__pycache__', '.pytest_cache', '.ruff_cache'}
+            )
+            for file_name in sorted(file_names):
+                if file_name.endswith(('.pyc', '.pyo')):
+                    continue
+                path = directory_path / file_name
+                if path.is_symlink():
+                    raise EvidenceError(f'runtime source contains a symbolic link: {path}')
+                relative = path.relative_to(repository).as_posix()
+                if relative == 'config/release-claims.json':
+                    continue
+                resolved = path.resolve(strict=True)
+                if repository not in resolved.parents or not resolved.is_file():
+                    raise EvidenceError(f'invalid runtime source entry: {path}')
+                metadata = resolved.stat()
+                entries.append(
+                    {
+                        'mode': format(stat.S_IMODE(metadata.st_mode), '04o'),
+                        'path': relative,
+                        'sha256': file_sha256(resolved),
+                        'size_bytes': metadata.st_size,
+                    }
+                )
+                if len(entries) > MAX_SOURCE_FILES:
+                    raise EvidenceError('runtime source manifest exceeds its file-count cap')
+    return {'schema_version': 1, 'files': sorted(entries, key=lambda item: item['path'])}
+
+
+def _canonical_manifest_document(path: Path, name: str) -> Mapping[str, Any]:
+    payload = _read_bounded_bytes(path, MAX_JSON_BYTES)
+    document = _mapping(load_json(path), name)
+    _exact_keys(document, SOURCE_MANIFEST_KEYS, name)
+    if _integer(document.get('schema_version'), f'{name}.schema_version') != 1:
+        raise EvidenceError(f'{name}.schema_version must be 1')
+    rows = _mapping_list(document.get('files'), f'{name}.files')
+    if not rows or len(rows) > MAX_SOURCE_FILES:
+        raise EvidenceError(f'{name}.files must be nonempty and bounded')
+    paths: list[str] = []
+    for index, row in enumerate(rows):
+        row_name = f'{name}.files[{index}]'
+        _exact_keys(row, SOURCE_MANIFEST_FILE_KEYS, row_name)
+        mode = _string(row.get('mode'), f'{row_name}.mode', maximum=4)
+        relative = _string(row.get('path'), f'{row_name}.path')
+        if re.fullmatch(r'[0-7]{4}', mode) is None:
+            raise EvidenceError(f'{row_name}.mode is not canonical')
+        if (
+            relative.startswith('/')
+            or '\\' in relative
+            or Path(relative).as_posix() != relative
+            or any(part in ('', '.', '..') for part in Path(relative).parts)
+        ):
+            raise EvidenceError(f'{row_name}.path is not a canonical relative path')
+        _sha256(row.get('sha256'), f'{row_name}.sha256')
+        _integer(row.get('size_bytes'), f'{row_name}.size_bytes', minimum=0)
+        paths.append(relative)
+    if paths != sorted(paths) or len(paths) != len(set(paths)):
+        raise EvidenceError(f'{name}.files paths are not sorted and unique')
+    if payload != canonical_json_bytes(document):
+        raise EvidenceError(f'{name} bytes are not canonical')
+    return document
+
+
+def runtime_staging_evidence_is_exact(
+    repository: Path,
+    context: Mapping[str, Any],
+    staging: Mapping[str, Any],
+    overlay_provenance: Mapping[str, Any],
+    source_manifest_path: Path,
+    install_manifest_path: Path,
+) -> bool:
+    """Replay the exact source, install, provenance, and active-target joins."""
+    try:
+        repository = repository.resolve(strict=True)
+        _exact_keys(staging, OVERLAY_PROVENANCE_KEYS, 'runtime staging provenance')
+        if not _type_exact_json_equal(staging, overlay_provenance):
+            return False
+        if _integer(staging.get('schema_version'), 'runtime staging schema_version') != 1:
+            return False
+        _utc_timestamp(staging.get('created_utc'), 'runtime staging created_utc')
+        git_commit = _string(staging.get('git_commit'), 'runtime staging git_commit')
+        git_dirty = _boolean(staging.get('git_dirty'), 'runtime staging git_dirty')
+        if re.fullmatch(r'[0-9a-f]{40}', git_commit) is None:
+            return False
+        expected_source = runtime_source_manifest(repository)
+        if _read_bounded_bytes(source_manifest_path, MAX_JSON_BYTES) != canonical_json_bytes(
+            expected_source
+        ):
+            return False
+        _canonical_manifest_document(install_manifest_path, 'overlay install manifest')
+        source_sha = file_sha256(source_manifest_path)
+        install_sha = file_sha256(install_manifest_path)
+        release_id = f'{git_commit[:12]}-{source_sha[:16]}-{str(git_dirty).lower()}'
+        release_path = f'/opt/robotest-lab-releases/{release_id}'
+        expected_build_command = [
+            'colcon',
+            '--log-base',
+            f'{release_path}/.log',
+            'build',
+            '--base-paths',
+            f'{repository}/src',
+            '--build-base',
+            f'{release_path}/.build',
+            '--install-base',
+            f'{release_path}/install',
+            '--executor',
+            'parallel',
+            '--parallel-workers',
+            '4',
+            '--event-handlers',
+            'console_direct+',
+            '--cmake-args',
+            '-DBUILD_TESTING=OFF',
+        ]
+        expected_provenance = {
+            'active_path': '/opt/robotest-lab',
+            'build_command': expected_build_command,
+            'created_utc': staging.get('created_utc'),
+            'git_commit': git_commit,
+            'git_dirty': git_dirty,
+            'install_manifest_sha256': install_sha,
+            'packages': OVERLAY_PACKAGES,
+            'release_id': release_id,
+            'schema_version': 1,
+            'source_manifest_sha256': source_sha,
+            'source_workspace': str(repository),
+        }
+        return (
+            _type_exact_json_equal(staging, expected_provenance)
+            and git_dirty is False
+            and context.get('source_git_commit') == git_commit
+            and context.get('source_git_dirty') is False
+            and context.get('active_overlay_target') == release_path
+        )
+    except (EvidenceError, OSError, RuntimeError):
+        return False
+
+
 def source_snapshot(repository: Path) -> dict[str, Any]:
     """Hash the bounded implementation/contract source set used by Phase 4."""
     roots = ('config', 'docs', 'packaging', 'scenarios', 'scripts', 'src', 'supervisor', 'tests')
@@ -1831,6 +3113,10 @@ def source_snapshot(repository: Path) -> dict[str, Any]:
         for path in candidates:
             relative = path.relative_to(repository)
             if any(part in ignored_parts for part in relative.parts):
+                continue
+            if relative.parts[:2] == ('docs', 'results'):
+                continue
+            if relative.as_posix() == 'config/release-claims.json':
                 continue
             if path.is_symlink():
                 raise EvidenceError(f'source snapshot contains a symlink: {relative}')
@@ -1857,13 +3143,12 @@ def source_snapshot(repository: Path) -> dict[str, Any]:
 
 def package_source_binding(repository: Path, manifest_path: Path) -> dict[str, Any]:
     """Compare a package candidate's source manifest to the live source bytes."""
+    candidate_payload = _read_bounded_bytes(manifest_path, MAX_JSON_BYTES)
     expected = load_json(manifest_path)
     actual = repository_package_manifest(repository)
     expected_document = _mapping(expected, 'candidate source manifest')
-    expected_files = {
-        _string(item.get('path'), 'manifest path'): item
-        for item in _mapping_list(expected_document.get('files'), 'candidate source manifest files')
-    }
+    expected_rows = _mapping_list(expected_document.get('files'), 'candidate source manifest files')
+    expected_files = {_string(item.get('path'), 'manifest path'): item for item in expected_rows}
     actual_files = {item['path']: item for item in actual['files']}
     missing = sorted(set(expected_files) - set(actual_files))
     extra = sorted(set(actual_files) - set(expected_files))
@@ -1876,9 +3161,11 @@ def package_source_binding(repository: Path, manifest_path: Path) -> dict[str, A
         not missing
         and not extra
         and not mismatched
-        and expected_document.get('schema_version') == 1
+        and len(expected_files) == len(expected_rows)
+        and _type_exact_json_equal(expected_document, actual)
+        and candidate_payload == canonical_json_bytes(actual)
     )
-    return {
+    report = {
         'schema_version': SCHEMA_VERSION,
         'verdict': 'PASS' if passed else 'FAIL',
         'candidate_manifest': str(manifest_path.resolve()),
@@ -1889,6 +3176,8 @@ def package_source_binding(repository: Path, manifest_path: Path) -> dict[str, A
         'mismatched_paths': mismatched,
         'file_count': len(actual_files),
     }
+    _exact_keys(report, PACKAGE_BINDING_KEYS, 'package source binding report')
+    return report
 
 
 def _mapping_list(value: Any, name: str) -> list[Mapping[str, Any]]:
@@ -2012,20 +3301,145 @@ def mission_pair(path_json: Path, path_csv: Path) -> tuple[Mapping[str, Any], bo
     return result, rows[0] == expected
 
 
+def _validate_timeline_details(kind: str, details: Mapping[str, Any]) -> None:
+    expected_keys = TIMELINE_DETAIL_KEYS.get(kind)
+    if expected_keys is None:
+        raise EvidenceError(f'timeline kind is not produced by Phase 4: {kind}')
+    _exact_keys(details, expected_keys, f'timeline.{kind}.details')
+    if kind in {
+        'active_goal_probe_started',
+        'followup_started',
+        'mission_started',
+    }:
+        _integer(details.get('pid'), f'timeline.{kind}.pid', minimum=2)
+        _integer(details.get('pgid'), f'timeline.{kind}.pgid', minimum=2)
+    elif kind == 'initial_ready':
+        for field in ('child_pgid', 'child_pid', 'main_pid'):
+            _integer(details.get(field), f'timeline.{kind}.{field}', minimum=2)
+        for field in ('systemd_nrestarts', 'systemd_owned_ros_service_count'):
+            _integer(details.get(field), f'timeline.{kind}.{field}', minimum=0)
+    elif kind == 'failure_injected':
+        for field in ('mission_pid', 'original_pgid', 'target_pid'):
+            _integer(details.get(field), f'timeline.{kind}.{field}', minimum=2)
+        _integer(
+            details.get('event_sequence_before'),
+            f'timeline.{kind}.event_sequence_before',
+            minimum=1,
+        )
+    elif kind in {'ready_unavailable', 'original_group_empty'}:
+        field = 'http_status' if kind == 'ready_unavailable' else 'member_count'
+        _integer(details.get(field), f'timeline.{kind}.{field}', minimum=0)
+    elif kind == 'ready_restored':
+        for field in ('child_pgid', 'child_pid', 'main_pid'):
+            _integer(details.get(field), f'timeline.{kind}.{field}', minimum=2)
+        for field in (
+            'event_sequence_after_recovery',
+            'http_status',
+            'systemd_nrestarts',
+            'systemd_owned_ros_service_count',
+        ):
+            _integer(details.get(field), f'timeline.{kind}.{field}', minimum=0)
+    elif kind == 'interrupted_mission_finished':
+        _integer(details.get('exit_code'), f'timeline.{kind}.exit_code')
+        _boolean(
+            details.get('process_group_empty'),
+            f'timeline.{kind}.process_group_empty',
+        )
+        _boolean(
+            details.get('terminated_by_harness'),
+            f'timeline.{kind}.terminated_by_harness',
+        )
+    elif kind in {'followup_finished', 'service_stopped'}:
+        field = 'exit_code' if kind == 'followup_finished' else 'event_sequence_before_stop'
+        _integer(details.get(field), f'timeline.{kind}.{field}', minimum=0)
+
+
 def _timeline_index(records: Sequence[Mapping[str, Any]]) -> dict[str, list[Mapping[str, Any]]]:
     index: dict[str, list[Mapping[str, Any]]] = {}
     previous_monotonic = -1
     for sequence, record in enumerate(records, 1):
-        if record.get('schema_version') != 1 or record.get('sequence') != sequence:
+        _exact_keys(record, TIMELINE_KEYS, f'timeline[{sequence - 1}]')
+        schema_version = _integer(
+            record.get('schema_version'), f'timeline[{sequence - 1}].schema_version'
+        )
+        record_sequence = _integer(
+            record.get('sequence'), f'timeline[{sequence - 1}].sequence', minimum=1
+        )
+        if schema_version != 1 or record_sequence != sequence:
             raise EvidenceError('timeline schema or sequence is invalid')
+        _utc_timestamp(record.get('timestamp_utc'), f'timeline[{sequence - 1}].timestamp_utc')
         monotonic = _integer(record.get('monotonic_ns'), 'timeline.monotonic_ns', minimum=0)
         if monotonic < previous_monotonic:
             raise EvidenceError('timeline monotonic time regressed')
         previous_monotonic = monotonic
         kind = _string(record.get('kind'), 'timeline.kind')
-        _mapping(record.get('details'), 'timeline.details')
+        details = _mapping(record.get('details'), 'timeline.details')
+        _validate_timeline_details(kind, details)
         index.setdefault(kind, []).append(record)
     return index
+
+
+def _validate_http_probe_record(
+    record: Mapping[str, Any],
+    *,
+    endpoint: str,
+    name: str,
+) -> int:
+    details = _mapping(record.get('details'), f'{name}.details')
+    _exact_keys(
+        details,
+        frozenset({'body', 'body_sha256', 'http_status', 'url'}),
+        f'{name}.details',
+    )
+    status = _integer(details.get('http_status'), f'{name}.http_status', minimum=0)
+    body = details.get('body')
+    if not isinstance(body, str) or len(body.encode()) > 65536:
+        raise EvidenceError(f'{name}.body must be a bounded string')
+    expected_bodies = (
+        {200: 'ok\n', 0: ''}
+        if endpoint == '/healthz'
+        else {200: 'ready\n', 503: 'not ready\n', 0: ''}
+    )
+    if details.get('url') != f'http://127.0.0.1:9080{endpoint}':
+        raise EvidenceError(f'{name} URL is not the exact supervisor endpoint')
+    if status not in expected_bodies or body != expected_bodies[status]:
+        raise EvidenceError(f'{name} status/body semantics are invalid')
+    if details.get('body_sha256') != hashlib.sha256(body.encode()).hexdigest():
+        raise EvidenceError(f'{name} body hash does not reconcile')
+    return status
+
+
+def _validate_http_probe_pairs(
+    health_records: Sequence[Mapping[str, Any]],
+    ready_records: Sequence[Mapping[str, Any]],
+    *,
+    lower_sequence: int,
+    upper_sequence: int,
+    name: str,
+    require_health_200: bool = True,
+) -> list[tuple[int, int]]:
+    if not health_records or len(health_records) != len(ready_records):
+        raise EvidenceError(f'{name} HTTP probe pairs are missing or unbalanced')
+    statuses: list[tuple[int, int]] = []
+    for index, (health, ready) in enumerate(zip(health_records, ready_records, strict=True)):
+        health_sequence = _integer(health.get('sequence'), f'{name}[{index}] health sequence')
+        ready_sequence = _integer(ready.get('sequence'), f'{name}[{index}] ready sequence')
+        if not (
+            lower_sequence < health_sequence
+            and ready_sequence == health_sequence + 1
+            and ready_sequence < upper_sequence
+        ):
+            raise EvidenceError(f'{name}[{index}] HTTP pair ordering is invalid')
+        health_status = _validate_http_probe_record(
+            health, endpoint='/healthz', name=f'{name}[{index}].health'
+        )
+        if require_health_200 and health_status != 200:
+            raise EvidenceError(f'{name}[{index}] health probe was not 200')
+        ready_status = _validate_http_probe_record(
+            ready, endpoint='/readyz', name=f'{name}[{index}].ready'
+        )
+        statuses.append((health_status, ready_status))
+    return statuses
 
 
 def _one(index: Mapping[str, list[Mapping[str, Any]]], kind: str) -> Mapping[str, Any]:
@@ -2055,6 +3469,86 @@ def _event_sequence(events: Sequence[Mapping[str, Any]]) -> None:
         _string(event.get('kind'), 'event kind')
 
 
+def _validate_supervisor_event_schema(event: Mapping[str, Any]) -> None:
+    kind = _string(event.get('kind'), 'supervisor event kind')
+    base = {'kind', 'schema_version', 'sequence', 'steady_wall_ns', 'timestamp_utc'}
+    suffixes = {
+        'supervisor_started': set(),
+        'shutdown_requested': set(),
+        'supervisor_stopped': set(),
+        'child_started': {'child', 'pgid', 'pid'},
+        'heartbeat_fresh': {'child'},
+        'heartbeat_stale': {'child'},
+        'readiness_changed': {'ready'},
+        'restart_scheduled': {'backoff_ms', 'child', 'restart_attempt'},
+        'restart_exhausted': {'child', 'restart_attempt'},
+        'child_stop_requested': {'child', 'pgid'},
+        'child_kill_escalated': {'child', 'pgid'},
+        'child_stopped': {'child', 'exit_code'},
+        'residual_process_group_detected': {'child', 'pgid'},
+        'residual_process_group_kill_escalated': {'child', 'pgid'},
+        'residual_process_group_stopped': {'child', 'pgid'},
+        'child_group_cleanup_incomplete': {
+            'child',
+            'details',
+            'failure_kind',
+            'pgid',
+            'pid',
+        },
+    }
+    if kind == 'failure_detected':
+        failure_kind = _string(event.get('failure_kind'), 'failure_detected.failure_kind')
+        failure_suffixes = {
+            'heartbeat_stale': {'child', 'failure_kind', 'pgid', 'pid'},
+            'heartbeat_startup_timeout': {'child', 'failure_kind', 'pgid', 'pid'},
+            'start_failed': {'child', 'details', 'failure_kind'},
+            'unexpected_exit': {
+                'child',
+                'details',
+                'exit_code',
+                'failure_kind',
+                'pgid',
+                'pid',
+            },
+        }
+        expected_suffix = failure_suffixes.get(failure_kind)
+    else:
+        expected_suffix = suffixes.get(kind)
+    if expected_suffix is None or set(event) != base | expected_suffix:
+        raise EvidenceError(f'supervisor event {kind!r} has a noncanonical schema')
+    if _integer(event.get('schema_version'), f'{kind}.schema_version') != 1:
+        raise EvidenceError(f'supervisor event {kind!r} has the wrong schema version')
+    _integer(event.get('sequence'), f'{kind}.sequence', minimum=1)
+    _integer(event.get('steady_wall_ns'), f'{kind}.steady_wall_ns', minimum=0)
+    _utc_timestamp(event.get('timestamp_utc'), f'{kind}.timestamp_utc')
+    if 'child' in event and _string(event.get('child'), f'{kind}.child') != EXPECTED_CHILD:
+        raise EvidenceError(f'supervisor event {kind!r} names an unexpected child')
+    for field in ('pid', 'pgid', 'restart_attempt', 'backoff_ms'):
+        if field in event:
+            _integer(event.get(field), f'{kind}.{field}', minimum=1)
+    if 'exit_code' in event:
+        _integer(event.get('exit_code'), f'{kind}.exit_code')
+    if 'ready' in event:
+        _boolean(event.get('ready'), f'{kind}.ready')
+    if 'failure_kind' in event:
+        _string(event.get('failure_kind'), f'{kind}.failure_kind')
+    if kind == 'failure_detected' and 'details' in event:
+        details = _mapping(event.get('details'), f'{kind}.details')
+        _exact_keys(details, frozenset({'error'}), f'{kind}.details')
+        _string(details.get('error'), f'{kind}.details.error')
+    if kind == 'child_group_cleanup_incomplete':
+        details = _mapping(event.get('details'), f'{kind}.details')
+        _exact_keys(
+            details,
+            frozenset({'captured_pgid', 'error', 'group_empty', 'leader_reaped'}),
+            f'{kind}.details',
+        )
+        _integer(details.get('captured_pgid'), f'{kind}.captured_pgid', minimum=1)
+        _string(details.get('error'), f'{kind}.error')
+        _boolean(details.get('group_empty'), f'{kind}.group_empty')
+        _boolean(details.get('leader_reaped'), f'{kind}.leader_reaped')
+
+
 def _add_check(checks: dict[str, bool], failures: list[str], name: str, condition: bool) -> None:
     checks[name] = bool(condition)
     if not condition:
@@ -2077,9 +3571,53 @@ def _relative_evidence_hashes(run_directory: Path, excluded: set[str]) -> dict[s
 def evaluate_run(run_directory: Path) -> dict[str, Any]:
     """Evaluate all frozen Scenario 6 gates from retained raw evidence."""
     context = _mapping(load_json(run_directory / 'context.json'), 'context')
-    if context.get('schema_version') != 1:
+    _exact_keys(context, CONTEXT_KEYS, 'context')
+    if _integer(context.get('schema_version'), 'context.schema_version') != 1:
         raise EvidenceError('context schema is unsupported')
     run_id = _string(context.get('run_id'), 'context.run_id')
+    if RUN_ID_RE.fullmatch(run_id) is None:
+        raise EvidenceError('context.run_id is not canonical')
+    _utc_timestamp(context.get('started_utc'), 'context.started_utc')
+    source_git_commit = _string(
+        context.get('source_git_commit'), 'context.source_git_commit', maximum=64
+    )
+    if re.fullmatch(r'[0-9a-f]{40}', source_git_commit) is None:
+        raise EvidenceError('context.source_git_commit is not a canonical Git object ID')
+    _boolean(context.get('source_git_dirty'), 'context.source_git_dirty')
+    _string(context.get('package_directory'), 'context.package_directory')
+    _string(context.get('active_overlay_target'), 'context.active_overlay_target')
+    _string(context.get('cpuset'), 'context.cpuset')
+    for descriptor_name in ('upgrade_package', 'baseline_package', 'lifecycle_evidence'):
+        descriptor = _mapping(context.get(descriptor_name), f'context.{descriptor_name}')
+        _exact_keys(descriptor, CONTEXT_FILE_DESCRIPTOR_KEYS, f'context.{descriptor_name}')
+        _string(descriptor.get('path'), f'context.{descriptor_name}.path')
+        _sha256(descriptor.get('sha256'), f'context.{descriptor_name}.sha256')
+    context_isolation = _mapping(context.get('isolation'), 'context.isolation')
+    _exact_keys(context_isolation, ISOLATION_KEYS, 'context.isolation')
+    if _integer(context_isolation.get('schema_version'), 'context.isolation.schema_version') != 1:
+        raise EvidenceError('context.isolation schema is unsupported')
+    if _string(context_isolation.get('run_id'), 'context.isolation.run_id') != run_id:
+        raise EvidenceError('context and isolation run IDs differ')
+    _integer(context_isolation.get('ros_domain_id'), 'context.isolation.ros_domain_id')
+    _string(context_isolation.get('gz_partition'), 'context.isolation.gz_partition')
+    _integer(
+        context_isolation.get('inspected_processes'),
+        'context.isolation.inspected_processes',
+        minimum=0,
+    )
+    _integer(
+        context_isolation.get('unreadable_process_environments'),
+        'context.isolation.unreadable_process_environments',
+        minimum=0,
+    )
+    _boolean(context_isolation.get('domain_was_unused'), 'context.isolation.domain_was_unused')
+    _boolean(
+        context_isolation.get('partition_was_unused'),
+        'context.isolation.partition_was_unused',
+    )
+    retained_isolation = _mapping(load_json(run_directory / 'isolation.json'), 'retained isolation')
+    if not _type_exact_json_equal(retained_isolation, context_isolation):
+        raise EvidenceError('retained isolation does not equal the context projection')
     timeline = load_jsonl(run_directory / 'timeline.jsonl')
     index = _timeline_index(timeline)
     initial = _one(index, 'initial_ready')
@@ -2094,6 +3632,27 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
     followup_finished = _one(index, 'followup_finished')
     service_stopped = _one(index, 'service_stopped')
     cleanup_event = _one(index, 'cleanup_complete')
+    startup_probe_statuses = _validate_http_probe_pairs(
+        index.get('startup_health_probe', []),
+        index.get('startup_ready_probe', []),
+        lower_sequence=0,
+        upper_sequence=_integer(initial.get('sequence'), 'initial_ready sequence'),
+        name='startup',
+        require_health_200=False,
+    )
+    recovery_probe_statuses = _validate_http_probe_pairs(
+        index.get('health_probe', []),
+        index.get('ready_probe', []),
+        lower_sequence=_integer(injection.get('sequence'), 'failure_injected sequence'),
+        upper_sequence=_integer(restored.get('sequence'), 'ready_restored sequence'),
+        name='recovery',
+    )
+    if startup_probe_statuses[-1] != (200, 200):
+        raise EvidenceError('startup HTTP probes do not end ready')
+    if 503 not in [ready for _health, ready in recovery_probe_statuses] or recovery_probe_statuses[
+        -1
+    ] != (200, 200):
+        raise EvidenceError('recovery HTTP probes do not span unavailable through ready')
     if not (
         int(initial['monotonic_ns']) < int(mission_started['monotonic_ns'])
         and int(mission_started['monotonic_ns']) < int(probe_started['monotonic_ns'])
@@ -2139,7 +3698,7 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
         raise EvidenceError('injection PGID does not match initial status')
 
     target = _mapping(load_json(run_directory / 'controller-target.json'), 'controller target')
-    target_lineage = _mapping_list(target.get('lineage'), 'controller target lineage')
+    target_lineage = validate_controller_target_document(target)
     active_goal = _mapping(load_json(run_directory / 'active-goal.json'), 'active goal')
     _exact_keys(active_goal, ACTIVE_GOAL_KEYS, 'active goal')
     active_goal_schema = _integer(active_goal.get('schema_version'), 'active goal schema_version')
@@ -2198,11 +3757,74 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
     )
     events = load_jsonl(run_directory / 'supervisor-events.jsonl')
     _event_sequence(events)
+    for event in events:
+        _validate_supervisor_event_schema(event)
     event_meta = _mapping(
         load_json(run_directory / 'supervisor-events.meta.json'), 'event metadata'
     )
+    _exact_keys(event_meta, EVENT_META_KEYS, 'event metadata')
+    event_meta_schema = _integer(event_meta.get('schema_version'), 'event metadata schema_version')
+    event_meta_saturated = _boolean(event_meta.get('saturated'), 'event metadata saturated')
+    event_meta_dropped = _integer(
+        event_meta.get('dropped_events'), 'event metadata dropped_events', minimum=0
+    )
+    event_meta_last_sequence = _integer(
+        event_meta.get('last_attempted_sequence'),
+        'event metadata last_attempted_sequence',
+        minimum=0,
+    )
     if observation_end_sequence > len(events):
         raise EvidenceError('pre-stop event sequence exceeds retained supervisor events')
+    startup_prefix = events[:baseline_sequence]
+    startup_prefix_valid = (
+        baseline_sequence == 4
+        and [event.get('kind') for event in startup_prefix]
+        == [
+            'supervisor_started',
+            'child_started',
+            'heartbeat_fresh',
+            'readiness_changed',
+        ]
+        and startup_prefix[1].get('child') == EXPECTED_CHILD
+        and startup_prefix[1].get('pid') == original_child_pid
+        and startup_prefix[1].get('pgid') == original_pgid
+        and startup_prefix[2].get('child') == EXPECTED_CHILD
+        and startup_prefix[3].get('ready') is True
+        and all(
+            left < right
+            for left, right in pairwise(
+                [
+                    _integer(event.get('steady_wall_ns'), 'startup event time')
+                    for event in startup_prefix
+                ]
+            )
+        )
+    )
+    shutdown_suffix = events[observation_end_sequence:]
+    shutdown_kinds = [event.get('kind') for event in shutdown_suffix]
+    expected_shutdown_kinds = [
+        'shutdown_requested',
+        'child_stop_requested',
+        'child_stopped',
+        'readiness_changed',
+        'supervisor_stopped',
+    ]
+    if 'child_kill_escalated' in shutdown_kinds:
+        expected_shutdown_kinds.insert(2, 'child_kill_escalated')
+    post_observation_shutdown_valid = (
+        shutdown_kinds == expected_shutdown_kinds
+        and shutdown_suffix[1].get('child') == EXPECTED_CHILD
+        and shutdown_suffix[1].get('pgid') == restored_details.get('child_pgid')
+        and shutdown_suffix[-2].get('ready') is False
+        and shutdown_suffix[-3].get('child') == EXPECTED_CHILD
+        and shutdown_suffix[-3].get('exit_code') == 143
+    )
+    if 'child_kill_escalated' in shutdown_kinds:
+        post_observation_shutdown_valid = (
+            post_observation_shutdown_valid
+            and shutdown_suffix[2].get('child') == EXPECTED_CHILD
+            and shutdown_suffix[2].get('pgid') == restored_details.get('child_pgid')
+        )
     after = [
         event
         for event in events
@@ -2237,6 +3859,7 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
         raise EvidenceError('ready transition occurs after the recorded recovery bound')
     transition_kinds = {
         'failure_detected',
+        'heartbeat_fresh',
         'restart_scheduled',
         'child_started',
         'readiness_changed',
@@ -2248,9 +3871,17 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
         'readiness_changed',
         'restart_scheduled',
         'child_started',
+        'heartbeat_fresh',
         'readiness_changed',
     ]:
-        failure_event, false_event, restart_event, start_event, true_event = transition_chain
+        (
+            failure_event,
+            false_event,
+            restart_event,
+            start_event,
+            heartbeat_event,
+            true_event,
+        ) = transition_chain
         chain_times = [int(event['steady_wall_ns']) for event in transition_chain]
         failure_exit = failure_event.get('exit_code')
         replacement_pid = restored_details.get('child_pid')
@@ -2273,6 +3904,7 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
             and start_event.get('child') == EXPECTED_CHILD
             and start_event.get('pid') == replacement_pid
             and start_event.get('pgid') == replacement_pgid
+            and heartbeat_event.get('child') == EXPECTED_CHILD
             and isinstance(replacement_pid, int)
             and not isinstance(replacement_pid, bool)
             and replacement_pid > 1
@@ -2283,9 +3915,35 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
             and all(left < right for left, right in pairwise(chain_times))
         )
 
-    detection_s = _duration_seconds(injection, unavailable)
+    ready_samples = index.get('ready_probe', [])
+    first_ready_503 = next(
+        sample
+        for sample in ready_samples
+        if _mapping(sample.get('details'), 'ready probe details').get('http_status') == 503
+    )
+    final_ready_200 = ready_samples[-1]
+    unavailable_sequence = _integer(unavailable.get('sequence'), 'ready unavailable sequence')
+    first_ready_503_sequence = _integer(first_ready_503.get('sequence'), 'first 503 sequence')
+    following_probe = min(
+        (
+            sample
+            for sample in [*index.get('health_probe', []), *ready_samples]
+            if _integer(sample.get('sequence'), 'following probe sequence') > unavailable_sequence
+        ),
+        key=lambda sample: _integer(sample.get('sequence'), 'following probe sequence'),
+    )
+    first_ready_503_ns = _integer(first_ready_503.get('monotonic_ns'), 'first 503 time')
+    unavailable_ns = _integer(unavailable.get('monotonic_ns'), 'ready unavailable time')
+    ready_unavailable_marker_exact = (
+        unavailable_sequence == first_ready_503_sequence + 1
+        and first_ready_503_ns <= unavailable_ns
+        and unavailable_ns <= _integer(following_probe.get('monotonic_ns'), 'following probe time')
+        and _mapping(unavailable.get('details'), 'ready unavailable details')
+        == {'http_status': 503}
+    )
+    detection_s = _duration_seconds(injection, first_ready_503)
     group_cleanup_s = _duration_seconds(injection, group_empty)
-    observed_recovery_s = _duration_seconds(unavailable, restored)
+    observed_recovery_s = _duration_seconds(first_ready_503, final_ready_200)
     event_recovery_s: float | None = None
     actual_backoff_s: float | None = None
     if len(failures_detected) == len(restart_events) == len(child_starts) == 1 and ready_true:
@@ -2297,24 +3955,15 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
         ) / 1_000_000_000
 
     health_samples = index.get('health_probe', [])
-    ready_samples = index.get('ready_probe', [])
-    unavailable_ns = int(unavailable['monotonic_ns'])
-    restored_ns = int(restored['monotonic_ns'])
-    unavailable_samples = [
-        sample
-        for sample in ready_samples
-        if unavailable_ns <= int(sample['monotonic_ns']) < restored_ns
+    first_ready_503_index = ready_samples.index(first_ready_503)
+    recovery_ready_statuses = [
+        _mapping(sample['details'], 'recovery ready sample').get('http_status')
+        for sample in ready_samples[first_ready_503_index:]
     ]
-    unavailable_statuses = [
-        _mapping(sample['details'], 'ready sample').get('http_status')
-        for sample in unavailable_samples
-    ]
-    readiness_interval_valid = bool(unavailable_statuses) and (
-        all(status == 503 for status in unavailable_statuses)
-        or (
-            unavailable_statuses[-1] == 200
-            and all(status == 503 for status in unavailable_statuses[:-1])
-        )
+    readiness_interval_valid = (
+        len(recovery_ready_statuses) >= 2
+        and recovery_ready_statuses[-1] == 200
+        and all(status == 503 for status in recovery_ready_statuses[:-1])
     )
 
     interrupted = _mapping(
@@ -2399,7 +4048,15 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
     followup_identity = _mapping(followup.get('identity'), 'followup identity')
     followup_verdict = _mapping(followup.get('verdict'), 'followup verdict')
     followup_measurements = _mapping(followup.get('measurements'), 'followup measurements')
-    followup_mission_sha = file_sha256(run_directory / 'followup-mission.json')
+    followup_mission_path = run_directory / 'followup-mission.json'
+    followup_mission_sha = file_sha256(followup_mission_path)
+    expected_followup = expected_followup_mission()
+    followup_mission = _mapping(load_json(followup_mission_path), 'followup mission')
+    followup_mission_is_exact = _read_bounded_bytes(
+        followup_mission_path, MAX_JSON_BYTES
+    ) == canonical_json_bytes(expected_followup) and _type_exact_json_equal(
+        followup_mission, expected_followup
+    )
     followup_event_details = _mapping(followup_finished.get('details'), 'followup_finished.details')
     _exact_keys(
         followup_event_details,
@@ -2410,11 +4067,32 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
         followup_event_details.get('exit_code'), 'followup completion exit_code'
     )
 
+    initial_status = _mapping(load_json(run_directory / 'initial-status.json'), 'initial status')
     restored_status = _mapping(
         load_json(run_directory / 'ready-restored-status.json'), 'restored status'
     )
-    restored_children = _mapping_list(restored_status.get('children'), 'restored children')
+    supervisor_status_final = _mapping(
+        load_json(run_directory / 'supervisor-status-final.json'),
+        'final supervisor status',
+    )
+    initial_owners = _mapping(
+        load_json(run_directory / 'systemd-owners-initial.json'), 'initial systemd owners'
+    )
+    restored_owners = _mapping(
+        load_json(run_directory / 'systemd-owners-restored.json'), 'restored systemd owners'
+    )
+    original_group_evidence = _mapping(
+        load_json(run_directory / 'original-group-empty.json'), 'original group evidence'
+    )
     service_final = _mapping(load_json(run_directory / 'service-final.json'), 'service final')
+    _exact_keys(service_final, SERVICE_FINAL_KEYS, 'service final')
+    if _integer(service_final.get('schema_version'), 'service final schema_version') != 1:
+        raise EvidenceError('service final schema_version must be 1')
+    _utc_timestamp(service_final.get('captured_utc'), 'service final captured_utc')
+    for field in ('active_before_stop', 'enabled_before_stop'):
+        _boolean(service_final.get(field), f'service final {field}')
+    _integer(service_final.get('main_pid_before_stop'), 'service final main PID', minimum=0)
+    _integer(service_final.get('nrestarts_before_stop'), 'service final NRestarts', minimum=0)
     cleanup = _mapping(load_json(run_directory / 'cleanup.json'), 'cleanup')
     interrupted_pgid = _integer(
         mission_started_details.get('pgid'), 'interrupted mission PGID', minimum=2
@@ -2447,7 +4125,30 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
     supervisor_config = _mapping(
         load_json(run_directory / 'supervisor-config.json'), 'supervisor config used'
     )
-    config_children = _mapping_list(supervisor_config.get('children'), 'supervisor config children')
+    supervisor_config_check_exact = (
+        _read_bounded_bytes(run_directory / 'supervisor-config-check.txt', 4096)
+        == SUPERVISOR_CONFIG_CHECK
+    )
+    expected_systemd_dropin = (
+        '[Service]\n'
+        'ExecStart=\n'
+        'ExecStart=/usr/bin/robotest-supervisor --config '
+        f'/var/lib/robotest-supervisor/{run_id}/config.json\n'
+    ).encode()
+    systemd_dropin_exact = (
+        _read_bounded_bytes(run_directory / 'systemd-dropin.conf', 4096) == expected_systemd_dropin
+    )
+    lifecycle_startup_result = _mapping(
+        load_json(run_directory / STARTUP_RESULT_NAME), 'lifecycle startup result'
+    )
+    initial_affinity = _mapping(
+        load_json(run_directory / 'runtime-affinity-initial.json'),
+        'initial runtime affinity',
+    )
+    restored_affinity = _mapping(
+        load_json(run_directory / 'runtime-affinity-restored.json'),
+        'restored runtime affinity',
+    )
     source_before = _mapping(
         load_json(run_directory / 'source-snapshot-before.json'), 'source snapshot before'
     )
@@ -2459,25 +4160,41 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
     before_snapshot_hash = hashlib.sha256(canonical_json_bytes(before_files)).hexdigest()
     after_snapshot_hash = hashlib.sha256(canonical_json_bytes(after_files)).hexdigest()
     repository = Path(__file__).resolve().parents[1]
-    rebound_package = package_source_binding(
-        repository,
-        Path(_string(package_binding.get('candidate_manifest'), 'candidate manifest')),
-    )
+    expected_source_snapshot = source_snapshot(repository)
     upgrade_context = _mapping(context.get('upgrade_package'), 'context upgrade package')
     baseline_context = _mapping(context.get('baseline_package'), 'context baseline package')
     lifecycle_context = _mapping(context.get('lifecycle_evidence'), 'context lifecycle evidence')
     upgrade_path = Path(_string(upgrade_context.get('path'), 'upgrade path'))
     baseline_path = Path(_string(baseline_context.get('path'), 'baseline path'))
-    package_directory = Path(_string(context.get('package_directory'), 'context package_directory'))
+    package_directory = Path(
+        _string(context.get('package_directory'), 'context package_directory')
+    ).resolve(strict=True)
+    candidate_manifest_path = Path(
+        _string(package_binding.get('candidate_manifest'), 'candidate manifest')
+    )
+    canonical_candidate_manifest = (package_directory / 'build-a/SOURCE-MANIFEST.json').resolve(
+        strict=True
+    )
+    candidate_manifest_is_canonical = (
+        not candidate_manifest_path.is_symlink()
+        and candidate_manifest_path.resolve(strict=True) == canonical_candidate_manifest
+    )
+    rebound_package = package_source_binding(repository, candidate_manifest_path)
     package_integrity = _mapping(
         load_json(run_directory / 'package-integrity.json'), 'package integrity'
+    )
+    package_source_rebuild = _mapping(
+        load_json(run_directory / 'package-source-rebuild.json'),
+        'package source rebuild',
     )
     _exact_keys(package_integrity, PACKAGE_INTEGRITY_KEYS, 'package integrity')
     rebound_integrity = verify_package_candidate(
         package_directory,
         upgrade_path,
         baseline_path,
+        repository,
     )
+    canonical_candidate_manifest_sha256 = file_sha256(canonical_candidate_manifest)
     upgrade_descriptor = package_artifact_descriptor(upgrade_path)
     baseline_descriptor = package_artifact_descriptor(baseline_path)
     validate_lifecycle_evidence(lifecycle, upgrade_descriptor, baseline_descriptor)
@@ -2491,6 +4208,131 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
         installed_package_state,
         lifecycle,
         upgrade_descriptor,
+    )
+    context_cpuset = _string(context.get('cpuset'), 'context cpuset')
+    initial_affinity_join = validate_runtime_affinity_evidence(
+        initial_affinity,
+        phase='initial',
+        main_pid=main_pid,
+        managed_child_pid=original_child_pid,
+        managed_child_pgid=original_pgid,
+        expected_cpuset=context_cpuset,
+    )
+    restored_child_pid = _integer(
+        restored_details.get('child_pid'), 'restored child PID', minimum=2
+    )
+    restored_child_pgid = _integer(
+        restored_details.get('child_pgid'), 'restored child PGID', minimum=2
+    )
+    restored_affinity_join = validate_runtime_affinity_evidence(
+        restored_affinity,
+        phase='restored',
+        main_pid=main_pid,
+        managed_child_pid=restored_child_pid,
+        managed_child_pgid=restored_child_pgid,
+        expected_cpuset=context_cpuset,
+    )
+    initial_status_child = validate_supervisor_status(initial_status, 'initial status')
+    restored_status_child = validate_supervisor_status(restored_status, 'restored status')
+    final_status_child = validate_supervisor_status(
+        supervisor_status_final, 'final supervisor status'
+    )
+    isolation_domain = _integer(isolation.get('ros_domain_id'), 'isolation ROS domain')
+    isolation_partition = _string(isolation.get('gz_partition'), 'isolation Gazebo partition')
+    validate_systemd_owners(
+        initial_owners,
+        ros_domain_id=isolation_domain,
+        gz_partition=isolation_partition,
+        expected_pids=[
+            process['pid']
+            for process in initial_affinity_join['processes']
+            if process['role'] != 'supervisor_main'
+        ],
+        name='initial systemd owners',
+    )
+    validate_systemd_owners(
+        restored_owners,
+        ros_domain_id=isolation_domain,
+        gz_partition=isolation_partition,
+        expected_pids=[
+            process['pid']
+            for process in restored_affinity_join['processes']
+            if process['role'] != 'supervisor_main'
+        ],
+        name='restored systemd owners',
+    )
+    _exact_keys(
+        original_group_evidence,
+        PROCESS_GROUP_EVIDENCE_KEYS,
+        'original group evidence',
+    )
+    if (
+        _integer(
+            original_group_evidence.get('schema_version'),
+            'original group evidence schema_version',
+        )
+        != 1
+    ):
+        raise EvidenceError('original group evidence schema_version must be 1')
+    _utc_timestamp(
+        original_group_evidence.get('captured_utc'),
+        'original group evidence captured_utc',
+    )
+    original_group_members = _mapping_list(
+        original_group_evidence.get('members'), 'original group evidence members'
+    )
+    status_projection_valid = (
+        initial_status.get('healthy') is True
+        and initial_status.get('ready') is True
+        and initial_status.get('persistence_healthy') is True
+        and initial_status.get('shutting_down') is False
+        and initial_status.get('event_count') == baseline_sequence
+        and initial_status.get('dropped_events') == 0
+        and initial_status_child.get('required') is True
+        and initial_status_child.get('running') is True
+        and initial_status_child.get('heartbeat_fresh') is True
+        and initial_status_child.get('circuit_open') is False
+        and initial_status_child.get('pid') == original_child_pid
+        and initial_status_child.get('pgid') == original_pgid
+        and initial_status_child.get('restart_count') == 0
+        and restored_status.get('healthy') is True
+        and restored_status.get('ready') is True
+        and restored_status.get('persistence_healthy') is True
+        and restored_status.get('shutting_down') is False
+        and restored_status.get('event_count') == recovery_end_sequence
+        and restored_status.get('dropped_events') == 0
+        and restored_status_child.get('required') is True
+        and restored_status_child.get('running') is True
+        and restored_status_child.get('heartbeat_fresh') is True
+        and restored_status_child.get('circuit_open') is False
+        and restored_status_child.get('pid') == restored_child_pid
+        and restored_status_child.get('pgid') == restored_child_pgid
+        and restored_status_child.get('restart_count') == 1
+        and supervisor_status_final.get('healthy') is True
+        and supervisor_status_final.get('ready') is False
+        and supervisor_status_final.get('persistence_healthy') is True
+        and supervisor_status_final.get('shutting_down') is True
+        and supervisor_status_final.get('event_count') == len(events)
+        and supervisor_status_final.get('dropped_events') == 0
+        and final_status_child.get('running') is False
+        and final_status_child.get('heartbeat_fresh') is False
+        and final_status_child.get('pid') == 0
+        and final_status_child.get('pgid') == 0
+        and final_status_child.get('restart_count') == 1
+        and final_status_child.get('last_exit_code') == 143
+    )
+    context_started_utc = datetime.fromisoformat(
+        _utc_timestamp(context.get('started_utc'), 'context started_utc').replace('Z', '+00:00')
+    )
+    startup_started_utc = datetime.fromisoformat(
+        _utc_timestamp(
+            lifecycle_startup_result.get('started_utc'), 'startup result started_utc'
+        ).replace('Z', '+00:00')
+    )
+    startup_completed_utc = datetime.fromisoformat(
+        _utc_timestamp(
+            lifecycle_startup_result.get('completed_utc'), 'startup result completed_utc'
+        ).replace('Z', '+00:00')
     )
 
     checks: dict[str, bool] = {}
@@ -2509,7 +4351,7 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
         checks,
         failures,
         'ready_503_within_3s',
-        unavailable['details'].get('http_status') == 503 and detection_s <= READY_FAILURE_TARGET_S,
+        ready_unavailable_marker_exact and detection_s <= READY_FAILURE_TARGET_S,
     )
     _add_check(
         checks,
@@ -2522,14 +4364,28 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
         failures,
         'original_process_group_empty_within_5s',
         group_cleanup_s <= PROCESS_GROUP_EXIT_TARGET_S
-        and _mapping(group_empty['details'], 'group empty').get('member_count') == 0,
+        and _mapping(group_empty['details'], 'group empty').get('member_count') == 0
+        and original_group_evidence.get('pgid') == original_pgid
+        and original_group_evidence.get('member_count') == 0
+        and original_group_members == [],
     )
     _add_check(checks, failures, 'exactly_one_failure_event', len(failures_detected) == 1)
     _add_check(checks, failures, 'exactly_one_restart_scheduled', len(restart_events) == 1)
     _add_check(checks, failures, 'exactly_one_replacement_child_start', len(child_starts) == 1)
     _add_check(checks, failures, 'readiness_false_event_present', len(ready_false) == 1)
     _add_check(checks, failures, 'readiness_true_event_present', len(ready_true) == 1)
-    _add_check(checks, failures, 'exact_causal_supervisor_event_chain', causal_chain_valid)
+    _add_check(
+        checks,
+        failures,
+        'exact_causal_supervisor_event_chain',
+        startup_prefix_valid and causal_chain_valid,
+    )
+    _add_check(
+        checks,
+        failures,
+        'post_observation_shutdown_is_exact',
+        post_observation_shutdown_valid,
+    )
     _add_check(
         checks,
         failures,
@@ -2566,6 +4422,12 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
     _add_check(
         checks,
         failures,
+        'supervisor_status_snapshots_are_exact',
+        status_projection_valid,
+    )
+    _add_check(
+        checks,
+        failures,
         'systemd_did_not_restart_supervisor',
         initial_details.get('systemd_nrestarts') == 0
         and restored_details.get('systemd_nrestarts') == 0
@@ -2578,7 +4440,9 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
         failures,
         'only_one_systemd_owned_ros_service',
         initial_details.get('systemd_owned_ros_service_count') == 1
-        and restored_details.get('systemd_owned_ros_service_count') == 1,
+        and restored_details.get('systemd_owned_ros_service_count') == 1
+        and initial_owners.get('unit_count') == 1
+        and restored_owners.get('unit_count') == 1,
     )
     _add_check(
         checks,
@@ -2593,11 +4457,10 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
         restored_status.get('schema_version') == 1
         and restored_status.get('ready') is True
         and restored_status.get('healthy') is True
-        and len(restored_children) == 1
-        and restored_children[0].get('name') == EXPECTED_CHILD
-        and restored_children[0].get('running') is True
-        and restored_children[0].get('heartbeat_fresh') is True
-        and restored_children[0].get('restart_count') == 1,
+        and restored_status_child.get('name') == EXPECTED_CHILD
+        and restored_status_child.get('running') is True
+        and restored_status_child.get('heartbeat_fresh') is True
+        and restored_status_child.get('restart_count') == 1,
     )
     _add_check(
         checks,
@@ -2680,7 +4543,8 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
         checks,
         failures,
         'fresh_followup_mission_succeeded',
-        followup_verdict.get('exit_code') == 0
+        followup_mission_is_exact
+        and followup_verdict.get('exit_code') == 0
         and followup_verdict.get('phase2_action_integration_status') == 'PASS'
         and followup_verdict.get('expected_outcome_met') is True
         and followup_measurements.get('goal_status') == 'SUCCEEDED'
@@ -2690,10 +4554,10 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
         checks,
         failures,
         'event_store_has_no_loss',
-        event_meta.get('schema_version') == 1
-        and event_meta.get('saturated') is False
-        and event_meta.get('dropped_events') == 0
-        and event_meta.get('last_attempted_sequence') == len(events),
+        event_meta_schema == 1
+        and event_meta_saturated is False
+        and event_meta_dropped == 0
+        and event_meta_last_sequence == len(events),
     )
     _add_check(
         checks,
@@ -2701,14 +4565,30 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
         'package_source_binding_passed',
         package_binding.get('verdict') == 'PASS'
         and rebound_package.get('verdict') == 'PASS'
+        and candidate_manifest_is_canonical
+        and _type_exact_json_equal(package_binding, rebound_package)
         and rebound_package.get('candidate_manifest_sha256')
-        == package_binding.get('candidate_manifest_sha256'),
+        == package_binding.get('candidate_manifest_sha256')
+        == rebound_integrity.get('source_manifest_sha256')
+        == canonical_candidate_manifest_sha256,
     )
     _add_check(
         checks,
         failures,
         'independent_package_reproducibility_passed',
-        package_integrity.get('verdict') == 'PASS' and dict(package_integrity) == rebound_integrity,
+        package_integrity.get('verdict') == 'PASS'
+        and _type_exact_json_equal(package_integrity, rebound_integrity),
+    )
+    _add_check(
+        checks,
+        failures,
+        'package_source_rebuild_is_exact',
+        package_source_rebuild_is_exact(
+            package_source_rebuild,
+            repository,
+            package_directory,
+            upgrade_path,
+        ),
     )
     _add_check(
         checks,
@@ -2738,39 +4618,79 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
     _add_check(
         checks,
         failures,
-        'runtime_staging_is_bound',
-        staging.get('schema_version') == 1
-        and staging.get('active_path') == '/opt/robotest-lab'
-        and SHA256_RE.fullmatch(str(staging.get('source_manifest_sha256', ''))) is not None
-        and SHA256_RE.fullmatch(str(staging.get('install_manifest_sha256', ''))) is not None
-        and dict(staging) == dict(overlay_provenance)
-        and staging.get('source_manifest_sha256') == file_sha256(overlay_source_manifest_path)
-        and staging.get('install_manifest_sha256') == file_sha256(overlay_install_manifest_path)
-        and staging.get('git_commit') == context.get('source_git_commit')
-        and staging.get('git_dirty') == context.get('source_git_dirty')
-        and Path(str(context.get('active_overlay_target', ''))).name == staging.get('release_id'),
+        'lifecycle_startup_result_is_exact',
+        lifecycle_startup_result_is_exact(lifecycle_startup_result)
+        and context_started_utc
+        <= startup_started_utc
+        <= startup_completed_utc
+        <= initial_affinity_join['captured_utc'],
     )
-    child_environment = (
-        _mapping(config_children[0].get('environment'), 'supervisor child environment')
-        if len(config_children) == 1
-        else {}
+    affinity_identity_fields = (
+        'pid',
+        'ppid',
+        'pgid',
+        'start_time_ticks',
+        'executable',
+        'cgroup',
+    )
+    initial_affinity_main = initial_affinity_join['main']
+    restored_affinity_main = restored_affinity_join['main']
+    initial_affinity_controller = initial_affinity_join['controller']
+    _add_check(
+        checks,
+        failures,
+        'runtime_cpu_affinity_is_limited',
+        context_cpuset == EXPECTED_CPUSET
+        and initial_affinity_join['limited'] is True
+        and restored_affinity_join['limited'] is True
+        and context_started_utc
+        <= initial_affinity_join['captured_utc']
+        <= restored_affinity_join['captured_utc']
+        and all(
+            initial_affinity_main.get(field) == restored_affinity_main.get(field)
+            for field in affinity_identity_fields
+        )
+        and all(
+            initial_affinity_controller.get(field) == target.get(field)
+            for field in affinity_identity_fields
+        ),
+    )
+    _add_check(
+        checks,
+        failures,
+        'runtime_staging_is_bound',
+        runtime_staging_evidence_is_exact(
+            repository,
+            context,
+            staging,
+            overlay_provenance,
+            overlay_source_manifest_path,
+            overlay_install_manifest_path,
+        ),
+    )
+    exact_runtime_config = expected_supervisor_config(
+        f'/var/lib/robotest-supervisor/{run_id}',
+        isolation.get('ros_domain_id'),
+        isolation.get('gz_partition'),
     )
     _add_check(
         checks,
         failures,
         'run_scoped_supervisor_config_is_exact',
-        supervisor_config.get('state_directory') == f'/var/lib/robotest-supervisor/{run_id}'
-        and len(config_children) == 1
-        and child_environment.get('ROS_DOMAIN_ID') == str(isolation.get('ros_domain_id'))
-        and child_environment.get('GZ_PARTITION') == isolation.get('gz_partition'),
+        _type_exact_json_equal(supervisor_config, exact_runtime_config)
+        and supervisor_config_check_exact
+        and systemd_dropin_exact,
     )
     _add_check(
         checks,
         failures,
         'source_snapshot_unchanged_and_self_consistent',
-        source_before.get('snapshot_sha256') == before_snapshot_hash
+        bool(expected_source_snapshot.get('files'))
+        and source_before.get('snapshot_sha256') == before_snapshot_hash
         and source_after.get('snapshot_sha256') == after_snapshot_hash
-        and before_snapshot_hash == after_snapshot_hash,
+        and before_snapshot_hash == after_snapshot_hash
+        and _type_exact_json_equal(source_before, source_after)
+        and _type_exact_json_equal(source_before, expected_source_snapshot),
     )
     _add_check(
         checks,
@@ -2926,6 +4846,478 @@ def write_checksums(run_directory: Path) -> None:
             raise EvidenceError(f'checksum changed during manifest creation: {name}')
 
 
+def _publication_directory(
+    path: Path,
+    label: str,
+    *,
+    owner_uid: int,
+    mode: int | None = None,
+) -> os.stat_result:
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise EvidenceError(f'{label} is unavailable: {path}') from exc
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise EvidenceError(f'{label} must be a non-symlink directory: {path}')
+    if metadata.st_uid != owner_uid:
+        raise EvidenceError(f'{label} has the wrong owner: {path}')
+    if mode is not None and stat.S_IMODE(metadata.st_mode) != mode:
+        raise EvidenceError(f'{label} mode is not {mode:04o}: {path}')
+    return metadata
+
+
+def _publication_file_digest(path: Path, metadata: os.stat_result, label: str) -> str:
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise EvidenceError(f'cannot open {label} without following links: {path}') from exc
+    digest = hashlib.sha256()
+    observed = 0
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or opened.st_nlink != 1
+        ):
+            raise EvidenceError(f'{label} changed identity while opening: {path}')
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            observed += len(chunk)
+            if observed > MAX_PUBLICATION_FILE_BYTES:
+                raise EvidenceError(f'{label} exceeds the per-file publication bound: {path}')
+            digest.update(chunk)
+        closed = os.fstat(descriptor)
+        if (
+            observed != metadata.st_size
+            or closed.st_size != metadata.st_size
+            or closed.st_mtime_ns != metadata.st_mtime_ns
+        ):
+            raise EvidenceError(f'{label} changed while hashing: {path}')
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
+def _publication_tree_snapshot(
+    root: Path,
+    label: str,
+    *,
+    owner_uid: int,
+    owner_gid: int,
+    directory_mode: int,
+    file_mode: int,
+) -> tuple[dict[str, tuple[str, int]], tuple[str, ...], int]:
+    _publication_directory(root, label, owner_uid=owner_uid, mode=directory_mode)
+    files: dict[str, tuple[str, int]] = {}
+    directories: list[str] = []
+    total_bytes = 0
+    entry_count = 0
+    for directory, raw_directory_names, raw_file_names in os.walk(root, followlinks=False):
+        current = Path(directory)
+        relative_directory = current.relative_to(root)
+        if len(relative_directory.parts) > MAX_PUBLICATION_DEPTH:
+            raise EvidenceError(f'{label} exceeds the publication depth bound')
+        current_metadata = os.lstat(current)
+        if (
+            not stat.S_ISDIR(current_metadata.st_mode)
+            or stat.S_ISLNK(current_metadata.st_mode)
+            or current_metadata.st_uid != owner_uid
+            or current_metadata.st_gid != owner_gid
+            or stat.S_IMODE(current_metadata.st_mode) != directory_mode
+        ):
+            raise EvidenceError(f'{label} contains an unsafe directory: {current}')
+        raw_directory_names.sort()
+        raw_file_names.sort()
+        for name in raw_directory_names:
+            path = current / name
+            metadata = os.lstat(path)
+            entry_count += 1
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != owner_uid
+                or metadata.st_gid != owner_gid
+                or stat.S_IMODE(metadata.st_mode) != directory_mode
+            ):
+                raise EvidenceError(f'{label} contains an unsafe directory entry: {path}')
+            relative = path.relative_to(root).as_posix()
+            if (
+                not relative
+                or len(relative.encode('utf-8')) > 4096
+                or any(character in relative for character in '\r\n')
+            ):
+                raise EvidenceError(f'{label} contains an unsafe relative directory path')
+            directories.append(relative)
+        for name in raw_file_names:
+            path = current / name
+            metadata = os.lstat(path)
+            entry_count += 1
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != owner_uid
+                or metadata.st_gid != owner_gid
+                or stat.S_IMODE(metadata.st_mode) != file_mode
+            ):
+                raise EvidenceError(f'{label} contains a linked or special file: {path}')
+            if not 0 <= metadata.st_size <= MAX_PUBLICATION_FILE_BYTES:
+                raise EvidenceError(f'{label} file exceeds the publication bound: {path}')
+            relative = path.relative_to(root).as_posix()
+            if (
+                not relative
+                or len(relative.encode('utf-8')) > 4096
+                or any(character in relative for character in '\r\n')
+            ):
+                raise EvidenceError(f'{label} contains an unsafe relative file path')
+            digest = _publication_file_digest(path, metadata, label)
+            files[relative] = (digest, metadata.st_size)
+            total_bytes += metadata.st_size
+            if total_bytes > MAX_PUBLICATION_TOTAL_BYTES:
+                raise EvidenceError(f'{label} exceeds the total publication byte bound')
+        if entry_count > MAX_EVIDENCE_FILES:
+            raise EvidenceError(f'{label} exceeds the publication entry-count bound')
+    return files, tuple(sorted(directories)), total_bytes
+
+
+def _validate_publication_manifest(
+    root: Path,
+    files: Mapping[str, tuple[str, int]],
+    label: str,
+) -> None:
+    manifest = root / 'SHA256SUMS'
+    if 'SHA256SUMS' not in files:
+        raise EvidenceError(f'{label} is missing SHA256SUMS')
+    payload = _read_bounded_bytes(manifest, MAX_TEXT_BYTES)
+    try:
+        text = payload.decode('ascii')
+    except UnicodeDecodeError as exc:
+        raise EvidenceError(f'{label} SHA256SUMS is not ASCII') from exc
+    if not text or not text.endswith('\n'):
+        raise EvidenceError(f'{label} SHA256SUMS has an incomplete final line')
+    declared: dict[str, str] = {}
+    for line_number, line in enumerate(text.splitlines(), 1):
+        match = re.fullmatch(r'([0-9a-f]{64})  ([^\r\n]+)', line)
+        if match is None:
+            raise EvidenceError(f'{label} SHA256SUMS line {line_number} is invalid')
+        digest, relative = match.groups()
+        path = Path(relative)
+        if (
+            relative != path.as_posix()
+            or path.is_absolute()
+            or '..' in path.parts
+            or relative in declared
+            or relative == 'SHA256SUMS'
+        ):
+            raise EvidenceError(f'{label} SHA256SUMS path is unsafe: {relative}')
+        declared[relative] = digest
+    expected = set(files) - {'SHA256SUMS'}
+    if set(declared) != expected:
+        raise EvidenceError(f'{label} SHA256SUMS coverage is not exact')
+    for relative, digest in declared.items():
+        if files[relative][0] != digest:
+            raise EvidenceError(f'{label} SHA256SUMS mismatch: {relative}')
+    canonical = ''.join(
+        f'{declared[relative]}  {relative}\n' for relative in sorted(declared)
+    ).encode('ascii')
+    if payload != canonical:
+        raise EvidenceError(f'{label} SHA256SUMS is not canonical')
+
+
+def _copy_publication_tree(
+    source: Path,
+    destination: Path,
+    source_files: Mapping[str, tuple[str, int]],
+    source_directories: Sequence[str],
+) -> None:
+    for relative in sorted(source_directories, key=lambda value: (value.count('/'), value)):
+        path = destination / relative
+        try:
+            path.mkdir(mode=0o750)
+        except OSError as exc:
+            raise EvidenceError(f'cannot create publication directory: {relative}') from exc
+        os.chmod(path, 0o750)
+    for relative in sorted(source_files):
+        source_path = source / relative
+        destination_path = destination / relative
+        source_flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+        destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+        try:
+            source_descriptor = os.open(source_path, source_flags)
+            destination_descriptor = os.open(destination_path, destination_flags, 0o640)
+        except OSError as exc:
+            with contextlib.suppress(UnboundLocalError, OSError):
+                os.close(source_descriptor)
+            raise EvidenceError(f'cannot create publication file: {relative}') from exc
+        digest = hashlib.sha256()
+        copied = 0
+        try:
+            source_metadata = os.fstat(source_descriptor)
+            if not stat.S_ISREG(source_metadata.st_mode) or source_metadata.st_nlink != 1:
+                raise EvidenceError(f'publication source changed identity: {relative}')
+            while True:
+                chunk = os.read(source_descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > MAX_PUBLICATION_FILE_BYTES:
+                    raise EvidenceError(f'publication source grew beyond its bound: {relative}')
+                digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_descriptor, view)
+                    if written <= 0:
+                        raise EvidenceError(f'short publication write: {relative}')
+                    view = view[written:]
+            expected_digest, expected_size = source_files[relative]
+            if copied != expected_size or digest.hexdigest() != expected_digest:
+                raise EvidenceError(f'publication source changed while copying: {relative}')
+            os.fchmod(destination_descriptor, 0o640)
+            os.fsync(destination_descriptor)
+        finally:
+            os.close(source_descriptor)
+            os.close(destination_descriptor)
+    for relative in sorted(source_directories, key=lambda value: value.count('/'), reverse=True):
+        descriptor = os.open(
+            destination / relative,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, 'O_NOFOLLOW', 0),
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    os.chmod(destination, 0o750)
+    descriptor = os.open(
+        destination,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, 'O_NOFOLLOW', 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _rename_directory_noreplace(
+    parent_descriptor: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, 'renameat2', None)
+    if renameat2 is None:
+        raise EvidenceError('renameat2(RENAME_NOREPLACE) is unavailable')
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        parent_descriptor,
+        os.fsencode(source_name),
+        parent_descriptor,
+        os.fsencode(destination_name),
+        1,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise EvidenceError('public evidence destination appeared before no-replace rename')
+        raise EvidenceError(f'no-replace evidence rename failed: {os.strerror(error_number)}')
+    os.fsync(parent_descriptor)
+
+
+def publish_run_evidence(
+    source: Path,
+    destination: Path,
+    repository: Path,
+    *,
+    live_root: Path = LIVE_EVIDENCE_ROOT,
+    expected_source_uid: int = 0,
+    require_unprivileged: bool = True,
+    temporary_name_factory: Callable[[], str] | None = None,
+    before_rename: Callable[[Path], None] | None = None,
+) -> dict[str, Any]:
+    """Copy one frozen root evidence tree and publish it with no-replace rename."""
+    publisher_uid = os.geteuid()
+    if require_unprivileged and publisher_uid == 0:
+        raise EvidenceError('evidence publication must run unprivileged')
+    for path, label in (
+        (source, 'live evidence source'),
+        (destination, 'public evidence destination'),
+        (repository, 'repository'),
+        (live_root, 'live evidence root'),
+    ):
+        if not path.is_absolute() or '..' in path.parts:
+            raise EvidenceError(f'{label} must be a canonical absolute path')
+    try:
+        resolved_repository = repository.resolve(strict=True)
+        resolved_live_root = live_root.resolve(strict=True)
+    except OSError as exc:
+        raise EvidenceError('publication root is unavailable') from exc
+    if resolved_repository != repository or resolved_live_root != live_root:
+        raise EvidenceError('publication roots must not traverse symbolic links')
+    run_id = source.name
+    if RUN_ID_RE.fullmatch(run_id) is None or source.parent != live_root:
+        raise EvidenceError('live evidence source is outside the exact run root')
+    expected_destination = repository / PUBLIC_EVIDENCE_RELATIVE_ROOT / run_id
+    if destination != expected_destination:
+        raise EvidenceError('public evidence destination is not canonical')
+
+    live_metadata = _publication_directory(
+        live_root,
+        'live evidence root',
+        owner_uid=expected_source_uid,
+        mode=0o710,
+    )
+    source_metadata = _publication_directory(
+        source,
+        'live evidence source',
+        owner_uid=expected_source_uid,
+        mode=0o550,
+    )
+    if source_metadata.st_gid != live_metadata.st_gid:
+        raise EvidenceError('live evidence source group differs from its root')
+    marker = source / LIVE_EVIDENCE_MARKER
+    marker_metadata = os.lstat(marker)
+    if (
+        not stat.S_ISREG(marker_metadata.st_mode)
+        or stat.S_ISLNK(marker_metadata.st_mode)
+        or marker_metadata.st_nlink != 1
+        or marker_metadata.st_uid != expected_source_uid
+        or marker_metadata.st_gid != source_metadata.st_gid
+        or stat.S_IMODE(marker_metadata.st_mode) != 0o440
+        or _read_bounded_bytes(marker, 4096) != f'{run_id}\n'.encode()
+    ):
+        raise EvidenceError('live evidence ownership marker is invalid')
+    source_files, source_directories, total_bytes = _publication_tree_snapshot(
+        source,
+        'live evidence source',
+        owner_uid=expected_source_uid,
+        owner_gid=source_metadata.st_gid,
+        directory_mode=0o550,
+        file_mode=0o440,
+    )
+    _validate_publication_manifest(source, source_files, 'live evidence source')
+
+    _publication_directory(repository, 'repository', owner_uid=publisher_uid)
+    current = repository
+    for component in PUBLIC_EVIDENCE_RELATIVE_ROOT.parts[:-1]:
+        current = current / component
+        metadata = _publication_directory(
+            current,
+            'public evidence ancestor',
+            owner_uid=publisher_uid,
+        )
+        if stat.S_IMODE(metadata.st_mode) & 0o022:
+            raise EvidenceError(f'public evidence ancestor is group/other writable: {current}')
+    public_parent = repository / PUBLIC_EVIDENCE_RELATIVE_ROOT
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(public_parent, 0o750)
+    parent_metadata = _publication_directory(
+        public_parent,
+        'public evidence parent',
+        owner_uid=publisher_uid,
+    )
+    if stat.S_IMODE(parent_metadata.st_mode) & 0o022:
+        raise EvidenceError('public evidence parent is group/other writable')
+    parent_descriptor = os.open(
+        public_parent,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, 'O_NOFOLLOW', 0),
+    )
+    opened_parent = os.fstat(parent_descriptor)
+    if (opened_parent.st_dev, opened_parent.st_ino) != (
+        parent_metadata.st_dev,
+        parent_metadata.st_ino,
+    ):
+        os.close(parent_descriptor)
+        raise EvidenceError('public evidence parent changed while opening')
+    temporary_name = ''
+    temporary_created = False
+    published = False
+    try:
+        try:
+            os.stat(run_id, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise EvidenceError('public evidence destination already exists')
+        token = (
+            temporary_name_factory()
+            if temporary_name_factory is not None
+            else secrets.token_hex(12)
+        )
+        if re.fullmatch(r'[A-Za-z0-9_-]{1,64}', token) is None:
+            raise EvidenceError('publication temporary token is invalid')
+        temporary_name = f'.{run_id}.publish-{token}'
+        try:
+            os.mkdir(temporary_name, 0o700, dir_fd=parent_descriptor)
+        except FileExistsError as exc:
+            raise EvidenceError('publication temporary directory already exists') from exc
+        temporary_created = True
+        descriptor_root = Path(f'/proc/self/fd/{parent_descriptor}')
+        temporary = descriptor_root / temporary_name
+        _copy_publication_tree(source, temporary, source_files, source_directories)
+        copied_gid = os.lstat(temporary).st_gid
+        copied_files, copied_directories, copied_total = _publication_tree_snapshot(
+            temporary,
+            'copied evidence',
+            owner_uid=publisher_uid,
+            owner_gid=copied_gid,
+            directory_mode=0o750,
+            file_mode=0o640,
+        )
+        _validate_publication_manifest(temporary, copied_files, 'copied evidence')
+        if (
+            copied_files != source_files
+            or copied_directories != source_directories
+            or copied_total != total_bytes
+        ):
+            raise EvidenceError('copied evidence differs from the frozen source')
+        if before_rename is not None:
+            before_rename(destination)
+        _rename_directory_noreplace(parent_descriptor, temporary_name, run_id)
+        published = True
+        final = descriptor_root / run_id
+        final_files, final_directories, final_total = _publication_tree_snapshot(
+            final,
+            'published evidence',
+            owner_uid=publisher_uid,
+            owner_gid=copied_gid,
+            directory_mode=0o750,
+            file_mode=0o640,
+        )
+        _validate_publication_manifest(final, final_files, 'published evidence')
+        if (
+            final_files != source_files
+            or final_directories != source_directories
+            or final_total != total_bytes
+        ):
+            raise EvidenceError('published evidence differs from the frozen source')
+        current_parent = os.lstat(public_parent)
+        if (current_parent.st_dev, current_parent.st_ino) != (
+            parent_metadata.st_dev,
+            parent_metadata.st_ino,
+        ):
+            raise EvidenceError('public evidence parent changed during publication')
+    finally:
+        if temporary_created and not published:
+            with contextlib.suppress(OSError):
+                shutil.rmtree(temporary_name, dir_fd=parent_descriptor)
+        os.close(parent_descriptor)
+    return {
+        'destination': str(destination),
+        'file_count': len(source_files),
+        'total_bytes': total_bytes,
+    }
+
+
 def _parse_details(values: Sequence[str]) -> dict[str, Any]:
     details: dict[str, Any] = {}
     for value in values:
@@ -2957,6 +5349,12 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument('--ros-domain-id', type=int, required=True)
     render.add_argument('--gz-partition', required=True)
 
+    overlay_script = subparsers.add_parser('render-overlay-stage-script')
+    overlay_script.add_argument('--template', type=Path, required=True)
+    overlay_script.add_argument('--output', type=Path, required=True)
+    overlay_script.add_argument('--project-root', type=Path, required=True)
+    overlay_script.add_argument('--evidence-directory', type=Path, required=True)
+
     followup = subparsers.add_parser('render-followup')
     followup.add_argument('--output', type=Path, required=True)
 
@@ -2969,7 +5367,23 @@ def build_parser() -> argparse.ArgumentParser:
     integrity.add_argument('--package-directory', type=Path, required=True)
     integrity.add_argument('--upgrade', type=Path, required=True)
     integrity.add_argument('--baseline', type=Path, required=True)
+    integrity.add_argument('--repository', type=Path, required=True)
     integrity.add_argument('--output', type=Path, required=True)
+
+    rebuild = subparsers.add_parser('package-source-rebuild')
+    rebuild.add_argument('--repository', type=Path, required=True)
+    rebuild.add_argument('--package-directory', type=Path, required=True)
+    rebuild.add_argument('--upgrade', type=Path, required=True)
+    rebuild.add_argument('--rebuilt-directory', type=Path, required=True)
+    rebuild.add_argument('--output', type=Path, required=True)
+
+    rebuild_import = subparsers.add_parser('import-package-source-rebuild')
+    rebuild_import.add_argument('--repository', type=Path, required=True)
+    rebuild_import.add_argument('--package-directory', type=Path, required=True)
+    rebuild_import.add_argument('--upgrade', type=Path, required=True)
+    rebuild_import.add_argument('--rebuilt-directory', type=Path, required=True)
+    rebuild_import.add_argument('--attestation', type=Path, required=True)
+    rebuild_import.add_argument('--output', type=Path, required=True)
 
     lifecycle = subparsers.add_parser('validate-lifecycle')
     lifecycle.add_argument('--evidence', type=Path, required=True)
@@ -3029,11 +5443,32 @@ def build_parser() -> argparse.ArgumentParser:
     owners.add_argument('--expected-unit', default=EXPECTED_UNIT)
     owners.add_argument('--output', type=Path, required=True)
 
+    affinity = subparsers.add_parser('capture-runtime-affinity')
+    affinity.add_argument('--main-pid', type=int, required=True)
+    affinity.add_argument('--managed-child-pid', type=int, required=True)
+    affinity.add_argument('--managed-child-pgid', type=int, required=True)
+    affinity.add_argument('--ros-domain-id', type=int, required=True)
+    affinity.add_argument('--gz-partition', required=True)
+    affinity.add_argument('--phase', choices=('initial', 'restored'), required=True)
+    affinity.add_argument('--unit', default=EXPECTED_UNIT)
+    affinity.add_argument('--expected-cpuset', default=EXPECTED_CPUSET)
+    affinity.add_argument('--output', type=Path, required=True)
+
+    ownership = subparsers.add_parser('validate-runtime-ownership')
+    ownership.add_argument('--before', type=Path, required=True)
+    ownership.add_argument('--after', type=Path, required=True)
+    ownership.add_argument('--affinity', type=Path, required=True)
+
     compose = subparsers.add_parser('compose')
     compose.add_argument('--run-directory', type=Path, required=True)
 
     checksums = subparsers.add_parser('checksums')
     checksums.add_argument('--run-directory', type=Path, required=True)
+
+    publish = subparsers.add_parser('publish-evidence')
+    publish.add_argument('--source', type=Path, required=True)
+    publish.add_argument('--destination', type=Path, required=True)
+    publish.add_argument('--repository', type=Path, required=True)
     return parser
 
 
@@ -3052,10 +5487,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.ros_domain_id,
                 args.gz_partition,
             )
+        elif args.command == 'render-overlay-stage-script':
+            render_overlay_stage_script(
+                args.template,
+                args.output,
+                args.project_root,
+                args.evidence_directory,
+            )
         elif args.command == 'render-followup':
             render_followup_mission(args.output)
         elif args.command == 'package-binding':
-            value = package_source_binding(args.repository.resolve(), args.manifest.resolve())
+            value = package_source_binding(args.repository.resolve(), args.manifest)
             atomic_write_json(args.output, value)
             if value['verdict'] != 'PASS':
                 return 1
@@ -3066,6 +5508,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.package_directory,
                     args.upgrade,
                     args.baseline,
+                    args.repository,
+                ),
+            )
+        elif args.command == 'package-source-rebuild':
+            atomic_write_json(
+                args.output,
+                package_source_rebuild_attestation(
+                    args.repository,
+                    args.package_directory,
+                    args.upgrade,
+                    args.rebuilt_directory,
+                ),
+            )
+        elif args.command == 'import-package-source-rebuild':
+            atomic_write_json(
+                args.output,
+                import_package_source_rebuild_attestation(
+                    args.repository,
+                    args.package_directory,
+                    args.upgrade,
+                    args.rebuilt_directory,
+                    args.attestation,
                 ),
             )
         elif args.command == 'validate-lifecycle':
@@ -3160,12 +5624,38 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(len(units))
             if value['verdict'] != 'PASS':
                 return 1
+        elif args.command == 'capture-runtime-affinity':
+            value = capture_runtime_affinity(
+                args.main_pid,
+                args.managed_child_pid,
+                args.managed_child_pgid,
+                args.ros_domain_id,
+                args.gz_partition,
+                args.phase,
+                unit=args.unit,
+                expected_cpuset=args.expected_cpuset,
+            )
+            atomic_write_json(args.output, value)
+            print(value['process_count'])
+        elif args.command == 'validate-runtime-ownership':
+            validate_stable_runtime_ownership_capture(
+                _mapping(load_json(args.before), 'owners before'),
+                _mapping(load_json(args.after), 'owners after'),
+                _mapping(load_json(args.affinity), 'runtime affinity'),
+            )
         elif args.command == 'compose':
             result = write_result(args.run_directory.resolve())
             if result['verdict']['status'] != 'PASS':
                 return 1
         elif args.command == 'checksums':
             write_checksums(args.run_directory.resolve())
+        elif args.command == 'publish-evidence':
+            result = publish_run_evidence(
+                args.source,
+                args.destination,
+                args.repository,
+            )
+            print(json.dumps(result, sort_keys=True))
         else:
             raise EvidenceError(f'unsupported command: {args.command}')
     except (EvidenceError, OSError, ValueError) as exc:

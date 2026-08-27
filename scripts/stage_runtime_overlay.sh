@@ -1,6 +1,44 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # Copyright 2026 Hasan Ahmed
 # SPDX-License-Identifier: Apache-2.0
+
+validate_root_entry_environment() {
+  [[ "${ROBOTEST_PHASE4_STAGE_ROOT_ENV:-}" == 1 &&
+    "${HOME:-}" == /root &&
+    "${LANG:-}" == C.UTF-8 &&
+    "${LC_ALL:-}" == C.UTF-8 &&
+    "${PATH:-}" == /usr/sbin:/usr/bin:/sbin:/bin &&
+    "${PYTHONDONTWRITEBYTECODE:-}" == 1 &&
+    "${PYTHONNOUSERSITE:-}" == 1 ]] || return 1
+
+  local variable_name
+  while IFS= read -r variable_name; do
+    case "${variable_name}" in
+      HOME | LANG | LC_ALL | PATH | PWD | PYTHONDONTWRITEBYTECODE | \
+        PYTHONNOUSERSITE | ROBOTEST_PHASE4_STAGE_ROOT_ENV | SHLVL | _) ;;
+      *) return 1 ;;
+    esac
+  done < <(compgen -e)
+}
+
+if ((EUID == 0)); then
+  if [[ "${ROBOTEST_PHASE4_STAGE_ROOT_ENV:-}" != 1 ]]; then
+    exec /usr/bin/env -i \
+      HOME=/root \
+      LANG=C.UTF-8 \
+      LC_ALL=C.UTF-8 \
+      PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      PYTHONDONTWRITEBYTECODE=1 \
+      PYTHONNOUSERSITE=1 \
+      ROBOTEST_PHASE4_STAGE_ROOT_ENV=1 \
+      /bin/bash -p -- "$0" "$@"
+  fi
+  validate_root_entry_environment || {
+    /usr/bin/printf '%s\n' \
+      '[stage_runtime_overlay] ERROR: privileged entry environment is not canonical.' >&2
+    exit 1
+  }
+fi
 
 set -Eeuo pipefail
 
@@ -37,6 +75,57 @@ run_root() {
   else
     sudo "$@"
   fi
+}
+
+sanitized_git() {
+  [[ ! -e "${PROJECT_ROOT}/.git/info/attributes" &&
+    ! -L "${PROJECT_ROOT}/.git/info/attributes" ]] ||
+    die 'Source Git info attributes are forbidden.'
+  env -i \
+    PATH=/usr/bin:/bin \
+    LANG=C \
+    HOME=/nonexistent \
+    GIT_ATTR_NOSYSTEM=1 \
+    GIT_OPTIONAL_LOCKS=0 \
+    GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_NO_REPLACE_OBJECTS=1 \
+    git \
+      -C "${PROJECT_ROOT}" \
+      --git-dir="${PROJECT_ROOT}/.git" \
+      --work-tree="${PROJECT_ROOT}" \
+      -c safe.directory="${PROJECT_ROOT}" \
+      -c core.attributesFile=/dev/null \
+      -c core.fileMode=true \
+      -c core.fsmonitor=false \
+      -c core.hooksPath=/dev/null \
+      -c core.bare=false \
+      "$@"
+}
+
+ignored_source_path_is_allowed() {
+  case "$1" in
+    config/release-claims.json | */.pytest_cache | */.pytest_cache/* | \
+      */__pycache__ | */__pycache__/*)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+verify_ignored_source_clean() {
+  local ignored_path
+  local -a ignored_paths=()
+  local -a roots=(config scenarios src)
+  sanitized_git ls-files --others --ignored --exclude-standard -- "${roots[@]}" \
+    >/dev/null || die 'Cannot inspect ignored runtime source paths.'
+  mapfile -d '' -t ignored_paths < <(
+    sanitized_git ls-files -z --others --ignored --exclude-standard -- "${roots[@]}"
+  )
+  for ignored_path in "${ignored_paths[@]}"; do
+    ignored_source_path_is_allowed "${ignored_path}" ||
+      die "Ignored untracked runtime source input is forbidden: ${ignored_path}"
+  done
 }
 
 die() {
@@ -166,6 +255,7 @@ json.dump(
     sys.stdout,
     ensure_ascii=False,
     separators=(",", ":"),
+    sort_keys=True,
 )
 sys.stdout.write("\n")
 PY
@@ -207,6 +297,9 @@ for runtime_root in runtime_roots:
             path = pathlib.Path(directory, name)
             if path.is_symlink():
                 raise SystemExit(f"symbolic-link runtime source file is forbidden: {path}")
+            relative = path.relative_to(project_root).as_posix()
+            if relative == "config/release-claims.json":
+                continue
             resolved = path.resolve(strict=True)
             if not (resolved == project_root or project_root in resolved.parents):
                 raise SystemExit(f"runtime source escapes the workspace: {path}")
@@ -220,7 +313,7 @@ for runtime_root in runtime_roots:
             entries.append(
                 {
                     "mode": format(stat.S_IMODE(metadata.st_mode), "04o"),
-                    "path": path.relative_to(project_root).as_posix(),
+                    "path": relative,
                     "sha256": digest.hexdigest(),
                     "size_bytes": metadata.st_size,
                 }
@@ -231,6 +324,7 @@ json.dump(
     sys.stdout,
     ensure_ascii=False,
     separators=(",", ":"),
+    sort_keys=True,
 )
 sys.stdout.write("\n")
 PY
@@ -406,6 +500,9 @@ apply_overlay() {
   [[ "${build_user}" =~ ^[a-z_][a-z0-9_-]*$ && "${build_user}" != "root" ]] ||
     die "The source workspace must be owned by a non-root build user: ${build_user}"
   id "${build_user}" >/dev/null 2>&1 || die "Unknown build user: ${build_user}"
+  [[ -d "${PROJECT_ROOT}/.git" && ! -L "${PROJECT_ROOT}/.git" ]] ||
+    die 'Source Git directory is missing or linked.'
+  verify_ignored_source_clean
 
   SOURCE_MANIFEST="$(mktemp /tmp/robotest-overlay-source-manifest.XXXXXX)"
   SOURCE_MANIFEST_END="$(mktemp /tmp/robotest-overlay-source-end.XXXXXX)"
@@ -414,9 +511,9 @@ apply_overlay() {
   PACKAGE_LIST="$(mktemp /tmp/robotest-overlay-packages.XXXXXX)"
   write_source_manifest "${SOURCE_MANIFEST}"
   source_manifest_sha="$(sha256sum "${SOURCE_MANIFEST}" | awk '{print $1}')"
-  git_commit="$(git -c safe.directory="${PROJECT_ROOT}" -C "${PROJECT_ROOT}" rev-parse HEAD)"
-  if [[ -n "$(git -c safe.directory="${PROJECT_ROOT}" -C "${PROJECT_ROOT}" \
-    status --porcelain=v1 --untracked-files=all)" ]]; then
+  git_commit="$(sanitized_git rev-parse HEAD)"
+  if [[ -n "$(sanitized_git status --porcelain=v1 --untracked-files=all \
+    --ignore-submodules=none)" ]]; then
     git_dirty=true
   else
     git_dirty=false
@@ -630,7 +727,7 @@ if (($# == 1)); then
 fi
 
 require_noble
-for command_name in awk cmp find flock git grep install mkdir mv python3 realpath sha256sum sort systemctl; do
+for command_name in awk cmp env find flock git grep install mkdir mv python3 realpath sha256sum sort systemctl; do
   require_command "${command_name}"
 done
 if [[ "${MODE}" == "apply" ]]; then

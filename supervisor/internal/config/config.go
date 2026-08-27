@@ -20,13 +20,16 @@ import (
 )
 
 const (
-	maxChildren        = 32
-	maxArguments       = 64
-	maxEnvironment     = 64
-	maxStringBytes     = 4096
-	maxEventEntries    = 16384
-	maxEventFileBytes  = 8 << 20
-	maxConfigFileBytes = 1 << 20
+	maxChildren                    = 32
+	maxArguments                   = 64
+	maxEnvironment                 = 64
+	maxStringBytes                 = 4096
+	maxEventEntries                = 16384
+	maxEventFileBytes              = 8 << 20
+	maxConfigFileBytes             = 1 << 20
+	packagedStackExecutable        = "/usr/libexec/robotest-supervisor/start-robotest-stack"
+	runtimeStateDirectoryEnv       = "ROBOTEST_RUNTIME_STATE_DIRECTORY"
+	packagedStackHeartbeatFileName = "robotest-stack.heartbeat"
 )
 
 var childNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
@@ -218,6 +221,11 @@ func (cfg Config) Validate() error {
 		if err := child.validate(); err != nil {
 			return fmt.Errorf("children[%d]: %w", index, err)
 		}
+		if child.Argv[0] == packagedStackExecutable {
+			if err := child.validatePackagedStackContract(cfg.StateDirectory); err != nil {
+				return fmt.Errorf("children[%d]: %w", index, err)
+			}
+		}
 		if _, exists := names[child.Name]; exists {
 			return fmt.Errorf("duplicate child name %q", child.Name)
 		}
@@ -314,6 +322,25 @@ func (child Child) validate() error {
 		if !filepath.IsAbs(child.HeartbeatFile) || filepath.Clean(child.HeartbeatFile) != child.HeartbeatFile || len(child.HeartbeatFile) > maxStringBytes || strings.ContainsRune(child.HeartbeatFile, '\x00') {
 			return errors.New("heartbeat_file must be a bounded canonical absolute path")
 		}
+	}
+	return nil
+}
+
+func (child Child) validatePackagedStackContract(stateDirectory string) error {
+	runtimeStateDirectory, exists := child.Environment[runtimeStateDirectoryEnv]
+	if !exists || runtimeStateDirectory != stateDirectory {
+		return fmt.Errorf(
+			"environment %s must be present and exactly match state_directory",
+			runtimeStateDirectoryEnv,
+		)
+	}
+	expectedHeartbeat := filepath.Join(stateDirectory, packagedStackHeartbeatFileName)
+	if child.HeartbeatFile != expectedHeartbeat {
+		return fmt.Errorf(
+			"heartbeat_file for %s must be exactly %q",
+			packagedStackExecutable,
+			expectedHeartbeat,
+		)
 	}
 	return nil
 }

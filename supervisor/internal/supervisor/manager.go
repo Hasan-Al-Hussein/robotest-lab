@@ -20,6 +20,105 @@ import (
 	"github.com/hasanahmed/robotest-lab/supervisor/internal/config"
 )
 
+const (
+	defaultCleanupKillGrace    = 2 * time.Second
+	defaultCleanupPollInterval = 20 * time.Millisecond
+	cleanupFailureKind         = "process_group_cleanup_incomplete"
+)
+
+// errProcessGroupCleanupIncomplete is returned after shutdown when a child
+// leader could not be reaped or its captured process group could not be proven
+// empty, or when a cleanup operation failed. The manager remains alive but
+// unready until that shutdown request.
+var errProcessGroupCleanupIncomplete = errors.New(cleanupFailureKind)
+
+type cleanupPolicy struct {
+	terminationGrace time.Duration
+	killGrace        time.Duration
+	pollInterval     time.Duration
+}
+
+type startedProcess struct {
+	pid  int
+	wait <-chan error
+}
+
+type processSystem interface {
+	Start(config.Child) (startedProcess, error)
+	SignalProcessGroup(int, syscall.Signal) error
+	ProcessGroupExists(int) (bool, error)
+}
+
+type unixProcessSystem struct{}
+
+func (unixProcessSystem) Start(spec config.Child) (startedProcess, error) {
+	cmd := exec.Command(spec.Argv[0], spec.Argv[1:]...)
+	cmd.Dir = spec.WorkingDirectory
+	cmd.Env = mergedEnvironment(spec.Environment)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGTERM}
+	if err := cmd.Start(); err != nil {
+		return startedProcess{}, err
+	}
+
+	wait := make(chan error, 1)
+	go func() {
+		wait <- cmd.Wait()
+		close(wait)
+	}()
+	return startedProcess{pid: cmd.Process.Pid, wait: wait}, nil
+}
+
+func (unixProcessSystem) SignalProcessGroup(pgid int, signal syscall.Signal) error {
+	return syscall.Kill(-pgid, signal)
+}
+
+func (unixProcessSystem) ProcessGroupExists(pgid int) (bool, error) {
+	if pgid <= 0 {
+		return false, nil
+	}
+	err := syscall.Kill(-pgid, 0)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, syscall.ESRCH):
+		return false, nil
+	default:
+		return true, err
+	}
+}
+
+type cleanupResult struct {
+	leaderReaped bool
+	waitErr      error
+	groupEmpty   bool
+	err          error
+}
+
+func (result cleanupResult) complete() bool {
+	return result.leaderReaped && result.groupEmpty && result.err == nil
+}
+
+type cleanupMode int
+
+const (
+	cleanupRequested cleanupMode = iota
+	cleanupResidual
+)
+
+type childMonitorResult struct {
+	failureKind     string
+	continuousReady time.Duration
+	stop            bool
+	cleanupErr      error
+}
+
+type restartWaitResult struct {
+	committed bool
+	restart   bool
+}
+
 type childRuntime struct {
 	spec                       config.Child
 	state                      ChildSnapshot
@@ -30,12 +129,15 @@ type childRuntime struct {
 
 // Manager supervises one fixed, validated set of child process groups.
 type Manager struct {
-	cfg    config.Config
-	clock  Clock
-	logger *slog.Logger
-	store  *eventStore
-	lock   *stateLock
+	cfg     config.Config
+	clock   Clock
+	logger  *slog.Logger
+	store   *eventStore
+	lock    *stateLock
+	system  processSystem
+	cleanup cleanupPolicy
 
+	transitionMu       sync.Mutex
 	mu                 sync.RWMutex
 	children           map[string]*childRuntime
 	shuttingDown       bool
@@ -45,6 +147,7 @@ type Manager struct {
 	runStarted         bool
 	runActive          bool
 	closed             bool
+	terminalErr        error
 	wg                 sync.WaitGroup
 }
 
@@ -77,11 +180,17 @@ func New(cfg config.Config, logger *slog.Logger) (*Manager, error) {
 		}
 	}
 	return &Manager{
-		cfg:                cfg,
-		clock:              realClock{},
-		logger:             logger,
-		store:              store,
-		lock:               lock,
+		cfg:    cfg,
+		clock:  realClock{},
+		logger: logger,
+		store:  store,
+		lock:   lock,
+		system: unixProcessSystem{},
+		cleanup: cleanupPolicy{
+			terminationGrace: cfg.TerminationGrace(),
+			killGrace:        defaultCleanupKillGrace,
+			pollInterval:     defaultCleanupPollInterval,
+		},
 		children:           children,
 		persistenceHealthy: !store.isSaturated(),
 	}, nil
@@ -139,10 +248,7 @@ func (manager *Manager) Run(ctx context.Context) error {
 	}
 
 	<-ctx.Done()
-	manager.mu.Lock()
-	manager.shuttingDown = true
-	manager.mu.Unlock()
-	manager.record(Event{Kind: "shutdown_requested"})
+	manager.beginShutdown()
 
 	done := make(chan struct{})
 	go func() {
@@ -159,13 +265,39 @@ func (manager *Manager) Run(ctx context.Context) error {
 			manager.runActive = false
 			manager.mu.Unlock()
 		}()
-		return errors.New("supervisor shutdown exceeded configured timeout")
+		return errors.Join(
+			errors.New("supervisor shutdown exceeded configured timeout"),
+			manager.terminalError(),
+		)
 	}
 	manager.record(Event{Kind: "supervisor_stopped"})
 	manager.mu.Lock()
 	manager.runActive = false
 	manager.mu.Unlock()
-	return nil
+	return manager.terminalError()
+}
+
+func (manager *Manager) beginShutdown() {
+	manager.transitionMu.Lock()
+	defer manager.transitionMu.Unlock()
+	manager.mu.Lock()
+	manager.shuttingDown = true
+	manager.mu.Unlock()
+	manager.record(Event{Kind: "shutdown_requested"})
+}
+
+// transitionPermittedLocked requires manager.mu to be held.
+func (manager *Manager) transitionPermittedLocked(ctx context.Context) bool {
+	return ctx.Err() == nil && !manager.shuttingDown
+}
+
+func (manager *Manager) transitionPermitted(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	return !manager.shuttingDown
 }
 
 func (manager *Manager) manageChild(ctx context.Context, runtime *childRuntime) {
@@ -174,24 +306,32 @@ func (manager *Manager) manageChild(ctx context.Context, runtime *childRuntime) 
 		if ctx.Err() != nil {
 			return
 		}
-		startedAt, pgid, wait, startErr := manager.startChild(runtime, !firstStart)
+		startedAt, pgid, wait, committed, startErr := manager.startChild(ctx, runtime, !firstStart)
 		firstStart = false
 		if startErr != nil {
-			manager.markFailure(runtime, "start_failed", nil, startErr, true)
-			if !manager.waitForRestart(ctx, runtime, 0) {
+			if !manager.markFailure(ctx, runtime, "start_failed", nil, startErr, true) {
+				return
+			}
+			restart := manager.waitForRestart(ctx, runtime, 0)
+			if !restart.committed || !restart.restart {
 				return
 			}
 			continue
 		}
+		if !committed {
+			manager.cleanupUncommittedStartedChild(runtime, pgid, wait)
+			return
+		}
 
-		failureKind, continuousReady, stop := manager.monitorStartedChild(ctx, runtime, startedAt, pgid, wait)
-		if stop {
+		result := manager.monitorStartedChild(ctx, runtime, startedAt, pgid, wait)
+		if result.stop {
 			return
 		}
-		if failureKind == "" {
+		if result.failureKind == "" {
 			return
 		}
-		if !manager.waitForRestart(ctx, runtime, continuousReady) {
+		restart := manager.waitForRestart(ctx, runtime, result.continuousReady)
+		if !restart.committed || !restart.restart {
 			return
 		}
 	}
@@ -203,24 +343,49 @@ func (manager *Manager) monitorStartedChild(
 	startedAt time.Time,
 	pgid int,
 	wait <-chan error,
-) (string, time.Duration, bool) {
-	// PGID is captured at start and cleaned on every return path, including a tie
-	// between leader exit and cancellation where either select arm may win.
-	defer manager.cleanupResidualProcessGroup(runtime.spec.Name, pgid)
+) childMonitorResult {
+	heartbeatTimer := manager.clock.After(manager.cfg.HeartbeatPoll())
 	for {
 		select {
-		case err := <-wait:
+		case waitErr, ok := <-wait:
 			continuousReady := manager.continuousReadyDuration(runtime, manager.clock.Now())
-			if ctx.Err() != nil {
-				manager.markStopped(runtime, exitCode(err))
-				return "", continuousReady, true
+			leaderReaped := ok
+			if !ok {
+				waitErr = errors.New("child wait channel closed without an exit status")
 			}
-			code := exitCode(err)
-			manager.markFailure(runtime, "unexpected_exit", &code, err, true)
-			return "unexpected_exit", continuousReady, false
-		case <-manager.clock.After(manager.cfg.HeartbeatPoll()):
+			stopping := ctx.Err() != nil
+			failureCommitted := false
+			if !stopping {
+				code := exitCode(waitErr)
+				failureCommitted = manager.markFailure(
+					ctx, runtime, "unexpected_exit", &code, waitErr, false,
+				)
+			}
+			cleanup := manager.cleanupProcessGroup(
+				context.Background(), runtime.spec.Name, pgid, nil, leaderReaped, waitErr, cleanupResidual,
+			)
+			if !cleanup.complete() {
+				manager.markCleanupIncomplete(runtime, pgid, cleanup)
+				return childMonitorResult{
+					continuousReady: continuousReady,
+					stop:            true,
+					cleanupErr:      cleanup.err,
+				}
+			}
+			manager.markStopped(runtime, exitCode(cleanup.waitErr))
+			if !failureCommitted || stopping || ctx.Err() != nil {
+				return childMonitorResult{continuousReady: continuousReady, stop: true}
+			}
+			return childMonitorResult{
+				failureKind:     "unexpected_exit",
+				continuousReady: continuousReady,
+			}
+		case <-heartbeatTimer:
 			now := manager.clock.Now()
 			continuousReady := manager.continuousReadyDuration(runtime, now)
+			if ctx.Err() != nil {
+				return manager.stopStartedChild(runtime, pgid, wait, continuousReady)
+			}
 			fresh, age := heartbeatState(runtime.spec.HeartbeatFile, startedAt, now, manager.cfg.HeartbeatStale())
 			manager.updateHeartbeat(runtime, fresh, age)
 			manager.mu.RLock()
@@ -233,36 +398,93 @@ func (manager *Manager) monitorStartedChild(
 				heartbeatFailureKind = "heartbeat_startup_timeout"
 			}
 			if !fresh && now.Sub(startedAt) >= failureAfter {
-				manager.markFailure(runtime, heartbeatFailureKind, nil, nil, false)
-				manager.stopProcessGroup(runtime, pgid, wait)
-				return heartbeatFailureKind, continuousReady, false
+				if ctx.Err() != nil {
+					return manager.stopStartedChild(runtime, pgid, wait, continuousReady)
+				}
+				failureCommitted := manager.markFailure(
+					ctx, runtime, heartbeatFailureKind, nil, nil, false,
+				)
+				cleanup := manager.cleanupProcessGroup(
+					context.Background(), runtime.spec.Name, pgid, wait, false, nil, cleanupRequested,
+				)
+				if !cleanup.complete() {
+					manager.markCleanupIncomplete(runtime, pgid, cleanup)
+					return childMonitorResult{
+						continuousReady: continuousReady,
+						stop:            true,
+						cleanupErr:      cleanup.err,
+					}
+				}
+				manager.markStopped(runtime, exitCode(cleanup.waitErr))
+				if !failureCommitted || ctx.Err() != nil {
+					return childMonitorResult{continuousReady: continuousReady, stop: true}
+				}
+				return childMonitorResult{
+					failureKind:     heartbeatFailureKind,
+					continuousReady: continuousReady,
+				}
 			}
+			heartbeatTimer = manager.clock.After(manager.cfg.HeartbeatPoll())
 		case <-ctx.Done():
-			manager.stopProcessGroup(runtime, pgid, wait)
-			return "", manager.continuousReadyDuration(runtime, manager.clock.Now()), true
+			continuousReady := manager.continuousReadyDuration(runtime, manager.clock.Now())
+			return manager.stopStartedChild(runtime, pgid, wait, continuousReady)
 		}
 	}
 }
 
-func (manager *Manager) startChild(runtime *childRuntime, restarted bool) (time.Time, int, <-chan error, error) {
-	startedAt := manager.clock.Now()
-	cmd := exec.Command(runtime.spec.Argv[0], runtime.spec.Argv[1:]...)
-	cmd.Dir = runtime.spec.WorkingDirectory
-	cmd.Env = mergedEnvironment(runtime.spec.Environment)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGTERM}
-	if err := cmd.Start(); err != nil {
-		return startedAt, 0, nil, err
+func (manager *Manager) stopStartedChild(
+	runtime *childRuntime,
+	pgid int,
+	wait <-chan error,
+	continuousReady time.Duration,
+) childMonitorResult {
+	cleanup := manager.cleanupProcessGroup(
+		context.Background(), runtime.spec.Name, pgid, wait, false, nil, cleanupRequested,
+	)
+	if !cleanup.complete() {
+		manager.markCleanupIncomplete(runtime, pgid, cleanup)
+		return childMonitorResult{
+			continuousReady: continuousReady,
+			stop:            true,
+			cleanupErr:      cleanup.err,
+		}
 	}
-	pid := cmd.Process.Pid
-	wait := make(chan error, 1)
-	go func() {
-		wait <- cmd.Wait()
-		close(wait)
-	}()
+	manager.markStopped(runtime, exitCode(cleanup.waitErr))
+	return childMonitorResult{continuousReady: continuousReady, stop: true}
+}
 
+func (manager *Manager) cleanupUncommittedStartedChild(
+	runtime *childRuntime,
+	pgid int,
+	wait <-chan error,
+) {
+	cleanup := manager.cleanupProcessGroup(
+		context.Background(), runtime.spec.Name, pgid, wait, false, nil, cleanupRequested,
+	)
+	if !cleanup.complete() {
+		manager.markCleanupIncomplete(runtime, pgid, cleanup)
+	}
+}
+
+func (manager *Manager) startChild(
+	ctx context.Context,
+	runtime *childRuntime,
+	restarted bool,
+) (time.Time, int, <-chan error, bool, error) {
+	startedAt := manager.clock.Now()
+	process, err := manager.system.Start(runtime.spec)
+	if err != nil {
+		return startedAt, 0, nil, false, err
+	}
+	pid := process.pid
+
+	manager.transitionMu.Lock()
 	manager.mu.Lock()
+	if !manager.transitionPermittedLocked(ctx) {
+		manager.mu.Unlock()
+		manager.transitionMu.Unlock()
+		return startedAt, pid, process.wait, false, nil
+	}
 	runtime.state.Running = true
 	runtime.state.PID = pid
 	runtime.state.PGID = pid
@@ -283,91 +505,181 @@ func (manager *Manager) startChild(runtime *childRuntime, restarted bool) (time.
 	manager.mu.Unlock()
 	manager.record(Event{Kind: "child_started", Child: runtime.spec.Name, PID: pid, PGID: pid})
 	manager.refreshReadiness()
-	return startedAt, pid, wait, nil
+	manager.transitionMu.Unlock()
+	return startedAt, pid, process.wait, true, nil
 }
 
-func (manager *Manager) stopProcessGroup(runtime *childRuntime, pgid int, wait <-chan error) {
-	if pgid <= 0 {
-		return
+func (manager *Manager) cleanupProcessGroup(
+	ctx context.Context,
+	child string,
+	pgid int,
+	wait <-chan error,
+	leaderReaped bool,
+	waitErr error,
+	mode cleanupMode,
+) cleanupResult {
+	result := cleanupResult{leaderReaped: leaderReaped, waitErr: waitErr}
+	result.groupEmpty, result.err = manager.processGroupEmpty(pgid)
+	if mode == cleanupResidual && result.complete() {
+		return result
 	}
-	manager.record(Event{Kind: "child_stop_requested", Child: runtime.spec.Name, PGID: pgid})
-	_ = syscall.Kill(-pgid, syscall.SIGTERM)
-	deadline := time.Now().Add(manager.cfg.TerminationGrace())
-	var waitErr error
-	waitComplete := false
-	for time.Now().Before(deadline) {
-		if !waitComplete {
+
+	if mode == cleanupResidual {
+		manager.record(Event{Kind: "residual_process_group_detected", Child: child, PGID: pgid})
+	} else {
+		manager.record(Event{Kind: "child_stop_requested", Child: child, PGID: pgid})
+	}
+	result.err = errors.Join(result.err, manager.signalProcessGroup(pgid, syscall.SIGTERM))
+	result = manager.waitEmpty(ctx, pgid, wait, result, manager.cleanup.terminationGrace)
+	if result.complete() {
+		if mode == cleanupResidual {
+			manager.record(Event{Kind: "residual_process_group_stopped", Child: child, PGID: pgid})
+		}
+		return result
+	}
+
+	killEvent := "child_kill_escalated"
+	if mode == cleanupResidual {
+		killEvent = "residual_process_group_kill_escalated"
+	}
+	manager.record(Event{Kind: killEvent, Child: child, PGID: pgid})
+	result.err = errors.Join(result.err, manager.signalProcessGroup(pgid, syscall.SIGKILL))
+	result = manager.waitEmpty(ctx, pgid, wait, result, manager.cleanup.killGrace)
+	if !result.leaderReaped {
+		result.err = errors.Join(result.err, errors.New("child leader was not reaped within the cleanup bound"))
+	}
+	if !result.groupEmpty {
+		result.err = errors.Join(result.err, errors.New("captured process group is not empty after SIGKILL"))
+	}
+	return result
+}
+
+func (manager *Manager) signalProcessGroup(pgid int, signal syscall.Signal) error {
+	if pgid <= 0 {
+		return nil
+	}
+	err := manager.system.SignalProcessGroup(pgid, signal)
+	if err == nil || errors.Is(err, syscall.ESRCH) {
+		return nil
+	}
+	return fmt.Errorf("signal process group %d with %s: %w", pgid, signal, err)
+}
+
+func (manager *Manager) processGroupEmpty(pgid int) (bool, error) {
+	exists, err := manager.system.ProcessGroupExists(pgid)
+	if err != nil {
+		return false, fmt.Errorf("probe process group %d: %w", pgid, err)
+	}
+	return !exists, nil
+}
+
+// waitEmpty uses real time because process termination is a kernel operation,
+// not restart policy. The final non-blocking wait and group probe close races at
+// both cancellation and deadline boundaries.
+func (manager *Manager) waitEmpty(
+	ctx context.Context,
+	pgid int,
+	wait <-chan error,
+	result cleanupResult,
+	timeout time.Duration,
+) cleanupResult {
+	if result.leaderReaped {
+		wait = nil
+	}
+	probe := func(final bool) {
+		if final && !result.leaderReaped && wait != nil {
 			select {
-			case waitErr = <-wait:
-				waitComplete = true
+			case observedErr, ok := <-wait:
+				wait = nil
+				if ok {
+					result.leaderReaped = true
+					result.waitErr = observedErr
+				} else {
+					result.err = errors.Join(
+						result.err,
+						errors.New("child wait channel closed without an exit status"),
+					)
+				}
 			default:
 			}
 		}
-		if waitComplete && !processGroupExists(pgid) {
-			manager.markStopped(runtime, exitCode(waitErr))
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+		groupEmpty, err := manager.processGroupEmpty(pgid)
+		result.groupEmpty = groupEmpty
+		result.err = errors.Join(result.err, err)
+	}
+	probe(false)
+	if result.leaderReaped && result.groupEmpty {
+		return result
 	}
 
-	manager.record(Event{Kind: "child_kill_escalated", Child: runtime.spec.Name, PGID: pgid})
-	_ = syscall.Kill(-pgid, syscall.SIGKILL)
-	if !waitComplete {
-		waitErr = <-wait
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(manager.cleanup.pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case observedErr, ok := <-wait:
+			wait = nil
+			if ok {
+				result.leaderReaped = true
+				result.waitErr = observedErr
+			} else {
+				result.err = errors.Join(
+					result.err,
+					errors.New("child wait channel closed without an exit status"),
+				)
+			}
+			probe(false)
+			if result.leaderReaped && result.groupEmpty {
+				return result
+			}
+		case <-ticker.C:
+			probe(false)
+			if result.leaderReaped && result.groupEmpty {
+				return result
+			}
+		case <-timer.C:
+			probe(true)
+			return result
+		case <-ctx.Done():
+			probe(true)
+			result.err = errors.Join(result.err, ctx.Err())
+			return result
+		}
 	}
-	killDeadline := time.Now().Add(2 * time.Second)
-	for processGroupExists(pgid) && time.Now().Before(killDeadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if processGroupExists(pgid) {
-		manager.record(Event{Kind: "child_group_cleanup_incomplete", Child: runtime.spec.Name, PGID: pgid})
-	}
-	manager.markStopped(runtime, exitCode(waitErr))
 }
 
 func processGroupExists(pgid int) bool {
-	if pgid <= 0 {
-		return false
-	}
-	err := syscall.Kill(-pgid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
+	exists, _ := (unixProcessSystem{}).ProcessGroupExists(pgid)
+	return exists
 }
 
-func (manager *Manager) cleanupResidualProcessGroup(child string, pgid int) {
-	if !processGroupExists(pgid) {
-		return
+func (manager *Manager) waitForRestart(
+	ctx context.Context,
+	runtime *childRuntime,
+	continuousReady time.Duration,
+) restartWaitResult {
+	if ctx.Err() != nil {
+		return restartWaitResult{}
 	}
-	manager.record(Event{Kind: "residual_process_group_detected", Child: child, PGID: pgid})
-	_ = syscall.Kill(-pgid, syscall.SIGTERM)
-	if waitForProcessGroupExit(pgid, manager.cfg.TerminationGrace()) {
-		manager.record(Event{Kind: "residual_process_group_stopped", Child: child, PGID: pgid})
-		return
-	}
-	manager.record(Event{Kind: "residual_process_group_kill_escalated", Child: child, PGID: pgid})
-	_ = syscall.Kill(-pgid, syscall.SIGKILL)
-	if !waitForProcessGroupExit(pgid, 2*time.Second) {
-		manager.record(Event{Kind: "child_group_cleanup_incomplete", Child: child, PGID: pgid})
-	}
-}
-
-func waitForProcessGroupExit(pgid int, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for processGroupExists(pgid) && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	return !processGroupExists(pgid)
-}
-
-func (manager *Manager) waitForRestart(ctx context.Context, runtime *childRuntime, continuousReady time.Duration) bool {
 	now := manager.clock.Now()
+	manager.transitionMu.Lock()
+	manager.mu.Lock()
+	if !manager.transitionPermittedLocked(ctx) {
+		manager.mu.Unlock()
+		manager.transitionMu.Unlock()
+		return restartWaitResult{}
+	}
 	delay, attempt, exhausted := runtime.tracker.RecordFailure(now, continuousReady)
 	if exhausted {
-		manager.mu.Lock()
 		runtime.state.CircuitOpen = true
-		manager.mu.Unlock()
+	}
+	manager.mu.Unlock()
+	if exhausted {
 		manager.record(Event{Kind: "restart_exhausted", Child: runtime.spec.Name, RestartAttempt: attempt})
 		manager.refreshReadiness()
-		return false
+		manager.transitionMu.Unlock()
+		return restartWaitResult{committed: true}
 	}
 	manager.record(Event{
 		Kind:           "restart_scheduled",
@@ -375,17 +687,37 @@ func (manager *Manager) waitForRestart(ctx context.Context, runtime *childRuntim
 		RestartAttempt: attempt,
 		BackoffMS:      delay.Milliseconds(),
 	})
+	manager.transitionMu.Unlock()
+	if !manager.transitionPermitted(ctx) {
+		return restartWaitResult{committed: true}
+	}
 	select {
 	case <-manager.clock.After(delay):
-		return true
+		if !manager.transitionPermitted(ctx) {
+			return restartWaitResult{committed: true}
+		}
+		return restartWaitResult{committed: true, restart: true}
 	case <-ctx.Done():
-		return false
+		return restartWaitResult{committed: true}
 	}
 }
 
-func (manager *Manager) markFailure(runtime *childRuntime, kind string, code *int, err error, processExited bool) {
+func (manager *Manager) markFailure(
+	ctx context.Context,
+	runtime *childRuntime,
+	kind string,
+	code *int,
+	err error,
+	processExited bool,
+) bool {
 	now := manager.clock.Now()
+	manager.transitionMu.Lock()
 	manager.mu.Lock()
+	if !manager.transitionPermittedLocked(ctx) {
+		manager.mu.Unlock()
+		manager.transitionMu.Unlock()
+		return false
+	}
 	runtime.state.Running = false
 	runtime.state.HeartbeatFresh = false
 	runtime.state.LastFailureKind = kind
@@ -413,6 +745,66 @@ func (manager *Manager) markFailure(runtime *childRuntime, kind string, code *in
 		Details:     details,
 	})
 	manager.refreshReadiness()
+	manager.transitionMu.Unlock()
+	return true
+}
+
+func (manager *Manager) markCleanupIncomplete(runtime *childRuntime, pgid int, cleanup cleanupResult) {
+	now := manager.clock.Now()
+	manager.mu.Lock()
+	publishedPID := runtime.state.PID
+	publishedPGID := runtime.state.PGID
+	if publishedPID == 0 {
+		publishedPID = pgid
+	}
+	if publishedPGID == 0 {
+		publishedPGID = pgid
+	}
+	runtime.state.Running = false
+	runtime.state.HeartbeatFresh = false
+	runtime.state.PID = publishedPID
+	runtime.state.PGID = publishedPGID
+	runtime.state.CircuitOpen = true
+	runtime.state.LastFailureKind = cleanupFailureKind
+	runtime.state.LastFailureUTC = now.UTC().Format(time.RFC3339Nano)
+	runtime.readySince = time.Time{}
+	if cleanup.leaderReaped {
+		code := exitCode(cleanup.waitErr)
+		runtime.state.PID = 0
+		runtime.state.LastExitCode = &code
+	}
+	// Keep the captured PGID on every incomplete cleanup as durable diagnostic
+	// identity. PID is cleared only when the leader's wait status was collected.
+	cause := cleanup.err
+	if cause == nil {
+		cause = errors.New("process group cleanup did not reach a complete state")
+	}
+	manager.terminalErr = errors.Join(
+		manager.terminalErr,
+		fmt.Errorf("%w for child %q: %v", errProcessGroupCleanupIncomplete, runtime.spec.Name, cause),
+	)
+	manager.mu.Unlock()
+
+	manager.record(Event{
+		Kind:        "child_group_cleanup_incomplete",
+		Child:       runtime.spec.Name,
+		PID:         publishedPID,
+		PGID:        publishedPGID,
+		FailureKind: cleanupFailureKind,
+		Details: map[string]any{
+			"error":         cause.Error(),
+			"leader_reaped": cleanup.leaderReaped,
+			"group_empty":   cleanup.groupEmpty,
+			"captured_pgid": pgid,
+		},
+	})
+	manager.refreshReadiness()
+}
+
+func (manager *Manager) terminalError() error {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	return manager.terminalErr
 }
 
 func (manager *Manager) markStopped(runtime *childRuntime, code int) {
@@ -571,18 +963,17 @@ func (manager *Manager) refreshReadiness() {
 }
 
 func (manager *Manager) isReady() bool {
-	_, dropped := manager.store.counts()
 	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	if manager.shuttingDown || !manager.persistenceHealthy || dropped != 0 {
-		return false
-	}
+	ready := !manager.shuttingDown && manager.persistenceHealthy
 	for _, runtime := range manager.children {
 		if runtime.spec.Required && (!runtime.state.Running || !runtime.state.HeartbeatFresh || runtime.state.CircuitOpen) {
-			return false
+			ready = false
+			break
 		}
 	}
-	return true
+	manager.mu.RUnlock()
+	_, dropped := manager.store.counts()
+	return ready && dropped == 0
 }
 
 // Snapshot returns a deterministic deep value for HTTP and persistence.

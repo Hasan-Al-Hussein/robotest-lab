@@ -5,21 +5,108 @@
 set -Eeuo pipefail
 
 readonly overlay_setup=/opt/robotest-lab/install/setup.bash
-readonly heartbeat=/var/lib/robotest-supervisor/robotest-stack.heartbeat
-readonly startup_result=/var/lib/robotest-supervisor/lifecycle-startup-result.json
+readonly runtime_state_base=/var/lib/robotest-supervisor
+readonly heartbeat_name=robotest-stack.heartbeat
+readonly startup_result_name=lifecycle-startup-result.json
+readonly startup_timeout_seconds=110
+readonly cleanup_grace_seconds=5
 
-if [[ ! -r "${overlay_setup}" ]]; then
+if [[ ${ROBOTEST_RUNTIME_STATE_DIRECTORY+x} == x ]]; then
+  runtime_state_directory=${ROBOTEST_RUNTIME_STATE_DIRECTORY}
+else
+  runtime_state_directory=${runtime_state_base}
+fi
+readonly runtime_state_directory
+
+if [[ -z ${runtime_state_directory} ]]; then
+  printf 'ROBOTEST_RUNTIME_STATE_DIRECTORY must not be empty\n' >&2
+  exit 64
+fi
+
+if ! /usr/bin/python3 - \
+  "${runtime_state_directory}" \
+  "${runtime_state_base}" \
+  "${heartbeat_name}" \
+  "${startup_result_name}" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+
+def reject(message: str) -> None:
+    raise ValueError(message)
+
+
+raw_path, raw_base, *derived_names = sys.argv[1:]
+try:
+    if len(os.fsencode(raw_path)) > 4096:
+        reject('path exceeds 4096 bytes')
+    if any(ord(character) < 32 or ord(character) == 127 for character in raw_path):
+        reject('path contains a control character')
+    if not os.path.isabs(raw_path):
+        reject('path must be absolute')
+    if raw_path.startswith('//') or os.path.normpath(raw_path) != raw_path:
+        reject('path must be canonical')
+
+    path = pathlib.Path(raw_path)
+    base = pathlib.Path(raw_base)
+    if path != base and base not in path.parents:
+        reject(f'path must be {base} or one of its descendants')
+
+    current = pathlib.Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        metadata = os.lstat(current)
+        if stat.S_ISLNK(metadata.st_mode):
+            reject(f'path component is a symbolic link: {current}')
+        if not stat.S_ISDIR(metadata.st_mode):
+            reject(f'path component is not a directory: {current}')
+    if pathlib.Path(os.path.realpath(path, strict=True)) != path:
+        reject('path does not resolve to itself')
+    if not os.access(path, os.W_OK | os.X_OK):
+        reject('directory is not writable and searchable')
+
+    effective_uid = os.geteuid()
+    for name in derived_names:
+        leaf = path / name
+        try:
+            metadata = os.lstat(leaf)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            reject(f'pre-existing derived path must be a regular non-symlink file: {leaf}')
+        if metadata.st_nlink != 1:
+            reject(f'pre-existing derived file must have exactly one link: {leaf}')
+        if metadata.st_uid != effective_uid:
+            reject(f'pre-existing derived file is not owned by the service user: {leaf}')
+        if stat.S_IMODE(metadata.st_mode) & 0o022:
+            reject(f'pre-existing derived file is group- or other-writable: {leaf}')
+        if not os.access(leaf, os.W_OK):
+            reject(f'pre-existing derived file is not writable: {leaf}')
+except (OSError, ValueError) as error:
+    print(f'invalid ROBOTEST_RUNTIME_STATE_DIRECTORY: {error}', file=sys.stderr)
+    raise SystemExit(1)
+PY
+then
+  exit 64
+fi
+
+readonly heartbeat=${runtime_state_directory}/${heartbeat_name}
+readonly startup_result=${runtime_state_directory}/${startup_result_name}
+
+if [[ ! -r ${overlay_setup} ]]; then
   printf 'missing runtime overlay: %s\n' "${overlay_setup}" >&2
   exit 66
 fi
 
 cpuset=${ROBOTEST_CPUSET:-0-5}
 namespace=${ROBOTEST_NAMESPACE:-robotest}
-if [[ ! "${cpuset}" =~ ^[0-9]+([,-][0-9]+)*$ ]]; then
+if [[ ! ${cpuset} =~ ^[0-9]+([,-][0-9]+)*$ ]]; then
   printf 'invalid ROBOTEST_CPUSET: %s\n' "${cpuset}" >&2
   exit 64
 fi
-if [[ ! "${namespace}" =~ ^[a-z][a-z0-9_]{0,63}$ ]]; then
+if [[ ! ${namespace} =~ ^[a-z][a-z0-9_]{0,63}$ ]]; then
   printf 'invalid ROBOTEST_NAMESPACE: %s\n' "${namespace}" >&2
   exit 64
 fi
@@ -34,6 +121,315 @@ source /opt/ros/jazzy/setup.bash
 source "${overlay_setup}"
 set -u
 
+readonly wrapper_pid=${BASHPID}
+launch_pid=
+heartbeat_worker_pid=
+cleanup_timer_pid=
+shutdown_status=0
+wait_interrupted=0
+reaped_status=0
+force_worker_cleanup=0
+worker_cleanup_forced=0
+
+job_is_owned() {
+  local target_pid=$1
+  local running_pid
+  while IFS= read -r running_pid; do
+    if [[ ${running_pid} == "${target_pid}" ]]; then
+      return 0
+    fi
+  done < <(jobs -p)
+  return 1
+}
+
+# Invoked only through the signal handlers below.
+# shellcheck disable=SC2317
+arm_force_kill_timer() {
+  if [[ -n ${cleanup_timer_pid} ]]; then
+    return
+  fi
+  (
+    trap '' INT TERM
+    sleep "${cleanup_grace_seconds}"
+    kill -USR1 "${wrapper_pid}" 2>/dev/null || true
+  ) &
+  cleanup_timer_pid=$!
+}
+
+# Invoked by the signal handlers and the post-launch race closure below.
+request_shutdown() {
+  local requested_status=$1
+  wait_interrupted=1
+  if ((shutdown_status == 0)); then
+    shutdown_status=${requested_status}
+  fi
+  if [[ -n ${heartbeat_worker_pid} ]] && job_is_owned "${heartbeat_worker_pid}"; then
+    kill -TERM "${heartbeat_worker_pid}" 2>/dev/null || true
+  fi
+  if [[ -n ${launch_pid} ]] && job_is_owned "${launch_pid}"; then
+    kill -TERM "${launch_pid}" 2>/dev/null || true
+    arm_force_kill_timer
+  fi
+}
+
+# Invoked only through the USR1 signal handler below.
+# shellcheck disable=SC2317
+force_owned_exit() {
+  wait_interrupted=1
+  if ((shutdown_status != 0)) && [[ -n ${launch_pid} ]] && job_is_owned "${launch_pid}"; then
+    kill -KILL "${launch_pid}" 2>/dev/null || true
+  fi
+  if ((shutdown_status != 0 || force_worker_cleanup != 0)) && \
+    [[ -n ${heartbeat_worker_pid} ]] && job_is_owned "${heartbeat_worker_pid}"; then
+    if kill -KILL "${heartbeat_worker_pid}" 2>/dev/null; then
+      worker_cleanup_forced=1
+    fi
+  fi
+}
+
+reap_owned_job() {
+  local owned_pid=$1
+  local candidate_status
+  while :; do
+    wait_interrupted=0
+    set +e
+    wait "${owned_pid}"
+    candidate_status=$?
+    set -e
+    if ((wait_interrupted != 0)); then
+      continue
+    fi
+    reaped_status=${candidate_status}
+    return
+  done
+}
+
+cancel_cleanup_timer() {
+  if [[ -z ${cleanup_timer_pid} ]]; then
+    return
+  fi
+  if job_is_owned "${cleanup_timer_pid}"; then
+    kill -KILL "${cleanup_timer_pid}" 2>/dev/null || true
+  fi
+  reap_owned_job "${cleanup_timer_pid}"
+  cleanup_timer_pid=
+}
+
+start_heartbeat_worker() {
+  /usr/bin/python3 - \
+    "${startup_result}" \
+    "${heartbeat}" \
+    "${wrapper_pid}" \
+    "${startup_timeout_seconds}" <<'PY' &
+from datetime import datetime
+import json
+import math
+import os
+import pathlib
+import re
+import signal
+import stat
+import sys
+import time
+
+expected = {
+    'schema_version', 'verdict', 'accepted', 'exit_code', 'service_name',
+    'command', 'elapsed_wall_sec', 'discovery_grace_sec',
+    'service_timeout_sec', 'response_timeout_sec', 'watch_pid',
+    'failure_kind', 'failure_message', 'started_utc', 'completed_utc',
+}
+utc_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$')
+startup_result = pathlib.Path(sys.argv[1])
+heartbeat = pathlib.Path(sys.argv[2])
+wrapper_pid = int(sys.argv[3])
+startup_timeout = float(sys.argv[4])
+
+
+def stop_cleanly(_signum: int, _frame: object) -> None:
+    raise SystemExit(0)
+
+
+def fail(message: str) -> None:
+    print(message, file=sys.stderr)
+    try:
+        os.kill(wrapper_pid, signal.SIGUSR2)
+    except ProcessLookupError:
+        pass
+    raise SystemExit(70)
+
+
+def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f'duplicate JSON key: {key}')
+        result[key] = value
+    return result
+
+
+def reject_constant(value: str) -> None:
+    raise ValueError(f'non-standard JSON numeric constant: {value}')
+
+
+def exact_number(value: object) -> bool:
+    return type(value) in (int, float) and math.isfinite(float(value))
+
+
+def parse_utc(name: str, value: object) -> datetime:
+    if not isinstance(value, str) or utc_pattern.fullmatch(value) is None:
+        raise ValueError(f'{name} must be a canonical UTC timestamp ending in Z')
+    try:
+        return datetime.fromisoformat(value[:-1] + '+00:00')
+    except ValueError as error:
+        raise ValueError(f'{name} is not a valid calendar timestamp') from error
+
+
+def read_startup_result() -> dict[str, object]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open(startup_result, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError('lifecycle result is not a regular non-symlink file')
+        if before.st_nlink != 1 or before.st_uid != os.geteuid():
+            raise ValueError('lifecycle result ownership or link count is invalid')
+        if stat.S_IMODE(before.st_mode) & 0o022:
+            raise ValueError('lifecycle result is group- or other-writable')
+        if before.st_size <= 0 or before.st_size > 65536:
+            raise ValueError('lifecycle result size is outside 1..65536 bytes')
+        payload = os.read(descriptor, 65537)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    path_metadata = os.lstat(startup_result)
+    before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    path_identity = (
+        path_metadata.st_dev,
+        path_metadata.st_ino,
+        path_metadata.st_size,
+        path_metadata.st_mtime_ns,
+    )
+    if before_identity != after_identity or before_identity != path_identity:
+        raise ValueError('lifecycle result changed while being read')
+    if len(payload) != before.st_size:
+        raise ValueError('lifecycle result was not read completely')
+    try:
+        value = json.loads(
+            payload.decode('utf-8'),
+            object_pairs_hook=strict_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(f'lifecycle result is not strict UTF-8 JSON: {error}') from error
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError('lifecycle result has the wrong schema')
+    return value
+
+
+def validate_pass(value: dict[str, object]) -> None:
+    if type(value['schema_version']) is not int or value['schema_version'] != 1:
+        raise ValueError('schema_version must be integer 1')
+    if value['verdict'] != 'PASS' or value['accepted'] is not True:
+        raise ValueError('lifecycle startup was not accepted')
+    if type(value['exit_code']) is not int or value['exit_code'] != 0:
+        raise ValueError('PASS requires integer exit_code 0')
+    if value['service_name'] != '/robotest/lifecycle_manager_navigation/manage_nodes':
+        raise ValueError('lifecycle service_name is not exact')
+    if type(value['command']) is not int or value['command'] != 0:
+        raise ValueError('lifecycle command is not integer STARTUP value 0')
+    elapsed = value['elapsed_wall_sec']
+    if not exact_number(elapsed) or not 0.0 <= float(elapsed) <= startup_timeout:
+        raise ValueError('elapsed_wall_sec must be finite and in [0,110]')
+    for name, expected_value in (
+        ('discovery_grace_sec', 4.0),
+        ('service_timeout_sec', 20.0),
+        ('response_timeout_sec', 60.0),
+    ):
+        observed = value[name]
+        if not exact_number(observed) or float(observed) != expected_value:
+            raise ValueError(f'{name} must equal {expected_value}')
+    if value['watch_pid'] is not None:
+        raise ValueError('PASS requires null watch_pid')
+    if value['failure_kind'] is not None or value['failure_message'] is not None:
+        raise ValueError('PASS requires null failure_kind and failure_message')
+    started = parse_utc('started_utc', value['started_utc'])
+    completed = parse_utc('completed_utc', value['completed_utc'])
+    if completed < started:
+        raise ValueError('completed_utc precedes started_utc')
+
+
+def open_heartbeat() -> int:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open(heartbeat, flags, 0o640)
+    metadata = os.fstat(descriptor)
+    path_metadata = os.lstat(heartbeat)
+    if not stat.S_ISREG(metadata.st_mode):
+        os.close(descriptor)
+        raise ValueError('heartbeat is not a regular non-symlink file')
+    if metadata.st_nlink != 1 or metadata.st_uid != os.geteuid():
+        os.close(descriptor)
+        raise ValueError('heartbeat ownership or link count is invalid')
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        os.close(descriptor)
+        raise ValueError('heartbeat is group- or other-writable')
+    if (metadata.st_dev, metadata.st_ino) != (path_metadata.st_dev, path_metadata.st_ino):
+        os.close(descriptor)
+        raise ValueError('heartbeat was replaced while being opened')
+    return descriptor
+
+
+def publish_heartbeat(descriptor: int) -> None:
+    metadata = os.fstat(descriptor)
+    path_metadata = os.lstat(heartbeat)
+    if (
+        stat.S_ISLNK(path_metadata.st_mode)
+        or not stat.S_ISREG(path_metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or (metadata.st_dev, metadata.st_ino) != (path_metadata.st_dev, path_metadata.st_ino)
+    ):
+        raise ValueError('heartbeat path was replaced or became unsafe')
+    os.utime(descriptor)
+    path_metadata = os.lstat(heartbeat)
+    if (
+        stat.S_ISLNK(path_metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino) != (path_metadata.st_dev, path_metadata.st_ino)
+    ):
+        raise ValueError('heartbeat path was replaced during publication')
+
+
+signal.signal(signal.SIGINT, stop_cleanly)
+signal.signal(signal.SIGTERM, stop_cleanly)
+deadline = time.monotonic() + startup_timeout
+try:
+    while not os.path.lexists(startup_result):
+        if time.monotonic() >= deadline:
+            fail('timed out waiting for the lifecycle startup result')
+        time.sleep(0.2)
+    validate_pass(read_startup_result())
+    heartbeat_descriptor = open_heartbeat()
+    try:
+        while True:
+            publish_heartbeat(heartbeat_descriptor)
+            time.sleep(0.5)
+    finally:
+        os.close(heartbeat_descriptor)
+except Exception as error:
+    fail(f'lifecycle/heartbeat worker failed: {type(error).__name__}: {error}')
+PY
+  heartbeat_worker_pid=$!
+}
+
+trap 'request_shutdown 130' INT
+trap 'request_shutdown 143' TERM
+trap force_owned_exit USR1
+trap 'request_shutdown 70' USR2
+
+if ((shutdown_status != 0)); then
+  exit "${shutdown_status}"
+fi
 taskset -c "${cpuset}" ros2 launch robotest_navigation phase2.launch.py \
   namespace:="${namespace}" \
   seed:=42 \
@@ -45,62 +441,36 @@ taskset -c "${cpuset}" ros2 launch robotest_navigation phase2.launch.py \
   lifecycle_startup_result_path:="${startup_result}" &
 launch_pid=$!
 
-# This function is invoked by the INT/TERM trap below.
-# shellcheck disable=SC2317
-terminate() {
-  trap - INT TERM
-  kill -TERM "${launch_pid}" 2>/dev/null || true
-  wait "${launch_pid}" 2>/dev/null || true
-  exit 143
-}
-trap terminate INT TERM
-
-while [[ ! -f "${startup_result}" ]]; do
-  if ! kill -0 "${launch_pid}" 2>/dev/null; then
-    set +e
-    wait "${launch_pid}"
-    status=$?
-    set -e
-    exit "${status}"
-  fi
-  sleep 0.2
-done
-
-if ! python3 - "${startup_result}" <<'PY'
-import json
-import pathlib
-import sys
-
-expected = {
-    'schema_version', 'verdict', 'accepted', 'exit_code', 'service_name',
-    'command', 'elapsed_wall_sec', 'discovery_grace_sec',
-    'service_timeout_sec', 'response_timeout_sec', 'watch_pid',
-    'failure_kind', 'failure_message', 'started_utc', 'completed_utc',
-}
-path = pathlib.Path(sys.argv[1])
-try:
-    value = json.loads(path.read_text(encoding='utf-8'))
-except (OSError, UnicodeError, json.JSONDecodeError) as error:
-    raise SystemExit(f'invalid lifecycle result: {error}')
-if not isinstance(value, dict) or set(value) != expected:
-    raise SystemExit('lifecycle result has the wrong schema')
-if value['schema_version'] != 1:
-    raise SystemExit('unsupported lifecycle result schema')
-if value['verdict'] != 'PASS' or value['accepted'] is not True or value['exit_code'] != 0:
-    raise SystemExit('lifecycle startup was not accepted')
-PY
-then
-  kill -TERM "${launch_pid}" 2>/dev/null || true
-  exit 70
+if ((shutdown_status != 0)); then
+  request_shutdown "${shutdown_status}"
+fi
+if ((shutdown_status == 0)); then
+  start_heartbeat_worker
 fi
 
-while kill -0 "${launch_pid}" 2>/dev/null; do
-  touch "${heartbeat}"
-  sleep 0.5
-done
+reap_owned_job "${launch_pid}"
+launch_status=${reaped_status}
+launch_pid=
+cancel_cleanup_timer
 
-set +e
-wait "${launch_pid}"
-status=$?
-set -e
-exit "${status}"
+heartbeat_worker_status=0
+if [[ -n ${heartbeat_worker_pid} ]]; then
+  force_worker_cleanup=1
+  if job_is_owned "${heartbeat_worker_pid}"; then
+    kill -TERM "${heartbeat_worker_pid}" 2>/dev/null || true
+    arm_force_kill_timer
+  fi
+  reap_owned_job "${heartbeat_worker_pid}"
+  heartbeat_worker_status=${reaped_status}
+  heartbeat_worker_pid=
+  force_worker_cleanup=0
+  cancel_cleanup_timer
+fi
+
+if ((shutdown_status != 0)); then
+  exit "${shutdown_status}"
+fi
+if ((heartbeat_worker_status != 0 && worker_cleanup_forced == 0)); then
+  exit 70
+fi
+exit "${launch_status}"

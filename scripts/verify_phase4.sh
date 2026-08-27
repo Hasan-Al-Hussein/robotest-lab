@@ -1,6 +1,44 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 # Copyright 2026 Hasan Ahmed
 # SPDX-License-Identifier: Apache-2.0
+
+validate_root_entry_environment() {
+  [[ "${ROBOTEST_PHASE4_VERIFY_ROOT_ENV:-}" == 1 &&
+    "${HOME:-}" == /root &&
+    "${LANG:-}" == C.UTF-8 &&
+    "${LC_ALL:-}" == C.UTF-8 &&
+    "${PATH:-}" == /usr/sbin:/usr/bin:/sbin:/bin &&
+    "${PYTHONDONTWRITEBYTECODE:-}" == 1 &&
+    "${PYTHONNOUSERSITE:-}" == 1 ]] || return 1
+
+  local variable_name
+  while IFS= read -r variable_name; do
+    case "${variable_name}" in
+      HOME | LANG | LC_ALL | PATH | PWD | PYTHONDONTWRITEBYTECODE | \
+        PYTHONNOUSERSITE | ROBOTEST_PHASE4_VERIFY_ROOT_ENV | SHLVL | _) ;;
+      *) return 1 ;;
+    esac
+  done < <(compgen -e)
+}
+
+if ((EUID == 0)); then
+  if [[ "${ROBOTEST_PHASE4_VERIFY_ROOT_ENV:-}" != 1 ]]; then
+    exec /usr/bin/env -i \
+      HOME=/root \
+      LANG=C.UTF-8 \
+      LC_ALL=C.UTF-8 \
+      PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      PYTHONDONTWRITEBYTECODE=1 \
+      PYTHONNOUSERSITE=1 \
+      ROBOTEST_PHASE4_VERIFY_ROOT_ENV=1 \
+      /bin/bash -p -- "$0" "$@"
+  fi
+  validate_root_entry_environment || {
+    /usr/bin/printf '%s\n' \
+      '[verify_phase4] ERROR: privileged entry environment is not canonical.' >&2
+    exit 1
+  }
+fi
 
 set -Eeuo pipefail
 export PYTHONDONTWRITEBYTECODE=1
@@ -13,25 +51,35 @@ readonly HELPER="${PROJECT_ROOT}/tests/phase4_acceptance.py"
 readonly ACTIVE_GOAL_PROBE="${PROJECT_ROOT}/tests/phase4_active_goal_probe.py"
 readonly SERVICE="robotest-supervisor.service"
 readonly BASE_URL="http://127.0.0.1:9080"
-readonly HEARTBEAT="/var/lib/robotest-supervisor/robotest-stack.heartbeat"
-readonly STARTUP_RESULT="/var/lib/robotest-supervisor/lifecycle-startup-result.json"
 readonly DROPIN_DIRECTORY="/run/systemd/system/${SERVICE}.d"
 readonly DROPIN_FILE="${DROPIN_DIRECTORY}/90-robotest-phase4-verifier.conf"
 readonly LOCK_FILE="/run/lock/robotest-phase4-verifier.lock"
+readonly LIVE_RUN_ROOT="/run/robotest-phase4-verifier"
 
 APPLY=0
 PACKAGE_DIRECTORY=""
-STATIC_TEMP=""
+STATIC_TEMP="${ROBOTEST_PHASE4_STATIC_TEMP:-}"
+STATIC_WORKER_MODE="${ROBOTEST_PHASE4_STATIC_WORKER:-0}"
+STATIC_WORKER_SCRATCH=""
+APPLY_SOURCE_HEAD=""
 RUN_ID=""
 RUN_DIRECTORY=""
+PUBLIC_RUN_DIRECTORY=""
+OVERLAY_STAGE_SCRATCH=""
+OVERLAY_STAGE_SCRIPT=""
+OVERLAY_STAGE_EVIDENCE=""
 STATE_RUN_DIRECTORY=""
 STATE_STAGING_DIRECTORY=""
+HEARTBEAT=""
+STARTUP_RESULT=""
 TIMELINE=""
 ROS_DOMAIN_ID=""
 GZ_PARTITION=""
 UPGRADE_DEB=""
 BASELINE_DEB=""
 PACKAGE_MANIFEST=""
+PACKAGE_SOURCE_REBUILD=""
+PACKAGE_REBUILD_SCRATCH=""
 LIFECYCLE_EVIDENCE=""
 PROJECT_USER=""
 PROJECT_GROUP=""
@@ -52,13 +100,17 @@ ORIGINAL_PGID=""
 RESTORED_PGID=""
 EVENT_SEQUENCE_BEFORE_STOP=0
 PENDING_PUBLICATION_SIGNAL=0
+PUBLICATION_SIGNAL_TRAPS_CLEARED=0
 FINALIZED=0
 FINALIZATION_STATE=0
 FINALIZATION_STATUS=0
 CLEANUP_STATUS=0
 COMPOSE_STATUS=0
 CHECKSUM_STATUS=0
-CHOWN_STATUS=0
+FREEZE_STATUS=0
+PUBLICATION_STATUS=0
+LIVE_REMOVAL_STATUS=0
+LIVE_RUN_OWNED=0
 SERVICE_INACTIVITY_PROVEN=0
 EXIT_HANDLER_ACTIVE=0
 DAEMON_RELOADED=0
@@ -99,6 +151,130 @@ validated_remove_static_temp() {
     *) die "Refusing unsafe static temporary cleanup: ${STATIC_TEMP}" ;;
   esac
   STATIC_TEMP=""
+}
+
+validated_remove_static_worker_scratch() {
+  [[ -n "${STATIC_WORKER_SCRATCH}" ]] || return 0
+  case "${STATIC_WORKER_SCRATCH}" in
+    /tmp/robotest-phase4-worker.*) ;;
+    *) die "Refusing unsafe static worker cleanup: ${STATIC_WORKER_SCRATCH}" ;;
+  esac
+  [[ -d "${STATIC_WORKER_SCRATCH}" && ! -L "${STATIC_WORKER_SCRATCH}" ]] ||
+    die "Static worker scratch is missing or linked: ${STATIC_WORKER_SCRATCH}"
+  rm -rf -- "${STATIC_WORKER_SCRATCH}"
+  STATIC_WORKER_SCRATCH=""
+}
+
+sanitized_git() {
+  [[ ! -e "${PROJECT_ROOT}/.git/info/attributes" &&
+    ! -L "${PROJECT_ROOT}/.git/info/attributes" ]] ||
+    die 'Candidate Git info attributes are forbidden.'
+  env -i \
+    PATH=/usr/bin:/bin \
+    LANG=C \
+    HOME=/nonexistent \
+    GIT_ATTR_NOSYSTEM=1 \
+    GIT_OPTIONAL_LOCKS=0 \
+    GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_NO_REPLACE_OBJECTS=1 \
+    git \
+      -C "${PROJECT_ROOT}" \
+      --git-dir="${PROJECT_ROOT}/.git" \
+      --work-tree="${PROJECT_ROOT}" \
+      -c safe.directory="${PROJECT_ROOT}" \
+      -c core.attributesFile=/dev/null \
+      -c core.fileMode=true \
+      -c core.fsmonitor=false \
+      -c core.hooksPath=/dev/null \
+      -c core.bare=false \
+      "$@"
+}
+
+ignored_source_path_is_allowed() {
+  case "$1" in
+    config/release-claims.json) return 0 ;;
+    config/* | scenarios/* | src/*)
+      case "$1" in
+        */.pytest_cache | */.pytest_cache/* | */__pycache__ | */__pycache__/*)
+          return 0
+          ;;
+        *) return 1 ;;
+      esac
+      ;;
+    packaging/debian | packaging/debian/* | supervisor/cmd | supervisor/cmd/* | \
+      supervisor/internal | supervisor/internal/*)
+      return 1
+      ;;
+    docs/results | docs/results/* | */.mypy_cache | */.mypy_cache/* | \
+      */.pytest_cache | */.pytest_cache/* | */__pycache__ | */__pycache__/* | \
+      */artifacts | */artifacts/* | */build | */build/* | \
+      */install | */install/* | */log | */log/*)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+verify_ignored_source_clean() {
+  local ignored_path
+  local -a ignored_paths=()
+  local -a roots=(config docs packaging scenarios scripts src supervisor tests)
+  sanitized_git ls-files --others --ignored --exclude-standard -- "${roots[@]}" \
+    >/dev/null || die 'Cannot inspect ignored candidate source paths.'
+  mapfile -d '' -t ignored_paths < <(
+    sanitized_git ls-files -z --others --ignored --exclude-standard -- "${roots[@]}"
+  )
+  for ignored_path in "${ignored_paths[@]}"; do
+    ignored_source_path_is_allowed "${ignored_path}" ||
+      die "Ignored untracked source input is forbidden: ${ignored_path}"
+  done
+}
+
+verify_apply_source_clean() {
+  local index_flags
+  local observed_head
+  local status_output
+  local submodule_output
+  [[ -d "${PROJECT_ROOT}/.git" && ! -L "${PROJECT_ROOT}/.git" ]] ||
+    die 'Candidate Git directory is missing or linked.'
+  observed_head="$(sanitized_git rev-parse --verify HEAD)" ||
+    die 'Cannot resolve the candidate Git HEAD.'
+  [[ "${observed_head}" =~ ^[0-9a-f]{40}$ ]] ||
+    die 'The candidate Git HEAD is not a canonical object ID.'
+  status_output="$(sanitized_git \
+    status --porcelain=v1 --untracked-files=all --ignore-submodules=none)" ||
+    die 'Cannot inspect candidate Git status.'
+  [[ -z "${status_output}" ]] || die 'Authoritative --apply requires an exactly clean source tree.'
+  verify_ignored_source_clean
+  index_flags="$(sanitized_git ls-files -v)" ||
+    die 'Cannot inspect candidate Git index flags.'
+  if grep -Eq '^[a-zS] ' <<<"${index_flags}"; then
+    die 'Authoritative --apply forbids assume-unchanged and skip-worktree index flags.'
+  fi
+  submodule_output="$(sanitized_git submodule status --recursive)" ||
+    die 'Cannot inspect candidate Git submodules.'
+  if grep -Eq '^[+-U]' <<<"${submodule_output}"; then
+    die 'Authoritative --apply requires initialized, unmodified submodules.'
+  fi
+  if [[ -z "${APPLY_SOURCE_HEAD}" ]]; then
+    APPLY_SOURCE_HEAD="${observed_head}"
+  else
+    [[ "${observed_head}" == "${APPLY_SOURCE_HEAD}" ]] ||
+      die 'Candidate Git HEAD changed during static verification.'
+  fi
+}
+
+validated_remove_package_rebuild_scratch() {
+  [[ -n "${PACKAGE_REBUILD_SCRATCH}" ]] || return 0
+  case "${PACKAGE_REBUILD_SCRATCH}" in
+    /tmp/robotest-phase4-rebuild.*) ;;
+    *) die "Refusing unsafe package rebuild cleanup: ${PACKAGE_REBUILD_SCRATCH}" ;;
+  esac
+  [[ -d "${PACKAGE_REBUILD_SCRATCH}" && ! -L "${PACKAGE_REBUILD_SCRATCH}" ]] ||
+    die "Package rebuild scratch is missing or linked: ${PACKAGE_REBUILD_SCRATCH}"
+  rm -rf -- "${PACKAGE_REBUILD_SCRATCH}"
+  PACKAGE_REBUILD_SCRATCH=""
 }
 
 resolve_package_directory() {
@@ -208,6 +384,7 @@ check_package_candidate() {
     --package-directory "${PACKAGE_DIRECTORY}" \
     --upgrade "${UPGRADE_DEB}" \
     --baseline "${BASELINE_DEB}" \
+    --repository "${PROJECT_ROOT}" \
     --output "${integrity_output}"
   if ! python3 "${HELPER}" package-binding \
     --repository "${PROJECT_ROOT}" \
@@ -218,11 +395,40 @@ check_package_candidate() {
   fi
 }
 
-run_static_checks() {
-  log 'Running bounded static, unit, concurrency, and package-source gates.'
-  STATIC_TEMP="$(mktemp -d /tmp/robotest-phase4-static.XXXXXX)"
+check_extracted_candidate_config() {
+  local extracted_root="${STATIC_TEMP}/candidate-root"
+  local rendered_config="${STATIC_TEMP}/candidate-config.json"
+  local actual_output="${STATIC_TEMP}/candidate-config-check.txt"
+  local binary="${extracted_root}/usr/bin/robotest-supervisor"
+  local template="${extracted_root}/etc/robotest-supervisor/config.json"
+  install -d -m 0755 -- "${extracted_root}"
+  dpkg-deb -x "${UPGRADE_DEB}" "${extracted_root}"
+  [[ -x "${binary}" && -f "${binary}" && ! -L "${binary}" ]] ||
+    die 'Extracted candidate supervisor binary is missing, linked, or not executable.'
+  [[ -f "${template}" && ! -L "${template}" ]] ||
+    die 'Extracted candidate supervisor config is missing or linked.'
+  python3 "${HELPER}" render-config \
+    --template "${template}" \
+    --output "${rendered_config}" \
+    --state-directory '/var/lib/robotest-supervisor/phase4-20000101T000000Z-1' \
+    --ros-domain-id 177 \
+    --gz-partition robotest_phase4_static_config_check
+  "${binary}" --config "${rendered_config}" --check-config >"${actual_output}"
+  printf 'configuration valid\n' | cmp -s - "${actual_output}" ||
+    die 'Extracted candidate did not produce the canonical config-check result.'
+}
 
-  for command_name in bash dpkg dpkg-deb find flock git go gofmt python3 \
+run_static_checks_worker() {
+  local rebuild_directory
+  log 'Running bounded static, unit, concurrency, and package-source gates.'
+  if [[ -z "${STATIC_TEMP}" ]]; then
+    STATIC_TEMP="$(mktemp -d /tmp/robotest-phase4-static.XXXXXX)"
+  fi
+  [[ -d "${STATIC_TEMP}" && ! -L "${STATIC_TEMP}" &&
+    "$(stat -c '%U:%a' -- "${STATIC_TEMP}")" == "$(id -un):700" ]] ||
+    die "Static worker scratch ownership or mode is unsafe: ${STATIC_TEMP}"
+
+  for command_name in bash cmp dpkg dpkg-deb env find flock git go gofmt python3 \
     realpath sha256sum shellcheck systemd-analyze; do
     require_command "${command_name}"
   done
@@ -233,14 +439,18 @@ run_static_checks() {
     "${SCRIPT_DIR}/stage_runtime_overlay.sh" \
     "${SCRIPT_DIR}/test_debian_package_lifecycle.sh" \
     "${SCRIPT_DIR}/verify_debian_reproducibility.sh" \
-    "${SCRIPT_DIR}/verify_phase4.sh"
+    "${SCRIPT_DIR}/verify_phase4.sh" \
+    "${PROJECT_ROOT}/packaging/debian/start-robotest-stack" \
+    "${PROJECT_ROOT}/packaging/debian/tests/installed"
   shellcheck \
     "${SCRIPT_DIR}/build_debian_package.sh" \
     "${SCRIPT_DIR}/create_debian_upgrade_fixture.sh" \
     "${SCRIPT_DIR}/stage_runtime_overlay.sh" \
     "${SCRIPT_DIR}/test_debian_package_lifecycle.sh" \
     "${SCRIPT_DIR}/verify_debian_reproducibility.sh" \
-    "${SCRIPT_DIR}/verify_phase4.sh"
+    "${SCRIPT_DIR}/verify_phase4.sh" \
+    "${PROJECT_ROOT}/packaging/debian/start-robotest-stack" \
+    "${PROJECT_ROOT}/packaging/debian/tests/installed"
   PYTHONPYCACHEPREFIX="${STATIC_TEMP}/pycache" \
     python3 -m py_compile "${HELPER}" "${ACTIVE_GOAL_PROBE}"
   PYTHONPATH="${PROJECT_ROOT}/src/robotest_missions:${PROJECT_ROOT}/tests" \
@@ -265,12 +475,221 @@ run_static_checks() {
   check_package_candidate \
     "${STATIC_TEMP}/package-binding.json" \
     "${STATIC_TEMP}/package-integrity.json"
+  rebuild_directory="${STATIC_TEMP}/source-rebuild"
+  ((EUID != 0)) || die 'Static worker must not execute as root.'
+  "${SCRIPT_DIR}/build_debian_package.sh" "${rebuild_directory}"
+  PACKAGE_SOURCE_REBUILD="${STATIC_TEMP}/package-source-rebuild.json"
+  python3 "${HELPER}" package-source-rebuild \
+    --repository "${PROJECT_ROOT}" \
+    --package-directory "${PACKAGE_DIRECTORY}" \
+    --upgrade "${UPGRADE_DEB}" \
+    --rebuilt-directory "${rebuild_directory}" \
+    --output "${PACKAGE_SOURCE_REBUILD}"
+  check_extracted_candidate_config
   check_lifecycle_evidence
   python3 "${HELPER}" source-snapshot \
     --repository "${PROJECT_ROOT}" \
     --output "${STATIC_TEMP}/source-snapshot.json"
   log "Static gates PASS; package candidate: ${PACKAGE_DIRECTORY}"
-  validated_remove_static_temp
+}
+
+run_static_checks_as_project_user() {
+  local worker_output
+  local worker_attestation
+  local worker_rebuild
+  local worker_file_count
+  local worker_total_bytes
+  STATIC_TEMP="$(mktemp -d /tmp/robotest-phase4-static.XXXXXX)"
+  chmod 0700 -- "${STATIC_TEMP}"
+  STATIC_WORKER_SCRATCH="$(mktemp -d /tmp/robotest-phase4-worker.XXXXXX)"
+  worker_output="${STATIC_WORKER_SCRATCH}/output"
+  for directory in home tmp cache go-cache go-tmp pycache output; do
+    mkdir -m 0700 -- "${STATIC_WORKER_SCRATCH}/${directory}"
+  done
+  chown "${PROJECT_USER}:${PROJECT_GROUP}" -- \
+    "${STATIC_WORKER_SCRATCH}" \
+    "${STATIC_WORKER_SCRATCH}/home" \
+    "${STATIC_WORKER_SCRATCH}/tmp" \
+    "${STATIC_WORKER_SCRATCH}/cache" \
+    "${STATIC_WORKER_SCRATCH}/go-cache" \
+    "${STATIC_WORKER_SCRATCH}/go-tmp" \
+    "${STATIC_WORKER_SCRATCH}/pycache" \
+    "${worker_output}"
+  runuser -u "${PROJECT_USER}" -- env -i \
+    HOME="${STATIC_WORKER_SCRATCH}/home" \
+    TMPDIR="${STATIC_WORKER_SCRATCH}/tmp" \
+    XDG_CACHE_HOME="${STATIC_WORKER_SCRATCH}/cache" \
+    GOCACHE="${STATIC_WORKER_SCRATCH}/go-cache" \
+    GOTMPDIR="${STATIC_WORKER_SCRATCH}/go-tmp" \
+    PYTHONPYCACHEPREFIX="${STATIC_WORKER_SCRATCH}/pycache" \
+    LANG=C.UTF-8 \
+    PATH=/usr/local/go/bin:/usr/bin:/bin \
+    USER="${PROJECT_USER}" \
+    LOGNAME="${PROJECT_USER}" \
+    ROBOTEST_PHASE4_STATIC_WORKER=1 \
+    ROBOTEST_PHASE4_STATIC_TEMP="${worker_output}" \
+    bash "${SCRIPT_DIR}/verify_phase4.sh" \
+      --package-dir "${PACKAGE_DIRECTORY}" \
+      --lifecycle-evidence "${LIFECYCLE_EVIDENCE}"
+  [[ -d "${STATIC_WORKER_SCRATCH}" && ! -L "${STATIC_WORKER_SCRATCH}" &&
+    "$(stat -c '%U:%G:%a' -- "${STATIC_WORKER_SCRATCH}")" == "${PROJECT_USER}:${PROJECT_GROUP}:700" ]] ||
+    die 'Static worker scratch ownership or mode changed.'
+  if find "${STATIC_WORKER_SCRATCH}" -xdev -type l -print -quit | grep -q .; then
+    die 'Static worker output contains a symbolic link.'
+  fi
+  if find "${STATIC_WORKER_SCRATCH}" -xdev \! -type d \! -type f -print -quit |
+    grep -q .; then
+    die 'Static worker output contains a special file.'
+  fi
+  if find "${STATIC_WORKER_SCRATCH}" -xdev -type f -links +1 -print -quit |
+    grep -q .; then
+    die 'Static worker output contains a multiply linked file.'
+  fi
+  if find "${STATIC_WORKER_SCRATCH}" -xdev \! -user "${PROJECT_USER}" -print -quit |
+    grep -q .; then
+    die 'Static worker output ownership changed.'
+  fi
+  if find "${STATIC_WORKER_SCRATCH}" -xdev -perm /022 -print -quit | grep -q .; then
+    die 'Static worker output is group- or world-writable.'
+  fi
+  read -r worker_file_count worker_total_bytes < <(
+    find "${STATIC_WORKER_SCRATCH}" -xdev -type f -printf '%s\n' |
+      awk '{count += 1; bytes += $1} END {print count + 0, bytes + 0}'
+  )
+  ((worker_file_count <= 20000 && worker_total_bytes <= 1073741824)) ||
+    die 'Static worker output exceeds its file-count or byte cap.'
+  worker_attestation="${worker_output}/package-source-rebuild.json"
+  worker_rebuild="${worker_output}/source-rebuild"
+  [[ -f "${worker_attestation}" && ! -L "${worker_attestation}" &&
+    "$(stat -c '%h:%s' -- "${worker_attestation}")" =~ ^1:[1-9][0-9]{0,6}$ ]] ||
+    die 'Static worker rebuild attestation is unsafe or oversized.'
+  [[ -d "${worker_rebuild}" && ! -L "${worker_rebuild}" ]] ||
+    die 'Static worker rebuild output is missing or linked.'
+  PACKAGE_SOURCE_REBUILD="${STATIC_TEMP}/package-source-rebuild.json"
+  python3 "${HELPER}" import-package-source-rebuild \
+    --repository "${PROJECT_ROOT}" \
+    --package-directory "${PACKAGE_DIRECTORY}" \
+    --upgrade "${UPGRADE_DEB}" \
+    --rebuilt-directory "${worker_rebuild}" \
+    --attestation "${worker_attestation}" \
+    --output "${PACKAGE_SOURCE_REBUILD}"
+  [[ -f "${PACKAGE_SOURCE_REBUILD}" && ! -L "${PACKAGE_SOURCE_REBUILD}" &&
+    "$(stat -c '%U:%G:%a:%h' -- "${PACKAGE_SOURCE_REBUILD}")" == 'root:root:644:1' ]] ||
+    die 'Imported rebuild attestation ownership or mode is unsafe.'
+  validated_remove_static_worker_scratch
+}
+
+remove_overlay_stage_scratch() {
+  [[ -n "${OVERLAY_STAGE_SCRATCH}" ]] || return 0
+  [[ "${OVERLAY_STAGE_SCRATCH}" == "${RUN_DIRECTORY}/overlay-stage-scratch" ]] || return 1
+  [[ ! -e "${OVERLAY_STAGE_SCRATCH}" ]] && return 0
+  [[ -d "${OVERLAY_STAGE_SCRATCH}" && ! -L "${OVERLAY_STAGE_SCRATCH}" &&
+    "$(stat -c '%U:%G:%a' -- "${OVERLAY_STAGE_SCRATCH}")" == 'root:root:700' ]] ||
+    return 1
+  if find "${OVERLAY_STAGE_SCRATCH}" -xdev -type l -print -quit | grep -q .; then
+    return 1
+  fi
+  if find "${OVERLAY_STAGE_SCRATCH}" -xdev \! -type d \! -type f -print -quit |
+    grep -q .; then
+    return 1
+  fi
+  if find "${OVERLAY_STAGE_SCRATCH}" -xdev -type f -links +1 -print -quit |
+    grep -q .; then
+    return 1
+  fi
+  rm -rf -- "${OVERLAY_STAGE_SCRATCH}"
+}
+
+stage_runtime_overlay_safely() {
+  local result
+  OVERLAY_STAGE_SCRATCH="${RUN_DIRECTORY}/overlay-stage-scratch"
+  OVERLAY_STAGE_SCRIPT="${OVERLAY_STAGE_SCRATCH}/stage_runtime_overlay.sh"
+  OVERLAY_STAGE_EVIDENCE="${OVERLAY_STAGE_SCRATCH}/evidence"
+  [[ ! -e "${OVERLAY_STAGE_SCRATCH}" && ! -L "${OVERLAY_STAGE_SCRATCH}" ]] || return 1
+  mkdir -m 0700 -- "${OVERLAY_STAGE_SCRATCH}"
+  [[ "$(stat -c '%U:%G:%a' -- "${OVERLAY_STAGE_SCRATCH}")" == 'root:root:700' ]] ||
+    return 1
+  python3 "${HELPER}" render-overlay-stage-script \
+    --template "${SCRIPT_DIR}/stage_runtime_overlay.sh" \
+    --output "${OVERLAY_STAGE_SCRIPT}" \
+    --project-root "${PROJECT_ROOT}" \
+    --evidence-directory "${OVERLAY_STAGE_EVIDENCE}"
+  [[ -f "${OVERLAY_STAGE_SCRIPT}" && ! -L "${OVERLAY_STAGE_SCRIPT}" &&
+    "$(stat -c '%U:%G:%a:%h' -- "${OVERLAY_STAGE_SCRIPT}")" == 'root:root:700:1' ]] ||
+    return 1
+  "${OVERLAY_STAGE_SCRIPT}" --apply
+  "${OVERLAY_STAGE_SCRIPT}" --check
+  result="${OVERLAY_STAGE_EVIDENCE}/runtime-staging.json"
+  [[ "$(realpath -e -- "${result}")" == "${result}" && -f "${result}" &&
+    ! -L "${result}" && "$(stat -c '%h' -- "${result}")" == 1 ]] || return 1
+  python3 - "${result}" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+payload = path.read_bytes()
+if not payload or len(payload) > 8 * 1024 * 1024 or not payload.endswith(b'\n'):
+    raise SystemExit('runtime staging evidence is empty, oversized, or incomplete')
+value = json.loads(payload)
+if not isinstance(value, dict) or value.get('schema_version') != 1:
+    raise SystemExit('runtime staging evidence is not the expected JSON object')
+PY
+  install -m 0644 -o root -g root -- "${result}" "${RUN_DIRECTORY}/runtime-staging.json"
+  remove_overlay_stage_scratch
+}
+
+capture_stable_runtime_ownership() {
+  local phase="$1"
+  local main_pid="$2"
+  local child_pid="$3"
+  local child_pgid="$4"
+  local owners_output="$5"
+  local affinity_output="$6"
+  local owners_before="${RUN_DIRECTORY}/.${phase}-owners-before.json"
+  local owners_after="${RUN_DIRECTORY}/.${phase}-owners-after.json"
+  local affinity_candidate="${RUN_DIRECTORY}/.${phase}-affinity.json"
+  local _attempt
+  for _attempt in {1..20}; do
+    rm -f -- "${owners_before}" "${owners_after}" "${affinity_candidate}"
+    if python3 "${HELPER}" systemd-owners \
+      --ros-domain-id "${ROS_DOMAIN_ID}" --gz-partition "${GZ_PARTITION}" \
+      --output "${owners_before}" >/dev/null &&
+      python3 "${HELPER}" capture-runtime-affinity \
+        --main-pid "${main_pid}" \
+        --managed-child-pid "${child_pid}" \
+        --managed-child-pgid "${child_pgid}" \
+        --ros-domain-id "${ROS_DOMAIN_ID}" \
+        --gz-partition "${GZ_PARTITION}" \
+        --phase "${phase}" \
+        --expected-cpuset 0-5 \
+        --output "${affinity_candidate}" >/dev/null &&
+      python3 "${HELPER}" systemd-owners \
+        --ros-domain-id "${ROS_DOMAIN_ID}" --gz-partition "${GZ_PARTITION}" \
+        --output "${owners_after}" >/dev/null &&
+      python3 "${HELPER}" validate-runtime-ownership \
+        --before "${owners_before}" \
+        --after "${owners_after}" \
+        --affinity "${affinity_candidate}"; then
+      mv --no-target-directory -- "${owners_after}" "${owners_output}"
+      mv --no-target-directory -- "${affinity_candidate}" "${affinity_output}"
+      rm -f -- "${owners_before}"
+      python3 - "${owners_output}" "${affinity_output}" <<'PY'
+import json
+import pathlib
+import sys
+
+owners = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding='utf-8'))
+affinity = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding='utf-8'))
+print(owners['unit_count'], affinity['process_count'])
+PY
+      return 0
+    fi
+    rm -f -- "${owners_before}" "${owners_after}" "${affinity_candidate}"
+    sleep 0.05
+  done
+  log "Runtime ownership did not stabilize for ${phase}."
+  return 1
 }
 
 record_timeline() {
@@ -324,18 +743,40 @@ captured_pgid() {
   return 1
 }
 
+latch_process_publication_signal() {
+  local status="$1"
+  if ((PENDING_PUBLICATION_SIGNAL == 0)); then
+    PENDING_PUBLICATION_SIGNAL="${status}"
+  fi
+}
+
 begin_process_publication() {
+  local hup_trap int_trap term_trap
+  hup_trap="$(trap -p HUP)"
+  int_trap="$(trap -p INT)"
+  term_trap="$(trap -p TERM)"
+  if [[ -z "${hup_trap}" && -z "${int_trap}" && -z "${term_trap}" ]]; then
+    PUBLICATION_SIGNAL_TRAPS_CLEARED=1
+  else
+    PUBLICATION_SIGNAL_TRAPS_CLEARED=0
+  fi
   PENDING_PUBLICATION_SIGNAL=0
-  trap 'PENDING_PUBLICATION_SIGNAL=129' HUP
-  trap 'PENDING_PUBLICATION_SIGNAL=130' INT
-  trap 'PENDING_PUBLICATION_SIGNAL=143' TERM
+  trap 'latch_process_publication_signal 129' HUP
+  trap 'latch_process_publication_signal 130' INT
+  trap 'latch_process_publication_signal 143' TERM
 }
 
 end_process_publication() {
-  local pending_signal="${PENDING_PUBLICATION_SIGNAL}"
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
+  local pending_signal
+  if ((PUBLICATION_SIGNAL_TRAPS_CLEARED)); then
+    trap - HUP INT TERM
+  else
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+  fi
+  PUBLICATION_SIGNAL_TRAPS_CLEARED=0
+  pending_signal="${PENDING_PUBLICATION_SIGNAL}"
   PENDING_PUBLICATION_SIGNAL=0
   ((pending_signal == 0)) || exit "${pending_signal}"
 }
@@ -379,13 +820,14 @@ copy_supervisor_state() {
   [[ -n "${RUN_DIRECTORY}" && -d "${RUN_DIRECTORY}" ]] || return 0
   [[ -n "${STATE_RUN_DIRECTORY}" && -d "${STATE_RUN_DIRECTORY}" ]] || return 0
   local source destination
-  for source in events.jsonl events.meta.json status.json; do
+  for source in events.jsonl events.meta.json status.json lifecycle-startup-result.json; do
     [[ -f "${STATE_RUN_DIRECTORY}/${source}" &&
       ! -L "${STATE_RUN_DIRECTORY}/${source}" ]] || continue
     case "${source}" in
       events.jsonl) destination=supervisor-events.jsonl ;;
       events.meta.json) destination=supervisor-events.meta.json ;;
       status.json) destination=supervisor-status-final.json ;;
+      lifecycle-startup-result.json) destination=lifecycle-startup-result.json ;;
     esac
     install -m 0644 -- "${STATE_RUN_DIRECTORY}/${source}" \
       "${RUN_DIRECTORY}/${destination}"
@@ -493,6 +935,84 @@ remove_owned_runtime_file() {
   [[ ! -e "${path}" ]] && return 0
   [[ -f "${path}" && ! -L "${path}" ]] || return 1
   rm -f -- "${path}"
+}
+
+freeze_live_evidence() {
+  [[ "${RUN_DIRECTORY}" == "${LIVE_RUN_ROOT}/${RUN_ID}" ]] || {
+    log "Refusing to freeze an unexpected live evidence path: ${RUN_DIRECTORY}"
+    return 1
+  }
+  [[ -d "${LIVE_RUN_ROOT}" && ! -L "${LIVE_RUN_ROOT}" &&
+    "$(stat -c '%U:%G:%a' -- "${LIVE_RUN_ROOT}")" == 'root:root:700' ]] || {
+    log 'Live evidence root is not the exact root:root 0700 directory.'
+    return 1
+  }
+  [[ -d "${RUN_DIRECTORY}" && ! -L "${RUN_DIRECTORY}" &&
+    "$(stat -c '%U:%G:%a' -- "${RUN_DIRECTORY}")" == 'root:root:700' ]] || {
+    log 'Live evidence leaf is not the exact root:root 0700 directory.'
+    return 1
+  }
+  [[ -f "${RUN_DIRECTORY}/.phase4-live-owned" &&
+    ! -L "${RUN_DIRECTORY}/.phase4-live-owned" &&
+    "$(<"${RUN_DIRECTORY}/.phase4-live-owned")" == "${RUN_ID}" ]] || {
+    log 'Live evidence ownership marker is absent or invalid.'
+    return 1
+  }
+  if find "${RUN_DIRECTORY}" -xdev \( -type l -o \! -user root \) -print -quit |
+    grep -q .; then
+    log 'Live evidence contains a symlink or non-root-owned entry.'
+    return 1
+  fi
+  if find "${RUN_DIRECTORY}" -xdev \! -type d \! -type f -print -quit | grep -q .; then
+    log 'Live evidence contains a special filesystem entry.'
+    return 1
+  fi
+  if find "${RUN_DIRECTORY}" -xdev -type f -links +1 -print -quit | grep -q .; then
+    log 'Live evidence contains a hard-linked file.'
+    return 1
+  fi
+  chown -R "root:${PROJECT_GROUP}" -- "${RUN_DIRECTORY}"
+  find "${RUN_DIRECTORY}" -xdev -type d -exec chmod 0550 -- {} +
+  find "${RUN_DIRECTORY}" -xdev -type f -exec chmod 0440 -- {} +
+  chown "root:${PROJECT_GROUP}" -- "${LIVE_RUN_ROOT}"
+  chmod 0710 -- "${LIVE_RUN_ROOT}"
+  [[ "$(stat -c '%U:%G:%a' -- "${LIVE_RUN_ROOT}")" == "root:${PROJECT_GROUP}:710" ]] ||
+    return 1
+  [[ "$(stat -c '%U:%G:%a' -- "${RUN_DIRECTORY}")" == "root:${PROJECT_GROUP}:550" ]] ||
+    return 1
+}
+
+publish_live_evidence() {
+  [[ "${RUN_DIRECTORY}" == "${LIVE_RUN_ROOT}/${RUN_ID}" ]] || return 1
+  [[ "${PUBLIC_RUN_DIRECTORY}" == "${PROJECT_ROOT}/artifacts/evidence/phase4/runs/${RUN_ID}" ]] ||
+    return 1
+  runuser -u "${PROJECT_USER}" -- env -i \
+    HOME="${PROJECT_ROOT}" \
+    LANG=C.UTF-8 \
+    PATH=/usr/bin:/bin \
+    PYTHONDONTWRITEBYTECODE=1 \
+    /usr/bin/python3 "${HELPER}" publish-evidence \
+    --source "${RUN_DIRECTORY}" \
+    --destination "${PUBLIC_RUN_DIRECTORY}" \
+    --repository "${PROJECT_ROOT}"
+}
+
+remove_published_live_evidence() {
+  ((SERVICE_INACTIVITY_PROVEN)) || return 1
+  ((PUBLICATION_STATUS == 0)) || return 1
+  [[ "${RUN_DIRECTORY}" == "${LIVE_RUN_ROOT}/${RUN_ID}" ]] || return 1
+  [[ -d "${RUN_DIRECTORY}" && ! -L "${RUN_DIRECTORY}" ]] || return 1
+  [[ -f "${RUN_DIRECTORY}/.phase4-live-owned" &&
+    ! -L "${RUN_DIRECTORY}/.phase4-live-owned" &&
+    "$(<"${RUN_DIRECTORY}/.phase4-live-owned")" == "${RUN_ID}" ]] || return 1
+  if find "${RUN_DIRECTORY}" -xdev -type l -print -quit | grep -q .; then
+    return 1
+  fi
+  rm -rf -- "${RUN_DIRECTORY}"
+  chown root:root -- "${LIVE_RUN_ROOT}"
+  chmod 0700 -- "${LIVE_RUN_ROOT}"
+  [[ ! -e "${RUN_DIRECTORY}" && ! -L "${RUN_DIRECTORY}" ]] || return 1
+  LIVE_RUN_OWNED=0
 }
 
 write_cleanup_evidence() {
@@ -620,7 +1140,10 @@ prove_service_inactive() {
 
 finalize_live_cleanup() {
   local cleanup_status=0
-  [[ -n "${RUN_DIRECTORY}" && -d "${RUN_DIRECTORY}" ]] || return 0
+  ((LIVE_RUN_OWNED)) || return 1
+  [[ -n "${RUN_DIRECTORY}" && -d "${RUN_DIRECTORY}" ]] || return 1
+
+  remove_overlay_stage_scratch || cleanup_status=1
 
   if [[ -n "${PROBE_PGID}" ]]; then
     stop_owned_group active-goal-probe "${PROBE_PID}" "${PROBE_PGID}" || cleanup_status=1
@@ -702,12 +1225,18 @@ PY
 }
 
 finalize_authoritative_run() {
+  local finalization_status
+  begin_process_publication
   if ((FINALIZATION_STATE == 2)); then
-    return "${FINALIZATION_STATUS}"
+    finalization_status="${FINALIZATION_STATUS}"
+    end_process_publication
+    return "${finalization_status}"
   fi
   if ((FINALIZATION_STATE == 1)); then
     log 'Refusing re-entrant finalization.'
-    return 1
+    finalization_status=1
+    end_process_publication
+    return "${finalization_status}"
   fi
   FINALIZATION_STATE=1
   if finalize_live_cleanup; then CLEANUP_STATUS=0; else CLEANUP_STATUS=$?; fi
@@ -721,18 +1250,40 @@ finalize_authoritative_run() {
   else
     CHECKSUM_STATUS=$?
   fi
-  if chown -R "${PROJECT_USER}:${PROJECT_GROUP}" -- "${RUN_DIRECTORY}"; then
-    CHOWN_STATUS=0
+  if freeze_live_evidence; then
+    FREEZE_STATUS=0
   else
-    CHOWN_STATUS=$?
+    FREEZE_STATUS=$?
+  fi
+  if ((FREEZE_STATUS == 0)) && publish_live_evidence; then
+    PUBLICATION_STATUS=0
+    log "Evidence published atomically: ${PUBLIC_RUN_DIRECTORY}"
+  else
+    PUBLICATION_STATUS=$?
+    ((PUBLICATION_STATUS != 0)) || PUBLICATION_STATUS=1
+  fi
+  LIVE_REMOVAL_STATUS=0
+  if ((CLEANUP_STATUS == 0 && CHECKSUM_STATUS == 0 &&
+    FREEZE_STATUS == 0 && PUBLICATION_STATUS == 0)); then
+    if remove_published_live_evidence; then
+      LIVE_REMOVAL_STATUS=0
+    else
+      LIVE_REMOVAL_STATUS=$?
+      log "Retaining live evidence after removal failure: ${RUN_DIRECTORY}"
+    fi
+  else
+    log "Retaining live evidence after incomplete finalization: ${RUN_DIRECTORY}"
   fi
   FINALIZATION_STATUS=0
-  if ((CLEANUP_STATUS != 0 || COMPOSE_STATUS != 0 || CHECKSUM_STATUS != 0 || CHOWN_STATUS != 0)); then
+  if ((CLEANUP_STATUS != 0 || COMPOSE_STATUS != 0 || CHECKSUM_STATUS != 0 ||
+    FREEZE_STATUS != 0 || PUBLICATION_STATUS != 0 || LIVE_REMOVAL_STATUS != 0)); then
     FINALIZATION_STATUS=1
   fi
   FINALIZATION_STATE=2
   FINALIZED=1
-  return "${FINALIZATION_STATUS}"
+  finalization_status="${FINALIZATION_STATUS}"
+  end_process_publication
+  return "${finalization_status}"
 }
 
 on_exit() {
@@ -741,7 +1292,7 @@ on_exit() {
   ((EXIT_HANDLER_ACTIVE == 0)) || exit "${status}"
   EXIT_HANDLER_ACTIVE=1
   set +e
-  if ((APPLY)) && ((FINALIZED == 0)) && [[ -n "${RUN_DIRECTORY}" ]]; then
+  if ((APPLY)) && ((FINALIZED == 0)) && ((LIVE_RUN_OWNED)); then
     finalize_authoritative_run
     local finalization_status=$?
     if ((status == 0 && finalization_status != 0)); then
@@ -749,6 +1300,8 @@ on_exit() {
     fi
   fi
   validated_remove_static_temp
+  validated_remove_static_worker_scratch
+  validated_remove_package_rebuild_scratch
   exit "${status}"
 }
 
@@ -784,39 +1337,112 @@ while (($#)); do
   esac
 done
 
+PROJECT_USER="$(stat -c '%U' -- "${PROJECT_ROOT}")"
+PROJECT_GROUP="$(stat -c '%G' -- "${PROJECT_ROOT}")"
+[[ "${PROJECT_USER}" != "root" ]] || die 'The source workspace must be non-root owned.'
+[[ "${STATIC_WORKER_MODE}" == 0 || "${STATIC_WORKER_MODE}" == 1 ]] ||
+  die 'Invalid internal static-worker mode.'
+
+if ((STATIC_WORKER_MODE)); then
+  ((APPLY == 0)) || die 'The internal static worker cannot enter apply mode.'
+  ((EUID != 0)) || die 'The internal static worker refuses root execution.'
+  [[ "$(id -un)" == "${PROJECT_USER}" ]] ||
+    die 'The internal static worker is not the workspace owner.'
+  case "${STATIC_TEMP}" in
+    /tmp/robotest-phase4-worker.*/output) ;;
+    *) die "Invalid internal static worker directory: ${STATIC_TEMP}" ;;
+  esac
+  [[ "$(realpath -e -- "${STATIC_TEMP}")" == "${STATIC_TEMP}" &&
+    "$(stat -c '%U:%a' -- "${STATIC_TEMP}")" == "$(id -un):700" ]] ||
+    die 'Internal static worker directory is not canonical and user-owned.'
+  resolve_package_directory
+  resolve_lifecycle_evidence
+  run_static_checks_worker
+  [[ -f "${STATIC_TEMP}/package-source-rebuild.json" &&
+    ! -L "${STATIC_TEMP}/package-source-rebuild.json" ]] ||
+    die 'Internal static worker did not retain its rebuild attestation.'
+  STATIC_TEMP=""
+  exit 0
+fi
+
+[[ -z "${STATIC_TEMP}" ]] || die 'Refusing inherited internal static-worker state.'
+if ((EUID == 0 && APPLY == 0)); then
+  die 'Static-only verification refuses root; rerun without sudo.'
+fi
+
+if ((APPLY)); then
+  ((EUID == 0)) || die '--apply requires root; rerun the exact command with sudo.'
+  require_command git
+  verify_apply_source_clean
+fi
+
 resolve_package_directory
 resolve_lifecycle_evidence
-run_static_checks
+if ((EUID == 0)); then
+  for command_name in awk bash chown cmp env find grep id mkdir mktemp python3 \
+    realpath runuser stat; do
+    require_command "${command_name}"
+  done
+  project_group_id="$(stat -c '%g' -- "${PROJECT_ROOT}")"
+  project_user_group_ids=" $(id -G "${PROJECT_USER}") "
+  [[ "${project_user_group_ids}" == *" ${project_group_id} "* ]] ||
+    die "Workspace owner ${PROJECT_USER} is not a member of ${PROJECT_GROUP}."
+  run_static_checks_as_project_user
+else
+  run_static_checks_worker
+fi
 
 if ((APPLY == 0)); then
+  validated_remove_static_temp
   log 'STATIC PREFLIGHT PASS ONLY; no Phase 4 release verdict was produced.'
   log 'After Phase 3 is STABLE, run the authoritative command with sudo and --apply.'
   exit 0
 fi
 
-((EUID == 0)) || die '--apply requires root; rerun the exact command with sudo.'
-for command_name in curl dpkg-query grep id install journalctl mv ps setsid ss stat \
-  systemctl taskset timeout tr; do
+for command_name in chmod chown curl dpkg-query env grep id install journalctl mkdir mv \
+  ps runuser setsid ss stat systemctl taskset timeout tr; do
   require_command "${command_name}"
 done
 
+verify_apply_source_clean
 exec 9>"${LOCK_FILE}"
 flock --nonblock 9 || die 'Another Phase 4 verifier owns the live-run lock.'
 
-PROJECT_USER="$(stat -c '%U' -- "${PROJECT_ROOT}")"
-PROJECT_GROUP="$(stat -c '%G' -- "${PROJECT_ROOT}")"
-[[ "${PROJECT_USER}" != "root" ]] || die 'The source workspace must be non-root owned.'
+if [[ -e "${LIVE_RUN_ROOT}" || -L "${LIVE_RUN_ROOT}" ]]; then
+  [[ -d "${LIVE_RUN_ROOT}" && ! -L "${LIVE_RUN_ROOT}" &&
+    "$(stat -c '%U:%G:%a' -- "${LIVE_RUN_ROOT}")" == 'root:root:700' ]] ||
+    die "Unsafe live evidence root: ${LIVE_RUN_ROOT}"
+else
+  install -d -m 0700 -o root -g root -- "${LIVE_RUN_ROOT}"
+fi
 
 RUN_ID="phase4-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 [[ "${RUN_ID}" =~ ^phase4-[0-9]{8}T[0-9]{6}Z-[0-9]+$ ]] ||
   die "Generated invalid run ID: ${RUN_ID}"
-RUN_DIRECTORY="${PROJECT_ROOT}/artifacts/evidence/phase4/runs/${RUN_ID}"
+RUN_DIRECTORY="${LIVE_RUN_ROOT}/${RUN_ID}"
+PUBLIC_RUN_DIRECTORY="${PROJECT_ROOT}/artifacts/evidence/phase4/runs/${RUN_ID}"
 STATE_RUN_DIRECTORY="/var/lib/robotest-supervisor/${RUN_ID}"
 STATE_STAGING_DIRECTORY="${STATE_RUN_DIRECTORY}.staging-${RUN_ID}"
+HEARTBEAT="${STATE_RUN_DIRECTORY}/robotest-stack.heartbeat"
+STARTUP_RESULT="${STATE_RUN_DIRECTORY}/lifecycle-startup-result.json"
 TIMELINE="${RUN_DIRECTORY}/timeline.jsonl"
 DROPIN_STAGING_FILE="${DROPIN_DIRECTORY}/.phase4-${RUN_ID}.tmp"
-[[ ! -e "${RUN_DIRECTORY}" ]] || die "Run directory already exists: ${RUN_DIRECTORY}"
-install -d -m 0755 -o "${PROJECT_USER}" -g "${PROJECT_GROUP}" -- "${RUN_DIRECTORY}"
+[[ ! -e "${RUN_DIRECTORY}" && ! -L "${RUN_DIRECTORY}" ]] ||
+  die "Live run directory already exists: ${RUN_DIRECTORY}"
+[[ ! -e "${PUBLIC_RUN_DIRECTORY}" && ! -L "${PUBLIC_RUN_DIRECTORY}" ]] ||
+  die "Public run directory already exists: ${PUBLIC_RUN_DIRECTORY}"
+mkdir -m 0700 -- "${RUN_DIRECTORY}"
+[[ "$(stat -c '%U:%G:%a' -- "${RUN_DIRECTORY}")" == 'root:root:700' ]] ||
+  die 'New live run directory ownership or mode is not exact.'
+printf '%s\n' "${RUN_ID}" >"${RUN_DIRECTORY}/.phase4-live-owned"
+chmod 0600 -- "${RUN_DIRECTORY}/.phase4-live-owned"
+LIVE_RUN_OWNED=1
+
+[[ -f "${PACKAGE_SOURCE_REBUILD}" && ! -L "${PACKAGE_SOURCE_REBUILD}" ]] ||
+  die 'Fresh package source rebuild evidence is missing or linked.'
+install -m 0600 -o root -g root -- \
+  "${PACKAGE_SOURCE_REBUILD}" "${RUN_DIRECTORY}/package-source-rebuild.json"
+validated_remove_static_temp
 
 python3 "${HELPER}" source-snapshot \
   --repository "${PROJECT_ROOT}" \
@@ -846,10 +1472,7 @@ if ss -H -ltn 'sport = :9080' | grep -q .; then
 fi
 
 log 'Applying the immutable runtime overlay (explicit --apply gate).'
-"${SCRIPT_DIR}/stage_runtime_overlay.sh" --apply
-"${SCRIPT_DIR}/stage_runtime_overlay.sh" --check
-install -m 0644 -- "${PROJECT_ROOT}/artifacts/evidence/phase4/runtime-staging.json" \
-  "${RUN_DIRECTORY}/runtime-staging.json"
+stage_runtime_overlay_safely
 active_overlay="$(realpath -e -- /opt/robotest-lab)"
 install -m 0644 -- "${active_overlay}/staging-provenance.json" \
   "${RUN_DIRECTORY}/overlay-provenance.json"
@@ -889,6 +1512,22 @@ python3 "${HELPER}" render-config \
   --state-directory "${STATE_RUN_DIRECTORY}" \
   --ros-domain-id "${ROS_DOMAIN_ID}" \
   --gz-partition "${GZ_PARTITION}"
+config_check_staging="${RUN_DIRECTORY}/.supervisor-config-check.txt"
+[[ -x /usr/bin/robotest-supervisor && -f /usr/bin/robotest-supervisor &&
+  ! -L /usr/bin/robotest-supervisor ]] ||
+  die 'Installed supervisor binary is missing, linked, or not executable.'
+if ! /usr/bin/robotest-supervisor \
+  --config "${RUN_DIRECTORY}/supervisor-config.json" --check-config \
+  >"${config_check_staging}"; then
+  rm -f -- "${config_check_staging}"
+  die 'Installed supervisor rejected the exact run-scoped configuration.'
+fi
+if ! printf 'configuration valid\n' | cmp -s - "${config_check_staging}"; then
+  rm -f -- "${config_check_staging}"
+  die 'Installed supervisor did not produce the canonical config-check result.'
+fi
+mv --no-target-directory -- "${config_check_staging}" \
+  "${RUN_DIRECTORY}/supervisor-config-check.txt"
 install -d -m 0750 -o robotest-supervisor -g robotest-supervisor -- \
   "${STATE_STAGING_DIRECTORY}"
 printf '%s\n' "${RUN_ID}" >"${STATE_STAGING_DIRECTORY}/.phase4-owned"
@@ -901,10 +1540,10 @@ chmod 0644 "${RUN_DIRECTORY}/supervisor-config.json"
 python3 "${HELPER}" render-followup \
   --output "${RUN_DIRECTORY}/followup-mission.json"
 
-git_commit="$(git -c safe.directory="${PROJECT_ROOT}" -C "${PROJECT_ROOT}" rev-parse HEAD)"
+git_commit="$(sanitized_git rev-parse HEAD)"
 git_dirty=false
-[[ -n "$(git -c safe.directory="${PROJECT_ROOT}" -C "${PROJECT_ROOT}" \
-  status --porcelain=v1 --untracked-files=all)" ]] && git_dirty=true
+[[ -n "$(sanitized_git status --porcelain=v1 --untracked-files=all \
+  --ignore-submodules=none)" ]] && git_dirty=true
 python3 - "${RUN_DIRECTORY}/context.json" "${RUN_ID}" \
   "${RUN_DIRECTORY}/isolation.json" "${git_commit}" "${git_dirty}" \
   "${PACKAGE_DIRECTORY}" "${UPGRADE_DEB}" "${BASELINE_DEB}" \
@@ -1017,9 +1656,15 @@ PY
   die 'Initial managed child PID/PGID/restart count is invalid.'
 group_exists "${ORIGINAL_PGID}" || die 'Initial managed process group is absent.'
 initial_nrestarts="$(systemctl show --property=NRestarts --value "${SERVICE}")"
-initial_owner_count="$(python3 "${HELPER}" systemd-owners \
-  --ros-domain-id "${ROS_DOMAIN_ID}" --gz-partition "${GZ_PARTITION}" \
-  --output "${RUN_DIRECTORY}/systemd-owners-initial.json")"
+initial_ownership_counts="$(capture_stable_runtime_ownership \
+  initial "${supervisor_main_pid}" "${original_child_pid}" "${ORIGINAL_PGID}" \
+  "${RUN_DIRECTORY}/systemd-owners-initial.json" \
+  "${RUN_DIRECTORY}/runtime-affinity-initial.json")" ||
+  die 'Initial runtime ownership did not stabilize.'
+read -r initial_owner_count initial_affinity_count <<<"${initial_ownership_counts}"
+[[ "${initial_owner_count}" == 1 && "${initial_affinity_count}" =~ ^[0-9]+$ &&
+  "${initial_affinity_count}" -ge 3 ]] ||
+  die 'Initial unit-cgroup affinity evidence is incomplete.'
 record_timeline initial_ready \
   "main_pid=${supervisor_main_pid}" \
   "child_pid=${original_child_pid}" \
@@ -1143,14 +1788,32 @@ if child.get('running') is not True or child.get('heartbeat_fresh') is not True:
 print(child['pid'], child['pgid'], child['restart_count'])
 PY
       ) || true
-      if [[ "${restored_child_pgid:-}" =~ ^[0-9]+$ &&
+      if [[ "${restored_child_pid:-}" =~ ^[0-9]+$ &&
+        "${restored_child_pgid:-}" =~ ^[0-9]+$ &&
+        "${restored_child_pid}" == "${restored_child_pgid}" &&
         "${restored_child_pgid}" != "${ORIGINAL_PGID}" &&
         "${restored_restart_count:-}" == 1 ]]; then
         restored_main_pid="$(systemctl show --property=MainPID --value "${SERVICE}")"
         restored_nrestarts="$(systemctl show --property=NRestarts --value "${SERVICE}")"
-        restored_owner_count="$(python3 "${HELPER}" systemd-owners \
-          --ros-domain-id "${ROS_DOMAIN_ID}" --gz-partition "${GZ_PARTITION}" \
-          --output "${RUN_DIRECTORY}/systemd-owners-restored.json")"
+        if ! restored_ownership_counts="$(capture_stable_runtime_ownership \
+          restored "${restored_main_pid}" "${restored_child_pid}" \
+          "${restored_child_pgid}" \
+          "${RUN_DIRECTORY}/systemd-owners-restored.json" \
+          "${RUN_DIRECTORY}/runtime-affinity-restored.json")"; then
+          sleep 0.05
+          continue
+        fi
+        read -r restored_owner_count restored_affinity_count \
+          <<<"${restored_ownership_counts}"
+        if [[ "${restored_owner_count}" != 1 ||
+          ! "${restored_affinity_count}" =~ ^[0-9]+$ ||
+          "${restored_affinity_count}" -lt 3 ]]; then
+          rm -f -- \
+            "${RUN_DIRECTORY}/runtime-affinity-restored.json" \
+            "${RUN_DIRECTORY}/systemd-owners-restored.json"
+          sleep 0.05
+          continue
+        fi
         recovery_event_sequence="$(last_supervisor_event_sequence)"
         RESTORED_PGID="${restored_child_pgid}"
         record_timeline ready_restored \
@@ -1274,9 +1937,15 @@ finalize_authoritative_run
 finalization_status=$?
 set -e
 
-((CLEANUP_STATUS == 0)) || die 'Owned cleanup did not complete cleanly.'
-((COMPOSE_STATUS == 0)) || die "Scenario 6 evidence verdict is FAIL: ${RUN_DIRECTORY}"
+((FREEZE_STATUS == 0)) || die "Live evidence freeze failed; retained at ${RUN_DIRECTORY}"
+((PUBLICATION_STATUS == 0)) ||
+  die "Evidence publication failed; live evidence retained at ${RUN_DIRECTORY}"
 ((CHECKSUM_STATUS == 0)) || die 'Evidence checksum generation failed.'
-((CHOWN_STATUS == 0)) || die 'Evidence ownership restoration failed.'
+((CLEANUP_STATUS == 0)) ||
+  die "Owned cleanup failed; evidence published at ${PUBLIC_RUN_DIRECTORY}"
+((COMPOSE_STATUS == 0)) ||
+  die "Scenario 6 evidence verdict is FAIL: ${PUBLIC_RUN_DIRECTORY}"
+((LIVE_REMOVAL_STATUS == 0)) ||
+  die "Published evidence is valid but live staging was retained at ${RUN_DIRECTORY}"
 ((finalization_status == 0)) || die 'Authoritative finalization failed.'
-log "PHASE 4 PASS: ${RUN_DIRECTORY}"
+log "PHASE 4 PASS: ${PUBLIC_RUN_DIRECTORY}"

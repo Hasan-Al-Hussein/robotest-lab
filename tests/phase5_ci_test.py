@@ -3961,6 +3961,18 @@ def _refresh_phase4_result(run_directory: Path) -> None:
     _refresh_phase4_manifest(run_directory)
 
 
+def _refresh_phase4_overlay_manifest_hashes(run_directory: Path) -> None:
+    staging = json.loads((run_directory / 'runtime-staging.json').read_text(encoding='utf-8'))
+    staging['source_manifest_sha256'] = phase5_module.file_sha256(
+        run_directory / 'overlay-source-manifest.json'
+    )
+    staging['install_manifest_sha256'] = phase5_module.file_sha256(
+        run_directory / 'overlay-install-manifest.json'
+    )
+    _canonical_file(run_directory / 'runtime-staging.json', staging)
+    _canonical_file(run_directory / 'overlay-provenance.json', staging)
+
+
 def _refresh_remote_proof(path: Path, document: object) -> None:
     _canonical_file(path, document)
     path.with_suffix('.SHA256SUMS').write_text(
@@ -4960,31 +4972,11 @@ PY
         }
     )
     _canonical_file(context_path, context)
-    for name in ('runtime-staging.json', 'overlay-provenance.json'):
-        path = phase4_run / name
-        document = json.loads(path.read_text(encoding='utf-8'))
-        document['git_commit'] = candidate_sha
-        document['git_dirty'] = False
-        _canonical_file(path, document)
-    phase4_module = release_module._load_repository_module(
+    scenario6_path = _rebind_phase4_evidence(
         repository,
-        'tests/phase4_acceptance.py',
-        'Phase 4 production acceptance module',
+        phase4_run,
+        completed_utc='2026-08-26T00:01:00.000000Z',
     )
-    package_manifest = phase4_run / 'packages/build-a/SOURCE-MANIFEST.json'
-    _canonical_file(
-        phase4_run / 'package-binding.json',
-        phase4_module.package_source_binding(repository, package_manifest),
-    )
-    original_utc_now = phase4_module.utc_now
-    phase4_module.utc_now = lambda: '2026-08-26T00:01:00.000000Z'
-    try:
-        scenario6 = phase4_module.write_result(phase4_run)
-    finally:
-        phase4_module.utc_now = original_utc_now
-    assert scenario6['verdict']['status'] == 'PASS', scenario6['verdict']
-    phase4_module.write_checksums(phase4_run)
-    scenario6_path = phase4_run / 'scenario6-result.json'
 
     remote_root = repository / 'docs/results/phase-5'
     remote_path = remote_root / f'remote-{candidate_sha}.json'
@@ -5525,7 +5517,7 @@ def _relocate_phase4_evidence(
     old_root: str,
 ) -> Path:
     context_path = run_directory / 'context.json'
-    context = _relocate_json(context_path, old_root, str(repository))
+    _relocate_json(context_path, old_root, str(repository))
     followup_path = run_directory / 'followup-result.json'
     followup = _relocate_json(followup_path, old_root, str(repository))
     missions_root = str(repository / 'src/robotest_missions')
@@ -5537,11 +5529,88 @@ def _relocate_phase4_evidence(
         followup_path,
         run_directory / 'followup-result.csv',
     )
+    return _rebind_phase4_evidence(repository, run_directory)
+
+
+def _rebind_phase4_runtime_staging(
+    repository: Path,
+    run_directory: Path,
+    phase4: object,
+    context: dict,
+) -> None:
+    source_snapshot = phase4.source_snapshot(repository)
+    for name in ('source-snapshot-before.json', 'source-snapshot-after.json'):
+        _canonical_file(run_directory / name, source_snapshot)
+
+    source_manifest_path = run_directory / 'overlay-source-manifest.json'
+    install_manifest_path = run_directory / 'overlay-install-manifest.json'
+    _canonical_file(source_manifest_path, phase4.runtime_source_manifest(repository))
+    install_manifest = json.loads(install_manifest_path.read_text(encoding='utf-8'))
+    _canonical_file(install_manifest_path, install_manifest)
+
+    git_commit = context['source_git_commit']
+    git_dirty = context['source_git_dirty']
+    source_manifest_sha = phase5_module.file_sha256(source_manifest_path)
+    install_manifest_sha = phase5_module.file_sha256(install_manifest_path)
+    release_id = f'{git_commit[:12]}-{source_manifest_sha[:16]}-{str(git_dirty).lower()}'
+    release_path = f'/opt/robotest-lab-releases/{release_id}'
+    previous_staging = json.loads(
+        (run_directory / 'runtime-staging.json').read_text(encoding='utf-8')
+    )
+    staging = {
+        'active_path': '/opt/robotest-lab',
+        'build_command': [
+            'colcon',
+            '--log-base',
+            f'{release_path}/.log',
+            'build',
+            '--base-paths',
+            f'{repository}/src',
+            '--build-base',
+            f'{release_path}/.build',
+            '--install-base',
+            f'{release_path}/install',
+            '--executor',
+            'parallel',
+            '--parallel-workers',
+            '4',
+            '--event-handlers',
+            'console_direct+',
+            '--cmake-args',
+            '-DBUILD_TESTING=OFF',
+        ],
+        'created_utc': previous_staging['created_utc'],
+        'git_commit': git_commit,
+        'git_dirty': git_dirty,
+        'install_manifest_sha256': install_manifest_sha,
+        'packages': list(phase4.OVERLAY_PACKAGES),
+        'release_id': release_id,
+        'schema_version': 1,
+        'source_manifest_sha256': source_manifest_sha,
+        'source_workspace': str(repository),
+    }
+    _canonical_file(run_directory / 'runtime-staging.json', staging)
+    _canonical_file(run_directory / 'overlay-provenance.json', staging)
+    context['active_overlay_target'] = release_path
+    _canonical_file(run_directory / 'context.json', context)
+
+
+def _rebind_phase4_evidence(
+    repository: Path,
+    run_directory: Path,
+    *,
+    completed_utc: str | None = None,
+) -> Path:
     phase4 = release_module._load_repository_module(
         repository,
         'tests/phase4_acceptance.py',
         'Phase 4 production acceptance fixture clone',
     )
+    context_path = run_directory / 'context.json'
+    context = json.loads(context_path.read_text(encoding='utf-8'))
+    _canonical_file(run_directory / 'isolation.json', context['isolation'])
+    _rebind_phase4_runtime_staging(repository, run_directory, phase4, context)
+
     package_directory = Path(context['package_directory'])
     upgrade_package = Path(context['upgrade_package']['path'])
     baseline_package = Path(context['baseline_package']['path'])
@@ -5551,6 +5620,7 @@ def _relocate_phase4_evidence(
             package_directory,
             upgrade_package,
             baseline_package,
+            repository,
         ),
     )
     package_manifest = package_directory / 'build-a/SOURCE-MANIFEST.json'
@@ -5558,10 +5628,11 @@ def _relocate_phase4_evidence(
         run_directory / 'package-binding.json',
         phase4.package_source_binding(repository, package_manifest),
     )
-    previous_result = json.loads(
-        (run_directory / 'scenario6-result.json').read_text(encoding='utf-8')
-    )
-    completed_utc = previous_result['identity']['completed_utc']
+    if completed_utc is None:
+        previous_result = json.loads(
+            (run_directory / 'scenario6-result.json').read_text(encoding='utf-8')
+        )
+        completed_utc = previous_result['identity']['completed_utc']
     original_utc_now = phase4.utc_now
     phase4.utc_now = lambda: completed_utc
     try:
@@ -5829,6 +5900,12 @@ def test_release_evidence_mode_passes_only_exact_selected_artifacts(tmp_path: Pa
     assert report['phase3']['smoke_profile_path'] == str(fixture['smoke_profile'])
     assert report['phase3']['smoke_profile_sha256'] == fixture['smoke_profile_sha256']
     assert 'clone-local Phase 3 smoke host profile' in report['verification_scope']
+    phase4_context = json.loads(
+        (Path(fixture['phase4_run']) / 'context.json').read_text(encoding='utf-8')
+    )
+    assert Path(phase4_context['upgrade_package']['path']).name == (
+        'robotest-supervisor_0.1.1_amd64.deb'
+    )
     command = _release_evidence_command(fixture)
     local_paths = [
         Path(fixture['local_aggregate']),
@@ -6508,6 +6585,278 @@ def test_release_evidence_rejects_hidden_index_flags(tmp_path: Path) -> None:
     )
 
     with pytest.raises(EvidenceError, match='release index contains'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_git_ignores_inherited_redirects_path_and_fsmonitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    decoy = tmp_path / 'decoy-repository'
+    decoy.mkdir()
+    (decoy / 'README.md').write_text('decoy repository\n', encoding='utf-8')
+    subprocess.run(['git', 'init', '-q'], cwd=decoy, check=True)
+    _commit_all(decoy, 'decoy')
+
+    marker = tmp_path / 'hostile-git-invoked'
+    fsmonitor_marker = tmp_path / 'hostile-fsmonitor-invoked'
+    hostile_bin = tmp_path / 'hostile-bin'
+    hostile_bin.mkdir()
+    hostile_git = hostile_bin / 'git'
+    hostile_git.write_text(
+        f'#!/bin/sh\nprintf invoked > {shlex.quote(str(marker))}\nexit 97\n',
+        encoding='utf-8',
+    )
+    hostile_git.chmod(0o755)
+    fsmonitor = tmp_path / 'hostile-fsmonitor'
+    fsmonitor.write_text(
+        f'#!/bin/sh\nprintf invoked > {shlex.quote(str(fsmonitor_marker))}\nexit 0\n',
+        encoding='utf-8',
+    )
+    fsmonitor.chmod(0o755)
+    inherited_git = {
+        'GIT_CONFIG_COUNT': '1',
+        'GIT_CONFIG_KEY_0': 'core.fsmonitor',
+        'GIT_CONFIG_VALUE_0': str(fsmonitor),
+        'GIT_DIR': str(decoy / '.git'),
+        'GIT_INDEX_FILE': str(decoy / '.git/index'),
+        'GIT_WORK_TREE': str(decoy),
+        'HOME': str(tmp_path / 'hostile-home'),
+    }
+    candidate_sha = str(fixture['candidate_sha'])
+    expected_readme = subprocess.run(
+        ['git', 'show', f'{candidate_sha}:README.md'],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+    ).stdout
+
+    with monkeypatch.context() as poisoned:
+        for name, value in inherited_git.items():
+            poisoned.setenv(name, value)
+        poisoned.setenv('PATH', str(hostile_bin))
+        top_level = release_module._git(repository, ['rev-parse', '--show-toplevel'])
+        candidate_readme = release_module._git_bytes(
+            repository,
+            ['show', f'{candidate_sha}:README.md'],
+        )
+        assert top_level.returncode == 0
+        assert top_level.stdout.strip() == str(repository)
+        assert candidate_readme.returncode == 0
+        assert candidate_readme.stdout == expected_readme
+        assert not marker.exists()
+        assert not fsmonitor_marker.exists()
+
+    with monkeypatch.context() as poisoned:
+        for name, value in inherited_git.items():
+            poisoned.setenv(name, value)
+        assert _validate_release_fixture(fixture)['status'] == 'PASS'
+        assert not fsmonitor_marker.exists()
+
+
+def test_release_evidence_rejects_git_replace_tree_illusion(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_sha = str(fixture['candidate_sha'])
+    evidence_tree = subprocess.run(
+        ['git', 'rev-parse', 'HEAD^{tree}'],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.strip()
+    replacement_sha = subprocess.run(
+        [
+            'git',
+            '-c',
+            'user.name=Phase5 Test',
+            '-c',
+            'user.email=phase5@example.invalid',
+            'commit-tree',
+            evidence_tree,
+        ],
+        cwd=repository,
+        input='replacement tree\n',
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ['git', 'replace', candidate_sha, replacement_sha],
+        cwd=repository,
+        check=True,
+    )
+
+    replaced_readme = subprocess.run(
+        ['git', 'show', f'{candidate_sha}:README.md'],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+    ).stdout
+    actual_readme = release_module._git_bytes(
+        repository,
+        ['show', f'{candidate_sha}:README.md'],
+    )
+    assert actual_readme.returncode == 0
+    assert replaced_readme != actual_readme.stdout
+    with pytest.raises(EvidenceError, match='repository contains Git replacement refs'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_git_grafted_ancestry(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    evidence_sha = str(fixture['evidence_sha'])
+    before = subprocess.run(
+        ['git', 'rev-list', '--parents', '-n', '1', evidence_sha],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.split()
+    assert len(before) == 2
+    grafts_path = repository / '.git/info/grafts'
+    grafts_path.write_text(f'{evidence_sha}\n', encoding='ascii')
+    grafted = subprocess.run(
+        ['git', 'rev-list', '--parents', '-n', '1', evidence_sha],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.split()
+    assert grafted == [evidence_sha]
+
+    with pytest.raises(EvidenceError, match='repository Git graft metadata is present'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_git_local_clean_filter_illusion(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    attributes_path = repository / '.git/info/attributes'
+    attributes_path.write_text('README.md filter=mask\n', encoding='utf-8')
+    subprocess.run(
+        ['git', 'config', 'filter.mask.clean', "sed '/^evil$/d'"],
+        cwd=repository,
+        check=True,
+    )
+    readme_path = repository / 'README.md'
+    readme_path.write_text(
+        readme_path.read_text(encoding='utf-8') + 'evil\n',
+        encoding='utf-8',
+    )
+    subprocess.run(['git', 'add', '--', 'README.md'], cwd=repository, check=True)
+    staged = subprocess.run(
+        ['git', 'diff', '--cached', '--quiet', '--', 'README.md'],
+        cwd=repository,
+        check=False,
+    )
+    assert staged.returncode == 0
+    raw_status = subprocess.run(
+        ['git', 'status', '--porcelain=v1', '--untracked-files=all'],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    assert raw_status.stdout == ''
+
+    with pytest.raises(EvidenceError, match='repository Git local attributes are present'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_git_local_exclude_illusion(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    forged_path = repository / 'forged-untracked.txt'
+    forged_path.write_text('hidden from release status\n', encoding='utf-8')
+    visible = subprocess.run(
+        ['git', 'status', '--porcelain=v1', '--untracked-files=all'],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    assert visible.stdout == '?? forged-untracked.txt\n'
+    exclude_path = repository / '.git/info/exclude'
+    exclude_path.write_text(
+        exclude_path.read_text(encoding='utf-8') + 'forged-untracked.txt\n',
+        encoding='utf-8',
+    )
+    hidden = subprocess.run(
+        ['git', 'status', '--porcelain=v1', '--untracked-files=all'],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    assert hidden.stdout == ''
+
+    with pytest.raises(EvidenceError, match='Git local excludes contain active rules'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_git_forces_file_mode_tracking(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    readme_path = repository / 'README.md'
+    readme_path.chmod(0o755)
+    subprocess.run(
+        ['git', 'config', 'core.fileMode', 'false'],
+        cwd=repository,
+        check=True,
+    )
+    raw_status = subprocess.run(
+        ['git', 'status', '--porcelain=v1', '--untracked-files=all'],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    assert raw_status.stdout == ''
+    sanitized_status = release_module._git(
+        repository,
+        ['status', '--porcelain=v1', '--untracked-files=all'],
+    )
+    assert sanitized_status.returncode == 0
+    assert sanitized_status.stdout == ' M README.md\n'
+
+    with pytest.raises(EvidenceError, match='release worktree is not clean'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_tracked_ignore_hidden_runtime_source(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    hidden_source = repository / 'src/robotest_missions/robotest_missions/evil.so'
+    hidden_source.write_bytes(b'ignored hostile runtime source\n')
+    ignored = subprocess.run(
+        ['git', 'check-ignore', '-q', '--', str(hidden_source.relative_to(repository))],
+        cwd=repository,
+        check=False,
+    )
+    status = subprocess.run(
+        ['git', 'status', '--porcelain=v1', '--untracked-files=all'],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    assert ignored.returncode == 0
+    assert status.stdout == ''
+    _rebind_phase4_evidence(repository, Path(fixture['phase4_run']))
+
+    with pytest.raises(
+        EvidenceError,
+        match=(
+            'ignored untracked source input is forbidden: '
+            r'src/robotest_missions/robotest_missions/evil\.so'
+        ),
+    ):
         _validate_release_fixture(fixture)
 
 
@@ -9007,7 +9356,7 @@ def test_release_evidence_rejects_rebound_phase4_raw_forgery(tmp_path: Path) -> 
     timeline_path = run_directory / 'timeline.jsonl'
     timeline = [json.loads(line) for line in timeline_path.read_text(encoding='utf-8').splitlines()]
     unavailable = next(item for item in timeline if item['kind'] == 'ready_unavailable')
-    unavailable['monotonic_ns'] += 100_000_000
+    unavailable['details']['http_status'] = 200
     timeline_path.write_text(
         ''.join(
             json.dumps(item, ensure_ascii=False, separators=(',', ':'), sort_keys=True) + '\n'
@@ -9034,11 +9383,322 @@ def test_release_evidence_rejects_boolean_phase4_context_schema(tmp_path: Path) 
         _validate_release_fixture(fixture)
 
 
-def test_release_evidence_rejects_missing_phase4_producer_raw_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    'name',
+    (
+        'lifecycle-startup-result.json',
+        'package-lifecycle.json',
+        'runtime-affinity-initial.json',
+        'runtime-affinity-restored.json',
+        'supervisor-config-check.txt',
+    ),
+)
+def test_release_evidence_rejects_missing_phase4_producer_raw_file(
+    tmp_path: Path,
+    name: str,
+) -> None:
     fixture = _release_fixture(tmp_path)
     run_directory = Path(fixture['phase4_run'])
-    (run_directory / 'package-lifecycle.json').unlink()
+    (run_directory / name).unlink()
     _refresh_phase4_result(run_directory)
 
     with pytest.raises(EvidenceError, match='raw evidence hash coverage is not exact'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase4_out_of_cpuset_process(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    affinity_path = run_directory / 'runtime-affinity-initial.json'
+    affinity = json.loads(affinity_path.read_text(encoding='utf-8'))
+    affinity['processes'][0]['cpus_allowed'] = '0000007f'
+    affinity['processes'][0]['cpus_allowed_list'] = '0-6'
+    _canonical_file(affinity_path, affinity)
+    _refresh_phase4_result(run_directory)
+
+    with pytest.raises(EvidenceError, match='CPU mask is invalid'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ('name', 'field'),
+    (
+        ('runtime-affinity-initial.json', 'main_pid'),
+        ('runtime-affinity-restored.json', 'managed_child_pgid'),
+    ),
+)
+def test_release_evidence_rejects_rebound_phase4_affinity_identity(
+    tmp_path: Path,
+    name: str,
+    field: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    affinity_path = run_directory / name
+    affinity = json.loads(affinity_path.read_text(encoding='utf-8'))
+    affinity[field] += 10_000
+    _canonical_file(affinity_path, affinity)
+    _refresh_phase4_result(run_directory)
+
+    with pytest.raises(EvidenceError, match='identity or unit affinity changed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase4_lifecycle_startup_failure(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    lifecycle_path = run_directory / 'lifecycle-startup-result.json'
+    lifecycle = json.loads(lifecycle_path.read_text(encoding='utf-8'))
+    lifecycle['accepted'] = False
+    _canonical_file(lifecycle_path, lifecycle)
+    _refresh_phase4_result(run_directory)
+
+    with pytest.raises(EvidenceError, match='lifecycle startup result is not canonical PASS'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    'forgery',
+    (
+        'restart_value',
+        'restart_boolean',
+        'timing_value',
+        'timing_boolean',
+        'event_cap_value',
+        'event_cap_boolean',
+        'extra_key',
+        'missing_key',
+        'child_argv',
+        'child_environment_extra',
+        'child_required_integer',
+    ),
+)
+def test_release_evidence_rejects_rebound_phase4_supervisor_config_forgery(
+    tmp_path: Path,
+    forgery: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    config_path = run_directory / 'supervisor-config.json'
+    config_check_path = run_directory / 'supervisor-config-check.txt'
+    config = json.loads(config_path.read_text(encoding='utf-8'))
+    child = config['children'][0]
+    if forgery == 'restart_value':
+        config['restart']['initial_backoff_ms'] = 1001
+    elif forgery == 'restart_boolean':
+        config['restart']['maximum_attempts'] = True
+    elif forgery == 'timing_value':
+        config['heartbeat_startup_timeout_ms'] = 109999
+    elif forgery == 'timing_boolean':
+        config['heartbeat_poll_ms'] = True
+    elif forgery == 'event_cap_value':
+        config['maximum_event_bytes'] = 8388609
+    elif forgery == 'event_cap_boolean':
+        config['maximum_event_entries'] = True
+    elif forgery == 'extra_key':
+        config['forged'] = 'retained-evidence-bypass'
+    elif forgery == 'missing_key':
+        del config['shutdown_timeout_ms']
+    elif forgery == 'child_argv':
+        child['argv'].append('--forged')
+    elif forgery == 'child_environment_extra':
+        child['environment']['FORGED'] = '1'
+    else:
+        assert forgery == 'child_required_integer'
+        child['required'] = 1
+    _canonical_file(config_path, config)
+    _refresh_phase4_result(run_directory)
+
+    assert config_check_path.read_bytes() == b'configuration valid\n'
+    with pytest.raises(EvidenceError, match='run-scoped supervisor config is not exact'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase4_config_check_forgery(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    (run_directory / 'supervisor-config-check.txt').write_text(
+        'configuration forged\n',
+        encoding='utf-8',
+    )
+    _refresh_phase4_result(run_directory)
+
+    with pytest.raises(EvidenceError, match='config check did not pass exactly'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_phase4_upgrade_version_before_replay(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_directory = Path(fixture['phase4_run'])
+    hostile_root = repository / 'artifacts/phase4-hostile-packages'
+    hostile_root.mkdir(parents=True)
+    phase4_fixture = release_module._load_repository_module(
+        repository,
+        'tests/phase4_acceptance_test.py',
+        'Phase 4 hostile package fixture',
+    )
+    downgrade = phase4_fixture._build_test_package(
+        hostile_root,
+        'robotest-supervisor_0.1.0_amd64.deb',
+        '0.1.0',
+        '127.0.0.1:9080',
+    )
+    context_path = run_directory / 'context.json'
+    context = json.loads(context_path.read_text(encoding='utf-8'))
+    context['upgrade_package'] = {
+        'path': str(downgrade),
+        'sha256': phase5_module.file_sha256(downgrade),
+    }
+    _canonical_file(context_path, context)
+    _refresh_phase4_result(run_directory)
+
+    with pytest.raises(
+        EvidenceError,
+        match=(
+            'Phase 4 production replay failed: selected upgrade version does not match '
+            'the repository Debian changelog'
+        ),
+    ):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_phase4_decoy_candidate_manifest(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_directory = Path(fixture['phase4_run'])
+    context = json.loads((run_directory / 'context.json').read_text(encoding='utf-8'))
+    canonical_manifest = Path(context['package_directory']) / 'build-a/SOURCE-MANIFEST.json'
+    decoy_manifest = repository / 'artifacts/phase4-decoy/SOURCE-MANIFEST.json'
+    decoy_manifest.parent.mkdir(parents=True)
+    shutil.copy2(canonical_manifest, decoy_manifest)
+    phase4 = release_module._load_repository_module(
+        repository,
+        'tests/phase4_acceptance.py',
+        'Phase 4 hostile package-binding replay',
+    )
+    forged_binding = phase4.package_source_binding(repository, decoy_manifest)
+    assert forged_binding['verdict'] == 'PASS'
+    _canonical_file(run_directory / 'package-binding.json', forged_binding)
+    _refresh_phase4_result(run_directory)
+
+    with pytest.raises(EvidenceError, match='exact production evaluation replay'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize('forgery', ('stored_field', 'extra_key'))
+def test_release_evidence_rejects_phase4_forged_stored_package_binding(
+    tmp_path: Path,
+    forgery: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    binding_path = run_directory / 'package-binding.json'
+    binding = json.loads(binding_path.read_text(encoding='utf-8'))
+    if forgery == 'stored_field':
+        binding['file_count'] += 1
+    else:
+        assert forgery == 'extra_key'
+        binding['forged'] = 'retained-evidence-bypass'
+    _canonical_file(binding_path, binding)
+    _refresh_phase4_result(run_directory)
+
+    with pytest.raises(EvidenceError, match='exact production evaluation replay'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ('manifest_name', 'forgery'),
+    (
+        ('overlay-source-manifest.json', 'empty'),
+        ('overlay-source-manifest.json', 'noncanonical'),
+        ('overlay-install-manifest.json', 'empty'),
+        ('overlay-install-manifest.json', 'noncanonical'),
+    ),
+)
+def test_release_evidence_rejects_phase4_overlay_manifest_forgery(
+    tmp_path: Path,
+    manifest_name: str,
+    forgery: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    manifest_path = run_directory / manifest_name
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    if forgery == 'empty':
+        manifest['files'] = []
+        _canonical_file(manifest_path, manifest)
+    else:
+        assert forgery == 'noncanonical'
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + '\n',
+            encoding='utf-8',
+        )
+    _refresh_phase4_overlay_manifest_hashes(run_directory)
+    _refresh_phase4_result(run_directory)
+
+    with pytest.raises(EvidenceError, match='exact production evaluation replay'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize('forgery', ('minimal', 'wrong_source_workspace'))
+def test_release_evidence_rejects_phase4_overlay_provenance_forgery(
+    tmp_path: Path,
+    forgery: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    staging_path = run_directory / 'runtime-staging.json'
+    staging = json.loads(staging_path.read_text(encoding='utf-8'))
+    if forgery == 'minimal':
+        staging = {'schema_version': 1}
+    else:
+        assert forgery == 'wrong_source_workspace'
+        staging['source_workspace'] = str(tmp_path / 'decoy-workspace')
+    _canonical_file(staging_path, staging)
+    _canonical_file(run_directory / 'overlay-provenance.json', staging)
+    _refresh_phase4_result(run_directory)
+
+    with pytest.raises(EvidenceError, match='exact production evaluation replay'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize('forgery', ('wrong_parent', 'wrong_release_id'))
+def test_release_evidence_rejects_phase4_active_overlay_identity_forgery(
+    tmp_path: Path,
+    forgery: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_directory = Path(fixture['phase4_run'])
+    context_path = run_directory / 'context.json'
+    context = json.loads(context_path.read_text(encoding='utf-8'))
+    staging_path = run_directory / 'runtime-staging.json'
+    staging = json.loads(staging_path.read_text(encoding='utf-8'))
+    if forgery == 'wrong_parent':
+        context['active_overlay_target'] = f'/opt/robotest-releases/{staging["release_id"]}'
+    else:
+        assert forgery == 'wrong_release_id'
+        old_release_id = staging['release_id']
+        forged_release_id = f'forged-{old_release_id}'
+        staging['release_id'] = forged_release_id
+        staging['build_command'] = [
+            value.replace(old_release_id, forged_release_id) for value in staging['build_command']
+        ]
+        _canonical_file(staging_path, staging)
+        _canonical_file(run_directory / 'overlay-provenance.json', staging)
+        context['active_overlay_target'] = f'/opt/robotest-lab-releases/{forged_release_id}'
+    _canonical_file(context_path, context)
+    _refresh_phase4_result(run_directory)
+
+    with pytest.raises(EvidenceError, match='exact production evaluation replay'):
         _validate_release_fixture(fixture)

@@ -10,8 +10,20 @@ systemd owns and may restart only the Go supervisor. The Go process owns its
 configured ROS child process groups and their bounded restart policy.
 
 The default service uses ROS_DOMAIN_ID 42, GZ_PARTITION
-robotest_supervised, CPUs 0-5, and a headless seeded Phase 2 stack. Change
-these conffile values when they conflict with another local ROS graph.
+robotest_supervised, CPUs 0-5, and a headless seeded Phase 2 stack. The unit
+enforces CPUAffinity=0-5, and the child wrapper retains taskset as a second
+CPU-affinity boundary. Change these conffile values together when they
+conflict with another local ROS graph or CPU allocation.
+
+The packaged child environment sets ROBOTEST_RUNTIME_STATE_DIRECTORY to the
+same value as state_directory. Its heartbeat_file is exactly
+state_directory/robotest-stack.heartbeat, and the wrapper derives
+state_directory/lifecycle-startup-result.json from that same directory. The
+wrapper accepts the base /var/lib/robotest-supervisor directory or an existing
+writable canonical descendant. It rejects path traversal, symbolic-link path
+components, and unsafe pre-existing derived files before reading the ROS
+overlay. Keep all three config values aligned when creating a run-scoped
+configuration.
 
 Administrative commands, after staging and validation, are:
 

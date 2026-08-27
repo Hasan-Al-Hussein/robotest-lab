@@ -32,7 +32,23 @@ go vet ./...
 The versioned, strict JSON configuration rejects duplicate or unknown keys, non-loopback listeners,
 duplicate children or heartbeat files, relative runtime paths, unbounded
 strings and collections, and policy values that differ from the frozen Phase
-4 targets.
+4 targets. A child that invokes the packaged
+`/usr/libexec/robotest-supervisor/start-robotest-stack` wrapper must also set
+`ROBOTEST_RUNTIME_STATE_DIRECTORY` exactly equal to `state_directory` and set
+`heartbeat_file` to `<state_directory>/robotest-stack.heartbeat`.
+
+The package wrapper derives `lifecycle-startup-result.json` from that same
+runtime directory. It accepts only the existing writable, canonical
+`/var/lib/robotest-supervisor` directory or one of its non-symlink
+descendants, and it validates any pre-existing derived files before removing
+them. Heartbeats begin only after the lifecycle startup result is an exact
+accepted PASS. A dedicated heartbeat worker leaves the main wrapper free to
+reap its `taskset`/`ros2 launch` child exactly once, including bounded
+TERM-to-KILL cleanup when a signal interrupts `wait`. The same bounded cleanup
+applies if the heartbeat worker itself is stopped or unresponsive.
+
+The packaged systemd unit sets `CPUAffinity=0-5`. The wrapper still applies
+`taskset -c "$ROBOTEST_CPUSET"` to the ROS launch child as a defense in depth.
 
 Read-only endpoints are:
 
