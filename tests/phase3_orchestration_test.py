@@ -33,6 +33,15 @@ runtime_observer = importlib.util.module_from_spec(OBSERVER_SPEC)
 sys.modules[OBSERVER_SPEC.name] = runtime_observer
 OBSERVER_SPEC.loader.exec_module(runtime_observer)
 
+LIFECYCLE_PROBE_PATH = Path(__file__).with_name('phase2_lifecycle_probe.py')
+LIFECYCLE_PROBE_SPEC = importlib.util.spec_from_file_location(
+    'phase2_lifecycle_probe', LIFECYCLE_PROBE_PATH
+)
+assert LIFECYCLE_PROBE_SPEC is not None and LIFECYCLE_PROBE_SPEC.loader is not None
+lifecycle_probe = importlib.util.module_from_spec(LIFECYCLE_PROBE_SPEC)
+sys.modules[LIFECYCLE_PROBE_SPEC.name] = lifecycle_probe
+LIFECYCLE_PROBE_SPEC.loader.exec_module(lifecycle_probe)
+
 RUNTIME_GATE_PATH = Path(__file__).with_name('phase3_runtime_gate.py')
 RUNTIME_GATE_MODULE = 'phase3_runtime_gate'
 RUNTIME_GATE_SPEC = importlib.util.spec_from_file_location(
@@ -471,6 +480,66 @@ def test_phase3_graph_validator_rejects_noncanonical_json_and_text_tampering(
             mission_client=False,
             expected_watch_pid=101,
         )
+
+
+def test_lifecycle_probe_fails_fast_on_missing_service_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = SimpleNamespace(now=0.0)
+
+    class FakeFuture:
+        def __init__(self, response: object | None) -> None:
+            self.response = response
+
+        def done(self) -> bool:
+            return self.response is not None
+
+        def result(self) -> object:
+            assert self.response is not None
+            return self.response
+
+    class FakeClient:
+        srv_name = '/robotest/amcl/get_state'
+
+        def __init__(self) -> None:
+            self.call_count = 0
+            self.removed_count = 0
+
+        def service_is_ready(self) -> bool:
+            return True
+
+        def call_async(self, _request: object) -> FakeFuture:
+            self.call_count += 1
+            return FakeFuture(None)
+
+        def remove_pending_request(self, future: FakeFuture) -> None:
+            assert future.response is None
+            self.removed_count += 1
+
+    client = FakeClient()
+    probe = SimpleNamespace(
+        _state_clients={'amcl': client},
+        destroy_node=lambda: None,
+    )
+    monkeypatch.setattr(lifecycle_probe, 'LifecycleProbe', lambda _namespace, _names: probe)
+    monkeypatch.setattr(lifecycle_probe, 'STATE_REQUEST_TIMEOUT_S', 0.2)
+    monkeypatch.setattr(lifecycle_probe.time, 'monotonic', lambda: clock.now)
+    monkeypatch.setattr(
+        lifecycle_probe.rclpy,
+        'spin_once',
+        lambda _probe, timeout_sec: setattr(clock, 'now', clock.now + timeout_sec),
+    )
+
+    result = lifecycle_probe.probe_states('/robotest', ['amcl'], 1.0, None)
+
+    assert result['verdict'] == 'FAIL'
+    assert result['failure'] == 'lifecycle state request for amcl exceeded 0.200s'
+    assert result['states']['amcl']['attempts'] == 1
+    assert result['states']['amcl']['state_id'] is None
+    assert result['states']['amcl']['error'] == ('lifecycle state response exceeded 0.200s')
+    assert client.call_count == 1
+    assert client.removed_count == 1
+    assert clock.now < 0.3
 
 
 def test_goal_observer_readiness_requires_endpoint_not_idle_status_message() -> None:

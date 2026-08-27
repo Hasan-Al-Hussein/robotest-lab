@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2026 Hasan Ahmed
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: I001
 
 """Boundedly prove that an exact set of ROS 2 lifecycle nodes is active."""
 
@@ -10,14 +11,17 @@ import argparse
 import json
 import math
 import os
-import time
 from pathlib import Path
+import time
 from typing import Any
 
-import rclpy
 from lifecycle_msgs.msg import State
 from lifecycle_msgs.srv import GetState
+import rclpy
 from rclpy.node import Node
+
+STATE_REQUEST_TIMEOUT_S = 2.0
+STATE_REQUEST_RETRY_S = 0.25
 
 
 class LifecycleProbe(Node):
@@ -49,7 +53,7 @@ def probe_states(
         }
         for name in names
     }
-    pending: dict[str, Any] = {}
+    pending: dict[str, tuple[Any, float]] = {}
     next_request = {name: 0.0 for name in names}
     deadline = time.monotonic() + wall_timeout
     failure = None
@@ -64,7 +68,12 @@ def probe_states(
             rclpy.spin_once(probe, timeout_sec=0.05)
             now = time.monotonic()
             for name, client in probe._state_clients.items():
-                future = pending.get(name)
+                pending_request = pending.get(name)
+                if pending_request is not None:
+                    future, request_deadline = pending_request
+                else:
+                    future = None
+                    request_deadline = 0.0
                 if future is not None and future.done():
                     try:
                         response = future.result()
@@ -74,16 +83,32 @@ def probe_states(
                         statuses[name]['label'] = response.current_state.label
                         statuses[name]['state_id'] = int(response.current_state.id)
                     pending.pop(name, None)
-                    next_request[name] = now + 0.25
+                    next_request[name] = now + STATE_REQUEST_RETRY_S
+                elif future is not None and now >= request_deadline:
+                    client.remove_pending_request(future)
+                    pending.pop(name, None)
+                    statuses[name]['error'] = (
+                        f'lifecycle state response exceeded {STATE_REQUEST_TIMEOUT_S:.3f}s'
+                    )
+                    failure = (
+                        f'lifecycle state request for {name} exceeded '
+                        f'{STATE_REQUEST_TIMEOUT_S:.3f}s'
+                    )
+                    break
                 if statuses[name]['state_id'] == State.PRIMARY_STATE_ACTIVE:
                     continue
                 if name not in pending and now >= next_request[name]:
                     if client.service_is_ready():
                         statuses[name]['service_seen'] = True
                         statuses[name]['attempts'] += 1
-                        pending[name] = client.call_async(GetState.Request())
+                        pending[name] = (
+                            client.call_async(GetState.Request()),
+                            now + STATE_REQUEST_TIMEOUT_S,
+                        )
                     else:
-                        next_request[name] = now + 0.25
+                        next_request[name] = now + STATE_REQUEST_RETRY_S
+            if failure is not None:
+                break
             if all(item['state_id'] == State.PRIMARY_STATE_ACTIVE for item in statuses.values()):
                 break
         active = all(item['state_id'] == State.PRIMARY_STATE_ACTIVE for item in statuses.values())
@@ -99,6 +124,9 @@ def probe_states(
             'watch_pid': watch_pid,
         }
     finally:
+        for name, (future, _) in tuple(pending.items()):
+            probe._state_clients[name].remove_pending_request(future)
+            pending.pop(name, None)
         probe.destroy_node()
 
 
