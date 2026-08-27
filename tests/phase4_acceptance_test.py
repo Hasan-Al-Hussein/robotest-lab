@@ -903,7 +903,7 @@ def _build_reproducible_package_fixture(root: Path) -> tuple[Path, Path, Path]:
         (directory / changes_name).write_text(
             'Format: 1.8\n'
             'Source: robotest-supervisor\n'
-            'Binary: robotest-supervisor robotest-supervisor-dbgsym\n'
+            'Binary: robotest-supervisor\n'
             'Architecture: amd64\n'
             f'Version: {version}\n'
             'Checksums-Sha1:\n'
@@ -3436,6 +3436,141 @@ def test_package_candidate_rejects_version_drift_in_generated_metadata(
         )
         _write_package_sha256sums(build)
     with pytest.raises(EvidenceError, match='wrong Version field'):
+        verify_package_candidate(
+            package_directory,
+            upgrade_package,
+            baseline_package,
+            REPOSITORY,
+        )
+
+
+@pytest.mark.parametrize(
+    ('metadata_name', 'correct_binary', 'wrong_binary'),
+    (
+        pytest.param(
+            'robotest-supervisor_0.1.1_amd64.buildinfo',
+            'robotest-supervisor robotest-supervisor-dbgsym',
+            'robotest-supervisor',
+            id='buildinfo-omits-debug-package',
+        ),
+        pytest.param(
+            'robotest-supervisor_0.1.1_amd64.changes',
+            'robotest-supervisor',
+            'robotest-supervisor robotest-supervisor-dbgsym',
+            id='changes-declares-automatic-debug-package',
+        ),
+        pytest.param(
+            'robotest-supervisor_0.1.1_amd64.buildinfo',
+            'robotest-supervisor robotest-supervisor-dbgsym',
+            'robotest-supervisor,,,robotest-supervisor-dbgsym',
+            id='buildinfo-comma-separated-binaries',
+        ),
+        pytest.param(
+            'robotest-supervisor_0.1.1_amd64.changes',
+            'robotest-supervisor',
+            'robotest-supervisor,,,',
+            id='changes-trailing-binary-delimiters',
+        ),
+        pytest.param(
+            'robotest-supervisor_0.1.1_amd64.buildinfo',
+            'robotest-supervisor robotest-supervisor-dbgsym',
+            'robotest-supervisor\u00a0robotest-supervisor-dbgsym',
+            id='buildinfo-unicode-binary-separator',
+        ),
+    ),
+)
+def test_package_candidate_rejects_metadata_specific_binary_drift(
+    tmp_path: Path,
+    metadata_name: str,
+    correct_binary: str,
+    wrong_binary: str,
+) -> None:
+    package_directory, upgrade_package, baseline_package = _build_reproducible_package_fixture(
+        tmp_path
+    )
+    for build_name in ('build-a', 'build-b'):
+        build = package_directory / build_name
+        metadata = build / metadata_name
+        metadata.write_text(
+            metadata.read_text(encoding='utf-8').replace(
+                f'Binary: {correct_binary}',
+                f'Binary: {wrong_binary}',
+            ),
+            encoding='utf-8',
+        )
+        _write_package_sha256sums(build)
+    with pytest.raises(EvidenceError, match='wrong Binary field'):
+        verify_package_candidate(
+            package_directory,
+            upgrade_package,
+            baseline_package,
+            REPOSITORY,
+        )
+
+
+@pytest.mark.parametrize(
+    ('metadata_name', 'correct_format'),
+    (
+        pytest.param(
+            'robotest-supervisor_0.1.1_amd64.buildinfo',
+            '1.0',
+            id='buildinfo-format',
+        ),
+        pytest.param(
+            'robotest-supervisor_0.1.1_amd64.changes',
+            '1.8',
+            id='changes-format',
+        ),
+    ),
+)
+def test_package_candidate_rejects_generated_metadata_format_drift(
+    tmp_path: Path,
+    metadata_name: str,
+    correct_format: str,
+) -> None:
+    package_directory, upgrade_package, baseline_package = _build_reproducible_package_fixture(
+        tmp_path
+    )
+    for build_name in ('build-a', 'build-b'):
+        build = package_directory / build_name
+        metadata = build / metadata_name
+        metadata.write_text(
+            metadata.read_text(encoding='utf-8').replace(
+                f'Format: {correct_format}',
+                'Format: 9.9',
+            ),
+            encoding='utf-8',
+        )
+        _write_package_sha256sums(build)
+    with pytest.raises(EvidenceError, match='wrong Format field'):
+        verify_package_candidate(
+            package_directory,
+            upgrade_package,
+            baseline_package,
+            REPOSITORY,
+        )
+
+
+def test_package_candidate_rejects_unicode_architecture_separator(tmp_path: Path) -> None:
+    package_directory, upgrade_package, baseline_package = _build_reproducible_package_fixture(
+        tmp_path
+    )
+    for build_name in ('build-a', 'build-b'):
+        build = package_directory / build_name
+        for metadata_name in (
+            'robotest-supervisor_0.1.1_amd64.buildinfo',
+            'robotest-supervisor_0.1.1_amd64.changes',
+        ):
+            metadata = build / metadata_name
+            metadata.write_text(
+                metadata.read_text(encoding='utf-8').replace(
+                    'Architecture: amd64',
+                    'Architecture: \u00a0amd64',
+                ),
+                encoding='utf-8',
+            )
+        _write_package_sha256sums(build)
+    with pytest.raises(EvidenceError, match='wrong Architecture field'):
         verify_package_candidate(
             package_directory,
             upgrade_package,

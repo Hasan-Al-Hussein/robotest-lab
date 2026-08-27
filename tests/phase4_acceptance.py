@@ -932,17 +932,36 @@ def _validate_generated_package_metadata(
     architecture: str,
 ) -> None:
     fields = _deb822_fields(path)
-    for name in ('Architecture', 'Binary', 'Source', 'Version'):
+    for name in ('Architecture', 'Binary', 'Format', 'Source', 'Version'):
         if name not in fields:
             raise EvidenceError(f'{path.name} is missing the {name} field')
-    binaries = sorted(filter(None, re.split(r'[,\s]+', fields['Binary'])))
+    if path.name.endswith('.buildinfo'):
+        expected_format = '1.0'
+        expected_binaries = ['robotest-supervisor', 'robotest-supervisor-dbgsym']
+    elif path.name.endswith('.changes'):
+        expected_format = '1.8'
+        expected_binaries = ['robotest-supervisor']
+    else:
+        raise EvidenceError(f'{path.name} is not generated package metadata')
+    binary_field = fields['Binary']
+    if (
+        re.fullmatch(
+            r'[a-z0-9][a-z0-9+.-]*(?:[ \t\n]+[a-z0-9][a-z0-9+.-]*)*',
+            binary_field,
+        )
+        is None
+    ):
+        raise EvidenceError(f'{path.name} has the wrong Binary field')
+    binaries = sorted(re.split(r'[ \t\n]+', binary_field))
+    if fields['Format'] != expected_format:
+        raise EvidenceError(f'{path.name} has the wrong Format field')
     if fields['Source'] != 'robotest-supervisor':
         raise EvidenceError(f'{path.name} has the wrong Source field')
     if fields['Version'] != version:
         raise EvidenceError(f'{path.name} has the wrong Version field')
-    if fields['Architecture'].split() != [architecture]:
+    if fields['Architecture'] != architecture:
         raise EvidenceError(f'{path.name} has the wrong Architecture field')
-    if binaries != ['robotest-supervisor', 'robotest-supervisor-dbgsym']:
+    if binaries != expected_binaries:
         raise EvidenceError(f'{path.name} has the wrong Binary field')
 
 
