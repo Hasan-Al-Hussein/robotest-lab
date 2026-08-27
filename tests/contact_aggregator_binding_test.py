@@ -523,6 +523,8 @@ def test_orchestrator_source_binding_freezes_aggregator_across_run(
         gates=gates,
         run_dir=tmp_path,
         component_manifest_sha256='b' * 64,
+        pre_mission_graph_sha256='d' * 64,
+        mission_graph_sha256='e' * 64,
     )
     assert evidence['source_binding']['contact_aggregator_binary'] == aggregator_binary
 
@@ -544,4 +546,6 @@ def test_orchestrator_source_binding_freezes_aggregator_across_run(
             gates=gates,
             run_dir=tmp_path,
             component_manifest_sha256='b' * 64,
+            pre_mission_graph_sha256='d' * 64,
+            mission_graph_sha256='e' * 64,
         )

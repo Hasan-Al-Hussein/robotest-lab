@@ -744,6 +744,8 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
+            "mission_graph_sha256",
+            "pre_mission_graph_sha256",
             "prerequisite_artifact_count",
             "prerequisite_checksums_verified",
             "prerequisite_manifest_sha256",
@@ -755,6 +757,8 @@
             "runtime_stdout_bytes"
           ],
           "properties": {
+            "mission_graph_sha256": {"$ref": "#/$defs/sha256"},
+            "pre_mission_graph_sha256": {"$ref": "#/$defs/sha256"},
             "prerequisite_artifact_count": {"type": "integer", "minimum": 1, "maximum": 256},
             "prerequisite_checksums_verified": {"type": "boolean"},
             "prerequisite_manifest_sha256": {"$ref": "#/$defs/sha256"},

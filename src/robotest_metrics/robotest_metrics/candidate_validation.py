@@ -874,6 +874,16 @@ def validate_orchestrator_evidence(
         artifacts.get('prerequisite_manifest_sha256'),
         'prerequisite artifact manifest hash',
     )
+    pre_mission_graph_sha256 = _sha256(
+        artifacts.get('pre_mission_graph_sha256'),
+        'pre-mission graph artifact hash',
+    )
+    mission_graph_sha256 = _sha256(
+        artifacts.get('mission_graph_sha256'),
+        'mission graph artifact hash',
+    )
+    if pre_mission_graph_sha256 == mission_graph_sha256:
+        raise MetricUnavailable('pre-mission and mission graph artifacts must be distinct')
     artifact_count = require_int(
         artifacts.get('prerequisite_artifact_count'),
         'orchestrator.artifacts.prerequisite_artifact_count',

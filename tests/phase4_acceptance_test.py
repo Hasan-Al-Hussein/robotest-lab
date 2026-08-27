@@ -23,7 +23,13 @@ sys.path.insert(0, str(TESTS))
 sys.path.insert(0, str(REPOSITORY / 'src/robotest_missions'))
 
 from phase4_acceptance import (  # noqa: E402
+    ACTIVE_GOAL_SCHEMA_VERSION,
+    FOLLOW_WAYPOINTS_ACTION,
+    FOLLOW_WAYPOINTS_ACTION_TYPE,
+    FOLLOW_WAYPOINTS_SEND_GOAL_SERVICE,
+    FOLLOW_WAYPOINTS_SEND_GOAL_TYPE,
     EvidenceError,
+    action_client_evidence_from_graph_entries,
     assert_process_identity,
     atomic_write_json,
     canonical_json_bytes,
@@ -52,6 +58,65 @@ from robotest_missions.execution import (  # noqa: E402
 )
 
 from robotest_missions.schema import load_mission  # noqa: E402
+
+
+def test_goal_capability_comes_only_from_exact_send_goal_service_client() -> None:
+    projected = [(FOLLOW_WAYPOINTS_ACTION, [FOLLOW_WAYPOINTS_ACTION_TYPE])]
+    passive_services = [
+        (
+            f'{FOLLOW_WAYPOINTS_ACTION}/_action/cancel_goal',
+            ['action_msgs/srv/CancelGoal'],
+        ),
+        (
+            f'{FOLLOW_WAYPOINTS_ACTION}/_action/get_result',
+            [f'{FOLLOW_WAYPOINTS_ACTION_TYPE}_GetResult'],
+        ),
+    ]
+    passive = action_client_evidence_from_graph_entries(passive_services, projected)
+    assert passive['mission_runner_is_goal_capable_action_client'] is False
+    assert passive['goal_capable_action_clients'] == {}
+    assert passive['projected_action_client_participants'] == {
+        FOLLOW_WAYPOINTS_ACTION: {'/robotest/mission_runner': [FOLLOW_WAYPOINTS_ACTION_TYPE]}
+    }
+
+    exact = action_client_evidence_from_graph_entries(
+        [
+            *passive_services,
+            (FOLLOW_WAYPOINTS_SEND_GOAL_SERVICE, [FOLLOW_WAYPOINTS_SEND_GOAL_TYPE]),
+        ],
+        projected,
+    )
+    assert exact['mission_runner_is_goal_capable_action_client'] is True
+    assert exact['goal_capable_action_clients'] == {
+        FOLLOW_WAYPOINTS_ACTION: {'/robotest/mission_runner': [FOLLOW_WAYPOINTS_ACTION_TYPE]}
+    }
+    assert exact['send_goal_service_name'] == FOLLOW_WAYPOINTS_SEND_GOAL_SERVICE
+    assert exact['send_goal_service_type'] == FOLLOW_WAYPOINTS_SEND_GOAL_TYPE
+
+
+@pytest.mark.parametrize(
+    'wrong_types',
+    (
+        ['example_interfaces/srv/AddTwoInts'],
+        [FOLLOW_WAYPOINTS_SEND_GOAL_TYPE, 'example_interfaces/srv/AddTwoInts'],
+    ),
+)
+def test_send_goal_service_type_must_be_exact(wrong_types: list[str]) -> None:
+    evidence = action_client_evidence_from_graph_entries(
+        [(FOLLOW_WAYPOINTS_SEND_GOAL_SERVICE, wrong_types)],
+        [(FOLLOW_WAYPOINTS_ACTION, [FOLLOW_WAYPOINTS_ACTION_TYPE])],
+    )
+    assert evidence['mission_runner_is_goal_capable_action_client'] is False
+
+
+def test_goal_capability_graph_snapshot_is_bounded_and_structural() -> None:
+    with pytest.raises(EvidenceError, match='exactly a name and type list'):
+        action_client_evidence_from_graph_entries([['only-a-name']], [])
+    with pytest.raises(EvidenceError, match='16-type cap'):
+        action_client_evidence_from_graph_entries(
+            [(FOLLOW_WAYPOINTS_SEND_GOAL_SERVICE, [f'pkg/srv/T{index}' for index in range(17)])],
+            [],
+        )
 
 
 def _proc_stat(
@@ -911,17 +976,42 @@ def _write_pass_fixture(root: Path) -> None:
             ],
         },
     )
+    active_client_evidence = action_client_evidence_from_graph_entries(
+        [
+            (
+                f'{FOLLOW_WAYPOINTS_ACTION}/_action/cancel_goal',
+                ['action_msgs/srv/CancelGoal'],
+            ),
+            (
+                f'{FOLLOW_WAYPOINTS_ACTION}/_action/get_result',
+                [f'{FOLLOW_WAYPOINTS_ACTION_TYPE}_GetResult'],
+            ),
+            (FOLLOW_WAYPOINTS_SEND_GOAL_SERVICE, [FOLLOW_WAYPOINTS_SEND_GOAL_TYPE]),
+        ],
+        [(FOLLOW_WAYPOINTS_ACTION, [FOLLOW_WAYPOINTS_ACTION_TYPE])],
+    )
     atomic_write_json(
         root / 'active-goal.json',
         {
-            'schema_version': 1,
+            'schema_version': ACTIVE_GOAL_SCHEMA_VERSION,
             'verdict': 'PASS',
+            'captured_utc': '2026-08-26T00:00:00.500000Z',
+            'observed_monotonic_ns': 500_000_000,
+            'elapsed_wall_s': 0.2,
             'mission_pid': 400,
             'mission_process_alive': True,
-            'mission_runner_is_action_client': True,
-            'action_name': '/robotest/follow_waypoints',
+            'mission_node': '/robotest/mission_runner',
+            'action_name': FOLLOW_WAYPOINTS_ACTION,
+            'action_type': FOLLOW_WAYPOINTS_ACTION_TYPE,
+            **active_client_evidence,
+            'goal_uuid': '00000000-0000-0000-0000-000000000001',
+            'accepted_goal_stamp_ns': 1_000_000_000,
             'goal_status_code': 2,
             'goal_status': 'EXECUTING',
+            'status_entry_count': 1,
+            'attempt_count': 4,
+            'ros_domain_id': '177',
+            'gz_partition': isolation['gz_partition'],
         },
     )
     events = [
@@ -1135,6 +1225,81 @@ def test_pass_fixture_reconciles_every_scenario6_gate(tmp_path: Path) -> None:
     }
     assert result['measurements']['restart_scheduled_count'] == 1
     assert result['measurements']['supervisor_recovery_time_wall_s'] == 4.0
+
+
+@pytest.mark.parametrize('mutation', ('projected_only', 'wrong_send_goal_type', 'legacy_schema'))
+def test_active_goal_requires_schema_v2_exact_send_goal_ownership(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    _write_pass_fixture(tmp_path)
+    path = tmp_path / 'active-goal.json'
+    active_goal = json.loads(path.read_text(encoding='utf-8'))
+    if mutation == 'projected_only':
+        active_goal['service_clients'] = [
+            entry
+            for entry in active_goal['service_clients']
+            if entry[0] != FOLLOW_WAYPOINTS_SEND_GOAL_SERVICE
+        ]
+    elif mutation == 'wrong_send_goal_type':
+        send_goal = next(
+            entry
+            for entry in active_goal['service_clients']
+            if entry[0] == FOLLOW_WAYPOINTS_SEND_GOAL_SERVICE
+        )
+        send_goal[1] = ['example_interfaces/srv/AddTwoInts']
+    else:
+        active_goal['schema_version'] = 1
+    atomic_write_json(path, active_goal)
+
+    result = evaluate_run(tmp_path)
+    assert result['verdict']['status'] == 'FAIL'
+    assert 'mission_was_active_before_injection' in result['verdict']['failures']
+
+
+def test_self_consistent_non_goal_capable_evidence_fails_closed(tmp_path: Path) -> None:
+    _write_pass_fixture(tmp_path)
+    path = tmp_path / 'active-goal.json'
+    active_goal = json.loads(path.read_text(encoding='utf-8'))
+    passive_service_clients = [
+        entry
+        for entry in active_goal['service_clients']
+        if entry[0] != FOLLOW_WAYPOINTS_SEND_GOAL_SERVICE
+    ]
+    rebound = action_client_evidence_from_graph_entries(
+        passive_service_clients,
+        active_goal['projected_action_clients'],
+    )
+    active_goal.update(rebound)
+    atomic_write_json(path, active_goal)
+
+    result = evaluate_run(tmp_path)
+    assert result['verdict']['status'] == 'FAIL'
+    assert 'mission_was_active_before_injection' in result['verdict']['failures']
+
+
+def test_active_goal_legacy_projected_ownership_shape_fails_closed(tmp_path: Path) -> None:
+    _write_pass_fixture(tmp_path)
+    path = tmp_path / 'active-goal.json'
+    active_goal = json.loads(path.read_text(encoding='utf-8'))
+    for key in (
+        'goal_capable_action_clients',
+        'mission_runner_is_goal_capable_action_client',
+        'projected_action_client_participants',
+        'projected_action_clients',
+        'send_goal_service_name',
+        'send_goal_service_type',
+        'service_clients',
+    ):
+        del active_goal[key]
+    active_goal['mission_runner_is_action_client'] = True
+    active_goal['action_clients'] = [[FOLLOW_WAYPOINTS_ACTION, [FOLLOW_WAYPOINTS_ACTION_TYPE]]]
+    active_goal['schema_version'] = 1
+    atomic_write_json(path, active_goal)
+
+    result = write_result(tmp_path)
+    assert result['verdict']['status'] == 'FAIL'
+    assert 'active goal schema mismatch' in result['verdict']['failures'][0]
 
 
 def _load_records(path: Path) -> list[dict]:

@@ -170,6 +170,7 @@ def test_component_gate_failures_force_canonical_fail(
         (('execution', 'wall_timed_out'), True),
         (('cleanup', 'no_orphans'), False),
         (('artifacts', 'prerequisite_checksums_verified'), False),
+        (('artifacts', 'pre_mission_graph_sha256'), 'not-a-sha256'),
         (('artifacts', 'prerequisite_maximum_file_bytes'), 33_554_433),
         (('gates', 'graph_contract_pass'), False),
         (('gates', 'qos_contract_pass'), False),
@@ -182,6 +183,17 @@ def test_every_orchestrator_gate_class_fails_the_sole_verdict(
     value: Any,
 ) -> None:
     _set_path(analysis_request['orchestrator'], path, value)
+    result = analyze_run(analysis_request)
+    assert result['verdict']['automated_status'] == 'FAIL'
+    assert 'orchestrator' in result['quality']['component_failures']
+
+
+def test_orchestrator_graph_artifacts_must_be_distinct(
+    analysis_request: dict[str, Any],
+) -> None:
+    analysis_request['orchestrator']['artifacts']['mission_graph_sha256'] = analysis_request[
+        'orchestrator'
+    ]['artifacts']['pre_mission_graph_sha256']
     result = analyze_run(analysis_request)
     assert result['verdict']['automated_status'] == 'FAIL'
     assert 'orchestrator' in result['quality']['component_failures']

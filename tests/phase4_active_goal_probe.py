@@ -17,15 +17,22 @@ from typing import Any
 
 import rclpy
 from action_msgs.msg import GoalStatus, GoalStatusArray
-from phase4_acceptance import atomic_write_json, utc_now
+from phase4_acceptance import (
+    ACTIVE_GOAL_SCHEMA_VERSION,
+    FOLLOW_WAYPOINTS_ACTION,
+    FOLLOW_WAYPOINTS_ACTION_TYPE,
+    action_client_evidence_from_graph_entries,
+    atomic_write_json,
+    utc_now,
+)
 from rclpy.action.graph import get_action_client_names_and_types_by_node
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_action_status_default
 
-SCHEMA_VERSION = 1
-ACTION_NAME = '/robotest/follow_waypoints'
-ACTION_TYPE = 'nav2_msgs/action/FollowWaypoints'
+SCHEMA_VERSION = ACTIVE_GOAL_SCHEMA_VERSION
+ACTION_NAME = FOLLOW_WAYPOINTS_ACTION
+ACTION_TYPE = FOLLOW_WAYPOINTS_ACTION_TYPE
 MISSION_NODE_NAME = 'mission_runner'
 MISSION_NODE_NAMESPACE = '/robotest'
 MAX_STATUS_ENTRIES = 1024
@@ -81,16 +88,15 @@ class ActiveGoalProbe(Node):
         self.latest = message
 
 
-def mission_client_present(node: Node) -> tuple[bool, list[list[Any]]]:
-    """Return exact action-client ownership and a deterministic raw snapshot."""
-    entries = get_action_client_names_and_types_by_node(
+def mission_client_evidence(node: Node) -> dict[str, Any]:
+    """Return SendGoal ownership plus diagnostic projected participants."""
+    projected_entries = get_action_client_names_and_types_by_node(
         node, MISSION_NODE_NAME, MISSION_NODE_NAMESPACE
     )
-    normalized = sorted([name, sorted(set(types))] for name, types in entries)
-    matches = [
-        entry for entry in normalized if entry[0] == ACTION_NAME and entry[1] == [ACTION_TYPE]
-    ]
-    return len(matches) == 1, normalized
+    service_entries = node.get_client_names_and_types_by_node(
+        MISSION_NODE_NAME, MISSION_NODE_NAMESPACE
+    )
+    return action_client_evidence_from_graph_entries(service_entries, projected_entries)
 
 
 def probe(mission_pid: int, wall_timeout_s: float) -> dict[str, Any]:
@@ -128,10 +134,10 @@ def probe(mission_pid: int, wall_timeout_s: float) -> dict[str, Any]:
                     f'expected one executing FollowWaypoints goal, found {len(executing)}'
                 )
             try:
-                client_present, clients = mission_client_present(node)
+                client_evidence = mission_client_evidence(node)
             except Exception:  # Graph discovery can change between status and query.
                 continue
-            if not client_present:
+            if not client_evidence['mission_runner_is_goal_capable_action_client']:
                 continue
             status = executing[0]
             raw_uuid = bytes(status.goal_info.goal_id.uuid)
@@ -148,10 +154,9 @@ def probe(mission_pid: int, wall_timeout_s: float) -> dict[str, Any]:
                 'mission_pid': mission_pid,
                 'mission_process_alive': process_alive(mission_pid),
                 'mission_node': '/robotest/mission_runner',
-                'mission_runner_is_action_client': True,
-                'action_clients': clients,
                 'action_name': ACTION_NAME,
                 'action_type': ACTION_TYPE,
+                **client_evidence,
                 'goal_uuid': str(uuid.UUID(bytes=raw_uuid)),
                 'accepted_goal_stamp_ns': accepted_stamp_ns,
                 'goal_status_code': int(status.status),

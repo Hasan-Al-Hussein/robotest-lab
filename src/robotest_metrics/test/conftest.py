@@ -152,6 +152,8 @@ def _scenario_result(identity: dict[str, Any], measurements: dict[str, Any]) -> 
 def _orchestrator(identity: dict[str, Any]) -> dict[str, Any]:
     return {
         'artifacts': {
+            'mission_graph_sha256': 'b' * 64,
+            'pre_mission_graph_sha256': 'c' * 64,
             'prerequisite_artifact_count': 6,
             'prerequisite_checksums_verified': True,
             'prerequisite_manifest_sha256': 'a' * 64,

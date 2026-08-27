@@ -14,6 +14,7 @@ import importlib.util
 import json
 import math
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1216,6 +1217,176 @@ def _positive_runtime_gate_graph_fixture() -> tuple[dict[str, dict], dict[str, d
     return exact_contract, topics
 
 
+def _candidate_runtime_gate_graph_fixture(runtime_gate: object) -> dict[str, dict]:
+    """Build all producer-contract topics with factual Fast DDS UNKNOWN/0 QoS."""
+    topic_types = {
+        '/clock': 'rosgraph_msgs/msg/Clock',
+        '/robotest/cmd_vel': 'geometry_msgs/msg/Twist',
+        '/robotest/cmd_vel_behavior_unused': 'geometry_msgs/msg/Twist',
+        '/robotest/cmd_vel_nav': 'geometry_msgs/msg/Twist',
+        '/robotest/cmd_vel_smoothed': 'geometry_msgs/msg/Twist',
+        '/robotest/collision_monitor_state': 'nav2_msgs/msg/CollisionMonitorState',
+        '/robotest/faults/events': 'robotest_interfaces/msg/FaultEvent',
+        '/robotest/imu': 'sensor_msgs/msg/Imu',
+        '/robotest/internal/raw_contacts': runtime_gate.CONTACT_MESSAGE_TYPE,
+        '/robotest/map': 'nav_msgs/msg/OccupancyGrid',
+        '/robotest/navigation/plan': 'nav_msgs/msg/Path',
+        '/robotest/odom': 'nav_msgs/msg/Odometry',
+        '/robotest/raw/imu': 'sensor_msgs/msg/Imu',
+        '/robotest/raw/odom': 'nav_msgs/msg/Odometry',
+        '/robotest/raw/scan': 'sensor_msgs/msg/LaserScan',
+        '/robotest/scan': 'sensor_msgs/msg/LaserScan',
+        '/robotest/validation/contacts': runtime_gate.CONTACT_MESSAGE_TYPE,
+        '/robotest/validation/ground_truth': 'nav_msgs/msg/Odometry',
+        '/robotest/validation/scenario_entity_poses': 'tf2_msgs/msg/TFMessage',
+        '/robotest/validation/world_stats': 'ros_gz_interfaces/msg/WorldStatistics',
+        '/tf': 'tf2_msgs/msg/TFMessage',
+        '/tf_static': 'tf2_msgs/msg/TFMessage',
+    }
+    assert set(topic_types) == set(runtime_gate.QOS_CONTRACTS)
+    expected_subscribers = {
+        '/clock': {'/robotest/metrics_collector'},
+        '/robotest/internal/raw_contacts': {'/robotest/contact_stream_gate'},
+        '/robotest/validation/contacts': {'/robotest/metrics_collector'},
+        '/robotest/validation/ground_truth': {'/robotest/metrics_collector'},
+        '/robotest/validation/scenario_entity_poses': {'/robotest/metrics_collector'},
+        '/robotest/validation/world_stats': {'/robotest/metrics_collector'},
+        **runtime_gate.CANDIDATE_EXPECTED_COMMAND_SUBSCRIBERS,
+        **runtime_gate.CANDIDATE_EXPECTED_CONTACT_SUBSCRIBERS,
+    }
+    gid_counter = 1
+
+    def endpoint(topic: str, side: str, node: str) -> dict:
+        nonlocal gid_counter
+        reliability, durability, _depth = runtime_gate._endpoint_qos_contract(
+            topic,
+            side,
+            node,
+        )
+        result = {
+            'depth': 0,
+            'durability': durability,
+            'gid': f'{gid_counter:032x}',
+            'history': 'UNKNOWN',
+            'node': node,
+            'reliability': reliability,
+            'topic_type': topic_types[topic],
+        }
+        gid_counter += 1
+        return result
+
+    topics: dict[str, dict] = {}
+    for topic in runtime_gate.QOS_CONTRACTS:
+        authoritative = runtime_gate.AUTHORITATIVE_PUBLISHER_CONTRACTS.get(topic)
+        if authoritative is None:
+            publisher_nodes = sorted(runtime_gate.CANDIDATE_EXPECTED_PUBLISHERS[topic])
+        else:
+            publisher_nodes = sorted(authoritative[0]) * authoritative[2]
+        publishers = sorted(
+            [endpoint(topic, 'publisher', node) for node in publisher_nodes],
+            key=lambda item: (item['node'], item['topic_type']),
+        )
+        subscribers = sorted(
+            [
+                endpoint(topic, 'subscriber', node)
+                for node in sorted(expected_subscribers.get(topic, set()))
+            ],
+            key=lambda item: (item['node'], item['topic_type']),
+        )
+        checks = []
+        for side, endpoint_records in (
+            ('publisher', publishers),
+            ('subscriber', subscribers),
+        ):
+            checks.extend(
+                {
+                    **runtime_gate._qos_status(
+                        record,
+                        runtime_gate._endpoint_qos_contract(topic, side, record['node']),
+                    ),
+                    'node': record['node'],
+                    'side': side,
+                }
+                for record in endpoint_records
+            )
+        checks.sort(key=lambda item: (item['side'], item['node']))
+        reliability, durability, depth = runtime_gate.QOS_CONTRACTS[topic]
+        expected = {
+            'depth': depth,
+            'durability': durability,
+            'endpoint_depth_overrides': [
+                {'depth': override_depth, 'node': node, 'side': side}
+                for (override_topic, side, node), override_depth in sorted(
+                    runtime_gate.QOS_DEPTH_OVERRIDES.items()
+                )
+                if override_topic == topic
+            ],
+            'history': 'KEEP_LAST',
+            'reliability': reliability,
+        }
+        topics[topic] = {
+            'bounded_depth_live_proven': bool(checks)
+            and all(item['bounded_depth_live_proven'] for item in checks),
+            'exact_depth_live_proven': bool(checks)
+            and all(item['exact_depth_live_proven'] for item in checks),
+            'expected': expected,
+            'publisher_qos_pass': bool(publishers)
+            and all(item['policy_contract_pass'] for item in checks if item['side'] == 'publisher'),
+            'publishers': publishers,
+            'qos_checks': checks,
+            'qos_introspection_complete': bool(checks)
+            and all(item['introspection_complete'] for item in checks),
+            'subscriber_qos_pass': all(
+                item['policy_contract_pass'] for item in checks if item['side'] == 'subscriber'
+            ),
+            'subscribers': subscribers,
+        }
+    authoritative_ownership = runtime_gate._authoritative_publisher_ownership(topics)
+    publisher_ownership = {
+        topic: (
+            authoritative_ownership[topic]
+            if topic in authoritative_ownership
+            else runtime_gate._exact_endpoint_owners(
+                topics[topic]['publishers'],
+                expected_nodes,
+                expected_type=(
+                    runtime_gate.CONTACT_MESSAGE_TYPE
+                    if topic in runtime_gate.CONTACT_TOPICS
+                    else None
+                ),
+            )
+        )
+        for topic, expected_nodes in runtime_gate.CANDIDATE_EXPECTED_PUBLISHERS.items()
+    }
+    command_subscriber_ownership = {
+        topic: runtime_gate._exact_endpoint_owners(
+            topics[topic]['subscribers'],
+            expected_nodes,
+        )
+        for topic, expected_nodes in runtime_gate.CANDIDATE_EXPECTED_COMMAND_SUBSCRIBERS.items()
+    }
+    contact_subscriber_ownership = {
+        topic: runtime_gate._exact_endpoint_owners(
+            topics[topic]['subscribers'],
+            expected_nodes,
+            expected_type=runtime_gate.CONTACT_MESSAGE_TYPE,
+        )
+        for topic, expected_nodes in runtime_gate.CANDIDATE_EXPECTED_CONTACT_SUBSCRIBERS.items()
+    }
+    assert all(publisher_ownership.values())
+    assert all(command_subscriber_ownership.values())
+    assert all(contact_subscriber_ownership.values())
+    return {
+        'command_subscriber_ownership': command_subscriber_ownership,
+        'contact_subscriber_ownership': contact_subscriber_ownership,
+        'exact_static_qos_depth_contract': {
+            topic: evidence['expected'] for topic, evidence in topics.items()
+        },
+        'publisher_ownership': publisher_ownership,
+        'topics': topics,
+    }
+
+
 def _bounded_process_fixture(
     *,
     role: str,
@@ -1282,6 +1453,11 @@ def _write_phase3_contact_gate_reobservation(
 ) -> None:
     frozen = build_binding['contact_gate_binary']
     frozen_aggregator = build_binding['contact_aggregator_binary']
+    runtime_gate_source = release_module._load_repository_module(
+        repository,
+        'tests/phase3_runtime_gate.py',
+        'Phase 3 runtime-gate fixture source contract',
+    )
     installed_path = (repository / frozen['installed_path']).resolve(strict=True)
     installed_stat = installed_path.stat()
     aggregator_installed_path = (repository / frozen_aggregator['installed_path']).resolve(
@@ -1454,11 +1630,52 @@ def _write_phase3_contact_gate_reobservation(
                 'validation_autonomy_isolation_pass': True,
             }
         )
+    else:
+        candidate_graph = _candidate_runtime_gate_graph_fixture(runtime_gate_source)
+        topics = candidate_graph['topics']
+        candidate_nodes = sorted(
+            {
+                '/robotest/evidence/phase3_runtime_gate',
+                *(f'/robotest/{name}' for name in runtime_gate_source.CANDIDATE_REQUIRED_NODES),
+            }
+        )
+        gate_document.update(
+            {
+                'attempt_count': 1,
+                'autonomy_validation_leaks': [],
+                'bounded_depth_live_proven_for_all_endpoints': all(
+                    evidence['bounded_depth_live_proven'] for evidence in topics.values()
+                ),
+                'cmd_vel_owner_pass': True,
+                'command_subscriber_ownership': candidate_graph['command_subscriber_ownership'],
+                'contact_subscriber_ownership': candidate_graph['contact_subscriber_ownership'],
+                'elapsed_wall_s': 0.5,
+                'exact_static_qos_depth_contract': candidate_graph[
+                    'exact_static_qos_depth_contract'
+                ],
+                'legacy_fault_service_absent': True,
+                'mode': 'candidate',
+                'namespace_isolation_pass': True,
+                'nodes': candidate_nodes,
+                'producer': 'robotest_phase3/runtime_gate',
+                'publisher_ownership': candidate_graph['publisher_ownership'],
+                'qos_contract_pass': True,
+                'qos_introspection_complete': all(
+                    evidence['qos_introspection_complete'] for evidence in topics.values()
+                ),
+                'required_nodes_missing': [],
+                'required_nodes_outside_namespace': [],
+                'scenario_services_missing': [],
+                'schema_version': 1,
+                'topics': topics,
+                'validation_autonomy_isolation_pass': True,
+            }
+        )
     initial_path = directory / 'runtime-gate.json'
     final_path = directory / 'contact-stream-final-gate.json'
     _canonical_file(initial_path, gate_document, sidecar=True)
     final_document = gate_document
-    if mode == 'positive_control':
+    if mode in {'positive_control', 'candidate'}:
         final_topics = {
             topic: copy.deepcopy(gate_document['topics'][topic])
             for topic in (
@@ -1484,14 +1701,16 @@ def _write_phase3_contact_gate_reobservation(
             'contact_stream_gate_present': True,
             'elapsed_wall_s': 0.5,
             'mode': 'contact_stream',
-            'nodes': [
-                '/robotest/contact_stream_gate',
-                '/robotest/evidence/phase3_runtime_gate',
-                '/robotest/fault_proxy',
-                '/robotest/metrics_collector',
-                '/robotest/parameter_bridge',
-                '/robotest/robot_state_publisher',
-            ],
+            'nodes': sorted(
+                [
+                    '/robotest/contact_stream_gate',
+                    '/robotest/evidence/phase3_runtime_gate',
+                    '/robotest/fault_proxy',
+                    '/robotest/metrics_collector',
+                    '/robotest/parameter_bridge',
+                    '/robotest/robot_state_publisher',
+                ]
+            ),
             'producer': 'robotest_phase3/runtime_gate',
             'publisher_ownership': {
                 '/robotest/internal/raw_contacts': True,
@@ -2101,6 +2320,277 @@ def _phase3_capture_fixture(
     return capture
 
 
+def _phase3_graph_document(
+    orchestration: object,
+    *,
+    mission_client: bool,
+    persistent_nodes: set[str],
+    watch_pid: int,
+) -> dict:
+    """Build one production-shaped schema-2 graph-probe PASS document."""
+    contracts = orchestration.phase3_graph_contracts(mission_client)
+    action_name = orchestration.PHASE3_GRAPH_ACTION_NAME
+    action_type = orchestration.PHASE3_GRAPH_ACTION_TYPE
+    passive_clients = ['/robotest/metrics_collector', '/robotest/scenario_controller']
+    goal_clients = (
+        {action_name: {orchestration.PHASE3_GRAPH_MISSION_CLIENT_NODE: [action_type]}}
+        if mission_client
+        else {}
+    )
+    participant_nodes = [
+        *passive_clients,
+        *([orchestration.PHASE3_GRAPH_MISSION_CLIENT_NODE] if mission_client else []),
+    ]
+    action_client_participants = {
+        action_name: {node: [action_type] for node in sorted(participant_nodes)}
+    }
+    action_servers = {action_name: {orchestration.PHASE3_GRAPH_ACTION_SERVER_NODE: [action_type]}}
+    topics = {name: [type_name] for name, type_name in contracts['topics'].items()}
+    topics['/robotest/internal/raw_contacts'] = [
+        contracts['topics']['/robotest/validation/contacts']
+    ]
+    services = {name: [type_name] for name, type_name in contracts['services'].items()}
+    if mission_client:
+        services.update(
+            {
+                '/robotest/mission_runner/describe_parameters': [
+                    'rcl_interfaces/srv/DescribeParameters'
+                ],
+                '/robotest/mission_runner/get_parameter_types': [
+                    'rcl_interfaces/srv/GetParameterTypes'
+                ],
+                '/robotest/mission_runner/get_parameters': ['rcl_interfaces/srv/GetParameters'],
+                '/robotest/mission_runner/list_parameters': ['rcl_interfaces/srv/ListParameters'],
+                '/robotest/mission_runner/set_parameters': ['rcl_interfaces/srv/SetParameters'],
+                '/robotest/mission_runner/set_parameters_atomically': [
+                    'rcl_interfaces/srv/SetParametersAtomically'
+                ],
+            }
+        )
+    actions = {name: [type_name] for name, type_name in contracts['actions'].items()}
+    node_names = sorted(
+        {
+            *persistent_nodes,
+            *passive_clients,
+            orchestration.PHASE3_GRAPH_ACTION_SERVER_NODE,
+            *([orchestration.PHASE3_GRAPH_MISSION_CLIENT_NODE] if mission_client else []),
+            orchestration.PHASE3_GRAPH_PARTICIPANT,
+        }
+    )
+    identities = []
+    for fully_qualified_name in node_names:
+        namespace, name = fully_qualified_name.rsplit('/', 1)
+        identities.append(
+            {
+                'fully_qualified_name': fully_qualified_name,
+                'hidden': False,
+                'is_probe_participant': (
+                    fully_qualified_name == orchestration.PHASE3_GRAPH_PARTICIPANT
+                ),
+                'name': name,
+                'namespace': namespace,
+            }
+        )
+    identities.sort(key=lambda item: (item['name'], item['namespace']))
+    public_node_names = sorted(
+        item['fully_qualified_name'] for item in identities if not item['is_probe_participant']
+    )
+    node_name_counts = {name: 1 for name in public_node_names}
+    topic_results, missing_topics, topic_mismatches = orchestration._phase3_graph_contract_results(
+        contracts['topics'], topics
+    )
+    service_results, missing_services, service_mismatches = (
+        orchestration._phase3_graph_contract_results(contracts['services'], services)
+    )
+    action_results, missing_actions, action_mismatches = (
+        orchestration._phase3_graph_contract_results(contracts['actions'], actions)
+    )
+    ownership_results, ownership_mismatches = orchestration._phase3_graph_action_results(
+        contracts,
+        goal_clients,
+        action_servers,
+    )
+    assert not any(
+        (
+            missing_topics,
+            missing_services,
+            missing_actions,
+            topic_mismatches,
+            service_mismatches,
+            action_mismatches,
+            ownership_mismatches,
+        )
+    )
+    return {
+        'action_ownership_mismatches': [],
+        'attempt_count': 2,
+        'contracts': contracts,
+        'duplicate_node_names': [],
+        'elapsed_wall_seconds': 0.25,
+        'failure': None,
+        'failure_kind': None,
+        'limits': {
+            'maximum_graph_names': orchestration.PHASE3_GRAPH_MAXIMUM_GRAPH_NAMES,
+            'maximum_graph_nodes': orchestration.PHASE3_GRAPH_MAXIMUM_GRAPH_NODES,
+            'maximum_types_per_name': orchestration.PHASE3_GRAPH_MAXIMUM_TYPES_PER_NAME,
+            'wall_timeout_seconds': orchestration.PHASE3_GRAPH_WALL_TIMEOUT_S,
+        },
+        'missing_actions': [],
+        'missing_services': [],
+        'missing_topics': [],
+        'node_name_counts': node_name_counts,
+        'observed': {
+            'action_client_participants': action_client_participants,
+            'action_clients': goal_clients,
+            'action_servers': action_servers,
+            'actions': actions,
+            'node_identities': identities,
+            'node_names': public_node_names,
+            'services': services,
+            'topics': topics,
+        },
+        'participant': orchestration.PHASE3_GRAPH_PARTICIPANT,
+        'query_errors': [],
+        'results': {
+            'action_ownership': ownership_results,
+            'actions': action_results,
+            'services': service_results,
+            'topics': topic_results,
+        },
+        'schema_version': orchestration.PHASE3_GRAPH_SCHEMA_VERSION,
+        'type_mismatches': {'actions': [], 'services': [], 'topics': []},
+        'verdict': 'PASS',
+        'watch_pid': watch_pid,
+    }
+
+
+def _write_phase3_graph_evidence(
+    run_root: Path,
+    *,
+    orchestration: object,
+    mission_client: bool,
+    persistent_nodes: set[str],
+    watch_pid: int,
+) -> dict:
+    """Write one graph JSON and its four exact text projections."""
+    prefix = 'mission-' if mission_client else ''
+    document = _phase3_graph_document(
+        orchestration,
+        mission_client=mission_client,
+        persistent_nodes=persistent_nodes,
+        watch_pid=watch_pid,
+    )
+    (run_root / f'{prefix}graph.json').write_bytes(orchestration._phase3_graph_json_bytes(document))
+    observed = document['observed']
+    (run_root / f'{prefix}nodes.txt').write_text(
+        ''.join(f'{name}\n' for name in observed['node_names']),
+        encoding='utf-8',
+    )
+    for name in ('topics', 'services', 'actions'):
+        (run_root / f'{prefix}{name}.txt').write_text(
+            orchestration._phase3_graph_text(observed[name]),
+            encoding='utf-8',
+        )
+    return orchestration.validate_phase3_graph_artifacts(
+        run_root,
+        mission_client=mission_client,
+        expected_watch_pid=watch_pid,
+    )
+
+
+def _write_phase3_graph_prerequisites(
+    repository: Path,
+    run_root: Path,
+    *,
+    orchestration: object,
+    plan: dict,
+) -> tuple[dict, dict]:
+    """Write the graph pair and the complete successful-run process registry."""
+    runtime_gate_source = release_module._load_repository_module(
+        repository,
+        'tests/phase3_runtime_gate.py',
+        'Phase 3 runtime-gate graph fixture source contract',
+    )
+    persistent_nodes = {
+        f'/robotest/{name}' for name in runtime_gate_source.CANDIDATE_REQUIRED_NODES
+    }
+    ros_domain_id = plan['ros_domain_id']
+    pre_watch_pid = 40_000 + ros_domain_id
+    mission_watch_pid = 41_000 + ros_domain_id
+    role_pids = {
+        role: 70_000 + ros_domain_id * 100 + index
+        for index, role in enumerate(release_module.PHASE3_PREREQUISITE_PROCESS_ROLES)
+    }
+    role_pids.update(
+        {
+            'full_stack': pre_watch_pid,
+            'graph_gate': 55_000 + ros_domain_id,
+            'mission_graph_gate': 56_000 + ros_domain_id,
+            'mission_runner': mission_watch_pid,
+        }
+    )
+    if plan['scenario_id'] == 4:
+        role_pids['lifecycle_sampler'] = 90_000 + ros_domain_id
+    timelines = {
+        'domain_preflight': (100_000, 200_000),
+        'partition_preflight': (300_000, 400_000),
+        'full_stack': (500_000, 17_000_000),
+        'startup_gate': (600_000, 700_000),
+        'lifecycle_gate': (800_000, 900_000),
+        'metrics_collector': (1_000_000, 15_000_000),
+        'scenario_controller': (1_100_000, 10_000_000),
+        'goal_observer': (1_200_000, 2_500_000),
+        'runtime_gate': (1_300_000, 1_400_000),
+        'graph_gate': (1_500_000, 1_600_000),
+        'mission_runner': (2_000_000, 9_000_000),
+        'lifecycle_sampler': (2_600_000, 16_000_000),
+        'mission_graph_gate': (3_000_000, 3_100_000),
+        'contact_drain': (11_000_000, 12_000_000),
+        'contact_stream_final_gate': (13_000_000, 14_000_000),
+        'domain_cleanup': (18_000_000, 18_500_000),
+        'partition_cleanup': (19_000_000, 19_500_000),
+    }
+    process_stubs = {role: {'pid': pid} for role, pid in role_pids.items()}
+    contracts = release_module._phase3_process_contracts(
+        repository,
+        run_root,
+        expected_plan=plan,
+        orchestration=orchestration,
+        process_records=process_stubs,
+    )
+    assert set(contracts) == set(role_pids)
+    for role, (command, wall_timeout_s, allowed_returncodes) in contracts.items():
+        started_steady_ns, finished_steady_ns = timelines[role]
+        _write_bounded_process_artifacts(
+            run_root,
+            _bounded_process_fixture(
+                role=role,
+                command=command,
+                cwd=repository,
+                pid=role_pids[role],
+                started_steady_ns=started_steady_ns,
+                finished_steady_ns=finished_steady_ns,
+                wall_timeout_s=wall_timeout_s,
+                returncode=(-15 if role == 'full_stack' else allowed_returncodes[-1]),
+            ),
+        )
+    pre_binding = _write_phase3_graph_evidence(
+        run_root,
+        orchestration=orchestration,
+        mission_client=False,
+        persistent_nodes=persistent_nodes,
+        watch_pid=pre_watch_pid,
+    )
+    mission_binding = _write_phase3_graph_evidence(
+        run_root,
+        orchestration=orchestration,
+        mission_client=True,
+        persistent_nodes=persistent_nodes,
+        watch_pid=mission_watch_pid,
+    )
+    return pre_binding, mission_binding
+
+
 def _phase3_bundle(
     repository: Path,
     directory: Path,
@@ -2228,6 +2718,56 @@ def _phase3_bundle(
             'sha256': schedule_sha256,
         },
     }
+    from robotest_missions import artifacts as mission_artifacts
+
+    mission['identity'].update(
+        {
+            'action_name': '/robotest/follow_waypoints',
+            'created_utc': '2026-01-01T00:00:00Z',
+            'fault_seed': scenario_document.get('fault_seed'),
+            'mission_file': str(repository / plan['scenario_path']),
+            'mission_name': plan['scenario_name'],
+            'mission_seed': scenario_document.get('mission_seed', 42),
+            'resolved_action_name': '/robotest/follow_waypoints',
+            'scenario_controller_seed': scenario_document.get('scenario_controller_seed', 42),
+            'simulator_seed': scenario_document['simulator_seed'],
+        }
+    )
+    mission['targets'].update(
+        {
+            'expected_outcome': scenario_document.get('expected_outcome', 'SUCCEEDED'),
+            'fault_event_trace_capacity': mission_artifacts.FAULT_EVENT_TRACE_CAPACITY,
+            'feedback_trace_capacity': mission_artifacts.FEEDBACK_TRACE_CAPACITY,
+            'mission_event_trace_capacity': mission_artifacts.MISSION_EVENT_TRACE_CAPACITY,
+        }
+    )
+    mission['measurements'].update(
+        {
+            'accepted_goal_stamp_source': mission_artifacts.ACCEPTED_GOAL_STAMP_SOURCE,
+            'completion_time_sim_s': (terminal_action_stamp_ns - accepted_goal_stamp_ns)
+            / 1_000_000_000,
+            'feedback_count': 3,
+            'goal_response_stamp_ns': accepted_goal_stamp_ns,
+            'goal_submission_stamp_ns': accepted_goal_stamp_ns - 100_000_000,
+            'mission_wall_duration_s': 30.0,
+            'nav2_error_code': 0,
+            'nav2_error_message': '',
+        }
+    )
+    mission['quality'].update(
+        {
+            'cancel_acknowledged': False,
+            'fault_event_overflow_count': 0,
+            'fault_protocol_status': 'RESET_CONFIRMED_AFTER_GOAL',
+            'feedback_trace_overflow_count': 0,
+        }
+    )
+    mission['verdict'].update(
+        {
+            'reason': None,
+            'scenario1_acceptance_status': mission_artifacts.PHASE3_BENCHMARK_NOT_EVALUATED,
+        }
+    )
     capture = _phase3_capture_fixture(
         metrics_fixture,
         scenario_id=scenario_id,
@@ -2316,16 +2856,17 @@ def _phase3_bundle(
     )
     run_root = directory.parent
     mission_path = run_root / 'mission-result.json'
+    mission_csv_path = run_root / 'mission-result.csv'
     scenario_path = run_root / 'scenario-result.json'
     capture_path = run_root / 'capture.json'
     orchestrator_path = run_root / 'orchestrator.json'
-    for path, document in (
-        (mission_path, mission),
-        (scenario_path, scenario),
-        (capture_path, capture),
-        (orchestrator_path, orchestrator),
-    ):
-        _canonical_file(path, document, sidecar=True)
+    mission_artifacts.write_result_artifacts(mission, mission_path, mission_csv_path)
+    Path(f'{mission_path}.sha256').write_text(
+        f'{phase5_module.file_sha256(mission_path)}  {mission_path.name}\n',
+        encoding='ascii',
+    )
+    _canonical_file(scenario_path, scenario, sidecar=True)
+    _canonical_file(capture_path, capture, sidecar=True)
     contact_items = capture['streams']['contacts']['items']
     qualifying_contact_stamp_ns = contact_items[-1]['stamp_ns']
     contact_drain = {
@@ -2379,6 +2920,102 @@ def _phase3_bundle(
         ros_domain_id=plan['ros_domain_id'],
         gz_partition=plan['gz_partition'],
     )
+    empty_gate = {
+        'attempt_count': 1,
+        'elapsed_wall_s': 0.05,
+        'mode': 'empty',
+        'nodes': ['/robotest/evidence/phase3_runtime_gate'],
+        'producer': 'robotest_phase3/runtime_gate',
+        'remaining_nodes': [],
+        'schema_version': 1,
+        'verdict': 'PASS',
+    }
+    _canonical_file(run_root / 'domain-preflight.json', empty_gate, sidecar=True)
+    _canonical_file(run_root / 'domain-cleanup.json', empty_gate, sidecar=True)
+    _canonical_file(run_root / 'lifecycle-startup-result.json', {'verdict': 'PASS'})
+    _canonical_file(run_root / 'startup-gate.json', {'verdict': 'PASS'})
+    lifecycle_states = {
+        node_name: {'label': 'active', 'state_id': 3}
+        for node_name in orchestration.REQUIRED_LIFECYCLE_NODES
+    }
+    _canonical_file(
+        run_root / 'lifecycle-ready.json',
+        {'states': lifecycle_states, 'verdict': 'PASS'},
+    )
+    for node_name in orchestration.REQUIRED_LIFECYCLE_NODES:
+        (run_root / f'lifecycle-ready-{node_name}.txt').write_text(
+            'active [3]\n',
+            encoding='utf-8',
+        )
+    _canonical_file(run_root / 'metrics.ready.json', {'status': 'READY'})
+    (run_root / 'metrics.stop').write_text(
+        'terminal-contact-drain-complete\n',
+        encoding='utf-8',
+    )
+    _canonical_file(run_root / 'scenario.ready.json', {'status': 'READY'})
+    (run_root / 'goal-observer.arm').write_text('arm-next-new-goal\n', encoding='utf-8')
+    _canonical_file(run_root / 'goal-observer.ready.json', {'status': 'READY'})
+    _canonical_file(run_root / 'goal-observer.armed.json', {'status': 'ARMED'})
+    goal_observer = {
+        'accepted_goal_stamp_ns': accepted_goal_stamp_ns,
+        'accepted_goal_uuid': goal_uuid,
+    }
+    _canonical_file(
+        run_root / 'goal-observer.json',
+        goal_observer,
+        sidecar=True,
+    )
+    _canonical_file(
+        run_root / 'component-exits.json',
+        {'mission_exit_code': 0, 'scenario_exit_code': 0},
+    )
+    _canonical_file(
+        run_root / 'goal-binding-reconciliation.json',
+        orchestration.reconcile_goal_binding(goal_observer, mission, scenario),
+    )
+    resource_samples = [
+        {
+            'affinity_checked_pid_count': 1,
+            'affinity_escape_count': 0,
+            'affinity_escape_prefix': [],
+            'affinity_observed_cpu_union': [0, 1, 2, 3, 4, 5],
+            'affinity_unreadable_count': 0,
+            'affinity_unreadable_pid_prefix': [],
+            'cpu_percent': 50.0,
+            'missing_count': 0,
+            'oom_kill': False,
+            'phase': 'before_launch',
+            'pid_reuse_detected': False,
+            'rss_sum_bytes': 1_000_000_000,
+            'wsl_memory_bytes': 2_000_000_000,
+            'wsl_swap_bytes': 0,
+        },
+        {
+            'affinity_checked_pid_count': 1,
+            'affinity_escape_count': 0,
+            'affinity_escape_prefix': [],
+            'affinity_observed_cpu_union': [0, 1, 2, 3, 4, 5],
+            'affinity_unreadable_count': 0,
+            'affinity_unreadable_pid_prefix': [],
+            'cpu_percent': 25.0,
+            'missing_count': 0,
+            'oom_kill': False,
+            'phase': 'after_shutdown',
+            'pid_reuse_detected': False,
+            'rss_sum_bytes': 500_000_000,
+            'wsl_memory_bytes': 1_500_000_000,
+            'wsl_swap_bytes': 0,
+        },
+    ]
+    resource_path = run_root / 'resources.jsonl'
+    resource_path.write_text(
+        ''.join(json.dumps(sample, sort_keys=True) + '\n' for sample in resource_samples),
+        encoding='utf-8',
+    )
+    resource_summary = orchestration.summarize_resources(resource_path)
+    orchestrator['resources'] = {
+        field: resource_summary[field] for field in orchestration.RESOURCE_METRIC_FIELDS
+    }
     lifecycle_path = None
     if scenario_id == 4:
         lifecycle_stamps = [13_000_000_000, 14_000_000_000]
@@ -2387,6 +3024,12 @@ def _phase3_bundle(
             'requested_stamps_ns': lifecycle_stamps,
             'run_id': plan['run_id'],
         }
+        _canonical_file(run_root / 'lifecycle-schedule.json', schedule, sidecar=True)
+        _canonical_file(run_root / 'lifecycle-sampler.ready.json', {'status': 'READY'})
+        (run_root / 'lifecycle-sampler.stop').write_text(
+            'mission-complete\n',
+            encoding='utf-8',
+        )
         records = []
         for round_index, stamp_ns in enumerate(lifecycle_stamps):
             for node in orchestration.REQUIRED_LIFECYCLE_NODES:
@@ -2465,6 +3108,26 @@ def _phase3_bundle(
         }
         lifecycle_path = run_root / 'lifecycle-snapshot.json'
         _canonical_file(lifecycle_path, lifecycle, sidecar=True)
+    pre_graph_binding, mission_graph_binding = _write_phase3_graph_prerequisites(
+        repository,
+        run_root,
+        orchestration=orchestration,
+        plan=plan,
+    )
+    mission_process = json.loads(
+        (run_root / 'processes/mission_runner.process.json').read_text(encoding='utf-8')
+    )
+    orchestrator['execution'] = {
+        'command': shlex.join(mission_process['command']),
+        'exit_code': mission_process['returncode'],
+        'wall_duration_s': (
+            mission_process['finished_steady_ns'] - mission_process['started_steady_ns']
+        )
+        / 1_000_000_000,
+        'wall_timed_out': False,
+        'wall_timeout_s': 300.0,
+        'working_directory': str(repository),
+    }
     trial_context = orchestration.make_trial_context(
         plan,
         workspace=repository,
@@ -2472,6 +3135,35 @@ def _phase3_bundle(
         build=build_binding,
         positive=json.loads(positive_binding_path.read_text(encoding='utf-8')),
     )
+    _canonical_file(run_root / 'trial-context.json', trial_context, sidecar=True)
+    prerequisite_paths = sorted(path for path in run_root.rglob('*') if path.is_file())
+    prerequisite_manifest = orchestration.component_manifest(prerequisite_paths, run_root)
+    prerequisite_manifest_path = run_root / 'prerequisite-manifest.json'
+    _canonical_file(prerequisite_manifest_path, prerequisite_manifest, sidecar=True)
+    assert orchestration.verify_component_manifest(prerequisite_manifest, run_root)
+    prerequisite_records = prerequisite_manifest['artifacts']
+    orchestrator['artifacts'] = {
+        'mission_graph_sha256': mission_graph_binding['graph_json_sha256'],
+        'pre_mission_graph_sha256': pre_graph_binding['graph_json_sha256'],
+        'prerequisite_artifact_count': len(prerequisite_records),
+        'prerequisite_checksums_verified': True,
+        'prerequisite_manifest_sha256': phase5_module.file_sha256(prerequisite_manifest_path),
+        'prerequisite_maximum_file_bytes': max(record['bytes'] for record in prerequisite_records),
+        'prerequisite_total_bytes': prerequisite_manifest['total_bytes'],
+        'prerequisites_finalized': True,
+        'prerequisites_within_caps': True,
+        'runtime_stderr_bytes': sum(
+            record['bytes']
+            for record in prerequisite_records
+            if record['path'].endswith('.stderr.log')
+        ),
+        'runtime_stdout_bytes': sum(
+            record['bytes']
+            for record in prerequisite_records
+            if record['path'].endswith('.stdout.log')
+        ),
+    }
+    _canonical_file(orchestrator_path, orchestrator, sidecar=True)
     analysis_request = orchestration.compose_analysis_request(
         workspace=repository,
         plan=plan,
@@ -2484,7 +3176,6 @@ def _phase3_bundle(
         contact_progress_path=run_root / 'contact-progress.json',
         lifecycle_snapshot_path=lifecycle_path,
     )
-    _canonical_file(run_root / 'trial-context.json', trial_context, sidecar=True)
     _canonical_file(run_root / 'analysis-request.json', analysis_request, sidecar=True)
     from robotest_metrics.analysis import analyze_run
 
@@ -2553,6 +3244,84 @@ def _refresh_phase3_bundle(directory: Path) -> str:
     manifest['quality']['artifact_count'] = len(records)
     _canonical_file(manifest_path, manifest, sidecar=True)
     return result_sha
+
+
+def _rebind_phase3_prerequisites(
+    repository: Path,
+    run_root: Path,
+    *,
+    omitted_paths: frozenset[str] = frozenset(),
+) -> None:
+    """Rebind a tampered raw set so tests reach semantic graph replay."""
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 prerequisite rebind fixture',
+    )
+    manifest_path = run_root / 'prerequisite-manifest.json'
+    previous = json.loads(manifest_path.read_text(encoding='utf-8'))
+    paths = [
+        run_root / record['path']
+        for record in previous['artifacts']
+        if record['path'] not in omitted_paths
+    ]
+    manifest = orchestration.component_manifest(paths, run_root)
+    _canonical_file(manifest_path, manifest, sidecar=True)
+    records = manifest['artifacts']
+    orchestrator_path = run_root / 'orchestrator.json'
+    orchestrator = json.loads(orchestrator_path.read_text(encoding='utf-8'))
+    orchestrator['artifacts'].update(
+        {
+            'mission_graph_sha256': phase5_module.file_sha256(run_root / 'mission-graph.json'),
+            'pre_mission_graph_sha256': phase5_module.file_sha256(run_root / 'graph.json'),
+            'prerequisite_artifact_count': len(records),
+            'prerequisite_manifest_sha256': phase5_module.file_sha256(manifest_path),
+            'prerequisite_maximum_file_bytes': max(record['bytes'] for record in records),
+            'prerequisite_total_bytes': manifest['total_bytes'],
+            'runtime_stderr_bytes': sum(
+                record['bytes'] for record in records if record['path'].endswith('.stderr.log')
+            ),
+            'runtime_stdout_bytes': sum(
+                record['bytes'] for record in records if record['path'].endswith('.stdout.log')
+            ),
+        }
+    )
+    _canonical_file(orchestrator_path, orchestrator, sidecar=True)
+
+
+def _rebind_phase3_smoke_runtime_gate(
+    repository: Path,
+    candidate_root: Path,
+    run_root: Path,
+) -> None:
+    """Cascade a smoke gate mutation through reobservation and the raw manifest."""
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 smoke runtime-gate rebind fixture',
+    )
+    build_binding = json.loads((candidate_root / 'build-binding.json').read_text(encoding='utf-8'))
+    suite_plan = json.loads((candidate_root / 'suite-plan.json').read_text(encoding='utf-8'))
+    smoke = suite_plan['smoke']
+    smoke_plan = {
+        **suite_plan['trials'][0],
+        'candidate_id': f'{suite_plan["candidate_id"]}-smoke',
+        'gz_partition': f'robotest_p3_{suite_plan["candidate_id"]}-smoke_00',
+        'ros_domain_id': smoke['ros_domain_id'],
+        'run_id': smoke['run_id'],
+    }
+    _canonical_file(
+        run_root / 'contact-gate-revalidation.json',
+        orchestration.reconcile_contact_gate_reobservation(
+            run_root / 'runtime-gate.json',
+            run_root / 'contact-stream-final-gate.json',
+            build_binding=build_binding,
+            expected_domain_id=smoke_plan['ros_domain_id'],
+            expected_gz_partition=smoke_plan['gz_partition'],
+        ),
+        sidecar=True,
+    )
+    _rebind_phase3_prerequisites(repository, run_root)
 
 
 def _refresh_phase4_manifest(run_directory: Path) -> None:
@@ -3681,6 +4450,8 @@ def _relocate_phase3_evidence(
     old_root: str,
 ) -> Path:
     release_module._activate_repository_packages(repository)
+    from robotest_missions.artifacts import write_result_artifacts
+
     orchestration = release_module._load_repository_module(
         repository,
         'tests/phase3_orchestration.py',
@@ -3756,6 +4527,57 @@ def _relocate_phase3_evidence(
     def replay(plan: dict, run_root: Path) -> tuple[dict, str]:
         result_directory = run_root / 'result'
         lifecycle_path = run_root / 'lifecycle-snapshot.json'
+        mission_path = run_root / 'mission-result.json'
+        mission_document = _relocate_json(
+            mission_path,
+            old_root,
+            str(repository),
+        )
+        write_result_artifacts(
+            mission_document,
+            mission_path,
+            run_root / 'mission-result.csv',
+        )
+        Path(f'{mission_path}.sha256').write_text(
+            f'{phase5_module.file_sha256(mission_path)}  {mission_path.name}\n',
+            encoding='ascii',
+        )
+        _relocate_json(
+            run_root / 'scenario-result.json',
+            old_root,
+            str(repository),
+            sidecar=True,
+        )
+        process_roles = set(release_module.PHASE3_PREREQUISITE_PROCESS_ROLES)
+        if (run_root / 'processes/lifecycle_sampler.process.json').is_file():
+            process_roles.add('lifecycle_sampler')
+        for role in process_roles:
+            _relocate_json(
+                run_root / f'processes/{role}.process.json',
+                old_root,
+                str(repository),
+            )
+        for gate_name in ('runtime-gate.json', 'contact-stream-final-gate.json'):
+            gate_path = run_root / gate_name
+            _relocate_json(gate_path, old_root, str(repository), sidecar=True)
+            _rebind_phase3_gate_attestation_workspace(
+                gate_path,
+                repository=repository,
+                build_binding=build_binding,
+                orchestration=orchestration,
+            )
+        contact_gate_revalidation = orchestration.reconcile_contact_gate_reobservation(
+            run_root / 'runtime-gate.json',
+            run_root / 'contact-stream-final-gate.json',
+            build_binding=build_binding,
+            expected_domain_id=plan['ros_domain_id'],
+            expected_gz_partition=plan['gz_partition'],
+        )
+        _canonical_file(
+            run_root / 'contact-gate-revalidation.json',
+            contact_gate_revalidation,
+            sidecar=True,
+        )
         context = orchestration.make_trial_context(
             plan,
             workspace=repository,
@@ -3763,6 +4585,70 @@ def _relocate_phase3_evidence(
             build=build_binding,
             positive=positive_binding,
         )
+        _canonical_file(run_root / 'trial-context.json', context, sidecar=True)
+        prerequisite_manifest_path = run_root / 'prerequisite-manifest.json'
+        previous_manifest = json.loads(prerequisite_manifest_path.read_text(encoding='utf-8'))
+        prerequisite_paths = [
+            run_root / record['path'] for record in previous_manifest['artifacts']
+        ]
+        prerequisite_manifest = orchestration.component_manifest(
+            prerequisite_paths,
+            run_root,
+        )
+        _canonical_file(prerequisite_manifest_path, prerequisite_manifest, sidecar=True)
+        assert orchestration.verify_component_manifest(prerequisite_manifest, run_root)
+        orchestrator_path = run_root / 'orchestrator.json'
+        orchestrator = _relocate_json(
+            orchestrator_path,
+            old_root,
+            str(repository),
+            sidecar=True,
+        )
+        full_stack_process = release_module._phase3_bounded_process_record(
+            repository,
+            run_root,
+            role='full_stack',
+        )
+        mission_process = release_module._phase3_bounded_process_record(
+            repository,
+            run_root,
+            role='mission_runner',
+        )
+        pre_graph = orchestration.validate_phase3_graph_artifacts(
+            run_root,
+            mission_client=False,
+            expected_watch_pid=full_stack_process['pid'],
+        )
+        mission_graph = orchestration.validate_phase3_graph_artifacts(
+            run_root,
+            mission_client=True,
+            expected_watch_pid=mission_process['pid'],
+        )
+        prerequisite_records = prerequisite_manifest['artifacts']
+        orchestrator['artifacts'] = {
+            'mission_graph_sha256': mission_graph['graph_json_sha256'],
+            'pre_mission_graph_sha256': pre_graph['graph_json_sha256'],
+            'prerequisite_artifact_count': len(prerequisite_records),
+            'prerequisite_checksums_verified': True,
+            'prerequisite_manifest_sha256': phase5_module.file_sha256(prerequisite_manifest_path),
+            'prerequisite_maximum_file_bytes': max(
+                record['bytes'] for record in prerequisite_records
+            ),
+            'prerequisite_total_bytes': prerequisite_manifest['total_bytes'],
+            'prerequisites_finalized': True,
+            'prerequisites_within_caps': True,
+            'runtime_stderr_bytes': sum(
+                record['bytes']
+                for record in prerequisite_records
+                if record['path'].endswith('.stderr.log')
+            ),
+            'runtime_stdout_bytes': sum(
+                record['bytes']
+                for record in prerequisite_records
+                if record['path'].endswith('.stdout.log')
+            ),
+        }
+        _canonical_file(orchestrator_path, orchestrator, sidecar=True)
         request = orchestration.compose_analysis_request(
             workspace=repository,
             plan=plan,
@@ -3770,17 +4656,26 @@ def _relocate_phase3_evidence(
             scenario_path=run_root / 'scenario-result.json',
             capture_path=run_root / 'capture.json',
             positive_binding_path=positive_binding_path,
-            orchestrator_path=run_root / 'orchestrator.json',
+            orchestrator_path=orchestrator_path,
             contact_drain_path=run_root / 'contact-drain.json',
             contact_progress_path=run_root / 'contact-progress.json',
             lifecycle_snapshot_path=(lifecycle_path if int(plan['scenario_id']) == 4 else None),
         )
-        _canonical_file(run_root / 'trial-context.json', context, sidecar=True)
         _canonical_file(run_root / 'analysis-request.json', request, sidecar=True)
         result = analyze_run(request)
         assert result['verdict']['automated_status'] == 'PASS', result['verdict']
         _canonical_file(result_directory / 'run-result.json', result)
-        return result, _refresh_phase3_bundle(result_directory)
+        result_sha = _refresh_phase3_bundle(result_directory)
+        stale_json_paths = [
+            path.relative_to(run_root).as_posix()
+            for path in run_root.rglob('*.json')
+            if old_root.encode('utf-8') in path.read_bytes()
+        ]
+        assert not stale_json_paths, {
+            'old_root': old_root,
+            'stale_phase3_json_paths': stale_json_paths,
+        }
+        return result, result_sha
 
     suite_plan = json.loads((candidate_root / 'suite-plan.json').read_text(encoding='utf-8'))
     results: list[dict] = []
@@ -4605,6 +5500,690 @@ def test_release_evidence_rejects_schema_invalid_phase3_manifest(tmp_path: Path)
     _canonical_file(manifest_path, manifest, sidecar=True)
 
     with pytest.raises(EvidenceError, match='result bundle verification failed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_phase3_manifest_missing_graph_projection(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 incomplete prerequisite fixture',
+    )
+    manifest_path = run_root / 'prerequisite-manifest.json'
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    paths = [
+        run_root / record['path']
+        for record in manifest['artifacts']
+        if record['path'] != 'mission-actions.txt'
+    ]
+    _canonical_file(
+        manifest_path,
+        orchestration.component_manifest(paths, run_root),
+        sidecar=True,
+    )
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='exact production pre-manifest snapshot'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ('role', 'case'),
+    [
+        ('full_stack', 'command'),
+        ('full_stack', 'timeout'),
+        ('mission_runner', 'command'),
+        ('mission_runner', 'timeout'),
+        ('runtime_gate', 'command'),
+    ],
+)
+def test_release_evidence_rejects_rebound_phase3_process_contract_forgery(
+    tmp_path: Path,
+    role: str,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    process_path = run_root / f'processes/{role}.process.json'
+    process = json.loads(process_path.read_text(encoding='utf-8'))
+    if case == 'command':
+        command = list(process['command'])
+        command[0] = 'forged-executable'
+        _rewrite_process_command(process, command)
+    else:
+        process['wall_timeout_s'] += 1.0
+        process['wrapped_command'][3] = f'{process["wall_timeout_s"]:.3f}s'
+    _canonical_file(process_path, process)
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match=rf'{role} process command, timeout, or outcome'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize('case', ['mission_before_graph', 'stack_ends_before_final_gate'])
+def test_release_evidence_rejects_rebound_phase3_process_timeline_forgery(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    if case == 'mission_before_graph':
+        process_path = run_root / 'processes/mission_runner.process.json'
+        process = json.loads(process_path.read_text(encoding='utf-8'))
+        process['started_steady_ns'] = 1_550_000
+    else:
+        process_path = run_root / 'processes/full_stack.process.json'
+        process = json.loads(process_path.read_text(encoding='utf-8'))
+        process['finished_steady_ns'] = 13_500_000
+    _canonical_file(process_path, process)
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='successful process timeline is invalid'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        ('command', 'forged mission'),
+        ('exit_code', 7),
+        ('wall_duration_s', 123.0),
+        ('wall_timeout_s', 301.0),
+        ('working_directory', '/tmp/forged'),
+    ],
+)
+def test_release_evidence_rejects_phase3_orchestrator_execution_forgery(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    orchestrator_path = run_root / 'orchestrator.json'
+    orchestrator = json.loads(orchestrator_path.read_text(encoding='utf-8'))
+    orchestrator['execution'][field] = value
+    _canonical_file(orchestrator_path, orchestrator, sidecar=True)
+
+    with pytest.raises(EvidenceError, match='exactly bind the mission process'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize('omitted_path', ['resources.jsonl', 'lifecycle-ready-map_server.txt'])
+def test_release_evidence_rejects_deleted_rebound_phase3_prerequisite(
+    tmp_path: Path,
+    omitted_path: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    (run_root / omitted_path).unlink()
+    _rebind_phase3_prerequisites(
+        repository,
+        run_root,
+        omitted_paths=frozenset({omitted_path}),
+    )
+
+    with pytest.raises(EvidenceError, match='exact successful-run snapshot'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_deleted_rebound_phase3_process_triplet(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    omitted_paths = frozenset(
+        {
+            'processes/runtime_gate.process.json',
+            'processes/runtime_gate.stderr.log',
+            'processes/runtime_gate.stdout.log',
+        }
+    )
+    for relative in omitted_paths:
+        (run_root / relative).unlink()
+    _rebind_phase3_prerequisites(repository, run_root, omitted_paths=omitted_paths)
+
+    with pytest.raises(EvidenceError, match='production role set'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase3_scenario4_sampler_command(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'runs/09'
+    process_path = run_root / 'processes/lifecycle_sampler.process.json'
+    process = json.loads(process_path.read_text(encoding='utf-8'))
+    command = list(process['command'])
+    command[command.index('--schedule') + 1] = str(run_root / 'forged-schedule.json')
+    _rewrite_process_command(process, command)
+    _canonical_file(process_path, process)
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(
+        EvidenceError,
+        match='lifecycle_sampler process command, timeout, or outcome',
+    ):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase3_mission_csv_forgery(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    csv_path = run_root / 'mission-result.csv'
+    rows = list(csv.reader(csv_path.read_text(encoding='utf-8').splitlines()))
+    rows[1][0] = 'forged-run-id'
+    csv_path.write_text(
+        ''.join(','.join(row) + '\n' for row in rows),
+        encoding='utf-8',
+    )
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='mission JSON/CSV reconciliation failed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase3_resource_summary_forgery(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    resource_path = run_root / 'resources.jsonl'
+    samples = [json.loads(line) for line in resource_path.read_text(encoding='utf-8').splitlines()]
+    samples[0]['cpu_percent'] += 1.0
+    resource_path.write_text(
+        ''.join(json.dumps(sample, sort_keys=True) + '\n' for sample in samples),
+        encoding='utf-8',
+    )
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='resources do not exactly match the raw resource'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase3_goal_binding_forgery(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    observer_path = run_root / 'goal-observer.json'
+    observer = json.loads(observer_path.read_text(encoding='utf-8'))
+    observer['accepted_goal_uuid'] = 'forged-goal-uuid'
+    _canonical_file(observer_path, observer, sidecar=True)
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='goal UUID/T0 evidence differs'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase3_empty_domain_gate_forgery(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    gate_path = run_root / 'domain-cleanup.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    gate['nodes'].append('/robotest/forged_survivor')
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(
+        EvidenceError,
+        match=r'domain-cleanup\.json is not an exact empty-domain PASS',
+    ):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        ('verdict', 'FAIL'),
+        ('qos_contract_pass', False),
+        ('namespace_isolation_pass', False),
+        ('cmd_vel_owner_pass', False),
+        ('validation_autonomy_isolation_pass', False),
+    ],
+)
+def test_release_evidence_rejects_rebound_phase3_candidate_gate_contradiction(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    gate_path = run_root / 'runtime-gate.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    gate[field] = value
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(
+        EvidenceError, match='candidate runtime gate is not a complete claimed PASS'
+    ):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_accepts_factual_unknown_phase3_qos_introspection(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    gate_path = Path(fixture['candidate_root']) / 'smoke/runtime-gate.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    assert gate['bounded_depth_live_proven_for_all_endpoints'] is False
+    assert gate['qos_introspection_complete'] is False
+    assert all(
+        evidence['publisher_qos_pass'] is True and evidence['subscriber_qos_pass'] is True
+        for evidence in gate['topics'].values()
+    )
+
+    report = _validate_release_fixture(fixture)
+    assert report['status'] == 'PASS'
+
+
+@pytest.mark.parametrize(
+    'case',
+    ['bounded_aggregate', 'introspection_aggregate', 'nested_bounded'],
+)
+def test_release_evidence_rejects_rebound_phase3_qos_introspection_inconsistency(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    gate_path = run_root / 'runtime-gate.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    if case == 'bounded_aggregate':
+        gate['bounded_depth_live_proven_for_all_endpoints'] = True
+        expected = 'claims differ from source-bound replay'
+    elif case == 'introspection_aggregate':
+        gate['qos_introspection_complete'] = True
+        expected = 'claims differ from source-bound replay'
+    else:
+        first_topic = next(iter(gate['topics'].values()))
+        first_topic['bounded_depth_live_proven'] = True
+        expected = 'differs from endpoint/QoS replay'
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match=expected):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    'case',
+    ['cross_authoritative_gid', 'rogue_publisher', 'wrong_contact_type'],
+)
+def test_release_evidence_rejects_cascaded_phase3_candidate_endpoint_forgery(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    run_root = candidate_root / 'smoke'
+    gate_path = run_root / 'runtime-gate.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    if case == 'cross_authoritative_gid':
+        gate['topics']['/robotest/validation/ground_truth']['publishers'][0]['gid'] = gate[
+            'topics'
+        ]['/clock']['publishers'][0]['gid']
+        expected = 'authoritative publisher ownership failed'
+    elif case == 'rogue_publisher':
+        topic = gate['topics']['/robotest/map']
+        topic['publishers'][0]['node'] = '/robotest/forged_map_server'
+        publisher_check = next(
+            check for check in topic['qos_checks'] if check['side'] == 'publisher'
+        )
+        publisher_check['node'] = '/robotest/forged_map_server'
+        expected = 'publisher_ownership differs from endpoint ownership replay'
+    else:
+        gate['topics']['/robotest/internal/raw_contacts']['publishers'][0]['topic_type'] = (
+            'std_msgs/msg/String'
+        )
+        expected = 'publisher_ownership differs from endpoint ownership replay'
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_smoke_runtime_gate(repository, candidate_root, run_root)
+
+    with pytest.raises(EvidenceError, match=expected):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_cascaded_phase3_candidate_qos_override(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    run_root = candidate_root / 'smoke'
+    gate_path = run_root / 'runtime-gate.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    topic = gate['topics']['/robotest/cmd_vel']
+    topic['expected']['endpoint_depth_overrides'][0]['depth'] = 2_048
+    gate['exact_static_qos_depth_contract']['/robotest/cmd_vel'] = copy.deepcopy(topic['expected'])
+    endpoint = next(
+        item for item in topic['subscribers'] if item['node'] == '/robotest/metrics_collector'
+    )
+    endpoint.update({'depth': 2_048, 'history': 'KEEP_LAST'})
+    check = next(
+        item
+        for item in topic['qos_checks']
+        if item['side'] == 'subscriber' and item['node'] == '/robotest/metrics_collector'
+    )
+    check.update(
+        {
+            'bounded_depth_live_proven': True,
+            'exact_depth_live_proven': True,
+            'expected_depth': 2_048,
+            'introspection_complete': True,
+            'policy_contract_pass': True,
+        }
+    )
+    topic['bounded_depth_live_proven'] = all(
+        item['bounded_depth_live_proven'] for item in topic['qos_checks']
+    )
+    topic['exact_depth_live_proven'] = all(
+        item['exact_depth_live_proven'] for item in topic['qos_checks']
+    )
+    topic['qos_introspection_complete'] = all(
+        item['introspection_complete'] for item in topic['qos_checks']
+    )
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_smoke_runtime_gate(repository, candidate_root, run_root)
+
+    with pytest.raises(EvidenceError, match='differs from endpoint/QoS replay'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize('case', ['publisher_type', 'raw_subscriber_owner'])
+def test_release_evidence_rejects_cascaded_phase3_final_contact_endpoint_forgery(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    run_root = candidate_root / 'smoke'
+    gate_path = run_root / 'contact-stream-final-gate.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    raw_contacts = gate['topics']['/robotest/internal/raw_contacts']
+    if case == 'publisher_type':
+        raw_contacts['publishers'][0]['topic_type'] = 'std_msgs/msg/String'
+    else:
+        raw_contacts['subscribers'][0]['node'] = '/robotest/forged_contact_sink'
+        subscriber_check = next(
+            check for check in raw_contacts['qos_checks'] if check['side'] == 'subscriber'
+        )
+        subscriber_check['node'] = '/robotest/forged_contact_sink'
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_smoke_runtime_gate(repository, candidate_root, run_root)
+
+    with pytest.raises(EvidenceError, match='final runtime-gate claims differ'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase3_candidate_node_snapshot_forgery(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    run_root = candidate_root / 'smoke'
+    gate_path = run_root / 'runtime-gate.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    gate['nodes'].append('/robotest/forged_persistent_node')
+    gate['nodes'].sort()
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_smoke_runtime_gate(repository, candidate_root, run_root)
+
+    with pytest.raises(EvidenceError, match='node snapshot differs from the validated graph'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_cascaded_phase3_candidate_endpoint_type_forgery(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    run_root = candidate_root / 'smoke'
+    gate_path = run_root / 'runtime-gate.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    gate['topics']['/robotest/map']['publishers'][0]['topic_type'] = 'std_msgs/msg/String'
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_smoke_runtime_gate(repository, candidate_root, run_root)
+
+    with pytest.raises(EvidenceError, match='endpoint types differ from the validated graph'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_cascaded_phase3_unknown_endpoint_node(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    run_root = candidate_root / 'smoke'
+    gate_path = run_root / 'runtime-gate.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    clock = gate['topics']['/clock']
+    subscriber = clock['subscribers'][0]
+    previous_node = subscriber['node']
+    subscriber['node'] = '/robotest/forged_unknown_node'
+    subscriber_check = next(
+        check
+        for check in clock['qos_checks']
+        if check['side'] == 'subscriber' and check['node'] == previous_node
+    )
+    subscriber_check['node'] = subscriber['node']
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_smoke_runtime_gate(repository, candidate_root, run_root)
+
+    with pytest.raises(EvidenceError, match='endpoint nodes differ from the validated graph'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_cascaded_phase3_final_wrong_type_subscriber(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    run_root = candidate_root / 'smoke'
+    gate_path = run_root / 'contact-stream-final-gate.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    contacts = gate['topics']['/robotest/validation/contacts']
+    forged_subscriber = copy.deepcopy(contacts['subscribers'][0])
+    forged_subscriber.update(
+        {
+            'gid': 'd' * 32,
+            'node': '/robotest/fault_proxy',
+            'topic_type': 'std_msgs/msg/String',
+        }
+    )
+    contacts['subscribers'].append(forged_subscriber)
+    contacts['subscribers'].sort(key=lambda item: (item['node'], item['topic_type']))
+    forged_check = copy.deepcopy(
+        next(check for check in contacts['qos_checks'] if check['side'] == 'subscriber')
+    )
+    forged_check['node'] = forged_subscriber['node']
+    contacts['qos_checks'].append(forged_check)
+    contacts['qos_checks'].sort(key=lambda item: (item['side'], item['node']))
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_smoke_runtime_gate(repository, candidate_root, run_root)
+
+    with pytest.raises(EvidenceError, match='endpoint types differ from the validated graph'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase3_legacy_service_graph_forgery(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 legacy-service graph forgery fixture',
+    )
+    graph_path = run_root / 'graph.json'
+    graph = orchestration._load_phase3_graph_json(graph_path)
+    graph['observed']['services']['/robotest/faults/load_schedule'] = [
+        'robotest_interfaces/srv/LoadFaultSchedule'
+    ]
+    graph_path.write_bytes(orchestration._phase3_graph_json_bytes(graph))
+    (run_root / 'services.txt').write_text(
+        orchestration._phase3_graph_text(graph['observed']['services']),
+        encoding='utf-8',
+    )
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='service claims differ from the validated graph'):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
+    ('gate_name', 'case'),
+    [
+        ('runtime-gate.json', 'extra'),
+        ('runtime-gate.json', 'missing'),
+        ('contact-stream-final-gate.json', 'extra'),
+        ('contact-stream-final-gate.json', 'missing'),
+    ],
+)
+def test_release_evidence_rejects_rebound_phase3_runtime_gate_shape_forgery(
+    tmp_path: Path,
+    gate_name: str,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    run_root = candidate_root / 'smoke'
+    gate_path = run_root / gate_name
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    if case == 'extra':
+        gate['unexpected_claim'] = True
+    elif gate_name == 'runtime-gate.json':
+        del gate['scenario_services_missing']
+    else:
+        del gate['raw_subscriber_ownership']
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_smoke_runtime_gate(repository, candidate_root, run_root)
+
+    with pytest.raises(EvidenceError, match='runtime gate is not a complete claimed PASS'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase3_graph_semantic_tamper(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 graph tamper fixture',
+    )
+    graph_path = run_root / 'graph.json'
+    graph = json.loads(graph_path.read_text(encoding='utf-8'))
+    action_name = orchestration.PHASE3_GRAPH_ACTION_NAME
+    action_type = orchestration.PHASE3_GRAPH_ACTION_TYPE
+    graph['observed']['action_clients'] = {
+        action_name: {'/robotest/metrics_collector': [action_type]}
+    }
+    ownership, mismatches = orchestration._phase3_graph_action_results(
+        graph['contracts'],
+        graph['observed']['action_clients'],
+        graph['observed']['action_servers'],
+    )
+    graph['results']['action_ownership'] = ownership
+    graph['action_ownership_mismatches'] = mismatches
+    graph_path.write_bytes(orchestration._phase3_graph_json_bytes(graph))
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='semantic PASS'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_rebound_phase3_graph_text_tamper(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    projection = run_root / 'mission-actions.txt'
+    projection.write_text(
+        projection.read_text(encoding='utf-8') + '/forged [example_msgs/action/Forged]\n',
+        encoding='utf-8',
+    )
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='does not match the graph JSON projection'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_cascaded_phase3_graph_watch_pid_forgery(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    process_path = run_root / 'processes/graph_gate.process.json'
+    process = json.loads(process_path.read_text(encoding='utf-8'))
+    watch_index = process['command'].index('--watch-pid') + 1
+    forged_watch_pid = int(process['command'][watch_index]) + 97
+    process['command'][watch_index] = str(forged_watch_pid)
+    process['wrapped_command'] = [
+        'timeout',
+        '--signal=TERM',
+        '--kill-after=10s',
+        f'{process["wall_timeout_s"]:.3f}s',
+        *process['command'],
+    ]
+    _canonical_file(process_path, process)
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 cascaded watch-PID tamper fixture',
+    )
+    graph_path = run_root / 'graph.json'
+    graph = json.loads(graph_path.read_text(encoding='utf-8'))
+    graph['watch_pid'] = forged_watch_pid
+    graph_path.write_bytes(orchestration._phase3_graph_json_bytes(graph))
+    _rebind_phase3_prerequisites(repository, run_root)
+
+    with pytest.raises(EvidenceError, match='graph_gate process command, timeout, or outcome'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_phase3_orchestrator_graph_hash_forgery(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    run_root = Path(fixture['candidate_root']) / 'smoke'
+    orchestrator_path = run_root / 'orchestrator.json'
+    orchestrator = json.loads(orchestrator_path.read_text(encoding='utf-8'))
+    orchestrator['artifacts']['pre_mission_graph_sha256'] = 'f' * 64
+    _canonical_file(orchestrator_path, orchestrator, sidecar=True)
+
+    with pytest.raises(EvidenceError, match='does not match its prerequisite manifest'):
         _validate_release_fixture(fixture)
 
 

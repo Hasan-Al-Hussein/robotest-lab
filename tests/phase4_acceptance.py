@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
+ACTIVE_GOAL_SCHEMA_VERSION = 2
 PRODUCER = 'robotest_phase4/acceptance_verifier'
 MAX_JSON_BYTES = 32 * 1024 * 1024
 MAX_TEXT_BYTES = 8 * 1024 * 1024
@@ -45,16 +46,65 @@ MAX_PROC_FILE_BYTES = 1024 * 1024
 MAX_EVIDENCE_FILES = 512
 MAX_SOURCE_FILES = 20000
 MAX_PACKAGE_BYTES = 512 * 1024 * 1024
+MAX_GRAPH_ENDPOINTS = 4096
+MAX_GRAPH_TYPES_PER_ENDPOINT = 16
 READY_FAILURE_TARGET_S = 3.0
 PROCESS_GROUP_EXIT_TARGET_S = 5.0
 RECOVERY_TARGET_S = 30.0
 EXPECTED_BACKOFF_MS = 1000
 EXPECTED_CHILD = 'robotest-stack'
 EXPECTED_UNIT = 'robotest-supervisor.service'
+FOLLOW_WAYPOINTS_ACTION = '/robotest/follow_waypoints'
+FOLLOW_WAYPOINTS_ACTION_TYPE = 'nav2_msgs/action/FollowWaypoints'
+FOLLOW_WAYPOINTS_SEND_GOAL_SERVICE = f'{FOLLOW_WAYPOINTS_ACTION}/_action/send_goal'
+FOLLOW_WAYPOINTS_SEND_GOAL_TYPE = f'{FOLLOW_WAYPOINTS_ACTION_TYPE}_SendGoal'
+MISSION_RUNNER_NODE = '/robotest/mission_runner'
 SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
 RUN_ID_RE = re.compile(r'^phase4-[0-9]{8}T[0-9]{6}Z-[0-9]+$')
 PARTITION_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_]{0,127}$')
+UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 _DEFAULT_API = object()
+
+ACTIVE_GOAL_CLIENT_EVIDENCE_KEYS = frozenset(
+    {
+        'goal_capable_action_clients',
+        'mission_runner_is_goal_capable_action_client',
+        'projected_action_client_participants',
+        'projected_action_clients',
+        'send_goal_service_name',
+        'send_goal_service_type',
+        'service_clients',
+    }
+)
+ACTIVE_GOAL_KEYS = frozenset(
+    {
+        'accepted_goal_stamp_ns',
+        'action_name',
+        'action_type',
+        'attempt_count',
+        'captured_utc',
+        'elapsed_wall_s',
+        'goal_capable_action_clients',
+        'goal_status',
+        'goal_status_code',
+        'goal_uuid',
+        'gz_partition',
+        'mission_node',
+        'mission_pid',
+        'mission_process_alive',
+        'mission_runner_is_goal_capable_action_client',
+        'observed_monotonic_ns',
+        'projected_action_client_participants',
+        'projected_action_clients',
+        'ros_domain_id',
+        'schema_version',
+        'send_goal_service_name',
+        'send_goal_service_type',
+        'service_clients',
+        'status_entry_count',
+        'verdict',
+    }
+)
 
 LIFECYCLE_KEYS = frozenset(
     {
@@ -402,6 +452,89 @@ def _exact_keys(value: Mapping[str, Any], expected: frozenset[str], name: str) -
         missing = sorted(expected - actual)
         extra = sorted(actual - expected)
         raise EvidenceError(f'{name} schema mismatch; missing={missing}, extra={extra}')
+
+
+def normalize_graph_endpoint_entries(value: Any, name: str) -> list[list[Any]]:
+    """Return a bounded, deterministic graph endpoint snapshot."""
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise EvidenceError(f'{name} must be a sequence')
+    if len(value) > MAX_GRAPH_ENDPOINTS:
+        raise EvidenceError(f'{name} exceeds the {MAX_GRAPH_ENDPOINTS}-endpoint cap')
+    endpoints: dict[str, set[str]] = {}
+    for index, raw_entry in enumerate(value):
+        entry_name = f'{name}[{index}]'
+        if isinstance(raw_entry, (str, bytes)) or not isinstance(raw_entry, Sequence):
+            raise EvidenceError(f'{entry_name} must be a two-item sequence')
+        if len(raw_entry) != 2:
+            raise EvidenceError(f'{entry_name} must contain exactly a name and type list')
+        endpoint = _string(raw_entry[0], f'{entry_name}.name')
+        raw_types = raw_entry[1]
+        if isinstance(raw_types, (str, bytes)) or not isinstance(raw_types, Sequence):
+            raise EvidenceError(f'{entry_name}.types must be a sequence')
+        if len(raw_types) > MAX_GRAPH_TYPES_PER_ENDPOINT:
+            raise EvidenceError(
+                f'{entry_name}.types exceeds the {MAX_GRAPH_TYPES_PER_ENDPOINT}-type cap'
+            )
+        endpoint_types = endpoints.setdefault(endpoint, set())
+        for type_index, raw_type in enumerate(raw_types):
+            endpoint_types.add(_string(raw_type, f'{entry_name}.types[{type_index}]'))
+        if len(endpoint_types) > MAX_GRAPH_TYPES_PER_ENDPOINT:
+            raise EvidenceError(
+                f'{endpoint} exceeds the {MAX_GRAPH_TYPES_PER_ENDPOINT}-type cap after merging'
+            )
+    return [[endpoint, sorted(types)] for endpoint, types in sorted(endpoints.items())]
+
+
+def action_client_evidence_from_graph_entries(
+    service_clients: Any,
+    projected_action_clients: Any,
+) -> dict[str, Any]:
+    """Derive exact Phase 4 goal capability from the hidden SendGoal client.
+
+    Jazzy can project passive action endpoint consumers as action clients.  The
+    projected entries remain diagnostic, while only the exact SendGoal service
+    client establishes that the mission runner can submit a goal.
+    """
+    normalized_services = normalize_graph_endpoint_entries(
+        service_clients, 'mission runner service clients'
+    )
+    normalized_projected = normalize_graph_endpoint_entries(
+        projected_action_clients, 'mission runner projected action clients'
+    )
+    send_goal_types: list[str] | None = None
+    for service_name, service_types in normalized_services:
+        if service_name == FOLLOW_WAYPOINTS_SEND_GOAL_SERVICE:
+            send_goal_types = service_types
+            break
+
+    goal_capable: dict[str, dict[str, list[str]]] = {}
+    if send_goal_types is not None:
+        action_types: set[str] = set()
+        for service_type in send_goal_types:
+            if service_type == FOLLOW_WAYPOINTS_SEND_GOAL_TYPE:
+                action_types.add(FOLLOW_WAYPOINTS_ACTION_TYPE)
+            elif service_type.endswith('_SendGoal'):
+                action_types.add(service_type[: -len('_SendGoal')])
+            else:
+                action_types.add(service_type)
+        goal_capable = {FOLLOW_WAYPOINTS_ACTION: {MISSION_RUNNER_NODE: sorted(action_types)}}
+
+    projected_participants = {
+        action_name: {MISSION_RUNNER_NODE: action_types}
+        for action_name, action_types in normalized_projected
+    }
+    expected_goal_capable = {
+        FOLLOW_WAYPOINTS_ACTION: {MISSION_RUNNER_NODE: [FOLLOW_WAYPOINTS_ACTION_TYPE]}
+    }
+    return {
+        'goal_capable_action_clients': goal_capable,
+        'mission_runner_is_goal_capable_action_client': goal_capable == expected_goal_capable,
+        'projected_action_client_participants': projected_participants,
+        'projected_action_clients': normalized_projected,
+        'send_goal_service_name': FOLLOW_WAYPOINTS_SEND_GOAL_SERVICE,
+        'send_goal_service_type': FOLLOW_WAYPOINTS_SEND_GOAL_TYPE,
+        'service_clients': normalized_services,
+    }
 
 
 def _utc_timestamp(value: Any, name: str) -> str:
@@ -2008,6 +2141,61 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
     target = _mapping(load_json(run_directory / 'controller-target.json'), 'controller target')
     target_lineage = _mapping_list(target.get('lineage'), 'controller target lineage')
     active_goal = _mapping(load_json(run_directory / 'active-goal.json'), 'active goal')
+    _exact_keys(active_goal, ACTIVE_GOAL_KEYS, 'active goal')
+    active_goal_schema = _integer(active_goal.get('schema_version'), 'active goal schema_version')
+    active_goal_verdict = _string(active_goal.get('verdict'), 'active goal verdict')
+    _utc_timestamp(active_goal.get('captured_utc'), 'active goal captured_utc')
+    active_goal_observed_ns = _integer(
+        active_goal.get('observed_monotonic_ns'),
+        'active goal observed_monotonic_ns',
+        minimum=1,
+    )
+    active_goal_elapsed_s = _number(
+        active_goal.get('elapsed_wall_s'), 'active goal elapsed_wall_s', minimum=0.0
+    )
+    active_goal_pid = _integer(active_goal.get('mission_pid'), 'active goal mission_pid', minimum=2)
+    active_goal_process_alive = _boolean(
+        active_goal.get('mission_process_alive'), 'active goal mission_process_alive'
+    )
+    active_goal_node = _string(active_goal.get('mission_node'), 'active goal mission_node')
+    active_goal_name = _string(active_goal.get('action_name'), 'active goal action_name')
+    active_goal_type = _string(active_goal.get('action_type'), 'active goal action_type')
+    active_goal_uuid = _string(active_goal.get('goal_uuid'), 'active goal goal_uuid', maximum=36)
+    active_goal_accepted_stamp_ns = _integer(
+        active_goal.get('accepted_goal_stamp_ns'),
+        'active goal accepted_goal_stamp_ns',
+        minimum=1,
+    )
+    active_goal_status_code = _integer(
+        active_goal.get('goal_status_code'), 'active goal goal_status_code'
+    )
+    active_goal_status = _string(active_goal.get('goal_status'), 'active goal goal_status')
+    active_goal_status_count = _integer(
+        active_goal.get('status_entry_count'), 'active goal status_entry_count', minimum=1
+    )
+    active_goal_attempt_count = _integer(
+        active_goal.get('attempt_count'), 'active goal attempt_count', minimum=1
+    )
+    active_goal_domain = _string(active_goal.get('ros_domain_id'), 'active goal ros_domain_id')
+    active_goal_partition = _string(active_goal.get('gz_partition'), 'active goal gz_partition')
+    mission_runner_is_goal_capable = _boolean(
+        active_goal.get('mission_runner_is_goal_capable_action_client'),
+        'active goal mission_runner_is_goal_capable_action_client',
+    )
+    _mapping(active_goal.get('goal_capable_action_clients'), 'active goal goal clients')
+    _mapping(
+        active_goal.get('projected_action_client_participants'),
+        'active goal projected participants',
+    )
+    rebound_active_client_evidence = action_client_evidence_from_graph_entries(
+        active_goal.get('service_clients'),
+        active_goal.get('projected_action_clients'),
+    )
+    active_client_evidence_exact = frozenset(
+        rebound_active_client_evidence
+    ) == ACTIVE_GOAL_CLIENT_EVIDENCE_KEYS and all(
+        active_goal.get(key) == value for key, value in rebound_active_client_evidence.items()
+    )
     events = load_jsonl(run_directory / 'supervisor-events.jsonl')
     _event_sequence(events)
     event_meta = _mapping(
@@ -2430,13 +2618,25 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
         checks,
         failures,
         'mission_was_active_before_injection',
-        active_goal.get('schema_version') == 1
-        and active_goal.get('goal_status_code') == 2
-        and active_goal.get('goal_status') == 'EXECUTING'
-        and active_goal.get('mission_pid') == injection_details.get('mission_pid')
-        and active_goal.get('mission_process_alive') is True
-        and active_goal.get('action_name') == '/robotest/follow_waypoints'
-        and active_goal.get('mission_runner_is_action_client') is True,
+        active_goal_schema == ACTIVE_GOAL_SCHEMA_VERSION
+        and active_goal_verdict == 'PASS'
+        and active_goal_observed_ns > 0
+        and active_goal_elapsed_s <= 60.0
+        and active_goal_pid == injection_details.get('mission_pid')
+        and active_goal_process_alive is True
+        and active_goal_node == MISSION_RUNNER_NODE
+        and active_goal_name == FOLLOW_WAYPOINTS_ACTION
+        and active_goal_type == FOLLOW_WAYPOINTS_ACTION_TYPE
+        and UUID_RE.fullmatch(active_goal_uuid) is not None
+        and active_goal_accepted_stamp_ns > 0
+        and active_goal_status_code == 2
+        and active_goal_status == 'EXECUTING'
+        and active_goal_status_count <= 1024
+        and active_goal_attempt_count <= 2048
+        and active_goal_domain == str(isolation.get('ros_domain_id'))
+        and active_goal_partition == isolation.get('gz_partition')
+        and mission_runner_is_goal_capable is True
+        and active_client_evidence_exact,
     )
     _add_check(
         checks,
@@ -2444,7 +2644,7 @@ def evaluate_run(run_directory: Path) -> dict[str, Any]:
         'published_process_groups_are_bound',
         mission_started_details.get('pid') == interrupted_pgid
         and injection_details.get('mission_pid') == interrupted_pgid
-        and active_goal.get('mission_pid') == interrupted_pgid
+        and active_goal_pid == interrupted_pgid
         and probe_started_details.get('pid') == probe_pgid
         and followup_started_details.get('pid') == followup_pgid,
     )

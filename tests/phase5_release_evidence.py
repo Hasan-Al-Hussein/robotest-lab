@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -84,6 +85,163 @@ PHASE3_REQUIRED_METRICS = [
     'measurements.rtf_median',
     'measurements.rtf_p5',
 ]
+PHASE3_GRAPH_PROCESS_TIMEOUTS = {
+    'graph_gate': 100.0,
+    'mission_graph_gate': 30.0,
+}
+PHASE3_GRAPH_WATCHED_PROCESS_ROLES = ('full_stack', 'mission_runner')
+PHASE3_PREREQUISITE_PROCESS_ROLES = (
+    'contact_drain',
+    'contact_stream_final_gate',
+    'domain_cleanup',
+    'domain_preflight',
+    'full_stack',
+    'goal_observer',
+    'graph_gate',
+    'lifecycle_gate',
+    'metrics_collector',
+    'mission_graph_gate',
+    'mission_runner',
+    'partition_cleanup',
+    'partition_preflight',
+    'runtime_gate',
+    'scenario_controller',
+    'startup_gate',
+)
+PHASE3_GRAPH_BINDING_PATHS = {
+    'actions_text_sha256': 'actions.txt',
+    'graph_json_sha256': 'graph.json',
+    'nodes_text_sha256': 'nodes.txt',
+    'services_text_sha256': 'services.txt',
+    'topics_text_sha256': 'topics.txt',
+}
+PHASE3_PREREQUISITE_POST_PATHS = {
+    'PASS.json',
+    'PASS.json.sha256',
+    'analysis-request.json',
+    'analysis-request.json.sha256',
+    'orchestrator.json',
+    'orchestrator.json.sha256',
+    'prerequisite-manifest.json',
+    'prerequisite-manifest.json.sha256',
+}
+PHASE3_PREREQUISITE_RAW_PATHS = {
+    'capture.json',
+    'capture.json.sha256',
+    'component-exits.json',
+    'contact-drain.json',
+    'contact-drain.json.sha256',
+    'contact-gate-revalidation.json',
+    'contact-gate-revalidation.json.sha256',
+    'contact-progress.json',
+    'contact-stream-final-gate.json',
+    'contact-stream-final-gate.json.sha256',
+    'domain-cleanup.json',
+    'domain-cleanup.json.sha256',
+    'domain-preflight.json',
+    'domain-preflight.json.sha256',
+    'goal-binding-reconciliation.json',
+    'goal-observer.arm',
+    'goal-observer.armed.json',
+    'goal-observer.json',
+    'goal-observer.json.sha256',
+    'goal-observer.ready.json',
+    'lifecycle-ready.json',
+    'lifecycle-startup-result.json',
+    'metrics.ready.json',
+    'metrics.stop',
+    'mission-result.csv',
+    'mission-result.json',
+    'mission-result.json.sha256',
+    'resources.jsonl',
+    'runtime-gate.json',
+    'runtime-gate.json.sha256',
+    'scenario-result.json',
+    'scenario-result.json.sha256',
+    'scenario.ready.json',
+    'startup-gate.json',
+    'trial-context.json',
+    'trial-context.json.sha256',
+}
+PHASE3_PREREQUISITE_RAW_PATHS.update(
+    {
+        f'lifecycle-ready-{node_name}.txt'
+        for node_name in (
+            'map_server',
+            'amcl',
+            'planner_server',
+            'controller_server',
+            'behavior_server',
+            'bt_navigator',
+            'waypoint_follower',
+            'velocity_smoother',
+            'collision_monitor',
+        )
+    }
+)
+PHASE3_RUNTIME_GATE_ENDPOINT_KEYS = {
+    'depth',
+    'durability',
+    'gid',
+    'history',
+    'node',
+    'reliability',
+    'topic_type',
+}
+PHASE3_RUNTIME_GATE_TOPIC_KEYS = {
+    'bounded_depth_live_proven',
+    'exact_depth_live_proven',
+    'expected',
+    'publisher_qos_pass',
+    'publishers',
+    'qos_checks',
+    'qos_introspection_complete',
+    'subscriber_qos_pass',
+    'subscribers',
+}
+PHASE3_CANDIDATE_RUNTIME_GATE_KEYS = {
+    'attempt_count',
+    'autonomy_validation_leaks',
+    'bounded_depth_live_proven_for_all_endpoints',
+    'cmd_vel_owner_pass',
+    'command_subscriber_ownership',
+    'contact_aggregator_binary_attestation',
+    'contact_gate_binary_attestation',
+    'contact_subscriber_ownership',
+    'elapsed_wall_s',
+    'exact_static_qos_depth_contract',
+    'legacy_fault_service_absent',
+    'mode',
+    'namespace_isolation_pass',
+    'nodes',
+    'producer',
+    'publisher_ownership',
+    'qos_contract_pass',
+    'qos_introspection_complete',
+    'required_nodes_missing',
+    'required_nodes_outside_namespace',
+    'scenario_services_missing',
+    'schema_version',
+    'topics',
+    'validation_autonomy_isolation_pass',
+    'verdict',
+}
+PHASE3_CONTACT_STREAM_RUNTIME_GATE_KEYS = {
+    'attempt_count',
+    'contact_aggregator_binary_attestation',
+    'contact_gate_binary_attestation',
+    'contact_stream_gate_present',
+    'elapsed_wall_s',
+    'mode',
+    'nodes',
+    'producer',
+    'publisher_ownership',
+    'qos_contract_pass',
+    'raw_subscriber_ownership',
+    'schema_version',
+    'topics',
+    'verdict',
+}
 PHASE3_GLOBAL_HASH_FIELDS = {
     'collector_configuration_sha256',
     'metrics_contract_sha256',
@@ -1124,6 +1282,1342 @@ def _validate_positive_component_processes(
         )
 
 
+def _phase3_graph_probe_command(
+    repository: Path,
+    run_root: Path,
+    *,
+    orchestration: Any,
+    mission_client: bool,
+    watch_pid: int,
+) -> list[str]:
+    """Rebuild the frozen graph-probe argv for one campaign gate."""
+    contracts = orchestration.phase3_graph_contracts(mission_client)
+    prefix = 'mission-' if mission_client else ''
+    command = ['python3', str(repository / 'tests/phase2_graph_probe.py')]
+    for name, type_name in contracts['topics'].items():
+        command.extend(['--topic', f'{name}={type_name}'])
+    for name, type_name in contracts['services'].items():
+        command.extend(['--service', f'{name}={type_name}'])
+    for name, type_name in contracts['actions'].items():
+        command.extend(['--action', f'{name}={type_name}'])
+    for name, node_names in contracts['action_servers'].items():
+        for node_name in node_names:
+            command.extend(['--action-server', f'{name}={node_name}'])
+    for name, node_names in contracts['action_clients'].items():
+        for node_name in node_names:
+            command.extend(['--action-client', f'{name}={node_name}'])
+    command.extend(
+        [
+            '--output',
+            str(run_root / f'{prefix}graph.json'),
+            '--nodes-output',
+            str(run_root / f'{prefix}nodes.txt'),
+            '--topics-output',
+            str(run_root / f'{prefix}topics.txt'),
+            '--services-output',
+            str(run_root / f'{prefix}services.txt'),
+            '--actions-output',
+            str(run_root / f'{prefix}actions.txt'),
+            '--watch-pid',
+            str(watch_pid),
+            '--wall-timeout',
+            '90',
+        ]
+    )
+    return command
+
+
+def _phase3_full_stack_command(run_root: Path) -> list[str]:
+    """Rebuild the exact production full-stack launch argv."""
+    return [
+        'ros2',
+        'launch',
+        'robotest_navigation',
+        'phase2.launch.py',
+        'namespace:=robotest',
+        'seed:=42',
+        'headless:=true',
+        'render_sensors:=true',
+        'rviz:=false',
+        'autostart:=true',
+        'navigation_start_delay_sec:=7.0',
+        'lifecycle_discovery_grace_sec:=4.0',
+        'lifecycle_service_timeout_sec:=20.0',
+        'lifecycle_response_timeout_sec:=60.0',
+        f'lifecycle_startup_result_path:={run_root / "lifecycle-startup-result.json"}',
+    ]
+
+
+def _phase3_mission_runner_command(
+    repository: Path,
+    run_root: Path,
+    plan: Mapping[str, Any],
+) -> list[str]:
+    """Rebuild the exact production mission-runner argv from the frozen plan."""
+    return [
+        'ros2',
+        'run',
+        'robotest_missions',
+        'mission_runner',
+        '--mission',
+        str(repository / str(plan['scenario_path'])),
+        '--json',
+        str(run_root / 'mission-result.json'),
+        '--csv',
+        str(run_root / 'mission-result.csv'),
+        '--run-id',
+        str(plan['run_id']),
+        '--candidate-id',
+        str(plan['candidate_id']),
+        '--repetition-index',
+        str(plan['repetition_index']),
+        '--suite-index',
+        str(plan['suite_index']),
+        '--ros-args',
+        '-r',
+        '__ns:=/robotest',
+    ]
+
+
+def _phase3_runtime_gate_command(
+    repository: Path,
+    output: Path,
+    *,
+    mode: str,
+    wall_timeout_s: float,
+    watch_pid: int | None = None,
+    launch_pid: int | None = None,
+    expected_plan: Mapping[str, Any] | None = None,
+) -> list[str]:
+    """Rebuild one production runtime-gate argv."""
+    command = [
+        'python3',
+        str(repository / 'tests/phase3_runtime_gate.py'),
+        '--mode',
+        mode,
+        '--output',
+        str(output),
+        '--workspace',
+        str(repository),
+        '--wall-timeout-s',
+        str(wall_timeout_s),
+    ]
+    if watch_pid is not None:
+        command.extend(['--watch-pid', str(watch_pid)])
+    if launch_pid is not None:
+        command.extend(['--launch-pid', str(launch_pid)])
+    if expected_plan is not None:
+        command.extend(
+            [
+                '--expected-domain-id',
+                str(expected_plan['ros_domain_id']),
+                '--expected-gz-partition',
+                str(expected_plan['gz_partition']),
+            ]
+        )
+    return command
+
+
+def _phase3_process_contracts(
+    repository: Path,
+    run_root: Path,
+    *,
+    expected_plan: Mapping[str, Any],
+    orchestration: Any,
+    process_records: Mapping[str, Mapping[str, Any]],
+) -> dict[str, tuple[list[str], float, tuple[int, ...]]]:
+    """Rebuild every successful runner process contract from frozen inputs."""
+    launch_pid = process_records['full_stack']['pid']
+    mission_pid = process_records['mission_runner']['pid']
+    lifecycle_arguments: list[str] = []
+    for node_name in orchestration.REQUIRED_LIFECYCLE_NODES:
+        lifecycle_arguments.extend(['--node', node_name])
+    scenario_command = [
+        'ros2',
+        'run',
+        'robotest_scenarios',
+        'scenario_controller',
+        '--scenario',
+        str(repository / str(expected_plan['scenario_path'])),
+        '--output',
+        str(run_root / 'scenario-result.json'),
+        '--ready-file',
+        str(run_root / 'scenario.ready.json'),
+        '--run-id',
+        str(expected_plan['run_id']),
+        '--candidate-id',
+        str(expected_plan['candidate_id']),
+        '--repetition-index',
+        str(expected_plan['repetition_index']),
+        '--suite-index',
+        str(expected_plan['suite_index']),
+        '--ros-args',
+        '-r',
+        '__ns:=/robotest',
+    ]
+    observer_command = [
+        'python3',
+        str(repository / 'tests/phase3_runtime_observer.py'),
+        'observe-goal',
+        '--run-id',
+        str(expected_plan['run_id']),
+        '--ready-file',
+        str(run_root / 'goal-observer.ready.json'),
+        '--arm-file',
+        str(run_root / 'goal-observer.arm'),
+        '--armed-file',
+        str(run_root / 'goal-observer.armed.json'),
+        '--output',
+        str(run_root / 'goal-observer.json'),
+        '--watch-pid',
+        str(launch_pid),
+        '--wall-timeout-s',
+        '300',
+        '--ros-args',
+        '-r',
+        '__ns:=/robotest',
+    ]
+    if expected_plan.get('scenario_id') == 4:
+        observer_command.extend(['--schedule-output', str(run_root / 'lifecycle-schedule.json')])
+    mission_document = _load_canonical_json(
+        run_root / 'mission-result.json',
+        'Phase 3 mission result process binding',
+        maximum_bytes=PHASE3_RESULT_JSON_MAX_BYTES,
+    )
+    measurements = _mapping(
+        mission_document.get('measurements'),
+        'Phase 3 mission measurements process binding',
+    )
+    terminal_stamp = measurements.get('terminal_action_stamp_ns')
+    _require(
+        _exact_integer(terminal_stamp) and terminal_stamp > 0,
+        'Phase 3 mission terminal stamp cannot bind the contact-drain process',
+    )
+    contracts: dict[str, tuple[list[str], float, tuple[int, ...]]] = {
+        'contact_drain': (
+            [
+                'python3',
+                str(repository / 'tests/phase3_runtime_observer.py'),
+                'wait-contact-drain',
+                '--terminal-action-stamp-ns',
+                str(terminal_stamp),
+                '--output',
+                str(run_root / 'contact-drain.json'),
+                '--watch-pid',
+                str(launch_pid),
+                '--wall-timeout-s',
+                '30',
+                '--ros-args',
+                '-r',
+                '__ns:=/robotest',
+            ],
+            35.0,
+            (0,),
+        ),
+        'contact_stream_final_gate': (
+            _phase3_runtime_gate_command(
+                repository,
+                run_root / 'contact-stream-final-gate.json',
+                mode='contact-stream',
+                wall_timeout_s=10.0,
+                watch_pid=launch_pid,
+                launch_pid=launch_pid,
+                expected_plan=expected_plan,
+            ),
+            15.0,
+            (0,),
+        ),
+        'domain_cleanup': (
+            _phase3_runtime_gate_command(
+                repository,
+                run_root / 'domain-cleanup.json',
+                mode='empty',
+                wall_timeout_s=15.0,
+            ),
+            20.0,
+            (0,),
+        ),
+        'domain_preflight': (
+            _phase3_runtime_gate_command(
+                repository,
+                run_root / 'domain-preflight.json',
+                mode='empty',
+                wall_timeout_s=10.0,
+            ),
+            15.0,
+            (0,),
+        ),
+        'full_stack': (_phase3_full_stack_command(run_root), 430.0, (-15, 0)),
+        'goal_observer': (observer_command, 310.0, (0,)),
+        'graph_gate': (
+            _phase3_graph_probe_command(
+                repository,
+                run_root,
+                orchestration=orchestration,
+                mission_client=False,
+                watch_pid=launch_pid,
+            ),
+            100.0,
+            (0,),
+        ),
+        'lifecycle_gate': (
+            [
+                'python3',
+                str(repository / 'tests/phase2_lifecycle_probe.py'),
+                '--namespace',
+                '/robotest',
+                '--output',
+                str(run_root / 'lifecycle-ready.json'),
+                '--text-dir',
+                str(run_root),
+                '--text-prefix',
+                'lifecycle-ready-',
+                '--wall-timeout',
+                '110',
+                '--watch-pid',
+                str(launch_pid),
+                *lifecycle_arguments,
+            ],
+            120.0,
+            (0,),
+        ),
+        'metrics_collector': (
+            [
+                'ros2',
+                'run',
+                'robotest_metrics',
+                'metrics_collector',
+                '--output',
+                str(run_root / 'capture.json'),
+                '--ready-file',
+                str(run_root / 'metrics.ready.json'),
+                '--stop-file',
+                str(run_root / 'metrics.stop'),
+                '--contact-progress-file',
+                str(run_root / 'contact-progress.json'),
+                '--wall-timeout-s',
+                '360',
+                '--ros-args',
+                '-r',
+                '__ns:=/robotest',
+            ],
+            370.0,
+            (0,),
+        ),
+        'mission_graph_gate': (
+            _phase3_graph_probe_command(
+                repository,
+                run_root,
+                orchestration=orchestration,
+                mission_client=True,
+                watch_pid=mission_pid,
+            ),
+            30.0,
+            (0,),
+        ),
+        'mission_runner': (
+            _phase3_mission_runner_command(repository, run_root, expected_plan),
+            310.0,
+            (0,),
+        ),
+        'partition_cleanup': (['gz', 'topic', '-l'], 15.0, (0,)),
+        'partition_preflight': (['gz', 'topic', '-l'], 15.0, (0,)),
+        'runtime_gate': (
+            _phase3_runtime_gate_command(
+                repository,
+                run_root / 'runtime-gate.json',
+                mode='candidate',
+                wall_timeout_s=60.0,
+                watch_pid=launch_pid,
+                launch_pid=launch_pid,
+                expected_plan=expected_plan,
+            ),
+            70.0,
+            (0,),
+        ),
+        'scenario_controller': (scenario_command, 310.0, (0,)),
+        'startup_gate': (
+            [
+                'python3',
+                str(repository / 'tests/phase2_startup_gate.py'),
+                '--result',
+                str(run_root / 'lifecycle-startup-result.json'),
+                '--output',
+                str(run_root / 'startup-gate.json'),
+                '--watch-pid',
+                str(launch_pid),
+                '--wall-timeout',
+                '110',
+                '--expected-service-name',
+                '/robotest/lifecycle_manager_navigation/manage_nodes',
+                '--expected-discovery-grace-sec',
+                '4.0',
+                '--expected-service-timeout-sec',
+                '20.0',
+                '--expected-response-timeout-sec',
+                '60.0',
+            ],
+            120.0,
+            (0,),
+        ),
+    }
+    if expected_plan.get('scenario_id') == 4:
+        contracts['lifecycle_sampler'] = (
+            [
+                'ros2',
+                'run',
+                'robotest_metrics',
+                'metrics_lifecycle_sampler',
+                '--schedule',
+                str(run_root / 'lifecycle-schedule.json'),
+                '--output',
+                str(run_root / 'lifecycle-snapshot.json'),
+                '--ready-file',
+                str(run_root / 'lifecycle-sampler.ready.json'),
+                '--stop-file',
+                str(run_root / 'lifecycle-sampler.stop'),
+                '--wall-timeout-s',
+                '360',
+                '--request-timeout-s',
+                '2',
+                '--ros-args',
+                '-r',
+                '__ns:=/robotest',
+            ],
+            370.0,
+            (0,),
+        )
+    return contracts
+
+
+def _phase3_current_prerequisite_paths(run_root: Path) -> set[str]:
+    """Recover the production pre-manifest snapshot from the finalized run tree."""
+    paths: set[str] = set()
+    for path in run_root.rglob('*'):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(run_root).as_posix()
+        if (
+            relative in PHASE3_PREREQUISITE_POST_PATHS
+            or relative.startswith('analysis-process/')
+            or relative.startswith('result/')
+        ):
+            continue
+        paths.add(relative)
+    return paths
+
+
+def _phase3_runtime_gate_endpoint(raw_endpoint: object, label: str) -> dict[str, Any]:
+    """Validate the exact JSON projection emitted by ``_endpoint_record``."""
+    endpoint = dict(_mapping(raw_endpoint, label))
+    _require(
+        set(endpoint) == PHASE3_RUNTIME_GATE_ENDPOINT_KEYS
+        and _exact_integer(endpoint.get('depth'))
+        and 0 <= endpoint['depth'] <= (2**63 - 1)
+        and endpoint.get('history') in {'KEEP_ALL', 'KEEP_LAST', 'SYSTEM_DEFAULT', 'UNKNOWN'}
+        and isinstance(endpoint.get('reliability'), str)
+        and endpoint['reliability']
+        and isinstance(endpoint.get('durability'), str)
+        and endpoint['durability']
+        and isinstance(endpoint.get('gid'), str)
+        and re.fullmatch(r'(?:[0-9a-f]{2})+', endpoint['gid']) is not None
+        and len(endpoint['gid']) <= 512
+        and isinstance(endpoint.get('node'), str)
+        and endpoint['node'].startswith('/')
+        and isinstance(endpoint.get('topic_type'), str)
+        and bool(endpoint['topic_type']),
+        f'{label} is not an exact runtime-gate endpoint record',
+    )
+    return endpoint
+
+
+def _phase3_runtime_gate_expected_contract(runtime_gate: Any, topic: str) -> dict[str, Any]:
+    reliability, durability, depth = runtime_gate.QOS_CONTRACTS[topic]
+    return {
+        'depth': depth,
+        'durability': durability,
+        'endpoint_depth_overrides': [
+            {'depth': override_depth, 'node': node, 'side': side}
+            for (override_topic, side, node), override_depth in sorted(
+                runtime_gate.QOS_DEPTH_OVERRIDES.items()
+            )
+            if override_topic == topic
+        ],
+        'history': 'KEEP_LAST',
+        'reliability': reliability,
+    }
+
+
+def _phase3_validate_runtime_gate_topics(
+    raw_topics: object,
+    *,
+    runtime_gate: Any,
+    expected_topics: object,
+) -> dict[str, Any]:
+    """Replay the producer's exact endpoint/QoS projection from frozen source constants."""
+    topics = _mapping(raw_topics, 'Phase 3 runtime-gate topics')
+    expected_topic_names = set(expected_topics)
+    _require(
+        expected_topic_names and set(topics) == expected_topic_names,
+        'Phase 3 runtime-gate topic set differs from the producer contract',
+    )
+    replayed_topics: dict[str, dict[str, Any]] = {}
+    exact_contract: dict[str, dict[str, Any]] = {}
+    for topic_name in sorted(expected_topic_names):
+        _require(
+            isinstance(topic_name, str) and topic_name.startswith('/'),
+            'Phase 3 runtime-gate topic name is invalid',
+        )
+        evidence = _mapping(topics[topic_name], f'Phase 3 runtime-gate topic {topic_name}')
+        _require(
+            set(evidence) == PHASE3_RUNTIME_GATE_TOPIC_KEYS,
+            f'Phase 3 runtime-gate topic {topic_name} shape changed',
+        )
+        endpoints: dict[str, list[dict[str, Any]]] = {}
+        for side, plural in (('publisher', 'publishers'), ('subscriber', 'subscribers')):
+            raw_endpoints = _list(
+                evidence.get(plural),
+                f'Phase 3 runtime-gate topic {topic_name} {plural}',
+            )
+            validated = [
+                _phase3_runtime_gate_endpoint(
+                    raw_endpoint,
+                    f'Phase 3 runtime-gate topic {topic_name} {side} endpoint {index}',
+                )
+                for index, raw_endpoint in enumerate(raw_endpoints)
+            ]
+            _require(
+                validated == sorted(validated, key=lambda item: (item['node'], item['topic_type'])),
+                f'Phase 3 runtime-gate topic {topic_name} {plural} are not canonical',
+            )
+            endpoints[plural] = validated
+        _require(
+            len(endpoints['publishers']) + len(endpoints['subscribers'])
+            <= runtime_gate.MAX_ENDPOINTS,
+            f'Phase 3 runtime-gate topic {topic_name} endpoint graph exceeds the bound',
+        )
+        checks = []
+        for side, plural in (('publisher', 'publishers'), ('subscriber', 'subscribers')):
+            for endpoint in endpoints[plural]:
+                endpoint_contract = runtime_gate._endpoint_qos_contract(
+                    topic_name,
+                    side,
+                    endpoint['node'],
+                )
+                checks.append(
+                    {
+                        **runtime_gate._qos_status(endpoint, endpoint_contract),
+                        'node': endpoint['node'],
+                        'side': side,
+                    }
+                )
+        checks.sort(key=lambda item: (item['side'], item['node']))
+        expected_contract = _phase3_runtime_gate_expected_contract(runtime_gate, topic_name)
+        replayed = {
+            'bounded_depth_live_proven': bool(checks)
+            and all(item['bounded_depth_live_proven'] for item in checks),
+            'exact_depth_live_proven': bool(checks)
+            and all(item['exact_depth_live_proven'] for item in checks),
+            'expected': expected_contract,
+            'publisher_qos_pass': bool(endpoints['publishers'])
+            and all(item['policy_contract_pass'] for item in checks if item['side'] == 'publisher'),
+            'publishers': endpoints['publishers'],
+            'qos_checks': checks,
+            'qos_introspection_complete': bool(checks)
+            and all(item['introspection_complete'] for item in checks),
+            'subscriber_qos_pass': all(
+                item['policy_contract_pass'] for item in checks if item['side'] == 'subscriber'
+            ),
+            'subscribers': endpoints['subscribers'],
+        }
+        _require(
+            _exact_json_equal(evidence, replayed),
+            f'Phase 3 runtime-gate topic {topic_name} differs from endpoint/QoS replay',
+        )
+        replayed_topics[topic_name] = replayed
+        exact_contract[topic_name] = expected_contract
+    return {
+        'bounded_depth_live_proven_for_all_endpoints': all(
+            evidence['bounded_depth_live_proven'] for evidence in replayed_topics.values()
+        ),
+        'exact_static_qos_depth_contract': exact_contract,
+        'qos_contract_pass': all(
+            evidence['publisher_qos_pass'] and evidence['subscriber_qos_pass']
+            for evidence in replayed_topics.values()
+        ),
+        'qos_introspection_complete': all(
+            evidence['qos_introspection_complete'] for evidence in replayed_topics.values()
+        ),
+        'topics': replayed_topics,
+    }
+
+
+def _phase3_runtime_gate_nodes(value: object, label: str) -> list[str]:
+    nodes = _list(value, label)
+    _require(
+        nodes
+        and nodes == sorted(set(nodes))
+        and all(isinstance(node, str) and node.startswith('/') for node in nodes),
+        f'{label} is not the exact canonical node snapshot',
+    )
+    return nodes
+
+
+def _phase3_bounded_process_record(
+    repository: Path,
+    run_root: Path,
+    *,
+    role: str,
+) -> Mapping[str, Any]:
+    """Load one exact, finalized ProcessRegistry record and its retained logs."""
+    label = f'Phase 3 {role} process'
+    process = _load_canonical_json(
+        run_root / f'processes/{role}.process.json',
+        label,
+        maximum_bytes=64 * 1024,
+    )
+    _require(set(process) == PHASE3_BOUNDED_PROCESS_KEYS, f'{label} fields are invalid')
+    command = _list(process.get('command'), f'{label} command')
+    pid = process.get('pid')
+    started = process.get('started_steady_ns')
+    finished = process.get('finished_steady_ns')
+    returncode = process.get('returncode')
+    wall_timeout_s = process.get('wall_timeout_s')
+    _require(
+        process.get('role') == role
+        and process.get('cwd') == str(repository.resolve())
+        and _exact_integer(pid)
+        and pid > 0
+        and process.get('pgid') == pid
+        and _exact_integer(started)
+        and started > 0
+        and _exact_integer(finished)
+        and finished >= started
+        and _exact_integer(returncode)
+        and returncode != 124
+        and process.get('timed_out') is False
+        and process.get('group_confirmed_empty') is True
+        and isinstance(wall_timeout_s, (int, float))
+        and not isinstance(wall_timeout_s, bool)
+        and math.isfinite(wall_timeout_s)
+        and wall_timeout_s > 0.0
+        and 1 <= len(command) <= 128
+        and all(
+            isinstance(item, str) and item and len(item.encode('utf-8')) <= 4096 for item in command
+        )
+        and process.get('wrapped_command')
+        == [
+            'timeout',
+            '--signal=TERM',
+            '--kill-after=10s',
+            f'{wall_timeout_s:.3f}s',
+            *command,
+        ],
+        f'{label} identity, lifetime, or wrapper binding is invalid',
+    )
+    for stream_name in ('stdout', 'stderr'):
+        stream_label = f'{label} {stream_name}'
+        stream = _mapping(process.get(stream_name), stream_label)
+        maximum_bytes = stream.get('maximum_bytes')
+        observed_bytes = stream.get('observed_bytes')
+        retained_bytes = stream.get('retained_bytes')
+        _require(
+            set(stream) == PHASE3_BOUNDED_STREAM_KEYS
+            and maximum_bytes == 8 * 1024 * 1024
+            and _exact_integer(observed_bytes)
+            and _exact_integer(retained_bytes)
+            and 0 <= retained_bytes <= observed_bytes <= maximum_bytes
+            and stream.get('overflow') is False
+            and stream.get('error') is None,
+            f'{stream_label} fields are invalid',
+        )
+        log_path = _regular_file(
+            run_root / f'processes/{role}.{stream_name}.log',
+            f'{stream_label} retained log',
+        )
+        _require(
+            log_path.stat().st_size == retained_bytes,
+            f'{stream_label} retained byte count differs from its log',
+        )
+    return process
+
+
+def _phase3_graph_process(
+    repository: Path,
+    run_root: Path,
+    *,
+    orchestration: Any,
+    role: str,
+    mission_client: bool,
+    expected_watch_pid: int,
+) -> Mapping[str, Any]:
+    """Validate one graph gate and tie its argv to an independently owned PID."""
+    process = _phase3_bounded_process_record(repository, run_root, role=role)
+    label = f'Phase 3 {role} process'
+    command = process['command']
+    watch_indexes = [index for index, value in enumerate(command) if value == '--watch-pid']
+    _require(
+        len(watch_indexes) == 1 and watch_indexes[0] + 1 < len(command),
+        f'{label} must contain exactly one watched PID',
+    )
+    watch_pid_text = command[watch_indexes[0] + 1]
+    _require(
+        isinstance(watch_pid_text, str)
+        and re.fullmatch(r'[1-9][0-9]*', watch_pid_text) is not None
+        and int(watch_pid_text) == expected_watch_pid,
+        f'{label} watched PID does not match its owned component process',
+    )
+    expected_timeout = PHASE3_GRAPH_PROCESS_TIMEOUTS[role]
+    expected_command = _phase3_graph_probe_command(
+        repository,
+        run_root,
+        orchestration=orchestration,
+        mission_client=mission_client,
+        watch_pid=expected_watch_pid,
+    )
+    _require(
+        process.get('pid') != expected_watch_pid
+        and process.get('returncode') == 0
+        and process.get('wall_timeout_s') == expected_timeout
+        and command == expected_command,
+        f'{label} command binding is invalid',
+    )
+    return process
+
+
+def _validate_phase3_graph_prerequisites(
+    repository: Path,
+    run_root: Path,
+    *,
+    expected_plan: Mapping[str, Any],
+    orchestrator_document: Mapping[str, Any],
+    orchestration: Any,
+) -> dict[str, dict[str, Any]]:
+    """Replay the manifest-bound pre-mission and mission graph evidence pair."""
+    manifest_path = run_root / 'prerequisite-manifest.json'
+    manifest = _load_canonical_json(
+        manifest_path,
+        'Phase 3 prerequisite manifest',
+        maximum_bytes=PHASE3_RESULT_JSON_MAX_BYTES,
+    )
+    _validate_json_sidecar(manifest_path, 'Phase 3 prerequisite manifest')
+    _require(
+        set(manifest) == {'aggregate_sha256', 'artifact_count', 'artifacts', 'total_bytes'},
+        'Phase 3 prerequisite manifest fields are invalid',
+    )
+    try:
+        orchestration.verify_component_manifest(manifest, run_root)
+    except Exception as exc:
+        raise EvidenceError(f'Phase 3 prerequisite manifest verification failed: {exc}') from exc
+    raw_records = _list(manifest.get('artifacts'), 'Phase 3 prerequisite artifact records')
+    records: dict[str, Mapping[str, Any]] = {}
+    ordered_paths: list[str] = []
+    for index, value in enumerate(raw_records):
+        record = _mapping(value, f'Phase 3 prerequisite record {index}')
+        _require(
+            set(record) == {'bytes', 'path', 'sha256'},
+            f'Phase 3 prerequisite record {index} fields are invalid',
+        )
+        path = record.get('path')
+        _require(isinstance(path, str) and path not in records, 'duplicate prerequisite path')
+        records[path] = record
+        ordered_paths.append(path)
+    _require(
+        ordered_paths == sorted(ordered_paths),
+        'Phase 3 prerequisite manifest records are not in canonical path order',
+    )
+    _require(
+        set(records) == _phase3_current_prerequisite_paths(run_root),
+        'Phase 3 prerequisite manifest is not the exact production pre-manifest snapshot',
+    )
+
+    required_paths = set(PHASE3_PREREQUISITE_RAW_PATHS)
+    required_paths.update(
+        {
+            f'{prefix}{relative}'
+            for prefix in ('', 'mission-')
+            for relative in PHASE3_GRAPH_BINDING_PATHS.values()
+        }
+    )
+    expected_process_roles = set(PHASE3_PREREQUISITE_PROCESS_ROLES)
+    if expected_plan.get('scenario_id') == 4:
+        expected_process_roles.add('lifecycle_sampler')
+        required_paths.update(
+            {
+                'lifecycle-sampler.ready.json',
+                'lifecycle-sampler.stop',
+                'lifecycle-schedule.json',
+                'lifecycle-schedule.json.sha256',
+                'lifecycle-snapshot.json',
+                'lifecycle-snapshot.json.sha256',
+            }
+        )
+    expected_process_paths = {
+        f'processes/{role}.{suffix}'
+        for role in expected_process_roles
+        for suffix in ('process.json', 'stderr.log', 'stdout.log')
+    }
+    observed_process_paths = {path for path in records if path.startswith('processes/')}
+    _require(
+        observed_process_paths == expected_process_paths,
+        'Phase 3 prerequisite process triplet set is not the production role set',
+    )
+    for role in expected_process_roles:
+        required_paths.update(
+            {
+                f'processes/{role}.process.json',
+                f'processes/{role}.stderr.log',
+                f'processes/{role}.stdout.log',
+            }
+        )
+    _require(
+        set(records) == required_paths,
+        'Phase 3 prerequisite manifest path set is not the exact successful-run snapshot',
+    )
+
+    process_records = {
+        role: _phase3_bounded_process_record(repository, run_root, role=role)
+        for role in expected_process_roles
+    }
+    process_contracts = _phase3_process_contracts(
+        repository,
+        run_root,
+        expected_plan=expected_plan,
+        orchestration=orchestration,
+        process_records=process_records,
+    )
+    _require(
+        set(process_contracts) == expected_process_roles,
+        'Phase 3 process contract role set is inconsistent',
+    )
+    for role, process in process_records.items():
+        expected_command, expected_timeout, allowed_returncodes = process_contracts[role]
+        _require(
+            process.get('command') == expected_command
+            and process.get('wall_timeout_s') == expected_timeout
+            and process.get('returncode') in allowed_returncodes,
+            f'Phase 3 {role} process command, timeout, or outcome binding is invalid',
+        )
+    _require(
+        len({process['pid'] for process in process_records.values()}) == len(process_records),
+        'Phase 3 process PIDs are not all distinct',
+    )
+    for role in ('partition_preflight', 'partition_cleanup'):
+        stdout_path = run_root / f'processes/{role}.stdout.log'
+        try:
+            stdout_empty = not stdout_path.read_text(encoding='utf-8').strip()
+        except (OSError, UnicodeError) as exc:
+            raise EvidenceError(f'cannot read Phase 3 {role} stdout: {exc}') from exc
+        _require(stdout_empty, f'Phase 3 {role} did not prove an unused Gazebo partition')
+
+    full_stack_process = process_records['full_stack']
+    mission_process = process_records['mission_runner']
+    expected_mission_command = process_contracts['mission_runner'][0]
+    _require(
+        full_stack_process.get('returncode') in (-15, 0)
+        and mission_process.get('returncode') == 0
+        and full_stack_process.get('pid') != mission_process.get('pid'),
+        'Phase 3 watched component process outcomes are invalid',
+    )
+    _phase3_graph_process(
+        repository,
+        run_root,
+        orchestration=orchestration,
+        role='graph_gate',
+        mission_client=False,
+        expected_watch_pid=full_stack_process['pid'],
+    )
+    _phase3_graph_process(
+        repository,
+        run_root,
+        orchestration=orchestration,
+        role='mission_graph_gate',
+        mission_client=True,
+        expected_watch_pid=mission_process['pid'],
+    )
+    process_started = {
+        role: process['started_steady_ns'] for role, process in process_records.items()
+    }
+    process_finished = {
+        role: process['finished_steady_ns'] for role, process in process_records.items()
+    }
+    online_roles = expected_process_roles - {
+        'domain_cleanup',
+        'domain_preflight',
+        'full_stack',
+        'partition_cleanup',
+        'partition_preflight',
+    }
+    timeline_valid = (
+        process_started['domain_preflight']
+        <= process_finished['domain_preflight']
+        <= process_started['partition_preflight']
+        <= process_finished['partition_preflight']
+        <= process_started['full_stack']
+        <= process_started['startup_gate']
+        <= process_finished['startup_gate']
+        <= process_started['lifecycle_gate']
+        <= process_finished['lifecycle_gate']
+        <= process_started['metrics_collector']
+        <= process_started['scenario_controller']
+        <= process_started['goal_observer']
+        <= process_started['runtime_gate']
+        <= process_finished['runtime_gate']
+        <= process_started['graph_gate']
+        <= process_finished['graph_gate']
+        <= process_started['mission_runner']
+        <= process_finished['goal_observer']
+        <= process_started['mission_graph_gate']
+        <= process_finished['mission_graph_gate']
+        <= process_finished['mission_runner']
+        <= process_started['contact_drain']
+        and process_finished['scenario_controller'] <= process_started['contact_drain']
+        and process_finished['contact_drain']
+        <= process_started['contact_stream_final_gate']
+        <= process_finished['contact_stream_final_gate']
+        <= process_finished['metrics_collector']
+        and all(
+            process_started['full_stack'] <= process_started[role]
+            and process_finished[role] <= process_finished['full_stack']
+            for role in online_roles
+        )
+        and process_finished['full_stack']
+        <= process_started['domain_cleanup']
+        <= process_finished['domain_cleanup']
+        <= process_started['partition_cleanup']
+        <= process_finished['partition_cleanup']
+    )
+    if expected_plan.get('scenario_id') == 4:
+        timeline_valid = (
+            timeline_valid
+            and process_finished['goal_observer']
+            <= process_started['lifecycle_sampler']
+            <= process_started['mission_graph_gate']
+            and process_finished['metrics_collector'] <= process_finished['lifecycle_sampler']
+        )
+    _require(timeline_valid, 'Phase 3 successful process timeline is invalid')
+    execution = _mapping(
+        orchestrator_document.get('execution'),
+        'Phase 3 orchestrator execution evidence',
+    )
+    expected_execution = {
+        'command': shlex.join(expected_mission_command),
+        'exit_code': mission_process['returncode'],
+        'wall_duration_s': (
+            mission_process['finished_steady_ns'] - mission_process['started_steady_ns']
+        )
+        / 1_000_000_000,
+        'wall_timed_out': False,
+        'wall_timeout_s': 300.0,
+        'working_directory': str(repository.resolve()),
+    }
+    _require(
+        execution == expected_execution,
+        'Phase 3 orchestrator execution does not exactly bind the mission process',
+    )
+    for gate_name, expected_timeout in (
+        ('domain-preflight.json', 10.0),
+        ('domain-cleanup.json', 15.0),
+    ):
+        gate_path = run_root / gate_name
+        gate = _load_canonical_json(
+            gate_path,
+            f'Phase 3 {gate_name} empty-domain evidence',
+        )
+        _validate_json_sidecar(gate_path, f'Phase 3 {gate_name} empty-domain evidence')
+        attempt_count = gate.get('attempt_count')
+        elapsed_wall_s = gate.get('elapsed_wall_s')
+        _require(
+            set(gate)
+            == {
+                'attempt_count',
+                'elapsed_wall_s',
+                'mode',
+                'nodes',
+                'producer',
+                'remaining_nodes',
+                'schema_version',
+                'verdict',
+            }
+            and _exact_integer(attempt_count)
+            and 1 <= attempt_count <= 4096
+            and isinstance(elapsed_wall_s, (int, float))
+            and not isinstance(elapsed_wall_s, bool)
+            and math.isfinite(elapsed_wall_s)
+            and 0.0 <= elapsed_wall_s <= expected_timeout
+            and gate.get('mode') == 'empty'
+            and gate.get('nodes') == ['/robotest/evidence/phase3_runtime_gate']
+            and gate.get('producer') == 'robotest_phase3/runtime_gate'
+            and gate.get('remaining_nodes') == []
+            and gate.get('schema_version') == 1
+            and gate.get('verdict') == 'PASS',
+            f'Phase 3 {gate_name} is not an exact empty-domain PASS',
+        )
+    resource_summary = orchestration.summarize_resources(run_root / 'resources.jsonl')
+    expected_orchestrator_resources = {
+        field: resource_summary[field] for field in orchestration.RESOURCE_METRIC_FIELDS
+    }
+    observed_orchestrator_resources = _mapping(
+        orchestrator_document.get('resources'),
+        'Phase 3 orchestrator resource evidence',
+    )
+    _require(
+        observed_orchestrator_resources == expected_orchestrator_resources,
+        'Phase 3 orchestrator resources do not exactly match the raw resource trace',
+    )
+    runtime_gate_source = _load_repository_module(
+        repository,
+        'tests/phase3_runtime_gate.py',
+        'Phase 3 runtime-gate source contract',
+    )
+    runtime_gates: dict[str, Mapping[str, Any]] = {}
+    for gate_name in ('runtime-gate.json', 'contact-stream-final-gate.json'):
+        runtime_gate = _load_canonical_json(
+            run_root / gate_name,
+            f'Phase 3 {gate_name} launch binding',
+            maximum_bytes=PHASE3_RESULT_JSON_MAX_BYTES,
+        )
+        runtime_gates[gate_name] = runtime_gate
+        for attestation_name in (
+            'contact_aggregator_binary_attestation',
+            'contact_gate_binary_attestation',
+        ):
+            attestation = _mapping(
+                runtime_gate.get(attestation_name),
+                f'Phase 3 {gate_name} {attestation_name}',
+            )
+            _require(
+                attestation.get('launch_root_pid') == full_stack_process['pid'],
+                f'Phase 3 {gate_name} does not independently bind the full-stack launch PID',
+            )
+    initial_gate = runtime_gates['runtime-gate.json']
+    initial_attempts = initial_gate.get('attempt_count')
+    initial_elapsed = initial_gate.get('elapsed_wall_s')
+    _require(
+        set(initial_gate) == PHASE3_CANDIDATE_RUNTIME_GATE_KEYS
+        and _exact_integer(initial_attempts)
+        and 1 <= initial_attempts <= 4096
+        and isinstance(initial_elapsed, (int, float))
+        and not isinstance(initial_elapsed, bool)
+        and math.isfinite(initial_elapsed)
+        and 0.0 <= initial_elapsed <= 60.0
+        and initial_gate.get('mode') == 'candidate'
+        and initial_gate.get('producer') == 'robotest_phase3/runtime_gate'
+        and initial_gate.get('schema_version') == 1
+        and initial_gate.get('verdict') == 'PASS'
+        and type(initial_gate.get('bounded_depth_live_proven_for_all_endpoints')) is bool
+        and initial_gate.get('cmd_vel_owner_pass') is True
+        and initial_gate.get('legacy_fault_service_absent') is True
+        and initial_gate.get('namespace_isolation_pass') is True
+        and initial_gate.get('qos_contract_pass') is True
+        and type(initial_gate.get('qos_introspection_complete')) is bool
+        and initial_gate.get('validation_autonomy_isolation_pass') is True
+        and initial_gate.get('autonomy_validation_leaks') == []
+        and initial_gate.get('required_nodes_missing') == []
+        and initial_gate.get('required_nodes_outside_namespace') == []
+        and initial_gate.get('scenario_services_missing') == [],
+        'Phase 3 candidate runtime gate is not a complete claimed PASS',
+    )
+    initial_nodes = _phase3_runtime_gate_nodes(
+        initial_gate.get('nodes'),
+        'Phase 3 candidate runtime-gate nodes',
+    )
+    initial_topic_replay = _phase3_validate_runtime_gate_topics(
+        initial_gate.get('topics'),
+        runtime_gate=runtime_gate_source,
+        expected_topics=runtime_gate_source.QOS_CONTRACTS,
+    )
+    initial_topics = initial_topic_replay['topics']
+    authoritative_publisher_ownership = runtime_gate_source._authoritative_publisher_ownership(
+        initial_topics
+    )
+    _require(
+        set(authoritative_publisher_ownership)
+        == set(runtime_gate_source.AUTHORITATIVE_PUBLISHER_CONTRACTS)
+        and all(authoritative_publisher_ownership.values()),
+        'Phase 3 candidate runtime-gate authoritative publisher ownership failed',
+    )
+    expected_publisher_ownership = {
+        topic: (
+            authoritative_publisher_ownership[topic]
+            if topic in authoritative_publisher_ownership
+            else runtime_gate_source._exact_endpoint_owners(
+                initial_topics[topic]['publishers'],
+                expected_nodes,
+                expected_type=(
+                    runtime_gate_source.CONTACT_MESSAGE_TYPE
+                    if topic in runtime_gate_source.CONTACT_TOPICS
+                    else None
+                ),
+            )
+        )
+        for topic, expected_nodes in runtime_gate_source.CANDIDATE_EXPECTED_PUBLISHERS.items()
+    }
+    expected_command_subscriber_ownership = {
+        topic: runtime_gate_source._exact_endpoint_owners(
+            initial_topics[topic]['subscribers'],
+            expected_nodes,
+        )
+        for topic, expected_nodes in (
+            runtime_gate_source.CANDIDATE_EXPECTED_COMMAND_SUBSCRIBERS.items()
+        )
+    }
+    expected_contact_subscriber_ownership = {
+        topic: runtime_gate_source._exact_endpoint_owners(
+            initial_topics[topic]['subscribers'],
+            expected_nodes,
+            expected_type=runtime_gate_source.CONTACT_MESSAGE_TYPE,
+        )
+        for topic, expected_nodes in (
+            runtime_gate_source.CANDIDATE_EXPECTED_CONTACT_SUBSCRIBERS.items()
+        )
+    }
+    for field, expected_ownership in (
+        ('publisher_ownership', expected_publisher_ownership),
+        ('command_subscriber_ownership', expected_command_subscriber_ownership),
+        ('contact_subscriber_ownership', expected_contact_subscriber_ownership),
+    ):
+        observed_ownership = _mapping(
+            initial_gate.get(field),
+            f'Phase 3 candidate runtime-gate {field}',
+        )
+        _require(
+            _exact_json_equal(observed_ownership, expected_ownership)
+            and expected_ownership
+            and all(expected_ownership.values()),
+            f'Phase 3 candidate runtime-gate {field} differs from endpoint ownership replay',
+        )
+    short_node_names = {node.rsplit('/', 1)[-1] for node in initial_nodes}
+    expected_required_nodes_missing = sorted(
+        runtime_gate_source.CANDIDATE_REQUIRED_NODES - short_node_names
+    )
+    expected_required_nodes_outside_namespace = sorted(
+        node
+        for node in initial_nodes
+        if node.rsplit('/', 1)[-1] in runtime_gate_source.CANDIDATE_REQUIRED_NODES
+        and not node.startswith('/robotest/')
+    )
+    project_endpoints = [
+        endpoint
+        for evidence in initial_topics.values()
+        for plural in ('publishers', 'subscribers')
+        for endpoint in evidence[plural]
+    ]
+    endpoint_namespace_pass = all(
+        endpoint['node'].startswith('/robotest/') for endpoint in project_endpoints
+    )
+    expected_namespace_pass = (
+        endpoint_namespace_pass and not expected_required_nodes_outside_namespace
+    )
+    expected_autonomy_leaks = [
+        {'node': subscriber['node'], 'topic': topic}
+        for topic in runtime_gate_source.VALIDATION_TOPICS
+        for subscriber in initial_topics[topic]['subscribers']
+        if subscriber['node'].rsplit('/', 1)[-1] in runtime_gate_source.AUTONOMY_NODE_NAMES
+    ]
+    _require(
+        initial_gate.get('bounded_depth_live_proven_for_all_endpoints')
+        == initial_topic_replay['bounded_depth_live_proven_for_all_endpoints']
+        and initial_gate.get('qos_introspection_complete')
+        == initial_topic_replay['qos_introspection_complete']
+        and initial_gate.get('qos_contract_pass') == initial_topic_replay['qos_contract_pass']
+        and _exact_json_equal(
+            initial_gate.get('exact_static_qos_depth_contract'),
+            initial_topic_replay['exact_static_qos_depth_contract'],
+        )
+        and initial_gate.get('cmd_vel_owner_pass')
+        is expected_publisher_ownership['/robotest/cmd_vel']
+        and _exact_json_equal(
+            initial_gate.get('autonomy_validation_leaks'),
+            expected_autonomy_leaks,
+        )
+        and initial_gate.get('validation_autonomy_isolation_pass') is (not expected_autonomy_leaks)
+        and _exact_json_equal(
+            initial_gate.get('required_nodes_missing'),
+            expected_required_nodes_missing,
+        )
+        and _exact_json_equal(
+            initial_gate.get('required_nodes_outside_namespace'),
+            expected_required_nodes_outside_namespace,
+        )
+        and initial_gate.get('namespace_isolation_pass') is expected_namespace_pass,
+        'Phase 3 candidate runtime-gate claims differ from source-bound replay',
+    )
+
+    final_gate = runtime_gates['contact-stream-final-gate.json']
+    final_attempts = final_gate.get('attempt_count')
+    final_elapsed = final_gate.get('elapsed_wall_s')
+    _require(
+        set(final_gate) == PHASE3_CONTACT_STREAM_RUNTIME_GATE_KEYS
+        and _exact_integer(final_attempts)
+        and 1 <= final_attempts <= 4096
+        and isinstance(final_elapsed, (int, float))
+        and not isinstance(final_elapsed, bool)
+        and math.isfinite(final_elapsed)
+        and 0.0 <= final_elapsed <= 10.0
+        and final_gate.get('mode') == 'contact_stream'
+        and final_gate.get('producer') == 'robotest_phase3/runtime_gate'
+        and final_gate.get('schema_version') == 1
+        and final_gate.get('verdict') == 'PASS'
+        and final_gate.get('contact_stream_gate_present') is True
+        and final_gate.get('qos_contract_pass') is True
+        and final_gate.get('raw_subscriber_ownership') is True,
+        'Phase 3 final contact-stream runtime gate is not a complete claimed PASS',
+    )
+    final_nodes = _phase3_runtime_gate_nodes(
+        final_gate.get('nodes'),
+        'Phase 3 final runtime-gate nodes',
+    )
+    final_topic_replay = _phase3_validate_runtime_gate_topics(
+        final_gate.get('topics'),
+        runtime_gate=runtime_gate_source,
+        expected_topics=runtime_gate_source.CONTACT_TOPICS,
+    )
+    final_topics = final_topic_replay['topics']
+    expected_final_publisher_ownership = {
+        topic: runtime_gate_source._exact_endpoint_owners(
+            final_topics[topic]['publishers'],
+            runtime_gate_source.CANDIDATE_EXPECTED_PUBLISHERS[topic],
+            expected_type=runtime_gate_source.CONTACT_MESSAGE_TYPE,
+        )
+        for topic in runtime_gate_source.CONTACT_TOPICS
+    }
+    expected_raw_subscriber_ownership = runtime_gate_source._exact_endpoint_owners(
+        final_topics['/robotest/internal/raw_contacts']['subscribers'],
+        {'/robotest/contact_stream_gate'},
+        expected_type=runtime_gate_source.CONTACT_MESSAGE_TYPE,
+    )
+    _require(
+        _exact_json_equal(
+            final_gate.get('publisher_ownership'),
+            expected_final_publisher_ownership,
+        )
+        and all(expected_final_publisher_ownership.values())
+        and final_gate.get('raw_subscriber_ownership') is expected_raw_subscriber_ownership
+        and expected_raw_subscriber_ownership
+        and final_gate.get('contact_stream_gate_present')
+        is ('/robotest/contact_stream_gate' in final_nodes)
+        and final_gate.get('qos_contract_pass') is final_topic_replay['qos_contract_pass'],
+        'Phase 3 final runtime-gate claims differ from source-bound replay',
+    )
+    try:
+        pre_binding = orchestration.validate_phase3_graph_artifacts(
+            run_root,
+            mission_client=False,
+            expected_watch_pid=full_stack_process['pid'],
+        )
+        mission_binding = orchestration.validate_phase3_graph_artifacts(
+            run_root,
+            mission_client=True,
+            expected_watch_pid=mission_process['pid'],
+        )
+    except Exception as exc:
+        raise EvidenceError(f'Phase 3 graph artifact replay failed: {exc}') from exc
+
+    pre_graph_document = orchestration._load_phase3_graph_json(run_root / 'graph.json')
+    pre_graph_observed = _mapping(
+        pre_graph_document.get('observed'),
+        'Phase 3 validated pre-mission graph observations',
+    )
+    pre_graph_services = _mapping(
+        pre_graph_observed.get('services'),
+        'Phase 3 validated pre-mission services',
+    )
+    pre_graph_topics = _mapping(
+        pre_graph_observed.get('topics'),
+        'Phase 3 validated pre-mission topics',
+    )
+    pre_graph_nodes = set(
+        _list(
+            pre_graph_observed.get('node_names'),
+            'Phase 3 validated pre-mission node names',
+        )
+    )
+    expected_scenario_services_missing = sorted(
+        set(runtime_gate_source.SCENARIO_SERVICES) - set(pre_graph_services)
+    )
+    _require(
+        _exact_json_equal(
+            initial_gate.get('scenario_services_missing'),
+            expected_scenario_services_missing,
+        )
+        and initial_gate.get('legacy_fault_service_absent')
+        is ('/robotest/faults/load_schedule' not in pre_graph_services),
+        'Phase 3 candidate runtime-gate service claims differ from the validated graph',
+    )
+    _require(
+        set(initial_nodes) - {'/robotest/evidence/phase3_runtime_gate'} == pre_graph_nodes,
+        'Phase 3 candidate runtime-gate node snapshot differs from the validated graph',
+    )
+    for gate_label, gate_topics in (
+        ('candidate', initial_topics),
+        ('final contact-stream', final_topics),
+    ):
+        for topic_name, topic_evidence in gate_topics.items():
+            graph_types = _list(
+                pre_graph_topics.get(topic_name),
+                f'Phase 3 validated pre-mission topic {topic_name} types',
+            )
+            _require(
+                len(graph_types) == 1,
+                f'Phase 3 validated pre-mission topic {topic_name} is not an exact singleton type',
+            )
+            endpoints = [
+                endpoint
+                for plural in ('publishers', 'subscribers')
+                for endpoint in topic_evidence[plural]
+            ]
+            _require(
+                all(endpoint['node'] in pre_graph_nodes for endpoint in endpoints),
+                f'Phase 3 {gate_label} runtime-gate {topic_name} endpoint nodes differ from '
+                'the validated graph',
+            )
+            _require(
+                all(endpoint['topic_type'] == graph_types[0] for endpoint in endpoints),
+                f'Phase 3 {gate_label} runtime-gate {topic_name} endpoint types differ from '
+                'the validated graph',
+            )
+
+    for prefix, binding in (('', pre_binding), ('mission-', mission_binding)):
+        for binding_key, relative in PHASE3_GRAPH_BINDING_PATHS.items():
+            manifest_record = records[f'{prefix}{relative}']
+            _require(
+                manifest_record.get('sha256') == binding[binding_key],
+                f'Phase 3 {prefix}{relative} is not bound by the prerequisite manifest',
+            )
+    try:
+        orchestration.validate_phase3_graph_pair(pre_binding, mission_binding)
+    except Exception as exc:
+        raise EvidenceError(f'Phase 3 graph pair replay failed: {exc}') from exc
+
+    artifacts = _mapping(
+        orchestrator_document.get('artifacts'),
+        'Phase 3 orchestrator artifact evidence',
+    )
+    maximum_file_bytes = max(record['bytes'] for record in raw_records)
+    runtime_stderr_bytes = sum(
+        record['bytes'] for record in raw_records if record['path'].endswith('.stderr.log')
+    )
+    runtime_stdout_bytes = sum(
+        record['bytes'] for record in raw_records if record['path'].endswith('.stdout.log')
+    )
+    _require(
+        artifacts.get('pre_mission_graph_sha256') == pre_binding['graph_json_sha256']
+        and artifacts.get('mission_graph_sha256') == mission_binding['graph_json_sha256']
+        and artifacts.get('prerequisite_artifact_count') == len(raw_records)
+        and artifacts.get('prerequisite_checksums_verified') is True
+        and artifacts.get('prerequisite_manifest_sha256') == file_sha256(manifest_path)
+        and artifacts.get('prerequisite_maximum_file_bytes') == maximum_file_bytes
+        and artifacts.get('prerequisite_total_bytes') == manifest.get('total_bytes')
+        and artifacts.get('prerequisites_finalized') is True
+        and artifacts.get('prerequisites_within_caps') is True
+        and artifacts.get('runtime_stderr_bytes') == runtime_stderr_bytes
+        and artifacts.get('runtime_stdout_bytes') == runtime_stdout_bytes,
+        'Phase 3 orchestrator artifact evidence does not match its prerequisite manifest',
+    )
+    return {'mission': mission_binding, 'pre_mission': pre_binding}
+
+
 def _validate_phase3_bundle(
     repository: Path,
     result_directory: Path,
@@ -1154,6 +2648,7 @@ def _validate_phase3_bundle(
             require_request_context_binding,
             validate_trial_context,
         )
+        from robotest_missions.artifacts import reconcile_artifacts as reconcile_mission_artifacts
 
         manifest = verify_result_bundle(result_directory)
     except Exception as exc:
@@ -1188,6 +2683,7 @@ def _validate_phase3_bundle(
         'Phase 3 analysis request',
     )
     mission_path = run_root / 'mission-result.json'
+    mission_csv_path = run_root / 'mission-result.csv'
     scenario_path = run_root / 'scenario-result.json'
     capture_path = run_root / 'capture.json'
     contact_drain_path = run_root / 'contact-drain.json'
@@ -1198,26 +2694,41 @@ def _validate_phase3_bundle(
     orchestrator_path = run_root / 'orchestrator.json'
     lifecycle_path = run_root / 'lifecycle-snapshot.json'
     raw_paths = (
-        (mission_path, 'Phase 3 mission result'),
-        (scenario_path, 'Phase 3 scenario result'),
-        (capture_path, 'Phase 3 capture'),
-        (contact_drain_path, 'Phase 3 contact drain'),
-        (initial_contact_gate_path, 'Phase 3 initial contact gate'),
-        (final_contact_gate_path, 'Phase 3 final contact gate'),
-        (contact_gate_revalidation_path, 'Phase 3 contact gate revalidation'),
-        (orchestrator_path, 'Phase 3 orchestrator result'),
+        (mission_path, 'Phase 3 mission result', True),
+        (scenario_path, 'Phase 3 scenario result', True),
+        (capture_path, 'Phase 3 capture', True),
+        (contact_drain_path, 'Phase 3 contact drain', True),
+        (initial_contact_gate_path, 'Phase 3 initial contact gate', True),
+        (final_contact_gate_path, 'Phase 3 final contact gate', True),
+        (contact_gate_revalidation_path, 'Phase 3 contact gate revalidation', True),
+        (orchestrator_path, 'Phase 3 orchestrator result', True),
     )
-    for path, label in raw_paths:
+    for path, label, has_sidecar in raw_paths:
         _regular_file(path, label)
-        _validate_json_sidecar(path, label)
+        if has_sidecar:
+            _validate_json_sidecar(path, label)
     mission = _load_canonical_json(
         mission_path,
         'Phase 3 mission result',
         maximum_bytes=PHASE3_RESULT_JSON_MAX_BYTES,
     )
+    try:
+        reconcile_mission_artifacts(mission_path, mission_csv_path)
+    except Exception as exc:
+        raise EvidenceError(f'Phase 3 mission JSON/CSV reconciliation failed: {exc}') from exc
+    scenario_document = _load_canonical_json(
+        scenario_path,
+        'Phase 3 scenario result',
+        maximum_bytes=PHASE3_RESULT_JSON_MAX_BYTES,
+    )
     capture_document = _load_canonical_json(
         capture_path,
         'Phase 3 capture',
+        maximum_bytes=PHASE3_RESULT_JSON_MAX_BYTES,
+    )
+    orchestrator_document = _load_canonical_json(
+        orchestrator_path,
+        'Phase 3 orchestrator result',
         maximum_bytes=PHASE3_RESULT_JSON_MAX_BYTES,
     )
     _regular_file(contact_progress_path, 'Phase 3 contact progress')
@@ -1247,6 +2758,29 @@ def _validate_phase3_bundle(
             f'Phase 3 run {suite_index} has an unexpected lifecycle snapshot',
         )
     try:
+        observer_path = run_root / 'goal-observer.json'
+        observer = _load_canonical_json(observer_path, 'Phase 3 goal observer')
+        _validate_json_sidecar(observer_path, 'Phase 3 goal observer')
+        expected_goal_binding = orchestration.reconcile_goal_binding(
+            observer,
+            mission,
+            scenario_document,
+        )
+        observed_goal_binding = _load_canonical_json(
+            run_root / 'goal-binding-reconciliation.json',
+            'Phase 3 goal-binding reconciliation',
+        )
+        _require(
+            _exact_json_equal(observed_goal_binding, expected_goal_binding),
+            'Phase 3 goal-binding reconciliation is not the exact production recomputation',
+        )
+        _validate_phase3_graph_prerequisites(
+            repository,
+            run_root,
+            expected_plan=expected_plan,
+            orchestrator_document=orchestrator_document,
+            orchestration=orchestration,
+        )
         validate_trial_context(context)
         require_request_context_binding(request, context)
         expected_context = orchestration.make_trial_context(

@@ -162,14 +162,18 @@ run_logged phase3-pytest 120s \
   pytest -q \
     tests/phase3_orchestration_test.py \
     tests/phase3_benchmark_runner_test.py
+run_logged phase3-graph-probe-self-test 30s \
+  python3 tests/phase2_graph_probe.py --self-test
 run_logged phase3-pycompile 30s \
   python3 -m py_compile \
+    tests/phase2_graph_probe.py \
     tests/phase3_orchestration.py \
     tests/phase3_benchmark_runner.py \
     tests/phase3_runtime_gate.py \
     tests/phase3_runtime_observer.py
 run_logged phase3-ament-flake8 60s \
   ament_flake8 \
+    tests/phase2_graph_probe.py \
     tests/phase3_orchestration.py \
     tests/phase3_benchmark_runner.py \
     tests/phase3_runtime_gate.py \

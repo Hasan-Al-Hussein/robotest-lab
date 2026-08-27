@@ -49,6 +49,7 @@ from phase3_orchestration import (
     LOG_MAX_BYTES,
     make_orchestrator_evidence,
     make_trial_context,
+    phase3_graph_contracts,
     positive_control_qualified_snapshot_stamp,
     PRODUCER,
     reconcile_contact_gate_reobservation,
@@ -62,6 +63,8 @@ from phase3_orchestration import (
     validate_contact_control_ready,
     validate_contact_drain_evidence,
     validate_contact_progress,
+    validate_phase3_graph_artifacts,
+    validate_phase3_graph_pair,
     validate_positive_runtime_gate_artifacts,
     verify_component_manifest,
     verify_json_sidecar,
@@ -672,6 +675,20 @@ def _write_marker(path: Path, document: Mapping[str, Any]) -> None:
     atomic_write_json(path, dict(document), maximum_bytes=64 * 1024, sidecar=True)
 
 
+def _write_existing_artifact_sidecar(path: Path) -> str:
+    """Create one runner-owned GNU-style checksum for a finalized artifact."""
+    if path.is_symlink() or not path.is_file():
+        raise EvidenceError(f'cannot bind missing or non-regular artifact: {path}')
+    sidecar = Path(f'{path}.sha256')
+    if sidecar.exists() or sidecar.is_symlink():
+        raise EvidenceError(f'artifact checksum sidecar already exists: {sidecar}')
+    digest = file_sha256(path)
+    atomic_write_bytes(sidecar, f'{digest}  {path.name}\n'.encode('ascii'), 256)
+    if verify_json_sidecar(path) != digest:
+        raise EvidenceError(f'artifact checksum sidecar could not be verified: {sidecar}')
+    return digest
+
+
 def _wait_for_file(
     path: Path,
     *,
@@ -923,58 +940,21 @@ def _graph_probe_command(
     watch_pid: int,
     mission_client: bool,
 ) -> list[str]:
-    topics = {
-        '/clock': 'rosgraph_msgs/msg/Clock',
-        '/tf': 'tf2_msgs/msg/TFMessage',
-        '/tf_static': 'tf2_msgs/msg/TFMessage',
-        '/robotest/cmd_vel': 'geometry_msgs/msg/Twist',
-        '/robotest/cmd_vel_behavior_unused': 'geometry_msgs/msg/Twist',
-        '/robotest/cmd_vel_nav': 'geometry_msgs/msg/Twist',
-        '/robotest/cmd_vel_smoothed': 'geometry_msgs/msg/Twist',
-        '/robotest/collision_monitor_state': 'nav2_msgs/msg/CollisionMonitorState',
-        '/robotest/faults/events': 'robotest_interfaces/msg/FaultEvent',
-        '/robotest/imu': 'sensor_msgs/msg/Imu',
-        '/robotest/map': 'nav_msgs/msg/OccupancyGrid',
-        '/robotest/navigation/plan': 'nav_msgs/msg/Path',
-        '/robotest/odom': 'nav_msgs/msg/Odometry',
-        '/robotest/raw/imu': 'sensor_msgs/msg/Imu',
-        '/robotest/raw/odom': 'nav_msgs/msg/Odometry',
-        '/robotest/raw/scan': 'sensor_msgs/msg/LaserScan',
-        '/robotest/scan': 'sensor_msgs/msg/LaserScan',
-        '/robotest/validation/contacts': 'ros_gz_interfaces/msg/Contacts',
-        '/robotest/validation/ground_truth': 'nav_msgs/msg/Odometry',
-        '/robotest/validation/scenario_entity_poses': 'tf2_msgs/msg/TFMessage',
-        '/robotest/validation/world_stats': 'ros_gz_interfaces/msg/WorldStatistics',
-    }
-    services = {
-        '/robotest/faults/arm_schedule': 'robotest_interfaces/srv/ArmFaultSchedule',
-        '/robotest/faults/preload_schedule': 'robotest_interfaces/srv/PreloadFaultSchedule',
-        '/robotest/faults/reset': 'std_srvs/srv/Trigger',
-        '/robotest/scenario/delete_entity': 'ros_gz_interfaces/srv/DeleteEntity',
-        '/robotest/scenario/set_entity_pose': 'ros_gz_interfaces/srv/SetEntityPose',
-        '/robotest/scenario/spawn_entity': 'ros_gz_interfaces/srv/SpawnEntity',
-    }
+    contracts = phase3_graph_contracts(mission_client)
     prefix = 'mission-' if mission_client else ''
     command = ['python3', str(workspace / 'tests/phase2_graph_probe.py')]
-    for name, type_name in topics.items():
+    for name, type_name in contracts['topics'].items():
         command.extend(['--topic', f'{name}={type_name}'])
-    for name, type_name in services.items():
+    for name, type_name in contracts['services'].items():
         command.extend(['--service', f'{name}={type_name}'])
-    command.extend(
-        [
-            '--action',
-            '/robotest/follow_waypoints=nav2_msgs/action/FollowWaypoints',
-            '--action-server',
-            '/robotest/follow_waypoints=/robotest/waypoint_follower',
-        ]
-    )
-    if mission_client:
-        command.extend(
-            [
-                '--action-client',
-                '/robotest/follow_waypoints=/robotest/mission_runner',
-            ]
-        )
+    for name, type_name in contracts['actions'].items():
+        command.extend(['--action', f'{name}={type_name}'])
+    for name, node_names in contracts['action_servers'].items():
+        for node_name in node_names:
+            command.extend(['--action-server', f'{name}={node_name}'])
+    for name, node_names in contracts['action_clients'].items():
+        for node_name in node_names:
+            command.extend(['--action-client', f'{name}={node_name}'])
     command.extend(
         [
             '--output',
@@ -1742,6 +1722,23 @@ class BenchmarkRunner:
                 wall_timeout_s=100.0,
                 stage='graph_gate',
             )
+            try:
+                graph_binding = validate_phase3_graph_artifacts(
+                    run_dir,
+                    mission_client=False,
+                    expected_watch_pid=launch.pid,
+                )
+            except EvidenceError as exc:
+                raise StageFailure(
+                    'graph_gate',
+                    'invalid_evidence',
+                    str(exc),
+                    evidence={
+                        'graph_path': str(run_dir / 'graph.json'),
+                        'mission_client': False,
+                        'watch_pid': launch.pid,
+                    },
+                ) from exc
             atomic_write_bytes(observer_arm, b'arm-next-new-goal\n', 256)
             _wait_for_file(
                 observer_armed,
@@ -1847,6 +1844,35 @@ class BenchmarkRunner:
                 wall_timeout_s=30.0,
                 stage='mission_graph_gate',
             )
+            try:
+                mission_graph_binding = validate_phase3_graph_artifacts(
+                    run_dir,
+                    mission_client=True,
+                    expected_watch_pid=mission.pid,
+                )
+            except EvidenceError as exc:
+                raise StageFailure(
+                    'mission_graph_gate',
+                    'invalid_evidence',
+                    str(exc),
+                    evidence={
+                        'graph_path': str(run_dir / 'mission-graph.json'),
+                        'mission_client': True,
+                        'watch_pid': mission.pid,
+                    },
+                ) from exc
+            try:
+                validate_phase3_graph_pair(graph_binding, mission_graph_binding)
+            except EvidenceError as exc:
+                raise StageFailure(
+                    'mission_graph_gate',
+                    'inconsistent_graph_pair',
+                    str(exc),
+                    evidence={
+                        'mission': mission_graph_binding,
+                        'pre_mission': graph_binding,
+                    },
+                ) from exc
             mission_status = mission.wait(320.0)
             scenario_status = scenario.wait(30.0)
             atomic_write_json(
@@ -2130,6 +2156,27 @@ class BenchmarkRunner:
                 ),
                 initial_context_sha256=context_start_hash,
             )
+        try:
+            sidecar_targets = [run_dir / 'capture.json', run_dir / 'mission-result.json']
+            if plan['scenario_id'] == 4:
+                sidecar_targets.append(run_dir / 'lifecycle-snapshot.json')
+            for target in sidecar_targets:
+                _write_existing_artifact_sidecar(target)
+        except (EvidenceError, OSError) as exc:
+            return self._analyze_failure(
+                plan,
+                build_start,
+                positive,
+                run_dir,
+                context_path,
+                StageFailure(
+                    'artifact_gate',
+                    'artifact_sidecar_finalization',
+                    str(exc),
+                    evidence={'exception_type': type(exc).__name__},
+                ),
+                initial_context_sha256=context_start_hash,
+            )
         core_paths = sorted(item for item in run_dir.rglob('*') if item.is_file())
         manifest_path = run_dir / 'prerequisite-manifest.json'
         try:
@@ -2209,6 +2256,8 @@ class BenchmarkRunner:
                 },
                 run_dir=run_dir,
                 component_manifest_sha256=file_sha256(manifest_path),
+                pre_mission_graph_sha256=graph_binding['graph_json_sha256'],
+                mission_graph_sha256=mission_graph_binding['graph_json_sha256'],
             )
         except (EvidenceError, OSError) as exc:
             return self._analyze_failure(

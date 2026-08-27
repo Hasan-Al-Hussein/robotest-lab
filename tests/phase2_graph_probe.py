@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 # Copyright 2026 Hasan Ahmed
 # SPDX-License-Identifier: Apache-2.0
+# ruff: noqa: I001
 
 """Boundedly prove Phase 2 node, topic, service, and action graph contracts."""
 
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from contextlib import suppress
 import json
 import math
 import os
+from pathlib import Path
 import re
 import sys
 import tempfile
 import time
-from collections import Counter
-from contextlib import suppress
-from pathlib import Path
 from typing import Any
 
-import rclpy
+from action_msgs.msg import GoalStatusArray
+from action_msgs.srv import CancelGoal
 from nav2_msgs.action import FollowWaypoints
+import rclpy
 from rclpy.action import ActionClient, ActionServer
 from rclpy.action.graph import (
     get_action_client_names_and_types_by_node,
@@ -29,23 +32,27 @@ from rclpy.action.graph import (
 )
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import qos_profile_action_status_default
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
 PROBE_NODE_NAME = 'phase2_graph_probe'
 PROBE_NAMESPACE = '/robotest/evidence'
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SPIN_QUANTUM_S = 0.05
 MAXIMUM_GRAPH_NAMES = 4096
 MAXIMUM_TYPES_PER_NAME = 16
 MAXIMUM_GRAPH_NODES = 1024
+ACTION_SEND_GOAL_SERVICE_SUFFIX = '/_action/send_goal'
+ACTION_SEND_GOAL_TYPE_SUFFIX = '_SendGoal'
 
 EXIT_PASS = 0
 EXIT_PROBE_FAILURE = 1
 EXIT_INTERNAL_ERROR = 3
 
 _GRAPH_NAME_TOKEN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
-_TYPE_NAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*/(?P<kind>msg|srv|action)/[A-Za-z_][A-Za-z0-9_]*$')
+_TYPE_TOKEN = r'[A-Za-z_][A-Za-z0-9_]*'
+_TYPE_NAME = re.compile(rf'^{_TYPE_TOKEN}/(?P<kind>msg|srv|action)/{_TYPE_TOKEN}$')
 
 
 def validate_graph_name(name: str) -> str:
@@ -66,7 +73,7 @@ def parse_contract(value: str, expected_kind: str) -> tuple[str, str]:
     name = validate_graph_name(name)
     match = _TYPE_NAME.fullmatch(type_name)
     if match is None or match.group('kind') != expected_kind:
-        raise ValueError(f'{name} type must be a canonical ROS {expected_kind} type: {type_name!r}')
+        raise ValueError(f'{name} must use canonical ROS {expected_kind} type: {type_name!r}')
     return name, type_name
 
 
@@ -105,6 +112,46 @@ def endpoint_contracts_from_values(
         seen.add(pair)
         endpoints[action_name].append(node_name)
     return {name: sorted(nodes) for name, nodes in sorted(endpoints.items())}
+
+
+def goal_action_clients_from_service_clients(
+    action_contracts: dict[str, str],
+    entries: list[tuple[str, list[str]]],
+) -> dict[str, list[str]]:
+    """Derive goal-capable actions from one node's SendGoal service clients."""
+    if len(entries) > MAXIMUM_GRAPH_NAMES:
+        raise ValueError(f'service-client count {len(entries)} exceeds {MAXIMUM_GRAPH_NAMES}')
+    service_types: dict[str, set[str]] = {}
+    for raw_name, raw_types in entries:
+        name = validate_graph_name(raw_name)
+        types = set(raw_types)
+        if len(types) > MAXIMUM_TYPES_PER_NAME:
+            raise ValueError(
+                f'{name} service client has {len(types)} types; bound is {MAXIMUM_TYPES_PER_NAME}'
+            )
+        merged_types = service_types.setdefault(name, set())
+        merged_types.update(types)
+        if len(merged_types) > MAXIMUM_TYPES_PER_NAME:
+            raise ValueError(
+                f'{name} service client has more than {MAXIMUM_TYPES_PER_NAME} merged types'
+            )
+
+    goal_actions: dict[str, list[str]] = {}
+    for action_name, expected_action_type in action_contracts.items():
+        send_goal_name = f'{action_name}{ACTION_SEND_GOAL_SERVICE_SUFFIX}'
+        if send_goal_name not in service_types:
+            continue
+        expected_send_goal_type = f'{expected_action_type}{ACTION_SEND_GOAL_TYPE_SUFFIX}'
+        observed_action_types: set[str] = set()
+        for service_type in service_types[send_goal_name]:
+            if service_type == expected_send_goal_type:
+                observed_action_types.add(expected_action_type)
+            elif service_type.endswith(ACTION_SEND_GOAL_TYPE_SUFFIX):
+                observed_action_types.add(service_type[: -len(ACTION_SEND_GOAL_TYPE_SUFFIX)])
+            else:
+                observed_action_types.add(service_type)
+        goal_actions[action_name] = sorted(observed_action_types)
+    return dict(sorted(goal_actions.items()))
 
 
 def serialize_result(result: dict[str, Any]) -> str:
@@ -227,21 +274,32 @@ def node_identity_snapshot(
 def action_endpoint_snapshot(
     probe: Node,
     identities: list[tuple[str, str]],
-) -> tuple[dict[str, dict[str, list[str]]], dict[str, dict[str, list[str]]], list[str]]:
-    """Map action client/server endpoints to exact remote node identities."""
-    clients: dict[str, dict[str, list[str]]] = {}
+    action_contracts: dict[str, str],
+) -> tuple[
+    dict[str, dict[str, list[str]]],
+    dict[str, dict[str, list[str]]],
+    dict[str, dict[str, list[str]]],
+    list[str],
+]:
+    """Map goal clients, projected client participants, and action servers."""
+    goal_clients: dict[str, dict[str, list[str]]] = {}
+    client_participants: dict[str, dict[str, list[str]]] = {}
     servers: dict[str, dict[str, list[str]]] = {}
     query_errors: list[str] = []
     for remote_name, remote_namespace in sorted(set(identities)):
         node_fqn = full_node_name(remote_name, remote_namespace)
         for role, query, destination in (
-            ('client', get_action_client_names_and_types_by_node, clients),
+            (
+                'client participant',
+                get_action_client_names_and_types_by_node,
+                client_participants,
+            ),
             ('server', get_action_server_names_and_types_by_node, servers),
         ):
             try:
                 entries = query(probe, remote_name, remote_namespace)
             except Exception as error:  # pragma: no cover - graph changes during query
-                query_errors.append(f'{role} query for {node_fqn}: {type(error).__name__}: {error}')
+                query_errors.append(f'{role} query {node_fqn}: {type(error).__name__}: {error}')
                 continue
             for action_name, raw_types in entries:
                 action_name = validate_graph_name(action_name)
@@ -252,8 +310,22 @@ def action_endpoint_snapshot(
                         f'bound is {MAXIMUM_TYPES_PER_NAME}'
                     )
                 destination.setdefault(action_name, {})[node_fqn] = types
+        try:
+            service_client_entries = probe.get_client_names_and_types_by_node(
+                remote_name, remote_namespace
+            )
+        except Exception as error:  # pragma: no cover - graph changes during query
+            query_errors.append(
+                f'service-client query for {node_fqn}: {type(error).__name__}: {error}'
+            )
+            continue
+        for action_name, types in goal_action_clients_from_service_clients(
+            action_contracts, service_client_entries
+        ).items():
+            goal_clients.setdefault(action_name, {})[node_fqn] = types
     return (
-        {name: dict(sorted(nodes.items())) for name, nodes in sorted(clients.items())},
+        {name: dict(sorted(nodes.items())) for name, nodes in sorted(goal_clients.items())},
+        {name: dict(sorted(nodes.items())) for name, nodes in sorted(client_participants.items())},
         {name: dict(sorted(nodes.items())) for name, nodes in sorted(servers.items())},
         sorted(query_errors),
     )
@@ -377,6 +449,7 @@ def initial_result(
         'node_name_counts': {},
         'observed': {
             'action_clients': {},
+            'action_client_participants': {},
             'action_servers': {},
             'actions': {},
             'node_identities': [],
@@ -440,9 +513,12 @@ def probe_graph(
             node_name_counts,
             duplicate_node_names,
         ) = node_identity_snapshot(probe)
-        action_clients, action_servers, query_errors = action_endpoint_snapshot(
-            probe, raw_node_identities
-        )
+        (
+            action_clients,
+            action_client_participants,
+            action_servers,
+            query_errors,
+        ) = action_endpoint_snapshot(probe, raw_node_identities, action_contracts)
         topic_results, missing_topics, topic_mismatches = evaluate_contracts(
             topic_contracts, topics
         )
@@ -462,6 +538,7 @@ def probe_graph(
         result['attempt_count'] += 1
         result['observed'] = {
             'action_clients': action_clients,
+            'action_client_participants': action_client_participants,
             'action_servers': action_servers,
             'actions': actions,
             'node_identities': node_identity_records,
@@ -672,6 +749,40 @@ def run_self_test() -> int:
         pass
     else:
         raise AssertionError('accepted action endpoint for an undeclared action')
+    action_contracts = {'/action': 'nav2_msgs/action/FollowWaypoints'}
+    assert goal_action_clients_from_service_clients(action_contracts, []) == {}
+    assert (
+        goal_action_clients_from_service_clients(
+            action_contracts,
+            [('/action/_action/cancel_goal', ['action_msgs/srv/CancelGoal'])],
+        )
+        == {}
+    )
+    assert goal_action_clients_from_service_clients(
+        action_contracts,
+        [
+            (
+                '/action/_action/send_goal',
+                ['nav2_msgs/action/FollowWaypoints_SendGoal'],
+            )
+        ],
+    ) == {'/action': ['nav2_msgs/action/FollowWaypoints']}
+    assert goal_action_clients_from_service_clients(
+        action_contracts,
+        [('/action/_action/send_goal', ['example_interfaces/srv/AddTwoInts'])],
+    ) == {'/action': ['example_interfaces/srv/AddTwoInts']}
+    try:
+        goal_action_clients_from_service_clients(
+            action_contracts,
+            [
+                ('/action/_action/send_goal', [f'example_interfaces/srv/Type{index}'])
+                for index in range(MAXIMUM_TYPES_PER_NAME + 1)
+            ],
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('accepted a merged service-client type set above the bound')
     assert graph_text({'/topic': ['std_msgs/msg/String']}) == ('/topic [std_msgs/msg/String]\n')
     try:
         serialize_result({'not_finite': math.nan})
@@ -723,6 +834,21 @@ def run_live_smoke_test() -> int:
         nodes.append(client)
         action_client = ActionClient(client, FollowWaypoints, 'smoke_action')
         action_clients.append(action_client)
+        passive = Node('graph_passive_observer', namespace=namespace)
+        nodes.append(passive)
+        passive_status = passive.create_subscription(
+            GoalStatusArray,
+            f'{action_name}/_action/status',
+            lambda _message: None,
+            qos_profile_action_status_default,
+        )
+        passive_feedback = passive.create_subscription(
+            FollowWaypoints.Impl.FeedbackMessage,
+            f'{action_name}/_action/feedback',
+            lambda _message: None,
+            10,
+        )
+        passive_cancel = passive.create_client(CancelGoal, f'{action_name}/_action/cancel_goal')
         probe = Node(f'{PROBE_NODE_NAME}_{os.getpid()}', namespace=namespace)
         nodes.append(probe)
         executor = SingleThreadedExecutor()
@@ -741,10 +867,20 @@ def run_live_smoke_test() -> int:
             None,
         )
         assert publisher is not None and service is not None
+        assert result['schema_version'] == SCHEMA_VERSION == 2
         assert result['duplicate_node_names'] == []
         assert result['node_name_counts'][server.get_fully_qualified_name()] == 1
         assert result['node_name_counts'][client.get_fully_qualified_name()] == 1
+        assert result['node_name_counts'][passive.get_fully_qualified_name()] == 1
         assert probe.get_fully_qualified_name() not in result['observed']['node_names']
+        participants = result['observed']['action_client_participants'][action_name]
+        goal_clients = result['observed']['action_clients'][action_name]
+        assert client.get_fully_qualified_name() in participants
+        assert client.get_fully_qualified_name() in goal_clients
+        assert passive.get_fully_qualified_name() in participants
+        assert passive.get_fully_qualified_name() not in goal_clients
+        assert passive_status is not None and passive_feedback is not None
+        assert passive_cancel is not None
         sys.stdout.write(serialize_result(result))
         return EXIT_PASS if result['verdict'] == 'PASS' else EXIT_PROBE_FAILURE
     finally:

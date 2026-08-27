@@ -47,6 +47,81 @@ RUN_DIRECTORY_MAX_BYTES = 256 * 1024 * 1024
 AGGREGATE_DIRECTORY_MAX_BYTES = 64 * 1024 * 1024
 RSS_MAX_BYTES = 6 * 1024**3
 STRING_MAX_BYTES = 4096
+PHASE3_GRAPH_SCHEMA_VERSION = 2
+PHASE3_GRAPH_ARTIFACT_MAX_BYTES = 8 * 1024 * 1024
+PHASE3_GRAPH_WALL_TIMEOUT_S = 90.0
+PHASE3_GRAPH_MAXIMUM_GRAPH_NAMES = 4096
+PHASE3_GRAPH_MAXIMUM_GRAPH_NODES = 1024
+PHASE3_GRAPH_MAXIMUM_TYPES_PER_NAME = 16
+PHASE3_GRAPH_MAXIMUM_ATTEMPTS = 2048
+PHASE3_GRAPH_PARTICIPANT = '/robotest/evidence/phase2_graph_probe'
+PHASE3_GRAPH_ACTION_NAME = '/robotest/follow_waypoints'
+PHASE3_GRAPH_ACTION_TYPE = 'nav2_msgs/action/FollowWaypoints'
+PHASE3_GRAPH_ACTION_SERVER_NODE = '/robotest/waypoint_follower'
+PHASE3_GRAPH_MISSION_CLIENT_NODE = '/robotest/mission_runner'
+PHASE3_GRAPH_TOPIC_CONTRACTS = {
+    '/clock': 'rosgraph_msgs/msg/Clock',
+    '/tf': 'tf2_msgs/msg/TFMessage',
+    '/tf_static': 'tf2_msgs/msg/TFMessage',
+    '/robotest/cmd_vel': 'geometry_msgs/msg/Twist',
+    '/robotest/cmd_vel_behavior_unused': 'geometry_msgs/msg/Twist',
+    '/robotest/cmd_vel_nav': 'geometry_msgs/msg/Twist',
+    '/robotest/cmd_vel_smoothed': 'geometry_msgs/msg/Twist',
+    '/robotest/collision_monitor_state': 'nav2_msgs/msg/CollisionMonitorState',
+    '/robotest/faults/events': 'robotest_interfaces/msg/FaultEvent',
+    '/robotest/imu': 'sensor_msgs/msg/Imu',
+    '/robotest/map': 'nav_msgs/msg/OccupancyGrid',
+    '/robotest/navigation/plan': 'nav_msgs/msg/Path',
+    '/robotest/odom': 'nav_msgs/msg/Odometry',
+    '/robotest/raw/imu': 'sensor_msgs/msg/Imu',
+    '/robotest/raw/odom': 'nav_msgs/msg/Odometry',
+    '/robotest/raw/scan': 'sensor_msgs/msg/LaserScan',
+    '/robotest/scan': 'sensor_msgs/msg/LaserScan',
+    '/robotest/validation/contacts': 'ros_gz_interfaces/msg/Contacts',
+    '/robotest/validation/ground_truth': 'nav_msgs/msg/Odometry',
+    '/robotest/validation/scenario_entity_poses': 'tf2_msgs/msg/TFMessage',
+    '/robotest/validation/world_stats': 'ros_gz_interfaces/msg/WorldStatistics',
+}
+PHASE3_GRAPH_SERVICE_CONTRACTS = {
+    '/robotest/faults/arm_schedule': 'robotest_interfaces/srv/ArmFaultSchedule',
+    '/robotest/faults/preload_schedule': 'robotest_interfaces/srv/PreloadFaultSchedule',
+    '/robotest/faults/reset': 'std_srvs/srv/Trigger',
+    '/robotest/scenario/delete_entity': 'ros_gz_interfaces/srv/DeleteEntity',
+    '/robotest/scenario/set_entity_pose': 'ros_gz_interfaces/srv/SetEntityPose',
+    '/robotest/scenario/spawn_entity': 'ros_gz_interfaces/srv/SpawnEntity',
+}
+PHASE3_GRAPH_TOP_LEVEL_KEYS = {
+    'action_ownership_mismatches',
+    'attempt_count',
+    'contracts',
+    'duplicate_node_names',
+    'elapsed_wall_seconds',
+    'failure',
+    'failure_kind',
+    'limits',
+    'missing_actions',
+    'missing_services',
+    'missing_topics',
+    'node_name_counts',
+    'observed',
+    'participant',
+    'query_errors',
+    'results',
+    'schema_version',
+    'type_mismatches',
+    'verdict',
+    'watch_pid',
+}
+PHASE3_GRAPH_OBSERVED_KEYS = {
+    'action_client_participants',
+    'action_clients',
+    'action_servers',
+    'actions',
+    'node_identities',
+    'node_names',
+    'services',
+    'topics',
+}
 COLLECTOR_WALL_TIMEOUT_S = 360.0
 TRIAL_WALL_TIMEOUT_S = 300.0
 CONTACT_CONTROL_WALL_TIMEOUT_S = 30.0
@@ -380,6 +455,11 @@ SHA256_PATTERN = re.compile(r'^[0-9a-f]{64}$')
 GIT_SHA_PATTERN = re.compile(r'^[0-9a-f]{40}$')
 IDENTIFIER_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
 ENDPOINT_GID_PATTERN = re.compile(r'^[0-9a-f]{32}$')
+PHASE3_GRAPH_NAME_PATTERN = re.compile(r'^/[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)*$')
+PHASE3_GRAPH_TYPE_PATTERN = re.compile(
+    r'^[A-Za-z_][A-Za-z0-9_]*/(?P<kind>msg|srv|action)/[A-Za-z_][A-Za-z0-9_]*$'
+)
+PHASE3_GRAPH_NODE_TOKEN_PATTERN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 SCENARIOS: tuple[tuple[int, str, str], ...] = (
     (1, 'baseline_navigation', 'scenarios/phase3_s1_baseline.yaml'),
@@ -714,6 +794,550 @@ def load_canonical_json(path: Path, *, maximum_bytes: int = JSON_MAX_BYTES) -> A
     if payload != canonical_json_bytes(document):
         raise EvidenceError(f'JSON artifact is not exact canonical JSON: {path}')
     return document
+
+
+def phase3_graph_contracts(mission_client: bool) -> dict[str, Any]:
+    """Return the one frozen Phase 3 graph contract for either mission state."""
+    if not isinstance(mission_client, bool):
+        raise EvidenceError('mission_client must be a boolean')
+    action_clients = [PHASE3_GRAPH_MISSION_CLIENT_NODE] if mission_client else []
+    return {
+        'action_clients': {PHASE3_GRAPH_ACTION_NAME: action_clients},
+        'action_servers': {
+            PHASE3_GRAPH_ACTION_NAME: [PHASE3_GRAPH_ACTION_SERVER_NODE],
+        },
+        'actions': {PHASE3_GRAPH_ACTION_NAME: PHASE3_GRAPH_ACTION_TYPE},
+        'services': dict(sorted(PHASE3_GRAPH_SERVICE_CONTRACTS.items())),
+        'topics': dict(sorted(PHASE3_GRAPH_TOPIC_CONTRACTS.items())),
+    }
+
+
+def _phase3_graph_json_bytes(document: Any) -> bytes:
+    """Reproduce the graph probe's exact, pretty canonical JSON encoding."""
+    try:
+        payload = json.dumps(
+            document,
+            allow_nan=False,
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise EvidenceError(f'graph evidence is not canonical-JSON serializable: {exc}') from exc
+    return (payload + '\n').encode('utf-8')
+
+
+def _load_phase3_graph_json(path: Path) -> Mapping[str, Any]:
+    """Load graph-probe JSON only when its exact producer encoding is intact."""
+    if path.is_symlink() or not path.is_file():
+        raise EvidenceError(f'Phase 3 graph artifact is not a regular file: {path}')
+    document = load_json(path, maximum_bytes=PHASE3_GRAPH_ARTIFACT_MAX_BYTES)
+    graph = _require_mapping(document, str(path))
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise EvidenceError(f'cannot read Phase 3 graph artifact {path}: {exc}') from exc
+    if payload != _phase3_graph_json_bytes(graph):
+        raise EvidenceError(f'Phase 3 graph artifact is not exact probe-canonical JSON: {path}')
+    return graph
+
+
+def _phase3_graph_name(value: Any, label: str) -> str:
+    name = require_bounded_string(value, label)
+    if PHASE3_GRAPH_NAME_PATTERN.fullmatch(name) is None:
+        raise EvidenceError(f'{label} is not a canonical absolute ROS graph name')
+    return name
+
+
+def _phase3_graph_type(value: Any, expected_kind: str, label: str) -> str:
+    type_name = require_bounded_string(value, label)
+    match = PHASE3_GRAPH_TYPE_PATTERN.fullmatch(type_name)
+    if match is None or match.group('kind') != expected_kind:
+        raise EvidenceError(f'{label} is not a canonical ROS {expected_kind} type')
+    return type_name
+
+
+def _validated_phase3_graph_snapshot(
+    value: Any,
+    *,
+    expected_kind: str,
+    label: str,
+) -> dict[str, list[str]]:
+    snapshot = _require_mapping(value, label)
+    if len(snapshot) > PHASE3_GRAPH_MAXIMUM_GRAPH_NAMES:
+        raise EvidenceError(f'{label} exceeds the graph-name bound')
+    validated: dict[str, list[str]] = {}
+    for raw_name, raw_types in snapshot.items():
+        name = _phase3_graph_name(raw_name, f'{label} name')
+        if not isinstance(raw_types, list) or len(raw_types) > (
+            PHASE3_GRAPH_MAXIMUM_TYPES_PER_NAME
+        ):
+            raise EvidenceError(f'{label}.{name} type set is invalid')
+        types = [
+            _phase3_graph_type(item, expected_kind, f'{label}.{name} type') for item in raw_types
+        ]
+        if types != sorted(set(types)):
+            raise EvidenceError(f'{label}.{name} type set is not sorted and unique')
+        validated[name] = types
+    return dict(sorted(validated.items()))
+
+
+def _validated_phase3_action_endpoints(value: Any, label: str) -> dict[str, dict[str, list[str]]]:
+    endpoints = _require_mapping(value, label)
+    if len(endpoints) > PHASE3_GRAPH_MAXIMUM_GRAPH_NAMES:
+        raise EvidenceError(f'{label} exceeds the action-name bound')
+    validated: dict[str, dict[str, list[str]]] = {}
+    for raw_action, raw_nodes in endpoints.items():
+        action = _phase3_graph_name(raw_action, f'{label} action')
+        nodes = _require_mapping(raw_nodes, f'{label}.{action}')
+        if len(nodes) > PHASE3_GRAPH_MAXIMUM_GRAPH_NODES:
+            raise EvidenceError(f'{label}.{action} exceeds the node bound')
+        validated_nodes: dict[str, list[str]] = {}
+        for raw_node, raw_types in nodes.items():
+            node = _phase3_graph_name(raw_node, f'{label}.{action} node')
+            if not isinstance(raw_types, list) or len(raw_types) > (
+                PHASE3_GRAPH_MAXIMUM_TYPES_PER_NAME
+            ):
+                raise EvidenceError(f'{label}.{action}.{node} type set is invalid')
+            types = [
+                _phase3_graph_type(item, 'action', f'{label}.{action}.{node} type')
+                for item in raw_types
+            ]
+            if types != sorted(set(types)):
+                raise EvidenceError(f'{label}.{action}.{node} type set is not sorted and unique')
+            validated_nodes[node] = types
+        validated[action] = dict(sorted(validated_nodes.items()))
+    return dict(sorted(validated.items()))
+
+
+def _validated_phase3_node_inventory(
+    graph: Mapping[str, Any],
+    observed: Mapping[str, Any],
+) -> set[str]:
+    raw_identities = observed.get('node_identities')
+    if not isinstance(raw_identities, list) or len(raw_identities) > (
+        PHASE3_GRAPH_MAXIMUM_GRAPH_NODES
+    ):
+        raise EvidenceError('Phase 3 graph node identities are invalid')
+    expected_identity_keys = {
+        'fully_qualified_name',
+        'hidden',
+        'is_probe_participant',
+        'name',
+        'namespace',
+    }
+    identities: list[dict[str, Any]] = []
+    raw_identity_order: list[tuple[str, str]] = []
+    participant_count = 0
+    for index, raw_record in enumerate(raw_identities):
+        label = f'Phase 3 graph node identity {index}'
+        record = _require_mapping(raw_record, label)
+        if set(record) != expected_identity_keys:
+            raise EvidenceError(f'{label} fields are invalid')
+        name = require_bounded_string(record.get('name'), f'{label}.name')
+        if PHASE3_GRAPH_NODE_TOKEN_PATTERN.fullmatch(name) is None:
+            raise EvidenceError(f'{label}.name is not canonical')
+        namespace = record.get('namespace')
+        if not isinstance(namespace, str) or len(namespace.encode('utf-8')) > STRING_MAX_BYTES:
+            raise EvidenceError(f'{label}.namespace is invalid')
+        if namespace in ('', '/'):
+            expected_fqn = f'/{name}'
+        else:
+            canonical_namespace = _phase3_graph_name(namespace, f'{label}.namespace')
+            expected_fqn = f'{canonical_namespace}/{name}'
+        fully_qualified_name = _phase3_graph_name(
+            record.get('fully_qualified_name'), f'{label}.fully_qualified_name'
+        )
+        hidden = any(token.startswith('_') for token in fully_qualified_name.split('/') if token)
+        is_participant = fully_qualified_name == PHASE3_GRAPH_PARTICIPANT
+        if (
+            fully_qualified_name != expected_fqn
+            or _require_bool(record.get('hidden'), f'{label}.hidden') is not hidden
+            or _require_bool(record.get('is_probe_participant'), f'{label}.is_probe_participant')
+            is not is_participant
+        ):
+            raise EvidenceError(f'{label} projection is inconsistent')
+        participant_count += int(is_participant)
+        raw_identity_order.append((name, namespace))
+        identities.append(
+            {
+                'fully_qualified_name': fully_qualified_name,
+                'hidden': hidden,
+                'is_probe_participant': is_participant,
+                'name': name,
+                'namespace': namespace,
+            }
+        )
+    if participant_count != 1 or raw_identity_order != sorted(raw_identity_order):
+        raise EvidenceError('Phase 3 graph probe participant/order is invalid')
+
+    non_probe_names = [
+        item['fully_qualified_name'] for item in identities if not item['is_probe_participant']
+    ]
+    expected_counts = dict(sorted(Counter(non_probe_names).items()))
+    raw_counts = _require_mapping(graph.get('node_name_counts'), 'Phase 3 graph node_name_counts')
+    validated_counts = {
+        _phase3_graph_name(name, 'Phase 3 graph counted node'): _require_int(
+            count,
+            f'Phase 3 graph node count {name}',
+            minimum=1,
+        )
+        for name, count in raw_counts.items()
+    }
+    expected_duplicates = sorted(name for name, count in expected_counts.items() if count > 1)
+    duplicate_node_names = graph.get('duplicate_node_names')
+    if not isinstance(duplicate_node_names, list) or any(
+        not isinstance(name, str) for name in duplicate_node_names
+    ):
+        raise EvidenceError('Phase 3 graph duplicate-node projection is invalid')
+    raw_public_names = observed.get('node_names')
+    if not isinstance(raw_public_names, list) or any(
+        not isinstance(name, str) for name in raw_public_names
+    ):
+        raise EvidenceError('Phase 3 graph public-node projection is invalid')
+    validated_public_names = [
+        _phase3_graph_name(name, 'Phase 3 graph public node') for name in raw_public_names
+    ]
+    expected_public_names = sorted(
+        item['fully_qualified_name']
+        for item in identities
+        if not item['is_probe_participant'] and not item['hidden']
+    )
+    if (
+        validated_counts != expected_counts
+        or duplicate_node_names != expected_duplicates
+        or validated_public_names != expected_public_names
+    ):
+        raise EvidenceError('Phase 3 graph node projections do not reconcile')
+    return set(expected_counts) | {PHASE3_GRAPH_PARTICIPANT}
+
+
+def _phase3_graph_contract_results(
+    expected: Mapping[str, str],
+    observed: Mapping[str, list[str]],
+) -> tuple[dict[str, dict[str, Any]], list[str], list[dict[str, Any]]]:
+    results: dict[str, dict[str, Any]] = {}
+    missing: list[str] = []
+    mismatches: list[dict[str, Any]] = []
+    for name, expected_type in expected.items():
+        observed_types = observed.get(name, [])
+        present = name in observed
+        exact = observed_types == [expected_type]
+        results[name] = {
+            'exact_type_match': exact,
+            'expected_type': expected_type,
+            'observed_types': observed_types,
+            'present': present,
+            'status': 'PASS' if exact else 'MISSING' if not present else 'TYPE_MISMATCH',
+        }
+        if not present:
+            missing.append(name)
+        elif not exact:
+            mismatches.append(
+                {
+                    'expected_type': expected_type,
+                    'name': name,
+                    'observed_types': observed_types,
+                }
+            )
+    return results, missing, mismatches
+
+
+def _phase3_graph_action_results(
+    contracts: Mapping[str, Any],
+    observed_clients: Mapping[str, dict[str, list[str]]],
+    observed_servers: Mapping[str, dict[str, list[str]]],
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    results: dict[str, dict[str, Any]] = {}
+    mismatches: list[dict[str, Any]] = []
+    for action_name, expected_type in contracts['actions'].items():
+        clients = observed_clients.get(action_name, {})
+        servers = observed_servers.get(action_name, {})
+        expected_client_nodes = contracts['action_clients'][action_name]
+        expected_server_nodes = contracts['action_servers'][action_name]
+        client_type_mismatches = {
+            node: types for node, types in clients.items() if types != [expected_type]
+        }
+        server_type_mismatches = {
+            node: types for node, types in servers.items() if types != [expected_type]
+        }
+        exact = (
+            sorted(clients) == expected_client_nodes
+            and sorted(servers) == expected_server_nodes
+            and not client_type_mismatches
+            and not server_type_mismatches
+        )
+        result = {
+            'client_type_mismatches': client_type_mismatches,
+            'exact_ownership_and_types': exact,
+            'expected_client_nodes': expected_client_nodes,
+            'expected_server_nodes': expected_server_nodes,
+            'expected_type': expected_type,
+            'observed_clients': clients,
+            'observed_servers': servers,
+            'server_type_mismatches': server_type_mismatches,
+            'status': 'PASS' if exact else 'OWNERSHIP_OR_TYPE_MISMATCH',
+        }
+        results[action_name] = result
+        if not exact:
+            mismatches.append({'action': action_name, **result})
+    return results, mismatches
+
+
+def _phase3_graph_text(snapshot: Mapping[str, list[str]]) -> str:
+    return ''.join(f'{name} [{", ".join(types)}]\n' for name, types in sorted(snapshot.items()))
+
+
+def _validate_phase3_graph_text(path: Path, expected: str, label: str) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise EvidenceError(f'{label} is not a regular file')
+    if path.stat().st_size > PHASE3_GRAPH_ARTIFACT_MAX_BYTES:
+        raise EvidenceError(f'{label} exceeds its byte cap')
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise EvidenceError(f'cannot read {label}: {exc}') from exc
+    if payload != expected.encode('utf-8'):
+        raise EvidenceError(f'{label} does not match the graph JSON projection')
+    return file_sha256(path)
+
+
+def validate_phase3_graph_artifacts(
+    run_dir: Path,
+    *,
+    mission_client: bool,
+    expected_watch_pid: int,
+) -> dict[str, Any]:
+    """Recompute one Phase 3 graph PASS and bind all five producer artifacts."""
+    contracts = phase3_graph_contracts(mission_client)
+    watch_pid = _require_int(expected_watch_pid, 'expected graph watch PID', minimum=1)
+    prefix = 'mission-' if mission_client else ''
+    graph_path = run_dir / f'{prefix}graph.json'
+    graph = _load_phase3_graph_json(graph_path)
+    if set(graph) != PHASE3_GRAPH_TOP_LEVEL_KEYS:
+        raise EvidenceError('Phase 3 graph top-level fields are invalid')
+    schema_version = _require_int(graph.get('schema_version'), 'Phase 3 graph schema_version')
+    if schema_version != PHASE3_GRAPH_SCHEMA_VERSION:
+        raise EvidenceError(f'Phase 3 graph schema_version must be {PHASE3_GRAPH_SCHEMA_VERSION}')
+    if graph.get('contracts') != contracts:
+        raise EvidenceError('Phase 3 graph contracts differ from the frozen runner contract')
+    if graph.get('participant') != PHASE3_GRAPH_PARTICIPANT:
+        raise EvidenceError('Phase 3 graph probe participant is invalid')
+    if _require_int(graph.get('watch_pid'), 'Phase 3 graph watch_pid', minimum=1) != watch_pid:
+        raise EvidenceError('Phase 3 graph watch_pid does not match its owned process')
+    attempt_count = _require_int(
+        graph.get('attempt_count'), 'Phase 3 graph attempt_count', minimum=1
+    )
+    elapsed = _require_number(
+        graph.get('elapsed_wall_seconds'),
+        'Phase 3 graph elapsed_wall_seconds',
+        minimum=0.0,
+    )
+    if attempt_count > PHASE3_GRAPH_MAXIMUM_ATTEMPTS or elapsed > PHASE3_GRAPH_WALL_TIMEOUT_S:
+        raise EvidenceError('Phase 3 graph convergence evidence is unbounded')
+    limits = _require_mapping(graph.get('limits'), 'Phase 3 graph limits')
+    if set(limits) != {
+        'maximum_graph_names',
+        'maximum_graph_nodes',
+        'maximum_types_per_name',
+        'wall_timeout_seconds',
+    }:
+        raise EvidenceError('Phase 3 graph limit fields are invalid')
+    validated_limits = {
+        'maximum_graph_names': _require_int(
+            limits.get('maximum_graph_names'), 'Phase 3 maximum_graph_names', minimum=1
+        ),
+        'maximum_graph_nodes': _require_int(
+            limits.get('maximum_graph_nodes'), 'Phase 3 maximum_graph_nodes', minimum=1
+        ),
+        'maximum_types_per_name': _require_int(
+            limits.get('maximum_types_per_name'),
+            'Phase 3 maximum_types_per_name',
+            minimum=1,
+        ),
+        'wall_timeout_seconds': _require_number(
+            limits.get('wall_timeout_seconds'),
+            'Phase 3 graph wall_timeout_seconds',
+            minimum=0.001,
+        ),
+    }
+    if validated_limits != {
+        'maximum_graph_names': PHASE3_GRAPH_MAXIMUM_GRAPH_NAMES,
+        'maximum_graph_nodes': PHASE3_GRAPH_MAXIMUM_GRAPH_NODES,
+        'maximum_types_per_name': PHASE3_GRAPH_MAXIMUM_TYPES_PER_NAME,
+        'wall_timeout_seconds': PHASE3_GRAPH_WALL_TIMEOUT_S,
+    }:
+        raise EvidenceError('Phase 3 graph limits differ from the frozen probe contract')
+
+    observed = _require_mapping(graph.get('observed'), 'Phase 3 graph observed')
+    if set(observed) != PHASE3_GRAPH_OBSERVED_KEYS:
+        raise EvidenceError('Phase 3 graph observed fields are invalid')
+    topics = _validated_phase3_graph_snapshot(
+        observed.get('topics'), expected_kind='msg', label='Phase 3 observed topics'
+    )
+    services = _validated_phase3_graph_snapshot(
+        observed.get('services'), expected_kind='srv', label='Phase 3 observed services'
+    )
+    actions = _validated_phase3_graph_snapshot(
+        observed.get('actions'), expected_kind='action', label='Phase 3 observed actions'
+    )
+    action_clients = _validated_phase3_action_endpoints(
+        observed.get('action_clients'), 'Phase 3 observed goal-capable action clients'
+    )
+    action_client_participants = _validated_phase3_action_endpoints(
+        observed.get('action_client_participants'),
+        'Phase 3 observed action client participants',
+    )
+    action_servers = _validated_phase3_action_endpoints(
+        observed.get('action_servers'), 'Phase 3 observed action servers'
+    )
+    known_nodes = _validated_phase3_node_inventory(graph, observed)
+    if set(action_clients) - set(contracts['actions']):
+        raise EvidenceError('Phase 3 goal-capable client projection contains an undeclared action')
+    for endpoint_projection in (action_clients, action_client_participants, action_servers):
+        endpoint_nodes = {node for nodes in endpoint_projection.values() for node in nodes}
+        if not endpoint_nodes.issubset(known_nodes):
+            raise EvidenceError('Phase 3 action endpoint references an unknown node identity')
+
+    topic_results, missing_topics, topic_mismatches = _phase3_graph_contract_results(
+        contracts['topics'], topics
+    )
+    service_results, missing_services, service_mismatches = _phase3_graph_contract_results(
+        contracts['services'], services
+    )
+    action_results, missing_actions, action_mismatches = _phase3_graph_contract_results(
+        contracts['actions'], actions
+    )
+    action_ownership_results, action_ownership_mismatches = _phase3_graph_action_results(
+        contracts,
+        action_clients,
+        action_servers,
+    )
+    expected_results = {
+        'action_ownership': action_ownership_results,
+        'actions': action_results,
+        'services': service_results,
+        'topics': topic_results,
+    }
+    expected_type_mismatches = {
+        'actions': action_mismatches,
+        'services': service_mismatches,
+        'topics': topic_mismatches,
+    }
+    if graph.get('results') != expected_results:
+        raise EvidenceError('Phase 3 graph stored results do not match observed endpoints')
+    if graph.get('type_mismatches') != expected_type_mismatches:
+        raise EvidenceError('Phase 3 graph type-mismatch projection is inconsistent')
+    if graph.get('action_ownership_mismatches') != action_ownership_mismatches:
+        raise EvidenceError('Phase 3 graph ownership-mismatch projection is inconsistent')
+    if (
+        graph.get('missing_topics') != missing_topics
+        or graph.get('missing_services') != missing_services
+        or graph.get('missing_actions') != missing_actions
+    ):
+        raise EvidenceError('Phase 3 graph missing-contract projection is inconsistent')
+    if (
+        missing_topics
+        or missing_services
+        or missing_actions
+        or topic_mismatches
+        or service_mismatches
+        or action_mismatches
+        or action_ownership_mismatches
+        or graph.get('duplicate_node_names') != []
+        or graph.get('query_errors') != []
+        or graph.get('failure') is not None
+        or graph.get('failure_kind') is not None
+        or graph.get('verdict') != 'PASS'
+    ):
+        raise EvidenceError('Phase 3 graph is not an independently recomputed semantic PASS')
+
+    nodes_text = ''.join(f'{name}\n' for name in observed['node_names'])
+    binding = {
+        'actions_text_sha256': _validate_phase3_graph_text(
+            run_dir / f'{prefix}actions.txt',
+            _phase3_graph_text(actions),
+            f'Phase 3 {prefix}actions text',
+        ),
+        'expected_action_client_nodes': contracts['action_clients'][PHASE3_GRAPH_ACTION_NAME],
+        'graph_json_sha256': file_sha256(graph_path),
+        'nodes_text_sha256': _validate_phase3_graph_text(
+            run_dir / f'{prefix}nodes.txt',
+            nodes_text,
+            f'Phase 3 {prefix}nodes text',
+        ),
+        'probe_schema_version': PHASE3_GRAPH_SCHEMA_VERSION,
+        'services_text_sha256': _validate_phase3_graph_text(
+            run_dir / f'{prefix}services.txt',
+            _phase3_graph_text(services),
+            f'Phase 3 {prefix}services text',
+        ),
+        'topics_text_sha256': _validate_phase3_graph_text(
+            run_dir / f'{prefix}topics.txt',
+            _phase3_graph_text(topics),
+            f'Phase 3 {prefix}topics text',
+        ),
+        'watch_pid': watch_pid,
+    }
+    return binding
+
+
+def validate_phase3_graph_pair(
+    pre_mission_value: Mapping[str, Any],
+    mission_value: Mapping[str, Any],
+) -> bool:
+    """Require one coherent stationary-to-mission graph evidence transition."""
+    pre_mission = _require_mapping(pre_mission_value, 'pre-mission graph binding')
+    mission = _require_mapping(mission_value, 'mission graph binding')
+    expected_keys = {
+        'actions_text_sha256',
+        'expected_action_client_nodes',
+        'graph_json_sha256',
+        'nodes_text_sha256',
+        'probe_schema_version',
+        'services_text_sha256',
+        'topics_text_sha256',
+        'watch_pid',
+    }
+    if set(pre_mission) != expected_keys or set(mission) != expected_keys:
+        raise EvidenceError('Phase 3 graph pair binding fields are invalid')
+    if (
+        _require_int(pre_mission.get('probe_schema_version'), 'pre-mission graph schema')
+        != PHASE3_GRAPH_SCHEMA_VERSION
+        or _require_int(mission.get('probe_schema_version'), 'mission graph schema')
+        != PHASE3_GRAPH_SCHEMA_VERSION
+        or pre_mission.get('expected_action_client_nodes') != []
+        or mission.get('expected_action_client_nodes') != [PHASE3_GRAPH_MISSION_CLIENT_NODE]
+    ):
+        raise EvidenceError('Phase 3 graph pair action-client transition is invalid')
+    pre_watch_pid = _require_int(
+        pre_mission.get('watch_pid'), 'pre-mission graph watch PID', minimum=1
+    )
+    mission_watch = mission.get('watch_pid')
+    mission_watch_pid = _require_int(mission_watch, 'mission graph watch PID', minimum=1)
+    if pre_watch_pid == mission_watch_pid:
+        raise EvidenceError('Phase 3 graph pair must watch distinct owned processes')
+    sha_fields = {
+        'actions_text_sha256',
+        'graph_json_sha256',
+        'nodes_text_sha256',
+        'services_text_sha256',
+        'topics_text_sha256',
+    }
+    for label, binding in (('pre-mission', pre_mission), ('mission', mission)):
+        for field in sha_fields:
+            require_sha256(binding.get(field), f'{label} graph {field}')
+    distinct_fields = {
+        'graph_json_sha256',
+        'nodes_text_sha256',
+        'services_text_sha256',
+    }
+    stable_fields = {'actions_text_sha256', 'topics_text_sha256'}
+    if any(pre_mission[field] == mission[field] for field in distinct_fields) or any(
+        pre_mission[field] != mission[field] for field in stable_fields
+    ):
+        raise EvidenceError('pre-mission and mission graph projections are not a coherent pair')
+    return True
 
 
 def _contact_control_arm_protocol(value: Any) -> dict[str, Any]:
@@ -3717,6 +4341,8 @@ def _artifact_sizes(
     run_dir: Path,
     *,
     component_manifest_sha256: str,
+    pre_mission_graph_sha256: str,
+    mission_graph_sha256: str,
 ) -> dict[str, Any]:
     files = [item for item in run_dir.rglob('*') if item.is_file()]
     stdout = sum(item.stat().st_size for item in files if item.name.endswith('.stdout.log'))
@@ -3733,6 +4359,7 @@ def _artifact_sizes(
     if not isinstance(records, list) or not records:
         raise EvidenceError('prerequisite manifest has no artifact records')
     verified_sizes: list[int] = []
+    manifest_hashes: dict[str, str] = {}
     for index, record_value in enumerate(records):
         record = _require_mapping(record_value, f'prerequisite record {index}')
         relative = require_bounded_string(record.get('path'), f'prerequisite[{index}].path')
@@ -3750,8 +4377,21 @@ def _artifact_sizes(
         ):
             raise EvidenceError(f'prerequisite manifest record does not reconcile: {relative}')
         verified_sizes.append(expected_bytes)
+        manifest_hashes[relative] = expected_sha
+    validated_pre_mission_graph_sha256 = require_sha256(
+        pre_mission_graph_sha256, 'pre_mission_graph_sha256'
+    )
+    validated_mission_graph_sha256 = require_sha256(mission_graph_sha256, 'mission_graph_sha256')
+    if validated_pre_mission_graph_sha256 == validated_mission_graph_sha256:
+        raise EvidenceError('pre-mission and mission graph artifacts must be distinct')
+    if manifest_hashes.get('graph.json') != validated_pre_mission_graph_sha256:
+        raise EvidenceError('prerequisite manifest does not bind the pre-mission graph')
+    if manifest_hashes.get('mission-graph.json') != validated_mission_graph_sha256:
+        raise EvidenceError('prerequisite manifest does not bind the mission graph')
     total = sum(verified_sizes)
     return {
+        'mission_graph_sha256': validated_mission_graph_sha256,
+        'pre_mission_graph_sha256': validated_pre_mission_graph_sha256,
         'prerequisite_artifact_count': len(records),
         'prerequisite_checksums_verified': True,
         'prerequisite_manifest_sha256': require_sha256(
@@ -3786,6 +4426,8 @@ def make_orchestrator_evidence(
     gates: Mapping[str, Any],
     run_dir: Path,
     component_manifest_sha256: str,
+    pre_mission_graph_sha256: str,
+    mission_graph_sha256: str,
 ) -> dict[str, Any]:
     """Compose the strict metrics orchestrator evidence object."""
     source_start = _require_mapping(build_start.get('source'), 'build_start.source')
@@ -3863,6 +4505,8 @@ def make_orchestrator_evidence(
         'artifacts': _artifact_sizes(
             run_dir,
             component_manifest_sha256=component_manifest_sha256,
+            pre_mission_graph_sha256=pre_mission_graph_sha256,
+            mission_graph_sha256=mission_graph_sha256,
         ),
         'cleanup': {field: _require_bool(cleanup.get(field), field) for field in cleanup_required},
         'execution': {

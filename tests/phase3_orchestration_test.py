@@ -119,6 +119,360 @@ def _workspace(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _phase3_graph_result(
+    expected: dict[str, str],
+    observed: dict[str, list[str]],
+) -> dict[str, dict]:
+    return {
+        name: {
+            'exact_type_match': observed.get(name) == [type_name],
+            'expected_type': type_name,
+            'observed_types': observed.get(name, []),
+            'present': name in observed,
+            'status': 'PASS',
+        }
+        for name, type_name in expected.items()
+    }
+
+
+def _phase3_graph_text(snapshot: dict[str, list[str]]) -> str:
+    return ''.join(f'{name} [{", ".join(types)}]\n' for name, types in sorted(snapshot.items()))
+
+
+def _write_phase3_graph_fixture(
+    run_dir: Path,
+    *,
+    mission_client: bool,
+    watch_pid: int,
+) -> dict:
+    contracts = orchestration.phase3_graph_contracts(mission_client)
+    action_name = orchestration.PHASE3_GRAPH_ACTION_NAME
+    action_type = orchestration.PHASE3_GRAPH_ACTION_TYPE
+    client_nodes = contracts['action_clients'][action_name]
+    server_nodes = contracts['action_servers'][action_name]
+    observed_clients = (
+        {action_name: {node: [action_type] for node in client_nodes}} if client_nodes else {}
+    )
+    participant_nodes = ['/robotest/metrics_collector', *client_nodes]
+    observed_client_participants = {
+        action_name: {node: [action_type] for node in sorted(participant_nodes)}
+    }
+    observed_servers = {action_name: {node: [action_type] for node in server_nodes}}
+    node_names = sorted(
+        {
+            '/robotest/metrics_collector',
+            '/robotest/waypoint_follower',
+            *client_nodes,
+        }
+    )
+    raw_identities = [
+        ('phase2_graph_probe', '/robotest/evidence'),
+        *((name.rsplit('/', 1)[1], name.rsplit('/', 1)[0]) for name in node_names),
+    ]
+    node_identities = [
+        {
+            'fully_qualified_name': f'{namespace}/{name}',
+            'hidden': False,
+            'is_probe_participant': (
+                f'{namespace}/{name}' == orchestration.PHASE3_GRAPH_PARTICIPANT
+            ),
+            'name': name,
+            'namespace': namespace,
+        }
+        for name, namespace in sorted(raw_identities)
+    ]
+    topics = {name: [type_name] for name, type_name in contracts['topics'].items()}
+    services = {name: [type_name] for name, type_name in contracts['services'].items()}
+    if mission_client:
+        services.update(
+            {
+                '/robotest/mission_runner/describe_parameters': [
+                    'rcl_interfaces/srv/DescribeParameters'
+                ],
+                '/robotest/mission_runner/get_parameter_types': [
+                    'rcl_interfaces/srv/GetParameterTypes'
+                ],
+                '/robotest/mission_runner/get_parameters': ['rcl_interfaces/srv/GetParameters'],
+                '/robotest/mission_runner/list_parameters': ['rcl_interfaces/srv/ListParameters'],
+                '/robotest/mission_runner/set_parameters': ['rcl_interfaces/srv/SetParameters'],
+                '/robotest/mission_runner/set_parameters_atomically': [
+                    'rcl_interfaces/srv/SetParametersAtomically'
+                ],
+            }
+        )
+    actions = {name: [type_name] for name, type_name in contracts['actions'].items()}
+    ownership_result = {
+        'client_type_mismatches': {},
+        'exact_ownership_and_types': True,
+        'expected_client_nodes': client_nodes,
+        'expected_server_nodes': server_nodes,
+        'expected_type': action_type,
+        'observed_clients': observed_clients.get(action_name, {}),
+        'observed_servers': observed_servers[action_name],
+        'server_type_mismatches': {},
+        'status': 'PASS',
+    }
+    observed = {
+        'action_clients': observed_clients,
+        'action_client_participants': observed_client_participants,
+        'action_servers': observed_servers,
+        'actions': actions,
+        'node_identities': node_identities,
+        'node_names': node_names,
+        'services': services,
+        'topics': topics,
+    }
+    graph = {
+        'action_ownership_mismatches': [],
+        'attempt_count': 2,
+        'contracts': contracts,
+        'duplicate_node_names': [],
+        'elapsed_wall_seconds': 0.25,
+        'failure': None,
+        'failure_kind': None,
+        'limits': {
+            'maximum_graph_names': orchestration.PHASE3_GRAPH_MAXIMUM_GRAPH_NAMES,
+            'maximum_graph_nodes': orchestration.PHASE3_GRAPH_MAXIMUM_GRAPH_NODES,
+            'maximum_types_per_name': orchestration.PHASE3_GRAPH_MAXIMUM_TYPES_PER_NAME,
+            'wall_timeout_seconds': orchestration.PHASE3_GRAPH_WALL_TIMEOUT_S,
+        },
+        'missing_actions': [],
+        'missing_services': [],
+        'missing_topics': [],
+        'node_name_counts': {name: 1 for name in node_names},
+        'observed': observed,
+        'participant': orchestration.PHASE3_GRAPH_PARTICIPANT,
+        'query_errors': [],
+        'results': {
+            'action_ownership': {action_name: ownership_result},
+            'actions': _phase3_graph_result(contracts['actions'], actions),
+            'services': _phase3_graph_result(contracts['services'], services),
+            'topics': _phase3_graph_result(contracts['topics'], topics),
+        },
+        'schema_version': orchestration.PHASE3_GRAPH_SCHEMA_VERSION,
+        'type_mismatches': {'actions': [], 'services': [], 'topics': []},
+        'verdict': 'PASS',
+        'watch_pid': watch_pid,
+    }
+    prefix = 'mission-' if mission_client else ''
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / f'{prefix}graph.json').write_bytes(
+        (json.dumps(graph, allow_nan=False, indent=2, sort_keys=True) + '\n').encode()
+    )
+    (run_dir / f'{prefix}nodes.txt').write_text(
+        ''.join(f'{name}\n' for name in node_names), encoding='utf-8'
+    )
+    for label, snapshot in (
+        ('topics', topics),
+        ('services', services),
+        ('actions', actions),
+    ):
+        (run_dir / f'{prefix}{label}.txt').write_text(
+            _phase3_graph_text(snapshot), encoding='utf-8'
+        )
+    return graph
+
+
+def _rewrite_phase3_graph(run_dir: Path, graph: dict, *, mission_client: bool) -> None:
+    prefix = 'mission-' if mission_client else ''
+    (run_dir / f'{prefix}graph.json').write_bytes(
+        (json.dumps(graph, allow_nan=False, indent=2, sort_keys=True) + '\n').encode()
+    )
+
+
+@pytest.mark.parametrize('mission_client', (False, True))
+def test_phase3_graph_validator_binds_exact_pass_artifacts(
+    tmp_path: Path,
+    mission_client: bool,
+) -> None:
+    watch_pid = 202 if mission_client else 101
+    _write_phase3_graph_fixture(
+        tmp_path,
+        mission_client=mission_client,
+        watch_pid=watch_pid,
+    )
+
+    binding = orchestration.validate_phase3_graph_artifacts(
+        tmp_path,
+        mission_client=mission_client,
+        expected_watch_pid=watch_pid,
+    )
+
+    prefix = 'mission-' if mission_client else ''
+    assert set(binding) == {
+        'actions_text_sha256',
+        'expected_action_client_nodes',
+        'graph_json_sha256',
+        'nodes_text_sha256',
+        'probe_schema_version',
+        'services_text_sha256',
+        'topics_text_sha256',
+        'watch_pid',
+    }
+    assert binding['expected_action_client_nodes'] == (
+        ['/robotest/mission_runner'] if mission_client else []
+    )
+    assert binding['probe_schema_version'] == 2
+    assert binding['watch_pid'] == watch_pid
+    for label in ('graph.json', 'nodes.txt', 'topics.txt', 'services.txt', 'actions.txt'):
+        field = {
+            'graph.json': 'graph_json_sha256',
+            'nodes.txt': 'nodes_text_sha256',
+            'topics.txt': 'topics_text_sha256',
+            'services.txt': 'services_text_sha256',
+            'actions.txt': 'actions_text_sha256',
+        }[label]
+        assert binding[field] == orchestration.file_sha256(tmp_path / f'{prefix}{label}')
+
+
+def test_phase3_graph_validator_does_not_promote_passive_participant(
+    tmp_path: Path,
+) -> None:
+    graph = _write_phase3_graph_fixture(
+        tmp_path,
+        mission_client=False,
+        watch_pid=101,
+    )
+    action_name = orchestration.PHASE3_GRAPH_ACTION_NAME
+    assert (
+        '/robotest/metrics_collector'
+        in graph['observed']['action_client_participants'][action_name]
+    )
+    assert graph['observed']['action_clients'] == {}
+    orchestration.validate_phase3_graph_artifacts(
+        tmp_path,
+        mission_client=False,
+        expected_watch_pid=101,
+    )
+
+    graph['observed']['action_clients'] = {
+        action_name: {
+            '/robotest/metrics_collector': [orchestration.PHASE3_GRAPH_ACTION_TYPE],
+        }
+    }
+    _rewrite_phase3_graph(tmp_path, graph, mission_client=False)
+    with pytest.raises(orchestration.EvidenceError, match='stored results'):
+        orchestration.validate_phase3_graph_artifacts(
+            tmp_path,
+            mission_client=False,
+            expected_watch_pid=101,
+        )
+
+
+def test_phase3_graph_bindings_identify_distinct_and_stable_projections(
+    tmp_path: Path,
+) -> None:
+    _write_phase3_graph_fixture(tmp_path, mission_client=False, watch_pid=101)
+    _write_phase3_graph_fixture(tmp_path, mission_client=True, watch_pid=202)
+
+    pre_mission = orchestration.validate_phase3_graph_artifacts(
+        tmp_path,
+        mission_client=False,
+        expected_watch_pid=101,
+    )
+    mission = orchestration.validate_phase3_graph_artifacts(
+        tmp_path,
+        mission_client=True,
+        expected_watch_pid=202,
+    )
+
+    assert orchestration.validate_phase3_graph_pair(pre_mission, mission) is True
+    assert pre_mission['graph_json_sha256'] != mission['graph_json_sha256']
+    assert pre_mission['nodes_text_sha256'] != mission['nodes_text_sha256']
+    assert pre_mission['services_text_sha256'] != mission['services_text_sha256']
+    for field in (
+        'topics_text_sha256',
+        'actions_text_sha256',
+    ):
+        assert pre_mission[field] == mission[field]
+
+    forged_mission = copy.deepcopy(mission)
+    forged_mission['services_text_sha256'] = pre_mission['services_text_sha256']
+    with pytest.raises(orchestration.EvidenceError, match='coherent pair'):
+        orchestration.validate_phase3_graph_pair(pre_mission, forged_mission)
+
+
+@pytest.mark.parametrize(
+    ('mutation', 'error'),
+    (
+        (lambda graph: graph.update(schema_version=True), 'schema_version'),
+        (lambda graph: graph.update(watch_pid=999), 'watch_pid'),
+        (lambda graph: graph.pop('query_errors'), 'top-level fields'),
+        (
+            lambda graph: graph['contracts']['action_clients'].update(
+                {orchestration.PHASE3_GRAPH_ACTION_NAME: ['/robotest/rogue_client']}
+            ),
+            'frozen runner contract',
+        ),
+        (lambda graph: graph.update(verdict='FAIL'), 'semantic PASS'),
+    ),
+)
+def test_phase3_graph_validator_rejects_invalid_envelope_and_contract(
+    tmp_path: Path,
+    mutation,
+    error: str,
+) -> None:
+    graph = _write_phase3_graph_fixture(
+        tmp_path,
+        mission_client=False,
+        watch_pid=101,
+    )
+    mutation(graph)
+    _rewrite_phase3_graph(tmp_path, graph, mission_client=False)
+
+    with pytest.raises(orchestration.EvidenceError, match=error):
+        orchestration.validate_phase3_graph_artifacts(
+            tmp_path,
+            mission_client=False,
+            expected_watch_pid=101,
+        )
+
+
+def test_phase3_graph_validator_recomputes_mission_goal_client_pass(
+    tmp_path: Path,
+) -> None:
+    graph = _write_phase3_graph_fixture(
+        tmp_path,
+        mission_client=True,
+        watch_pid=202,
+    )
+    graph['observed']['action_clients'] = {}
+    _rewrite_phase3_graph(tmp_path, graph, mission_client=True)
+
+    with pytest.raises(orchestration.EvidenceError, match='stored results'):
+        orchestration.validate_phase3_graph_artifacts(
+            tmp_path,
+            mission_client=True,
+            expected_watch_pid=202,
+        )
+
+
+def test_phase3_graph_validator_rejects_noncanonical_json_and_text_tampering(
+    tmp_path: Path,
+) -> None:
+    graph = _write_phase3_graph_fixture(
+        tmp_path,
+        mission_client=False,
+        watch_pid=101,
+    )
+    (tmp_path / 'graph.json').write_text(json.dumps(graph), encoding='utf-8')
+    with pytest.raises(orchestration.EvidenceError, match='probe-canonical'):
+        orchestration.validate_phase3_graph_artifacts(
+            tmp_path,
+            mission_client=False,
+            expected_watch_pid=101,
+        )
+
+    _rewrite_phase3_graph(tmp_path, graph, mission_client=False)
+    (tmp_path / 'actions.txt').write_text('tampered\n', encoding='utf-8')
+    with pytest.raises(orchestration.EvidenceError, match='actions text'):
+        orchestration.validate_phase3_graph_artifacts(
+            tmp_path,
+            mission_client=False,
+            expected_watch_pid=101,
+        )
+
+
 def test_goal_observer_readiness_requires_endpoint_not_idle_status_message() -> None:
     publisher_count = 1
     node = SimpleNamespace(
@@ -2583,7 +2937,11 @@ def test_orchestrator_evidence_matches_metrics_schema(tmp_path: Path) -> None:
     run.mkdir()
     core = run / 'core.json'
     core.write_text('{}\n', encoding='utf-8')
-    manifest = orchestration.component_manifest([core], run)
+    graph_path = run / 'graph.json'
+    graph_path.write_text('{"state":"pre-mission"}\n', encoding='utf-8')
+    mission_graph_path = run / 'mission-graph.json'
+    mission_graph_path.write_text('{"state":"mission"}\n', encoding='utf-8')
+    manifest = orchestration.component_manifest([core, graph_path, mission_graph_path], run)
     manifest_path = run / 'prerequisite-manifest.json'
     orchestration.atomic_write_json(manifest_path, manifest, sidecar=True)
     (run / 'probe.stdout.log').write_text('ok\n', encoding='utf-8')
@@ -2691,6 +3049,8 @@ def test_orchestrator_evidence_matches_metrics_schema(tmp_path: Path) -> None:
         },
         run_dir=run,
         component_manifest_sha256=orchestration.file_sha256(manifest_path),
+        pre_mission_graph_sha256=orchestration.file_sha256(graph_path),
+        mission_graph_sha256=orchestration.file_sha256(mission_graph_path),
     )
     schema = json.loads(
         (
@@ -2703,6 +3063,39 @@ def test_orchestrator_evidence_matches_metrics_schema(tmp_path: Path) -> None:
         '$ref': '#/$defs/orchestrator',
     }
     assert list(Draft202012Validator(wrapper).iter_errors(evidence)) == []
+
+
+def test_orchestrator_artifacts_bind_both_graph_documents(tmp_path: Path) -> None:
+    run = tmp_path / 'run'
+    run.mkdir()
+    graph_path = run / 'graph.json'
+    graph_path.write_text('{"state":"pre-mission"}\n', encoding='utf-8')
+    mission_graph_path = run / 'mission-graph.json'
+    mission_graph_path.write_text('{"state":"mission"}\n', encoding='utf-8')
+    manifest_path = run / 'prerequisite-manifest.json'
+    orchestration.atomic_write_json(
+        manifest_path,
+        orchestration.component_manifest([graph_path, mission_graph_path], run),
+    )
+    pre_hash = orchestration.file_sha256(graph_path)
+    mission_hash = orchestration.file_sha256(mission_graph_path)
+
+    artifacts = orchestration._artifact_sizes(
+        run,
+        component_manifest_sha256=orchestration.file_sha256(manifest_path),
+        pre_mission_graph_sha256=pre_hash,
+        mission_graph_sha256=mission_hash,
+    )
+    assert artifacts['pre_mission_graph_sha256'] == pre_hash
+    assert artifacts['mission_graph_sha256'] == mission_hash
+
+    with pytest.raises(orchestration.EvidenceError, match='pre-mission graph'):
+        orchestration._artifact_sizes(
+            run,
+            component_manifest_sha256=orchestration.file_sha256(manifest_path),
+            pre_mission_graph_sha256='f' * 64,
+            mission_graph_sha256=mission_hash,
+        )
 
 
 def test_goal_binding_reconciliation_is_exact() -> None:

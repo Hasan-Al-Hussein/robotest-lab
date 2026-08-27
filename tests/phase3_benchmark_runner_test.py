@@ -38,6 +38,106 @@ metrics_constants = _load(
 )
 
 
+def test_finalized_component_artifact_gets_one_verified_sidecar(tmp_path: Path) -> None:
+    artifact = tmp_path / 'capture.json'
+    artifact.write_bytes(b'{"capture_schema_version":1}\n')
+
+    digest = runner._write_existing_artifact_sidecar(artifact)
+
+    assert digest == runner.file_sha256(artifact)
+    assert (tmp_path / 'capture.json.sha256').read_text(encoding='ascii') == (
+        f'{digest}  capture.json\n'
+    )
+    assert runner.verify_json_sidecar(artifact) == digest
+    with pytest.raises(runner.EvidenceError, match='already exists'):
+        runner._write_existing_artifact_sidecar(artifact)
+    with pytest.raises(runner.EvidenceError, match='missing or non-regular'):
+        runner._write_existing_artifact_sidecar(tmp_path / 'missing.json')
+
+
+def test_component_sidecars_are_finalized_before_prerequisite_manifest() -> None:
+    source = (TEST_DIR / 'phase3_benchmark_runner.py').read_text(encoding='utf-8')
+    trial_start = source.index('    def _run_trial(')
+    trial_source = source[trial_start:]
+
+    sidecar_targets = trial_source.index("sidecar_targets = [run_dir / 'capture.json'")
+    scenario_four_target = trial_source.index(
+        "run_dir / 'lifecycle-snapshot.json'", sidecar_targets
+    )
+    write_sidecar = trial_source.index('_write_existing_artifact_sidecar(target)', sidecar_targets)
+    snapshot_paths = trial_source.index(
+        "core_paths = sorted(item for item in run_dir.rglob('*') if item.is_file())",
+        write_sidecar,
+    )
+
+    assert sidecar_targets < scenario_four_target < write_sidecar < snapshot_paths
+
+
+def test_graph_probe_binds_exact_goal_capable_action_clients(tmp_path: Path) -> None:
+    def flag_values(command: list[str], flag: str) -> list[str]:
+        return [command[index + 1] for index, value in enumerate(command[:-1]) if value == flag]
+
+    pre_mission = runner._graph_probe_command(
+        tmp_path,
+        tmp_path / 'pre-mission',
+        watch_pid=101,
+        mission_client=False,
+    )
+    with_mission = runner._graph_probe_command(
+        tmp_path,
+        tmp_path / 'mission',
+        watch_pid=202,
+        mission_client=True,
+    )
+    pre_contracts = orchestration.phase3_graph_contracts(False)
+    mission_contracts = orchestration.phase3_graph_contracts(True)
+    assert flag_values(pre_mission, '--topic') == [
+        f'{name}={type_name}' for name, type_name in pre_contracts['topics'].items()
+    ]
+    assert flag_values(pre_mission, '--service') == [
+        f'{name}={type_name}' for name, type_name in pre_contracts['services'].items()
+    ]
+    assert flag_values(pre_mission, '--action') == [
+        '/robotest/follow_waypoints=nav2_msgs/action/FollowWaypoints'
+    ]
+    assert flag_values(pre_mission, '--action-server') == [
+        '/robotest/follow_waypoints=/robotest/waypoint_follower'
+    ]
+    assert flag_values(pre_mission, '--action-client') == []
+    assert flag_values(with_mission, '--action-client') == [
+        '/robotest/follow_waypoints=/robotest/mission_runner',
+    ]
+    assert pre_contracts['topics'] == mission_contracts['topics']
+    assert pre_contracts['services'] == mission_contracts['services']
+
+
+def test_graph_artifacts_are_validated_before_each_trial_can_advance() -> None:
+    source = (TEST_DIR / 'phase3_benchmark_runner.py').read_text(encoding='utf-8')
+    trial_start = source.index('    def _run_trial(')
+    trial_source = source[trial_start:]
+
+    graph_run = trial_source.index("'graph_gate',")
+    graph_validation = trial_source.index(
+        'graph_binding = validate_phase3_graph_artifacts(', graph_run
+    )
+    observer_arm = trial_source.index('atomic_write_bytes(observer_arm,', graph_validation)
+    mission_graph_run = trial_source.index("'mission_graph_gate',", observer_arm)
+    mission_graph_validation = trial_source.index(
+        'mission_graph_binding = validate_phase3_graph_artifacts(', mission_graph_run
+    )
+    pair_validation = trial_source.index(
+        'validate_phase3_graph_pair(graph_binding, mission_graph_binding)',
+        mission_graph_validation,
+    )
+    pair_check = trial_source.index("'inconsistent_graph_pair'", mission_graph_validation)
+    mission_wait = trial_source.index('mission_status = mission.wait(', pair_check)
+
+    assert graph_run < graph_validation < observer_arm
+    assert (
+        mission_graph_run < mission_graph_validation < pair_validation < pair_check < mission_wait
+    )
+
+
 def test_goal_observer_arm_ack_is_validated_before_mission_launch() -> None:
     prearm_hash = orchestration.canonical_sha256([])
     acknowledgment = {

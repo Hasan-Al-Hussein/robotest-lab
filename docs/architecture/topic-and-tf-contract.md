@@ -93,6 +93,17 @@ the verifier requires active lifecycle state for `map_server`, `amcl`,
 monitor activation is checked again immediately before the goal. Action,
 cancellation, and terminal-result waits retain steady wall-clock deadlines.
 
+Phase 3 adds two passive evidence consumers before mission launch:
+`/robotest/metrics_collector` and `/robotest/scenario_controller`. They observe
+the raw FollowWaypoints feedback and status endpoints without owning goal
+submission, but Jazzy's action-graph projection reports those endpoint bundles
+as action clients. The graph probe retains those projected participants as
+diagnostics, but derives goal-capable ownership from the exact hidden
+`/_action/send_goal` service-client endpoint. The pre-mission graph gate
+therefore requires zero goal-capable clients. After mission launch it requires
+exactly `/robotest/mission_runner`; any missing, mistyped, or additional goal
+client remains a gate failure.
+
 ## Fault-control interfaces
 
 The Phase 3 interface package owns:

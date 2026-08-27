@@ -59,7 +59,11 @@ remains disabled.
 
 After initial readiness, the verifier starts the baseline mission in a recorded
 process group. A ROS status probe proves one exact `EXECUTING` FollowWaypoints
-UUID and exact mission-runner action ownership. The injection target must be the
+UUID and derives mission-runner goal capability from the exact
+`/robotest/follow_waypoints/_action/send_goal` service-client endpoint with type
+`nav2_msgs/action/FollowWaypoints_SendGoal`. Jazzy's projected action-client
+participants are retained in `active-goal.json` as diagnostics, but they are
+not accepted as goal-submission ownership. The injection target must be the
 single nested `controller_server` that simultaneously matches:
 
 - descendant lineage from the configured managed child;
