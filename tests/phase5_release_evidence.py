@@ -25,6 +25,10 @@ from typing import Any
 import yaml
 from jsonschema import Draft202012Validator
 from phase5_ci import EvidenceError, atomic_write_json, canonical_json_bytes, file_sha256
+from phase5_portfolio_evidence import (
+    portfolio_projection_paths,
+    validate_portfolio_evidence,
+)
 from phase5_release_docs import validate_release_documents
 
 GIT_SHA = re.compile(r'^[0-9a-f]{40}$')
@@ -533,6 +537,23 @@ PHASE3_RECOVERED_LIFECYCLE_TIMEOUT_KEYS = {
     'text',
     'timed_out_attempts',
 }
+
+
+def _expected_portfolio_projection_paths(candidate_sha: str) -> tuple[str, ...]:
+    """Freeze the six evidence-commit additions at the final-gate boundary."""
+    _require(
+        GIT_SHA.fullmatch(candidate_sha) is not None,
+        'portfolio projection candidate SHA is invalid',
+    )
+    root = 'docs/results/phase-5'
+    return (
+        f'{root}/portfolio-{candidate_sha}.json',
+        f'{root}/portfolio-{candidate_sha}.SHA256SUMS',
+        f'{root}/portfolio-{candidate_sha}.validation.txt',
+        f'{root}/architecture-{candidate_sha}.svg',
+        f'{root}/release-flow-{candidate_sha}.svg',
+        f'{root}/scenario5-localization-error-{candidate_sha}.png',
+    )
 
 
 def _require(condition: bool, message: str) -> None:
@@ -4792,6 +4813,7 @@ def _phase4_evidence(repository: Path, run_directory: Path, scenario6_path: Path
         'Scenario 6 result is not the exact production evaluation replay',
     )
     return {
+        'completed_utc': completed_utc.isoformat(),
         'git_sha': git_sha,
         'manifest_file_count': len(manifest),
         'run_directory': str(run_directory),
@@ -5035,6 +5057,7 @@ def _validate_remote_proof_document(
         set(run)
         == {
             'conclusion',
+            'completed_at',
             'created_at',
             'head_sha',
             'run_id',
@@ -5049,8 +5072,12 @@ def _validate_remote_proof_document(
         f'{label} verdict or identity is invalid',
     )
     created_at = _utc_timestamp(run.get('created_at'), f'{label} run.created_at')
+    completed_at = _utc_timestamp(run.get('completed_at'), f'{label} run.completed_at')
     checked_at = _utc_timestamp(proof.get('checked_at'), f'{label} checked_at')
-    _require(checked_at >= created_at, f'{label} was checked before its workflow run')
+    _require(
+        created_at <= completed_at <= checked_at,
+        f'{label} timestamps do not bracket the completed workflow run',
+    )
     run_id = run.get('run_id')
     _require(
         isinstance(run_id, int) and not isinstance(run_id, bool) and 0 < run_id < 2**63,
@@ -5132,6 +5159,7 @@ def _validate_remote_proof_document(
         )
     return {
         'checked_at': checked_at,
+        'completed_at': completed_at,
         'created_at': created_at,
         'repository_name': repository_name,
         'repository_url': repository_url,
@@ -5180,7 +5208,7 @@ def _local_aggregate_evidence(repository: Path, path: Path) -> dict[str, Any]:
         and aggregate.get('outstanding_gates') == LOCAL_OUTSTANDING_GATES,
         'local aggregate verification scope changed',
     )
-    _utc_timestamp(aggregate.get('checked_at'), 'local aggregate checked_at')
+    checked_at = _utc_timestamp(aggregate.get('checked_at'), 'local aggregate checked_at')
     command = _mapping(aggregate.get('command'), 'local aggregate command')
     _require(set(command) == {'argv', 'cwd'}, 'local aggregate command schema changed')
     argv = _list(command.get('argv'), 'local aggregate command argv')
@@ -5278,6 +5306,7 @@ def _local_aggregate_evidence(repository: Path, path: Path) -> dict[str, Any]:
             f'local aggregate is not tracked: {relative}',
         )
     return {
+        'checked_at': checked_at.isoformat(),
         'evidence_commit_paths': [
             *(item.relative_to(repository).as_posix() for item in aggregate_paths),
             *changed_paths,
@@ -5295,6 +5324,8 @@ def _phase5_evidence(
     proof_path: Path,
     local_evidence_commit_paths: list[str],
     release_document_paths: list[str],
+    portfolio_projection_paths_: list[str],
+    portfolio_prepared_utc: datetime,
 ) -> dict[str, Any]:
     expected_root = _repository_directory(
         repository, 'docs/results/phase-5', 'Phase 5 tracked evidence root'
@@ -5315,6 +5346,10 @@ def _phase5_evidence(
         expected_sha=filename_sha,
         expected_mode='--remote',
         label='Phase 5 remote proof',
+    )
+    _require(
+        proof_identity['completed_at'] <= portfolio_prepared_utc,
+        'portfolio preparation predates completed candidate CI',
     )
     run_id = proof_identity['run_id']
     repository_name = proof_identity['repository_name']
@@ -5363,9 +5398,36 @@ def _phase5_evidence(
     _require(
         changed.returncode == 0
         and set(changed.stdout.splitlines())
-        == set(relative_paths) | set(local_evidence_commit_paths) | set(release_document_paths),
-        'evidence-only commit changed files outside the remote proof trio',
+        == set(relative_paths)
+        | set(local_evidence_commit_paths)
+        | set(release_document_paths)
+        | set(portfolio_projection_paths_),
+        'evidence-only commit changed files outside the exact release allowlist',
     )
+    portfolio_status = _git(
+        repository,
+        [
+            'diff-tree',
+            '--no-commit-id',
+            '--name-status',
+            '-r',
+            parent_fields[0],
+            '--',
+            *portfolio_projection_paths_,
+        ],
+    )
+    _require(
+        portfolio_status.returncode == 0
+        and set(portfolio_status.stdout.splitlines())
+        == {f'A\t{relative}' for relative in portfolio_projection_paths_},
+        'portfolio projection is not an exact six-path addition',
+    )
+    for relative in portfolio_projection_paths_:
+        candidate_entry = _git(repository, ['ls-tree', filename_sha, '--', relative])
+        _require(
+            candidate_entry.returncode == 0 and candidate_entry.stdout == '',
+            f'portfolio projection already exists in candidate commit: {relative}',
+        )
     for relative in sorted(set(changed.stdout.splitlines())):
         mode = _git(repository, ['ls-tree', parent_fields[0], '--', relative])
         fields = mode.stdout.split()
@@ -5376,6 +5438,7 @@ def _phase5_evidence(
     return {
         'candidate_git_sha': filename_sha,
         'checked_at': proof_identity['checked_at'].isoformat(),
+        'completed_at': proof_identity['completed_at'].isoformat(),
         'manifest_path': str(manifest_path),
         'proof_path': str(proof_path),
         'proof_sha256': file_sha256(proof_path),
@@ -5461,6 +5524,8 @@ def validate_release_evidence(
     phase3_aggregate: Path,
     phase4_run_directory: Path,
     phase4_scenario6: Path,
+    phase5_portfolio_root: Path,
+    phase5_portfolio_proof: Path,
     phase5_remote_proof: Path,
     phase5_evidence_commit_remote_proof: Path,
 ) -> dict[str, Any]:
@@ -5478,8 +5543,71 @@ def validate_release_evidence(
     _activate_repository_packages(repository)
     local = _local_aggregate_evidence(repository, local_aggregate)
     phase3 = _phase3_evidence(repository, phase3_candidate_root, phase3_aggregate)
-    phase4 = _phase4_evidence(repository, phase4_run_directory, phase4_scenario6)
     candidate_sha = local['git_sha']
+    _require(
+        phase3['git_sha'] == candidate_sha,
+        'Phase 3 evidence and local aggregate bind different candidate SHAs',
+    )
+    portfolio = validate_portfolio_evidence(
+        repository,
+        phase5_portfolio_root,
+        phase5_portfolio_proof,
+        phase3_candidate_root,
+        candidate_sha,
+    )
+    expected_portfolio_paths = list(_expected_portfolio_projection_paths(candidate_sha))
+    producer_projection_paths = list(portfolio_projection_paths(candidate_sha))
+    expected_portfolio_proof = repository / expected_portfolio_paths[0]
+    selected_portfolio_proof = _regular_file(
+        phase5_portfolio_proof, 'tracked portfolio proof integration boundary'
+    ).resolve(strict=True)
+    tracked_portfolio = _load_canonical_json(
+        selected_portfolio_proof, 'tracked portfolio proof integration boundary'
+    )
+    _require(
+        set(portfolio)
+        == {
+            'attempt_id',
+            'candidate_git_sha',
+            'finalized_utc',
+            'portfolio_proof_path',
+            'portfolio_proof_sha256',
+            'prepared_utc',
+            'projection_paths',
+            'scenario5_run_id',
+            'status',
+            'verification_scope',
+        }
+        and portfolio.get('candidate_git_sha') == candidate_sha
+        and portfolio.get('status') == 'PASS'
+        and selected_portfolio_proof == expected_portfolio_proof
+        and portfolio.get('portfolio_proof_path') == expected_portfolio_paths[0]
+        and portfolio.get('portfolio_proof_sha256') == file_sha256(selected_portfolio_proof)
+        and portfolio.get('prepared_utc') == tracked_portfolio.get('prepared_utc')
+        and portfolio.get('finalized_utc') == tracked_portfolio.get('finalized_utc')
+        and portfolio.get('projection_paths') == expected_portfolio_paths
+        and producer_projection_paths == expected_portfolio_paths
+        and len(expected_portfolio_paths) == 6
+        and len(set(expected_portfolio_paths)) == 6,
+        'portfolio validator returned a manipulated projection contract',
+    )
+    portfolio_prepared_utc = _utc_timestamp(portfolio.get('prepared_utc'), 'portfolio prepared_utc')
+    portfolio_finalized_utc = _utc_timestamp(
+        portfolio.get('finalized_utc'), 'portfolio finalized_utc'
+    )
+    _require(
+        portfolio_prepared_utc <= portfolio_finalized_utc,
+        'portfolio finalization predates preparation',
+    )
+    phase4 = _phase4_evidence(repository, phase4_run_directory, phase4_scenario6)
+    _require(
+        datetime.fromisoformat(phase4['completed_utc']) <= portfolio_prepared_utc,
+        'portfolio preparation predates completed Phase 4 evidence',
+    )
+    _require(
+        portfolio_finalized_utc <= datetime.fromisoformat(local['checked_at']),
+        'bare local aggregate predates portfolio finalization',
+    )
     candidate_readme = _git_bytes(repository, ['show', f'{candidate_sha}:README.md'])
     candidate_claims = _git_bytes(
         repository, ['show', f'{candidate_sha}:config/release-claims.json']
@@ -5505,6 +5633,8 @@ def validate_release_evidence(
         phase5_remote_proof,
         local['evidence_commit_paths'],
         release_document_paths,
+        expected_portfolio_paths,
+        portfolio_prepared_utc,
     )
     phase5_evidence_commit = _phase5_evidence_commit_remote(
         repository, phase5_evidence_commit_remote_proof, phase5
@@ -5521,13 +5651,15 @@ def validate_release_evidence(
         'phase4': phase4,
         'phase5': phase5,
         'phase5_evidence_commit': phase5_evidence_commit,
+        'portfolio': portfolio,
         'release_eligible': True,
-        'schema_version': 1,
+        'schema_version': 2,
         'status': 'PASS',
         'verification_scope': (
             'Read-only revalidation of the clone-local Phase 3 smoke host profile and '
             'caller-selected Phase 3 campaign, Phase 4 Scenario 6, tracked exact-SHA Phase 5 '
-            'remote evidence, and a prior local aggregate; no latest discovery or execution'
+            'remote evidence, immutable portfolio proof, and a prior local aggregate; no latest '
+            'discovery or execution'
         ),
     }
 
@@ -5540,6 +5672,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument('--phase3-aggregate', type=Path, required=True)
     parser.add_argument('--phase4-run-directory', type=Path, required=True)
     parser.add_argument('--phase4-scenario6', type=Path, required=True)
+    parser.add_argument('--phase5-portfolio-root', type=Path, required=True)
+    parser.add_argument('--phase5-portfolio-proof', type=Path, required=True)
     parser.add_argument('--phase5-remote-proof', type=Path, required=True)
     parser.add_argument('--phase5-evidence-commit-remote-proof', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
@@ -5556,6 +5690,8 @@ def main() -> int:
             arguments.phase3_aggregate,
             arguments.phase4_run_directory,
             arguments.phase4_scenario6,
+            arguments.phase5_portfolio_root,
+            arguments.phase5_portfolio_proof,
             arguments.phase5_remote_proof,
             arguments.phase5_evidence_commit_remote_proof,
         )

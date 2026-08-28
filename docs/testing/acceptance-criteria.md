@@ -395,15 +395,97 @@ second systemd-owned ROS process is failure.
 
 ## Portfolio release criteria
 
-A release tag and completed CV bullets require all of:
+A release tag and completed-project CV bullets require every criterion below.
 
-- every phase gate passed at its claimed verification level;
-- scenarios 1–6 satisfied their frozen targets;
-- public standard-runner CI passed on the tagged commit;
-- README commands replayed from the clean-environment matrix;
-- genuine demonstration media corresponds to a recorded passing run;
-- every benchmark table value resolves to a canonical JSON field and run ID;
-- no paid service, proprietary dataset, GPU requirement, or fabricated result.
+### P5-04 — documentation replay
 
-If an external item cannot be produced, the repository may still document local
-work, but the full Definition of Done remains explicitly incomplete.
+1. Candidate commit `C` contains the final README command surfaces. Every
+   fenced block whose info string is exactly `bash` is one replay unit. It must
+   contain `cd /home/hasan/robotest-lab` plus exactly one workflow command,
+   without a placeholder, inline comment, or interactive prompt.
+2. `config/phase5-readme-replay.json` preserves every unit's exact
+   LF-normalized body and order, expected exit code, wall timeout, log cap,
+   authorization class, and exact tracked-state postcondition. Non-Phase 0
+   units finish clean; each Phase 0 unit may allow only its explicitly named
+   generated files, with the observed subset, sizes, and hashes recorded. The
+   inventory has no missing, extra, reordered, or altered command.
+3. For replay, capture validates the exact two-line source unit but does not
+   execute its first-line `cd`. That line is the frozen documented-root
+   assertion; capture executes the second line with its working directory
+   mapped to a detached clean checkout at exact `C`, without an inherited
+   workspace overlay, and records both roots. Read-only units run without extra
+   authority; setup/install units run only after the operator supplies the
+   capture command's explicit mutating-command authorization.
+4. Every unit reaches its frozen expected exit and postcondition within its
+   bounds. Bare `scripts/verify_all.sh` must exit `3`/`INCOMPLETE`; treating
+   that documented outcome as exit zero or release success is failure.
+5. Every capture writes a new immutable attempt child below
+   `artifacts/evidence/phase5/portfolio/<C>/` and records complete bounded
+   command logs, source-fence/matrix identities, exact allowed Phase 0
+   generated deltas, outcomes, and checksums. Failed attempts and superseded
+   render attempts remain preserved. A timeout, truncation, undeclared delta,
+   wrong SHA, or command/matrix drift fails closed and requires a new attempt
+   or candidate according to the recovery boundary.
+
+### P5-05 — genuine media and diagrams
+
+1. The portfolio chart is the accepted Phase 3 Scenario 5 trial at
+   `runs/12`, selected without operator choice. Capture independently joins
+   its `localization-error.png` and canonical PASS run result to the exact
+   candidate, complete suite and aggregate, run manifest plus validation
+   sidecar, expected dimensions, bytes, and SHA-256.
+2. `docs/results/phase-5/scenario5-localization-error-<C>.png` is a
+   byte-identical projection of that already accepted artifact. It is a
+   run-derived metric chart, not a screenshot, a render of a robot scene, or a
+   hand-authored illustration.
+3. The tracked Phase 1 RViz image is a genuine screenshot from its separately
+   identified development run. It cannot substitute for or be relabeled as
+   the Phase 3 chart, and it is not projected as P5-05 release media.
+4. Exact candidate source contains two and only two marked portfolio Mermaid
+   fences: `architecture` and `release-flow`. Prepare extracts both sources,
+   binds each source-fence SHA-256 from `git show C:README.md`, and emits the
+   exact render request. The operator renders those sources outside the
+   attempt. Only after a human inspects those exact bytes may the finalize stage
+   validate their bounded safe-SVG structure, accept a canonical hash-bound
+   visual-review PASS, and seal the portfolio bundle.
+5. Generated, mocked, or synthetic runtime imagery is never represented as
+   execution evidence. Explanatory Mermaid renders prove only their source and
+   rendering review.
+
+### P5-04/05 projection and final join
+
+The capture projects exactly six new regular mode-`100644` files into the
+single evidence-only child commit `E`:
+
+- `docs/results/phase-5/portfolio-<C>.json`;
+- `docs/results/phase-5/portfolio-<C>.SHA256SUMS`;
+- `docs/results/phase-5/portfolio-<C>.validation.txt`;
+- `docs/results/phase-5/architecture-<C>.svg`;
+- `docs/results/phase-5/release-flow-<C>.svg`; and
+- `docs/results/phase-5/scenario5-localization-error-<C>.png`.
+
+The final release validator compares those exact tracked bytes and modes with
+one explicitly selected checksummed PASS attempt, reconstructs the README and
+replay inventory from `C`, revalidates the Phase 3 chart lineage, and requires
+`E` to be the exact allowlisted direct child of `C`. Extra, missing, renamed,
+rebound, modified, overwritten-attempt, or undeclared-delta files fail closed.
+Candidate CI and Phase 4 completion must not postdate portfolio
+`prepared_utc`, and portfolio `finalized_utc` must not postdate the bare local
+aggregate's `checked_at`; chronology outside that order fails closed.
+
+All other release criteria still apply: every phase gate must pass at its
+claimed verification level; Scenarios 1–6 must satisfy their frozen targets;
+public standard-runner CI must pass for exact `C` and `E`; every benchmark
+table value must resolve to canonical JSON and a run ID; and no paid service,
+proprietary dataset, GPU requirement, or fabricated result is allowed.
+
+Until the final read-only release-evidence gate returns
+`release_eligible=true`, portfolio/CV bullets remain explicitly limited to the
+checked-in Phase 1 and Phase 2 development results. If any external item cannot
+be produced, the repository may still document local work, but the full
+Definition of Done remains incomplete.
+
+The evidence-bounded wording is maintained in the
+[portfolio notes](../portfolio.md), with engineering context in the
+[case study](../case-study.md) and the executable proof order in the
+[verification matrix](verification-matrix.md).

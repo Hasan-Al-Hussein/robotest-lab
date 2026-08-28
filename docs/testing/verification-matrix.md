@@ -229,9 +229,47 @@ wsl -d Ubuntu -- bash -lc 'cd /home/hasan/robotest-lab && scripts/verify_phase5.
 | P5-01 Local CI equivalent | Formatting, lint, unit/build/short smoke workflow locally | Local workflow command log and clean exit | Local/CI command divergence or failure | Fix locally before commit/push |
 | P5-02 Public standard-runner CI | Candidate commit, pushed SHA, workflow wait by SHA | Public repository URL and successful workflow URL for exact SHA | Missing auth/repo, wrong SHA, canceled/failed workflow, paid/larger runner | Leave remote criterion incomplete or fix workflow; never claim CI pass |
 | P5-03 Evidence commit | Record candidate workflow evidence, create evidence-only commit, push, verify its SHA | Second workflow succeeds; recorded URLs/SHA and repository state reconcile | Evidence file points to another commit/run or second CI fails | Correct evidence and repeat remote verification |
-| P5-04 Documentation replay | Execute README setup/run/test commands in clean-environment matrix | Command transcript matches documented paths and expected behavior | Stale command, hidden prerequisite, untested platform claim | Correct documentation or implementation and replay from start |
-| P5-05 Media and diagrams | Render Mermaid; capture genuine run media tied to run ID | Valid diagrams and media checksum; displayed behavior matches passing evidence | Mock/generated runtime image represented as evidence, broken diagram, no run link | Re-record/re-render; leave criterion incomplete if capture unavailable |
-| P5-06 Licenses and claims | License inventory and claim-to-evidence audit | Apache-2.0 original code; third-party notices; README/CV values resolve to measurements | Unsupported license/claim or placeholder filled without measurement | Remove claim/dependency or document compatible treatment |
+| P5-04a README inventory | Compare every exact-`bash` README fence from `git show C:README.md` with `config/phase5-readme-replay.json` | Exact LF-normalized body/order, expected exit, timeout/log cap, authorization class, and exact tracked-state postcondition match with no extra/missing unit | Fence/matrix drift, blanket-clean rule hiding a declared Phase 0 evidence delta, multiple commands, placeholder/comment/prompt | Correct README and matrix, then create a new clean candidate `C` |
+| P5-04b Clean-checkout replay | Validate each first-line documented-root assertion, then execute only its second line with cwd mapped to a detached checkout at exact `C`; mutating units require explicit capture authorization | Both roots recorded; every unit reaches its frozen exit/postcondition; only exact matrix-declared Phase 0 generated deltas are allowed; bare `verify_all.sh` is expected exit `3`/`INCOMPLETE`; immutable checksummed attempt | Literal `cd` escape, wrong/dirty SHA, inherited overlay, undeclared delta, missing authorization, timeout, truncation, wrong exit/postcondition, overwritten attempt | Preserve failed attempt; fix source/docs and restart from the required boundary |
+| P5-05a Run-derived chart | Deterministically join Scenario 5 `runs/12` PASS `localization-error.png` to its run result, manifest/sidecar, suite, aggregate, candidate, dimensions, bytes, and hash | Tracked portfolio PNG is byte-identical to the accepted run artifact | Operator-selected trial, screenshot, generated/mock runtime image, wrong scenario/run/SHA, forged copy, manifest or byte mismatch | Repair/rerun the candidate; never relabel or substitute media |
+| P5-05b Mermaid diagrams | Prepare extracts the two marked README fences (`architecture`, `release-flow`) from exact `C` and emits a render request; the operator renders outside the attempt, then finalize validates the supplied SVGs and later human review | Two safe bounded SVGs bind exact source-fence/render hashes and canonical human PASS reviews created after rendering | Pre-supplied review, missing/extra marker, unsafe/external SVG, render failure, wrong source/render hash, failed visual review | Re-render unchanged source and review its new exact bytes, or correct source and restart from a new `C` |
+| P5-05c Portfolio projection | Compare one explicit immutable raw PASS attempt with the exact six tracked additions in evidence-only child `E` | JSON, checksum manifest, validation text, two SVGs, and one chart are regular `100644` files with exact paths/bytes/modes | Extra/missing/renamed path, mode drift, raw/tracked mismatch, overwritten attempt, wrong parent | Discard failed `E`; project the exact PASS attempt into one direct child of `C` |
+| P5-06 Licenses and claims | License inventory and claim-to-evidence audit | Apache-2.0 original code; third-party notices; pre-release README/portfolio/CV values resolve only to checked-in Phase 1/2 development measurements | Unsupported license/claim, later-phase result claimed before final acceptance, or placeholder filled without measurement | Remove the claim/dependency or document compatible treatment |
+
+P5-04 and P5-05 run in this exact release order:
+
+1. freeze the two marked Mermaid fences, executable README units, and replay
+   matrix in clean candidate `C`, push C, and wait for exact-C public CI to
+   complete successfully;
+2. while the primary checkout remains clean at C, produce the exact accepted
+   Phase 3 and Phase 4 evidence; candidate CI and Phase 4 must both complete
+   before portfolio `prepared_utc`;
+3. validate each README root assertion and replay its workflow line with cwd
+   mapped to fresh detached C checkouts; select and revalidate deterministic
+   `runs/12`; prepare the two Mermaid sources, render them, then finalize a new
+   immutable attempt from the later human review bound to those exact SVG
+   bytes;
+4. after portfolio `finalized_utc`, run bare `scripts/verify_all.sh` from clean
+   C; its expected exit is `3`/`INCOMPLETE`, and the attempt must predate the
+   aggregate's `checked_at`;
+5. capture C's already-completed public-CI proof, then run the deterministic
+   release-document producer to write the Phase 3/4 result documents and
+   project exactly
+   `portfolio-<C>.{json,SHA256SUMS,validation.txt}`,
+   `architecture-<C>.svg`, `release-flow-<C>.svg`, and
+   `scenario5-localization-error-<C>.png` below `docs/results/phase-5/`;
+6. create one allowlisted evidence-only direct child `E`, push it, wait for its
+   public CI, and capture the exact-`E` proof only in ignored evidence; and
+7. invoke the final read-only release-evidence gate with all exact Phase 3,
+   Phase 4, public-CI, prior-local, and selected portfolio PASS-attempt paths.
+   Only that gate may set `release_eligible=true`.
+
+The portfolio chart is a run-derived metric plot. The tracked Phase 1 RViz
+screenshot is genuine but belongs to a separate development run; it is not the
+Scenario 5 chart and cannot satisfy P5-05a. Mermaid renders are explanatory
+diagrams, not runtime evidence. Published pre-release wording remains bounded
+by the [portfolio notes](../portfolio.md) and
+[case study](../case-study.md).
 
 ## Final gate
 
@@ -246,7 +284,7 @@ Final read-only evidence command, with every path selected explicitly by the
 reviewer:
 
 ```powershell
-wsl -d Ubuntu -- bash -lc 'cd /home/hasan/robotest-lab && scripts/verify_all.sh --release-evidence --local-aggregate <exact-prior-verify-all.json> --phase3-candidate-root <exact-phase3-candidate-root> --phase3-aggregate <exact-phase3-candidate-root>/aggregate/aggregate-result.json --phase4-run-directory <exact-phase4-run-directory> --phase4-scenario6 <exact-phase4-run-directory>/scenario6-result.json --phase5-remote-proof docs/results/phase-5/remote-<candidate-sha>.json --phase5-evidence-commit-remote-proof artifacts/evidence/phase5/remote-evidence-commit/remote-<evidence-commit-sha>.json'
+wsl -d Ubuntu -- bash -lc 'cd /home/hasan/robotest-lab && scripts/verify_all.sh --release-evidence --local-aggregate <exact-prior-verify-all.json> --phase3-candidate-root <exact-phase3-candidate-root> --phase3-aggregate <exact-phase3-candidate-root>/aggregate/aggregate-result.json --phase4-run-directory <exact-phase4-run-directory> --phase4-scenario6 <exact-phase4-run-directory>/scenario6-result.json --phase5-portfolio-root artifacts/evidence/phase5/portfolio/<candidate-sha> --phase5-portfolio-proof docs/results/phase-5/portfolio-<candidate-sha>.json --phase5-remote-proof docs/results/phase-5/remote-<candidate-sha>.json --phase5-evidence-commit-remote-proof artifacts/evidence/phase5/remote-evidence-commit/remote-<evidence-commit-sha>.json'
 ```
 
 Bare `verify_all.sh` is the only mode that orchestrates phase verifiers, and it
@@ -261,12 +299,14 @@ the deterministic `tests/phase5_release_docs.py` producer on those exact Phase
 3/4 inputs. E must add exactly the six derived Phase 3/4 JSON/CSV/Markdown
 documents, the two bounded README region replacements, the exact
 `config/release-claims.json` extension, the prior local/Phase 0 evidence, and
-the candidate remote-proof trio; every changed path must be a regular `100644`
-blob. Release mode reconstructs README and claims from `git show C`, rejects
-extra or missing E paths, and never discovers a latest run. Only one clean
-candidate SHA, complete canonical PASS evidence, an exact evidence-only child
-commit, and a successful exact-SHA CI run for that child can produce
-`release_eligible=true`.
+the candidate remote-proof trio, plus the exact six P5-04/05 portfolio files;
+every changed path must be a regular `100644` blob. Release mode reconstructs
+README, the replay inventory, and claims from `git show C`, rejects extra or
+missing E paths, joins one explicit immutable portfolio PASS attempt to its
+tracked projection, and never discovers a latest run. Only one clean candidate
+SHA, complete canonical
+PASS evidence, an exact evidence-only child commit, and a successful exact-SHA
+CI run for that child can produce `release_eligible=true`.
 Long benchmarks still run through
 `scripts/run_benchmarks.sh`; public CI and genuine visual inspection retain
 their own evidence.

@@ -1,6 +1,7 @@
 ca-certificates
 curl
 git
+gh
 gnupg
 build-essential
 cmake

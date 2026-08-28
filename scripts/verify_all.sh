@@ -26,6 +26,8 @@ phase3_candidate_root=''
 phase3_aggregate=''
 phase4_run_directory=''
 phase4_scenario6=''
+phase5_portfolio_root=''
+phase5_portfolio_proof=''
 phase5_remote_proof=''
 phase5_evidence_commit_remote_proof=''
 
@@ -39,6 +41,8 @@ Usage:
     --phase3-aggregate <exact-path> \
     --phase4-run-directory <exact-path> \
     --phase4-scenario6 <exact-path> \
+    --phase5-portfolio-root <exact-path> \
+    --phase5-portfolio-proof <exact-path> \
     --phase5-remote-proof <exact-tracked-json-path> \
     --phase5-evidence-commit-remote-proof <exact-ignored-json-path>
 
@@ -46,10 +50,11 @@ Bare mode runs the normal Phase 0-5 verifier routing, invokes Phase 5 only as
 --local, and exits 3/INCOMPLETE because it never authorizes acceptance work.
 
 --release-evidence is evidence-only. It invokes no phase verifier and only
-revalidates the seven exact caller-selected paths. It never starts the Phase 3
+revalidates the nine exact caller-selected paths. It never starts the Phase 3
 campaign, invokes Phase 4 --apply, publishes, or discovers latest evidence.
-The prior local aggregate and all three acceptance lanes must bind one clean
-candidate Git SHA. Its separate result never overwrites the prior aggregate.
+The prior local aggregate plus Phase 3, Phase 4, portfolio, and public-CI
+evidence must bind one clean candidate Git SHA. Its separate result never
+overwrites the prior aggregate.
 EOF
 }
 
@@ -104,6 +109,20 @@ elif (($# > 0)); then
         }
         phase4_scenario6="$2"
         ;;
+      --phase5-portfolio-root)
+        [[ -z "${phase5_portfolio_root}" ]] || {
+          printf 'Duplicate %s\n' "$1" >&2
+          exit 2
+        }
+        phase5_portfolio_root="$2"
+        ;;
+      --phase5-portfolio-proof)
+        [[ -z "${phase5_portfolio_proof}" ]] || {
+          printf 'Duplicate %s\n' "$1" >&2
+          exit 2
+        }
+        phase5_portfolio_proof="$2"
+        ;;
       --phase5-remote-proof)
         [[ -z "${phase5_remote_proof}" ]] || {
           printf 'Duplicate %s\n' "$1" >&2
@@ -127,7 +146,8 @@ elif (($# > 0)); then
   done
   [[ -n "${local_aggregate}" && -n "${phase3_candidate_root}" && \
     -n "${phase3_aggregate}" && -n "${phase4_run_directory}" && \
-    -n "${phase4_scenario6}" && -n "${phase5_remote_proof}" && \
+    -n "${phase4_scenario6}" && -n "${phase5_portfolio_root}" && \
+    -n "${phase5_portfolio_proof}" && -n "${phase5_remote_proof}" && \
     -n "${phase5_evidence_commit_remote_proof}" ]] || {
     usage >&2
     exit 2
@@ -135,6 +155,7 @@ elif (($# > 0)); then
 fi
 readonly mode local_aggregate phase3_candidate_root phase3_aggregate
 readonly phase4_run_directory phase4_scenario6 phase5_remote_proof
+readonly phase5_portfolio_root phase5_portfolio_proof
 readonly phase5_evidence_commit_remote_proof
 
 WORK_ROOT="$(mktemp -d /tmp/robotest-verify-all.XXXXXX)"
@@ -213,6 +234,8 @@ if [[ "${mode}" == 'release-evidence' ]]; then
     --phase3-aggregate "${phase3_aggregate}" \
     --phase4-run-directory "${phase4_run_directory}" \
     --phase4-scenario6 "${phase4_scenario6}" \
+    --phase5-portfolio-root "${phase5_portfolio_root}" \
+    --phase5-portfolio-proof "${phase5_portfolio_proof}" \
     --phase5-remote-proof "${phase5_remote_proof}" \
     --phase5-evidence-commit-remote-proof "${phase5_evidence_commit_remote_proof}" \
     --output "${release_output}"; then
@@ -238,7 +261,7 @@ path.write_text(
         {
             'checked_at': datetime.now(timezone.utc).isoformat(),
             'release_eligible': False,
-            'schema_version': 1,
+            'schema_version': 2,
             'status': 'FAIL',
             'verification_scope': (
                 'Evidence-only validation failed; no phase verifier or acceptance action ran'

@@ -15,6 +15,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${SCRIPT_PATH}")" && pwd -P)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 readonly SCRIPT_PATH SCRIPT_DIR PROJECT_ROOT
 readonly HELPER="${PROJECT_ROOT}/tests/phase5_ci.py"
+readonly PORTFOLIO_HELPER="${PROJECT_ROOT}/tests/phase5_portfolio_evidence.py"
 readonly WORKFLOW="${PROJECT_ROOT}/.github/workflows/robotest-ci.yml"
 readonly EVIDENCE_ROOT="${PROJECT_ROOT}/artifacts/evidence/phase5"
 readonly REMOTE_EVIDENCE_ROOT="${PROJECT_ROOT}/docs/results/phase-5"
@@ -320,7 +321,7 @@ PY
     --workflow robotest-ci.yml \
     --commit "${REMOTE_SHA}" \
     --limit 50 \
-    --json databaseId,headSha,status,conclusion,url,workflowName,createdAt >"${runs_json}" ||
+    --json databaseId,headSha,status,conclusion,url,workflowName,createdAt,updatedAt >"${runs_json}" ||
     die 'Unable to list RoboTest CI workflow runs.'
 
   mkdir -p -- "${output_root}"
@@ -392,6 +393,8 @@ if [[ "${MODE}" == "remote" || "${MODE}" == "remote-evidence-commit" ]]; then
   exit 0
 fi
 
+[[ -f "${PORTFOLIO_HELPER}" && ! -L "${PORTFOLIO_HELPER}" ]] ||
+  die "Missing regular portfolio helper: ${PORTFOLIO_HELPER}"
 require_noble
 for command_name in bash colcon git go python3 realpath rosdep shellcheck timeout; do
   require_command "${command_name}"
@@ -491,6 +494,10 @@ run_check license-inventory 60s \
   python3 "${HELPER}" licenses --repository "${PROJECT_ROOT}" --output "${LICENSE_REPORT}"
 run_check release-claims 30s \
   python3 "${HELPER}" claims --repository "${PROJECT_ROOT}" --output "${CLAIMS_REPORT}"
+run_check portfolio-contract 30s \
+  python3 "${PORTFOLIO_HELPER}" contract \
+    --repository "${PROJECT_ROOT}" \
+    --candidate-sha "${GIT_SHA}"
 run_check non-live-test-surface 30s \
   python3 "${HELPER}" test-surface \
     --repository "${PROJECT_ROOT}" \

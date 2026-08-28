@@ -41,6 +41,11 @@ target as Ubuntu 24.04.1 LTS in the `Ubuntu` WSL distribution and records:
   `8.4.4-1noble.20260615.124621`; and
 - colcon-core `0.21.0` and Python `3.12.3`.
 
+The Phase 5 public-CI prerequisite was audited and installed on **2026-08-28**:
+Ubuntu Noble `gh` `2.45.0-1ubuntu0.3`. Its installed Debian copyright file is
+bound in `config/dependency-license-inventory.json`. Authentication remains a
+per-user secret and is never stored in the repository.
+
 The development Phase 3 verifier record at
 `artifacts/evidence/phase3/20260826T052402Z-3022/` reports a successful fresh
 build, package-test result, static checks, installed CLI checks, and `rosdep`
@@ -100,8 +105,9 @@ The manifest intentionally records direct project tooling even when a metapackag
 ### Bootstrap and native build
 
 `ca-certificates`, `curl`, and `gnupg` establish authenticated source retrieval.
-`git`, `build-essential`, `cmake`, `ninja-build`, and `pkg-config` support the
-mixed C++/Python workspace. `libssl-dev` supplies the OpenSSL EVP SHA-256 API
+`git`, `gh`, `build-essential`, `cmake`, `ninja-build`, and `pkg-config` support
+the mixed C++/Python workspace and the read-only Phase 5 GitHub evidence
+capture. `libssl-dev` supplies the OpenSSL EVP SHA-256 API
 used to recompute canonical fault-schedule digests, and
 `nlohmann-json3-dev` supplies the strict bounded C++ JSON parser used for
 mode-specific fault parameters. Several packages are already installed, but

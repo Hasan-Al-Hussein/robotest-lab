@@ -83,8 +83,92 @@
       "evidence_document": "docs/results/phase-2/20260826T010218Z-466.md",
       "evidence_text": "all 111 checksum entries validated",
       "id": "phase2-checksum-count"
+    },
+    {
+      "claim_document": "docs/portfolio.md",
+      "claim_text": "Phase 1 development run completed 103 tests with 0 errors or failures",
+      "evidence_document": "docs/results/phase-1/20260825T200725Z-1333.md",
+      "evidence_text": "103 tests, 0 errors, 0 failures",
+      "id": "portfolio-phase1-test-count"
+    },
+    {
+      "claim_document": "docs/portfolio.md",
+      "claim_text": "calculated real-time factor median `0.9999`",
+      "evidence_document": "docs/results/phase-1/20260825T200725Z-1333.md",
+      "evidence_text": "`0.9999416661302953`",
+      "id": "portfolio-phase1-rtf-median"
+    },
+    {
+      "claim_document": "docs/portfolio.md",
+      "claim_text": "p5 `0.9162`",
+      "evidence_document": "docs/results/phase-1/20260825T200725Z-1333.md",
+      "evidence_text": "`0.9162105536383762`",
+      "id": "portfolio-phase1-rtf-p5"
+    },
+    {
+      "claim_document": "docs/portfolio.md",
+      "claim_text": "peak launch-group RSS to `795,476 KiB`",
+      "evidence_document": "docs/results/phase-1/20260825T200725Z-1333.md",
+      "evidence_text": "`795,476 KiB` (`776.83 MiB`)",
+      "id": "portfolio-phase1-peak-rss"
+    },
+    {
+      "claim_document": "docs/portfolio.md",
+      "claim_text": "`0.2962 m` of bounded displacement",
+      "evidence_document": "docs/results/phase-1/20260825T200725Z-1333.md",
+      "evidence_text": "`0.29619887895167835 m`",
+      "id": "portfolio-phase1-displacement"
+    },
+    {
+      "claim_document": "docs/portfolio.md",
+      "claim_text": "all 45 Phase 1 manifest entries",
+      "evidence_document": "docs/results/phase-1/20260825T200725Z-1333.md",
+      "evidence_text": "all 45 manifest entries validated",
+      "id": "portfolio-phase1-checksum-count"
+    },
+    {
+      "claim_document": "docs/portfolio.md",
+      "claim_text": "returned `SUCCEEDED` for 3/3 ordered waypoints",
+      "evidence_document": "docs/results/phase-2/20260826T010218Z-466.md",
+      "evidence_text": "Nav2 `SUCCEEDED`; 3/3 completed",
+      "id": "portfolio-phase2-mission-result"
+    },
+    {
+      "claim_document": "docs/portfolio.md",
+      "claim_text": "completed 213 tests with 0 errors or failures",
+      "evidence_document": "docs/results/phase-2/20260826T010218Z-466.md",
+      "evidence_text": "213 tests, 0 errors, 0 failures",
+      "id": "portfolio-phase2-test-count"
+    },
+    {
+      "claim_document": "docs/portfolio.md",
+      "claim_text": "calculated real-time factor median `0.9863`",
+      "evidence_document": "docs/results/phase-2/20260826T010218Z-466.md",
+      "evidence_text": "`0.9863029171557808`",
+      "id": "portfolio-phase2-rtf-median"
+    },
+    {
+      "claim_document": "docs/portfolio.md",
+      "claim_text": "p5 `0.9302`",
+      "evidence_document": "docs/results/phase-2/20260826T010218Z-466.md",
+      "evidence_text": "`0.9302367113894893`",
+      "id": "portfolio-phase2-rtf-p5"
+    },
+    {
+      "claim_document": "docs/portfolio.md",
+      "claim_text": "peak owned-process-group RSS to `1,372,244 KiB`",
+      "evidence_document": "docs/results/phase-2/20260826T010218Z-466.md",
+      "evidence_text": "`1,372,244 KiB`",
+      "id": "portfolio-phase2-peak-rss"
+    },
+    {
+      "claim_document": "docs/portfolio.md",
+      "claim_text": "all 111 Phase 2 manifest entries",
+      "evidence_document": "docs/results/phase-2/20260826T010218Z-466.md",
+      "evidence_text": "all 111 checksum entries validated",
+      "id": "portfolio-phase2-checksum-count"
     }
   ],
   "schema_version": 1,
-  "scope": "Quantitative and outcome claims currently published in README.md. No CV document is present in this repository."
+  "scope": "Quantitative and outcome claims published in README.md and the evidence-bounded CV bullets in docs/portfolio.md."
 }

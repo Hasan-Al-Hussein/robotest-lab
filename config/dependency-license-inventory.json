@@ -11,6 +11,7 @@
     "dh-golang": {"audited_version": "1.62", "copyright_sha256": "e14e0b5248d212681d3e3d9fa95b2c7cbf13b4e105f516be012f146893073f65", "declared_licenses": ["GPL-2+"]},
     "dpkg-dev": {"audited_version": "1.22.6ubuntu6.6", "copyright_sha256": "6511e06b27f2297fde6ee8fb2e59807b7712dda61837ca00a0980da1e5df07ac", "declared_licenses": ["GPL-2+", "public-domain-s-s-d"]},
     "fakeroot": {"audited_version": "1.33-1", "copyright_sha256": "f3be4874598a121349c16fdb3d000703d871807558f26ac876c83cb35f1bc804", "declared_licenses": ["Artistic-1.0-Perl", "GPL-3.0-or-later"]},
+    "gh": {"audited_version": "2.45.0-1ubuntu0.3", "copyright_sha256": "9900637065bd15f281845af2ba5f4fba1509698a0e67f9821ecf5fd8853e915d", "declared_licenses": ["BSD-3-Clause", "Expat"]},
     "git": {"audited_version": "1:2.43.0-1ubuntu7.3", "copyright_sha256": "e7efbd67e2dac6d950e4607b541778a610561ec77562b8b0a9704a7a3fcbc39c", "declared_licenses": ["Apache-2.0", "BSD-3-clause", "Boost", "EDL-1.0", "Expat", "GPL-1+ or Artistic-1", "GPL-2", "GPL-2+", "ISC", "LGPL-2+", "LGPL-2.1+", "Zlib", "dlmalloc", "mingw-runtime"]},
     "gnupg": {"audited_version": "2.4.4-2ubuntu17.4", "copyright_sha256": "2be9a9a5d7db2584cf984de83379d395bb4a33478404160d1d77d0060b5a1bd1", "declared_licenses": ["BSD-3-clause", "CC0-1.0", "Expat", "GPL-2+", "GPL-3+", "GPL-3+ or BSD-3-clause", "LGPL-2.1+", "LGPL-3+", "LGPL-3+ or GPL-2+", "RFC-Reference", "TinySCHEME", "permissive"]},
     "golang-go": {"audited_version": "2:1.22~2build1", "copyright_sha256": "d31252007971abc81742f8941fb514391cd48ef7dd5a93bc8df7872142dbcc4f", "declared_licenses": ["Go"]},
@@ -44,7 +45,7 @@
     "shellcheck": {"audited_version": "0.9.0-1", "copyright_sha256": "921382c59778a630609c6b1c2a8ce115b8f75b18efe8ee9910fa5f324f3b89d0", "declared_licenses": ["GPL-3+"]}
   },
   "audit": {
-    "captured_at_utc": "2026-08-26",
+    "captured_at_utc": "2026-08-28",
     "platform": "Ubuntu 24.04 (Noble), ROS 2 Jazzy",
     "scope": "Direct repository declarations only: the Phase 0 apt manifest, external package.xml dependencies, pinned Python development tooling, pinned GitHub Actions, and direct Go modules. Resolver-added transitive operating-system dependencies are not bundled by this repository and remain governed by their installed package notices."
   },

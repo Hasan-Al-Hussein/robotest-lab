@@ -17,6 +17,21 @@ campaign evidence, Phase 4 privileged acceptance evidence, and Phase 5 public-CI
 and release-evidence validation remain pending.
 <!-- ROBOTEST_RELEASE_STATUS_END -->
 
+## Start here
+
+- [Set up and verify the Ubuntu environment](#phase-0-workflow).
+- [Run the bounded Phase 1 and Phase 2 development gates](#phase-1-verification).
+- [Run the Phase 3–5 static gates](#phase-3-5-static-gates) before any
+  separately authorized benchmark, privileged package, or remote-CI step.
+- Read the [acceptance criteria](docs/testing/acceptance-criteria.md) and
+  [verification matrix](docs/testing/verification-matrix.md) before producing
+  evidence.
+- Use the [troubleshooting guide](docs/troubleshooting.md) when a gate stops or
+  returns incomplete.
+- See the [case study](docs/case-study.md) for the engineering narrative and
+  the [portfolio notes](docs/portfolio.md) for evidence-bounded project and CV
+  language.
+
 ## Why this project exists
 
 The goal is not another “robot moves in Gazebo” example. The system
@@ -46,6 +61,7 @@ measured evidence from planned work.
 
 ## Architecture
 
+<!-- ROBOTEST_PORTFOLIO_DIAGRAM: architecture -->
 ```mermaid
 flowchart LR
     Gazebo["Gazebo Harmonic\nheadless by default"]
@@ -67,34 +83,88 @@ This diagram describes the implemented design. The Phase 1 and Phase 2 results
 remain limited to their documented development scopes; they do not imply that
 the later campaign, supervisor, packaging, or public-CI acceptance gates ran.
 
+The release path keeps runtime evidence, tracked projections, public-CI proof,
+and the final decision separate:
+
+<!-- ROBOTEST_PORTFOLIO_DIAGRAM: release-flow -->
+```mermaid
+flowchart TD
+    C["Clean candidate commit C"]
+    CandidateCI["Push C and complete successful public CI\nfor exact C"]
+    Runtime["Phase 3 campaign and Phase 4 --apply\nexact caller-selected evidence"]
+    Portfolio["Capture and finalize P5-04 replay and P5-05 media\nfrom C and accepted run evidence"]
+    Local["Bare verify_all\nexpected INCOMPLETE local aggregate"]
+    CandidateProof["Capture the completed exact-C\npublic-CI proof"]
+    Projection["Generate Phase 3 and Phase 4 documents\nand project the six portfolio files"]
+    E["Evidence-only child commit E"]
+    EvidenceCI["Capture successful public CI\nfor exact E in ignored evidence"]
+    Final["Read-only --release-evidence gate\nrelease_eligible only if every join passes"]
+
+    C --> CandidateCI --> Runtime --> Portfolio --> Local
+    Local --> CandidateProof --> Projection --> E --> EvidenceCI --> Final
+```
+
+P5-05 treats a run-derived chart and a screenshot as different evidence. The
+release portfolio chart must be a byte-identical projection of an accepted
+Phase 3 Scenario 5 `runs/12` `localization-error.png`, joined to its run ID,
+manifest, candidate SHA, and canonical PASS result. The existing
+[Phase 1 RViz image](docs/results/phase-1/rviz-phase1.png) is a genuine manual
+screenshot from a separate development run; it is not a benchmark chart and
+cannot substitute for the Phase 3 artifact. The exact capture and projection
+order is documented in the
+[Phase 5 CI gate](docs/testing/phase5-ci.md#documentation-replay-and-portfolio-media).
+
 ## Phase 0 workflow
 
 Run these commands only inside the verified Ubuntu 24.04 distribution. The
 repository and dependency scripts reject Ubuntu 20.04.
 
+The repository-source check is read-only. It is expected to fail until the
+pinned official ROS source package has been applied.
+
 ```bash
 cd /home/hasan/robotest-lab
-
-# Read-only check. It is expected to fail until the pinned official ROS source
-# package has been applied.
 scripts/setup_ros2_repository.sh --check
+```
 
-# Explicitly configure the pinned official ROS apt source and refresh indexes.
-# This is the first command in this sequence that invokes sudo or apt changes.
+The first mutating setup step requires explicit authorization and the literal
+`--apply` flag:
+
+```bash
+cd /home/hasan/robotest-lab
 scripts/setup_ros2_repository.sh --apply
+```
 
-# Simulate the exact manifest and enforce storage/reserve gates. No package is
-# installed by this command.
+Simulate the exact manifest and enforce storage/reserve gates before installing
+anything:
+
+```bash
+cd /home/hasan/robotest-lab
 scripts/verify_phase0_preinstall.sh
+```
 
-# Install the validated direct manifest plus normal resolver-required
-# dependencies, initialize rosdep, create the local tooling virtual
-# environment, and run the post-install verifier.
+Install the validated manifest, initialize rosdep, create the local tooling
+environment, and run the post-install verifier only with explicit
+authorization:
+
+```bash
+cd /home/hasan/robotest-lab
 scripts/install_dependencies.sh --apply
+```
 
-# Repeatable post-install/static routing. The aggregate exits 3 (INCOMPLETE)
-# until exact caller-selected release evidence is validated separately.
+The post-install Phase 0 verifier is repeatable and read-only:
+
+```bash
+cd /home/hasan/robotest-lab
 scripts/verify_phase0.sh
+```
+
+The bare aggregate is also read-only. It intentionally exits `3`
+(`INCOMPLETE`) until exact caller-selected release evidence is validated
+separately:
+
+```bash
+cd /home/hasan/robotest-lab
 scripts/verify_all.sh
 ```
 
@@ -174,6 +244,34 @@ reported live history/depth as `UNKNOWN`/`0`; bounded queues retain static
 source-and-test proof. Required TF edges and endpoint sets were observed, but
 Jazzy callbacks did not provide per-edge publisher-GID attribution.
 
+## Phase 3-5 static gates
+
+These commands exercise source, build, unit, policy, and short non-live checks.
+They do not authorize the Phase 3 campaign, the privileged Phase 4 lifecycle
+run, GitHub publication, or a release verdict.
+
+```bash
+cd /home/hasan/robotest-lab
+taskset -c 0-5 scripts/verify_phase3.sh
+```
+
+```bash
+cd /home/hasan/robotest-lab
+taskset -c 0-5 scripts/verify_phase4.sh
+```
+
+```bash
+cd /home/hasan/robotest-lab
+scripts/verify_phase5.sh --local
+```
+
+The Phase 3 campaign and Phase 4 `--apply` run have explicit authorization,
+clean-source, and evidence-binding requirements. Follow the canonical commands
+and order in the [verification matrix](docs/testing/verification-matrix.md),
+then use the [Phase 5 CI gate](docs/testing/phase5-ci.md) for candidate and
+evidence-commit proof. A successful static gate is not runtime or release
+acceptance.
+
 ## Safety properties of setup
 
 - Mutating setup scripts require an explicit `--apply` argument.
@@ -212,6 +310,24 @@ benchmarks/          Benchmark definitions and bounded outputs
 docs/                Architecture, decisions, testing, and results
 artifacts/evidence/  Machine-readable verification evidence
 ```
+
+## Documentation map
+
+- [Architecture contracts](docs/architecture/metrics-contract.md) define the
+  evidence and metric semantics.
+- [Acceptance criteria](docs/testing/acceptance-criteria.md) freeze pass/fail
+  targets; the [verification matrix](docs/testing/verification-matrix.md) maps
+  each target to proof.
+- [Troubleshooting](docs/troubleshooting.md) preserves failed evidence and
+  diagnoses the first failing layer.
+- [Case study](docs/case-study.md) explains the engineering choices and the
+  current evidence boundary.
+- [Portfolio notes](docs/portfolio.md) preserve source-linked Phase 1 and Phase
+  2 development bullets and condition every later-phase claim on the exact
+  final release gate.
+- [Phase 5 CI and release order](docs/testing/phase5-ci.md) defines local CI,
+  public proof, documentation replay, genuine-media projection, and the final
+  read-only decision.
 
 ## Contributing and security
 

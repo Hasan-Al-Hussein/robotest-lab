@@ -10,11 +10,18 @@ import argparse
 import hashlib
 import json
 import re
+import stat
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from phase5_ci import EvidenceError, atomic_write_bytes, canonical_json_bytes
+from phase5_portfolio_evidence import (
+    portfolio_attempt_id,
+    portfolio_projection_paths,
+    project_portfolio,
+)
 
 RELEASE_STATUS_START = '<!-- ROBOTEST_RELEASE_STATUS_START -->'
 RELEASE_STATUS_END = '<!-- ROBOTEST_RELEASE_STATUS_END -->'
@@ -24,6 +31,19 @@ GIT_SHA = re.compile(r'^[0-9a-f]{40}$')
 SAFE_IDENTIFIER = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
 PHASE4_RUN_ID = re.compile(r'^phase4-[0-9]{8}T[0-9]{6}Z-[0-9]+$')
 MAX_JSON_BYTES = 64 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _FileSnapshot:
+    payload: bytes | None
+    mode: int | None
+
+
+@dataclass(frozen=True)
+class _WrittenFile:
+    identity: tuple[int, int]
+    payload: bytes
+    mode: int
 
 
 def _require(condition: bool, message: str) -> None:
@@ -373,11 +393,9 @@ def _release_root(repository: Path, relative: str, *, create: bool) -> Path:
     return resolved
 
 
-def _release_paths(
-    repository: Path, selected: dict[str, Any], *, create_roots: bool = False
-) -> dict[str, Path]:
-    phase3_root = _release_root(repository, 'docs/results/phase-3', create=create_roots)
-    phase4_root = _release_root(repository, 'docs/results/phase-4', create=create_roots)
+def _prospective_release_paths(repository: Path, selected: Mapping[str, Any]) -> dict[str, Path]:
+    phase3_root = repository / 'docs/results/phase-3'
+    phase4_root = repository / 'docs/results/phase-4'
     candidate_id = selected['candidate_id']
     run_id = selected['phase4_run_id']
     return {
@@ -388,6 +406,14 @@ def _release_paths(
         'phase4_csv': phase4_root / f'{run_id}.csv',
         'phase4_markdown': phase4_root / f'{run_id}.md',
     }
+
+
+def _release_paths(
+    repository: Path, selected: dict[str, Any], *, create_roots: bool = False
+) -> dict[str, Path]:
+    _release_root(repository, 'docs/results/phase-3', create=create_roots)
+    _release_root(repository, 'docs/results/phase-4', create=create_roots)
+    return _prospective_release_paths(repository, selected)
 
 
 def _validate_exact_direct_files(paths: dict[str, Path]) -> None:
@@ -402,6 +428,20 @@ def _validate_exact_direct_files(paths: dict[str, Path]) -> None:
         _require(
             path.is_file() and not path.is_symlink(), f'missing regular release summary: {path}'
         )
+
+
+def _validate_release_summary_payloads(payloads: Mapping[str, bytes]) -> None:
+    for name, payload in payloads.items():
+        _require(
+            b'\r' not in payload and payload.endswith(b'\n'),
+            f'release summary text is invalid: {name}',
+        )
+        if name.endswith('markdown'):
+            _require(len(payload) <= 256 * 1024, f'release Markdown exceeds its size bound: {name}')
+            try:
+                payload.decode('utf-8')
+            except UnicodeError as exc:
+                raise EvidenceError(f'release Markdown is not UTF-8: {name}') from exc
 
 
 def validate_release_documents(
@@ -436,17 +476,8 @@ def validate_release_documents(
             csv_bytes=selected['phase4_csv_bytes'],
         ),
     }
+    _validate_release_summary_payloads(expected)
     for name, payload in expected.items():
-        _require(
-            b'\r' not in payload and payload.endswith(b'\n'),
-            f'release summary text is invalid: {name}',
-        )
-        if name.endswith('markdown'):
-            _require(len(payload) <= 256 * 1024, f'release Markdown exceeds its size bound: {name}')
-            try:
-                payload.decode('utf-8')
-            except UnicodeError as exc:
-                raise EvidenceError(f'release Markdown is not UTF-8: {name}') from exc
         _require(paths[name].read_bytes() == payload, f'release summary differs: {paths[name]}')
     expected_readme = render_final_readme(
         candidate_readme,
@@ -484,29 +515,287 @@ def validate_release_documents(
     }
 
 
+def _snapshot_regular_file(
+    path: Path,
+    label: str,
+    *,
+    required: bool,
+    maximum_bytes: int = MAX_JSON_BYTES,
+) -> _FileSnapshot:
+    if not path.exists() and not path.is_symlink():
+        _require(not required, f'missing regular {label}: {path}')
+        return _FileSnapshot(payload=None, mode=None)
+    before = path.lstat()
+    _require(
+        stat.S_ISREG(before.st_mode) and before.st_nlink == 1,
+        f'{label} is not a single-link regular file: {path}',
+    )
+    _require(
+        0 <= before.st_size <= maximum_bytes,
+        f'{label} exceeds its size bound: {path}',
+    )
+    payload = path.read_bytes()
+    after = path.lstat()
+    _require(
+        (before.st_dev, before.st_ino, before.st_size, before.st_mode, before.st_nlink)
+        == (after.st_dev, after.st_ino, after.st_size, after.st_mode, after.st_nlink)
+        and len(payload) == after.st_size,
+        f'{label} changed while it was read: {path}',
+    )
+    return _FileSnapshot(payload=payload, mode=stat.S_IMODE(after.st_mode))
+
+
+def _matches_snapshot(path: Path, snapshot: _FileSnapshot) -> bool:
+    if snapshot.payload is None:
+        return not path.exists() and not path.is_symlink()
+    if not path.exists() or path.is_symlink():
+        return False
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        return False
+    if before.st_size != len(snapshot.payload):
+        return False
+    payload = path.read_bytes()
+    after = path.lstat()
+    return (
+        (before.st_dev, before.st_ino, before.st_size, before.st_mode, before.st_nlink)
+        == (after.st_dev, after.st_ino, after.st_size, after.st_mode, after.st_nlink)
+        and stat.S_IMODE(after.st_mode) == snapshot.mode
+        and payload == snapshot.payload
+    )
+
+
+def _capture_written_file_in_modes(
+    path: Path,
+    payload: bytes,
+    modes: frozenset[int],
+    label: str,
+) -> _WrittenFile:
+    before = path.lstat()
+    _require(
+        stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size == len(payload),
+        f'{label} write postcondition changed: {path}',
+    )
+    observed = path.read_bytes()
+    after = path.lstat()
+    _require(
+        stat.S_ISREG(before.st_mode)
+        and before.st_nlink == 1
+        and (before.st_dev, before.st_ino, before.st_size, before.st_mode, before.st_nlink)
+        == (after.st_dev, after.st_ino, after.st_size, after.st_mode, after.st_nlink)
+        and stat.S_IMODE(after.st_mode) in modes
+        and observed == payload,
+        f'{label} write postcondition changed: {path}',
+    )
+    return _WrittenFile(
+        identity=(after.st_dev, after.st_ino),
+        payload=payload,
+        mode=stat.S_IMODE(after.st_mode),
+    )
+
+
+def _capture_written_file(path: Path, payload: bytes, mode: int, label: str) -> _WrittenFile:
+    return _capture_written_file_in_modes(path, payload, frozenset({mode}), label)
+
+
+def _write_transaction_file(
+    path: Path,
+    payload: bytes,
+    mode: int,
+    written: dict[Path, _WrittenFile],
+) -> None:
+    atomic_write_bytes(path, payload)
+    metadata = path.lstat()
+    written[path] = _WrittenFile(
+        identity=(metadata.st_dev, metadata.st_ino),
+        payload=payload,
+        mode=stat.S_IMODE(metadata.st_mode),
+    )
+    written[path] = _capture_written_file(
+        path,
+        payload,
+        written[path].mode,
+        'release transaction pre-mode',
+    )
+    path.chmod(mode)
+    written[path] = _WrittenFile(
+        identity=written[path].identity,
+        payload=payload,
+        mode=mode,
+    )
+    written[path] = _capture_written_file(path, payload, mode, 'release transaction')
+
+
+def _rollback_release_transaction(
+    snapshots: Mapping[Path, _FileSnapshot],
+    expected_writes: Mapping[Path, tuple[bytes, int]],
+    written: Mapping[Path, _WrittenFile],
+    created_directories: list[Path],
+    direct_directory_entries: Mapping[Path, set[str]],
+    guarded_snapshots: Mapping[Path, _FileSnapshot],
+) -> None:
+    failures: list[str] = []
+    for path, snapshot in reversed(list(snapshots.items())):
+        try:
+            if _matches_snapshot(path, snapshot):
+                continue
+            expected_payload, expected_mode = expected_writes[path]
+            recorded = written.get(path)
+            if recorded is None:
+                current = _capture_written_file_in_modes(
+                    path,
+                    expected_payload,
+                    frozenset({0o600, expected_mode}),
+                    'release rollback target',
+                )
+            else:
+                current = _capture_written_file(
+                    path,
+                    recorded.payload,
+                    recorded.mode,
+                    'release rollback target',
+                )
+                _require(
+                    recorded.identity == current.identity,
+                    f'release rollback target identity changed: {path}',
+                )
+            if snapshot.payload is None:
+                path.unlink()
+            else:
+                _require(snapshot.mode is not None, f'release rollback mode is missing: {path}')
+                atomic_write_bytes(path, snapshot.payload)
+                path.chmod(snapshot.mode)
+                _require(
+                    _matches_snapshot(path, snapshot),
+                    f'release rollback restoration changed: {path}',
+                )
+        except (EvidenceError, OSError) as exc:
+            failures.append(str(exc))
+    for directory in reversed(created_directories):
+        try:
+            if not directory.exists() and not directory.is_symlink():
+                continue
+            _require(
+                directory.is_dir() and not directory.is_symlink(),
+                f'created release directory changed type: {directory}',
+            )
+            directory.rmdir()
+        except (EvidenceError, OSError) as exc:
+            failures.append(str(exc))
+    for directory, expected_entries in direct_directory_entries.items():
+        try:
+            _require(
+                directory.is_dir() and not directory.is_symlink(),
+                f'pre-existing release directory changed type: {directory}',
+            )
+            _require(
+                {path.name for path in directory.iterdir()} == expected_entries,
+                f'foreign drift remains in release directory: {directory}',
+            )
+        except (EvidenceError, OSError) as exc:
+            failures.append(str(exc))
+    for path, snapshot in guarded_snapshots.items():
+        try:
+            _require(
+                _matches_snapshot(path, snapshot),
+                f'foreign drift remains in guarded release file: {path}',
+            )
+        except (EvidenceError, OSError) as exc:
+            failures.append(str(exc))
+    _require(
+        not failures,
+        'release document rollback could not safely restore the before-tree: '
+        + '; '.join(failures),
+    )
+
+
 def write_release_documents(
     repository: Path,
     phase3_aggregate: Path,
     phase4_scenario6: Path,
+    phase3_candidate_root: Path,
+    phase5_portfolio_root: Path,
+    phase5_portfolio_raw_proof: Path,
 ) -> dict[str, Any]:
-    """Write the deterministic six-file projection and bounded README block."""
+    """Write all tracked release projections as one rollback-safe transaction."""
     repository = repository.resolve(strict=True)
     selected = _selected_evidence(phase3_aggregate, phase4_scenario6)
-    paths = _release_paths(repository, selected, create_roots=True)
-    for root in {path.parent for path in paths.values()}:
-        expected = {path.name for path in paths.values() if path.parent == root}
-        observed = {path.name for path in root.iterdir()}
-        _require(observed <= expected, f'release summary directory contains stale files: {root}')
-        for path in paths.values():
-            if path.parent == root:
-                _require(not path.is_symlink(), f'release summary is a symlink: {path}')
+    git_sha = selected['git_sha']
+
+    portfolio_root = _release_root(repository, 'docs/results/phase-5', create=False)
+    expected_portfolio_paths = list(portfolio_projection_paths(git_sha))
+    expected_portfolio_names = {Path(relative).name for relative in expected_portfolio_paths}
+    observed_phase5_before = {path.name: path for path in portfolio_root.iterdir()}
+    direct_directory_entries = {portfolio_root: set(observed_phase5_before)}
+    _require(
+        not expected_portfolio_names & set(observed_phase5_before),
+        'portfolio projection destination already exists',
+    )
+    phase5_snapshots = {
+        name: _snapshot_regular_file(path, 'pre-existing Phase 5 result', required=True)
+        for name, path in observed_phase5_before.items()
+    }
+    attempt_id = portfolio_attempt_id(
+        phase5_portfolio_root,
+        phase5_portfolio_raw_proof,
+        git_sha,
+    )
+    raw_projection_root = phase5_portfolio_raw_proof.resolve(strict=True).parent
+    portfolio_payloads = {
+        repository / relative: _snapshot_regular_file(
+            raw_projection_root / Path(relative).name,
+            'raw portfolio projection',
+            required=True,
+            maximum_bytes=MAX_JSON_BYTES,
+        ).payload
+        for relative in expected_portfolio_paths
+    }
+    _require(
+        all(payload is not None for payload in portfolio_payloads.values()),
+        'raw portfolio projection payload is missing',
+    )
+
+    paths = _prospective_release_paths(repository, selected)
+    results_root = _release_root(repository, 'docs/results', create=False)
+    summary_roots = sorted({path.parent for path in paths.values()})
+    planned_directories: list[Path] = []
+    for root in summary_roots:
+        _require(root.parent == results_root, f'release summary root is not canonical: {root}')
+        if root.exists() or root.is_symlink():
+            _require(
+                root.is_dir() and not root.is_symlink(),
+                f'release summary root contains a symlink or non-directory: {root}',
+            )
+            expected_names = {path.name for path in paths.values() if path.parent == root}
+            observed_names = {path.name for path in root.iterdir()}
+            _require(
+                observed_names <= expected_names,
+                f'release summary directory contains stale files: {root}',
+            )
+            direct_directory_entries[root] = observed_names
+        else:
+            planned_directories.append(root)
+
+    readme = repository / 'README.md'
+    claims_path = _release_root(repository, 'config', create=False) / 'release-claims.json'
+    readme_snapshot = _snapshot_regular_file(readme, 'README.md', required=True)
+    claims_snapshot = _snapshot_regular_file(claims_path, 'release claims', required=True)
+    _require(
+        readme_snapshot.payload is not None
+        and readme_snapshot.mode is not None
+        and claims_snapshot.payload is not None
+        and claims_snapshot.mode is not None,
+        'release source snapshot is incomplete',
+    )
+    candidate_readme = readme_snapshot.payload
+    candidate_claims = claims_snapshot.payload
     payloads = {
         'phase3_json': selected['phase3_bytes'],
         'phase3_csv': selected['phase3_csv_bytes'],
         'phase3_markdown': _phase3_markdown(
             selected['phase3'],
             candidate_id=selected['candidate_id'],
-            git_sha=selected['git_sha'],
+            git_sha=git_sha,
             json_bytes=selected['phase3_bytes'],
             csv_bytes=selected['phase3_csv_bytes'],
         ),
@@ -515,54 +804,134 @@ def write_release_documents(
         'phase4_markdown': _phase4_markdown(
             selected['phase4'],
             run_id=selected['phase4_run_id'],
-            git_sha=selected['git_sha'],
+            git_sha=git_sha,
             json_bytes=selected['phase4_bytes'],
             csv_bytes=selected['phase4_csv_bytes'],
         ),
     }
-    for name, payload in payloads.items():
-        atomic_write_bytes(paths[name], payload)
-    readme = repository / 'README.md'
-    _require(readme.is_file() and not readme.is_symlink(), 'missing regular README.md')
-    candidate_readme = readme.read_bytes()
-    claims_path = _release_root(repository, 'config', create=False) / 'release-claims.json'
-    _require(
-        claims_path.is_file() and not claims_path.is_symlink(),
-        'missing regular release claims',
-    )
-    candidate_claims = claims_path.read_bytes()
-    atomic_write_bytes(
-        readme,
-        render_final_readme(
-            candidate_readme,
-            candidate_id=selected['candidate_id'],
-            phase4_run_id=selected['phase4_run_id'],
-            git_sha=selected['git_sha'],
-        ),
-    )
-    atomic_write_bytes(
-        claims_path,
-        render_final_claims(
-            candidate_claims,
-            candidate_id=selected['candidate_id'],
-            phase4_run_id=selected['phase4_run_id'],
-            git_sha=selected['git_sha'],
-        ),
-    )
-    return validate_release_documents(
-        repository,
-        phase3_aggregate,
-        phase4_scenario6,
+    _validate_release_summary_payloads(payloads)
+    rendered_readme = render_final_readme(
         candidate_readme,
-        candidate_claims,
+        candidate_id=selected['candidate_id'],
+        phase4_run_id=selected['phase4_run_id'],
+        git_sha=git_sha,
     )
+    rendered_claims = render_final_claims(
+        candidate_claims,
+        candidate_id=selected['candidate_id'],
+        phase4_run_id=selected['phase4_run_id'],
+        git_sha=git_sha,
+    )
+
+    snapshots: dict[Path, _FileSnapshot] = {
+        path: _snapshot_regular_file(path, 'portfolio destination', required=False)
+        for path in portfolio_payloads
+    }
+    snapshots.update(
+        {
+            path: _snapshot_regular_file(path, 'release summary destination', required=False)
+            for path in paths.values()
+        }
+    )
+    snapshots[readme] = readme_snapshot
+    snapshots[claims_path] = claims_snapshot
+    expected_writes: dict[Path, tuple[bytes, int]] = {}
+    for path, optional_payload in portfolio_payloads.items():
+        _require(optional_payload is not None, f'portfolio payload is missing: {path}')
+        expected_writes[path] = (optional_payload, 0o644)
+    expected_writes.update({paths[name]: (payload, 0o644) for name, payload in payloads.items()})
+    expected_writes[readme] = (rendered_readme, readme_snapshot.mode)
+    expected_writes[claims_path] = (rendered_claims, claims_snapshot.mode)
+    _require(
+        set(snapshots) == set(expected_writes),
+        'release transaction target set is not exact',
+    )
+
+    written: dict[Path, _WrittenFile] = {}
+    created_directories: list[Path] = []
+    try:
+        project_portfolio(
+            repository,
+            phase5_portfolio_root,
+            git_sha,
+            phase3_candidate_root,
+            attempt_id,
+        )
+        for path, optional_payload in portfolio_payloads.items():
+            _require(optional_payload is not None, f'portfolio payload is missing: {path}')
+            written[path] = _capture_written_file(
+                path,
+                optional_payload,
+                0o644,
+                'portfolio projection',
+            )
+        observed_phase5_after = {path.name: path for path in portfolio_root.iterdir()}
+        _require(
+            set(observed_phase5_after) == set(observed_phase5_before) | expected_portfolio_names,
+            'portfolio producer did not add exactly six projected paths',
+        )
+        for name, snapshot in phase5_snapshots.items():
+            _require(
+                _matches_snapshot(observed_phase5_after[name], snapshot),
+                f'portfolio projection changed a pre-existing Phase 5 result: {name}',
+            )
+
+        for root in planned_directories:
+            root.mkdir()
+            created_directories.append(root)
+        for name, payload in payloads.items():
+            _write_transaction_file(paths[name], payload, 0o644, written)
+        _write_transaction_file(
+            readme,
+            rendered_readme,
+            readme_snapshot.mode,
+            written,
+        )
+        _write_transaction_file(
+            claims_path,
+            rendered_claims,
+            claims_snapshot.mode,
+            written,
+        )
+        report = validate_release_documents(
+            repository,
+            phase3_aggregate,
+            phase4_scenario6,
+            candidate_readme,
+            candidate_claims,
+        )
+    except BaseException as error:
+        try:
+            _rollback_release_transaction(
+                snapshots,
+                expected_writes,
+                written,
+                created_directories,
+                direct_directory_entries,
+                {
+                    observed_phase5_before[name]: snapshot
+                    for name, snapshot in phase5_snapshots.items()
+                },
+            )
+        except (EvidenceError, OSError) as rollback_error:
+            raise EvidenceError(
+                f'{rollback_error}; original release document failure: {error}'
+            ) from error
+        raise
+
+    report['portfolio_attempt_id'] = attempt_id
+    report['portfolio_projection_paths'] = expected_portfolio_paths
+    return report
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repository', type=Path, required=True)
+    parser.add_argument('--phase3-candidate-root', type=Path, required=True)
     parser.add_argument('--phase3-aggregate', type=Path, required=True)
     parser.add_argument('--phase4-scenario6', type=Path, required=True)
+    parser.add_argument('--phase5-portfolio-root', type=Path, required=True)
+    parser.add_argument('--phase5-portfolio-raw-proof', type=Path, required=True)
     return parser
 
 
@@ -573,6 +942,9 @@ def main() -> int:
             arguments.repository,
             arguments.phase3_aggregate,
             arguments.phase4_scenario6,
+            arguments.phase3_candidate_root,
+            arguments.phase5_portfolio_root,
+            arguments.phase5_portfolio_raw_proof,
         )
     except (EvidenceError, OSError, UnicodeError, json.JSONDecodeError) as error:
         raise SystemExit(str(error)) from error

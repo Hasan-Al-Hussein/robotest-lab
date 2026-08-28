@@ -941,7 +941,7 @@ def validate_license_declarations(repository: Path) -> dict[str, object]:
 
 
 def validate_release_claims(repository: Path) -> dict[str, object]:
-    """Bind each published quantitative README claim to a checked-in result."""
+    """Bind published README and portfolio claims to checked-in results."""
     repository = repository.resolve(strict=True)
     audit_path = _repository_regular_file(
         repository, 'config/release-claims.json', 'release claim audit'
@@ -950,7 +950,9 @@ def validate_release_claims(repository: Path) -> dict[str, object]:
     _require(set(audit) == {'claims', 'schema_version', 'scope'}, 'claim audit keys changed')
     _require(audit['schema_version'] == 1, 'claim audit schema changed')
     _require(
-        isinstance(audit['scope'], str) and 'README.md' in audit['scope'],
+        isinstance(audit['scope'], str)
+        and 'README.md' in audit['scope']
+        and 'docs/portfolio.md' in audit['scope'],
         'claim audit scope is missing',
     )
     claims = audit['claims']
@@ -1003,6 +1005,68 @@ def validate_release_claims(repository: Path) -> dict[str, object]:
         'phase2-rtf-p5',
         'phase2-test-count',
     }
+    portfolio_contracts = {
+        'portfolio-phase1-checksum-count': {
+            'claim_text': 'all 45 Phase 1 manifest entries',
+            'evidence_document': 'docs/results/phase-1/20260825T200725Z-1333.md',
+            'evidence_text': 'all 45 manifest entries validated',
+        },
+        'portfolio-phase1-displacement': {
+            'claim_text': '`0.2962 m` of bounded displacement',
+            'evidence_document': 'docs/results/phase-1/20260825T200725Z-1333.md',
+            'evidence_text': '`0.29619887895167835 m`',
+        },
+        'portfolio-phase1-peak-rss': {
+            'claim_text': 'peak launch-group RSS to `795,476 KiB`',
+            'evidence_document': 'docs/results/phase-1/20260825T200725Z-1333.md',
+            'evidence_text': '`795,476 KiB` (`776.83 MiB`)',
+        },
+        'portfolio-phase1-rtf-median': {
+            'claim_text': 'calculated real-time factor median `0.9999`',
+            'evidence_document': 'docs/results/phase-1/20260825T200725Z-1333.md',
+            'evidence_text': '`0.9999416661302953`',
+        },
+        'portfolio-phase1-rtf-p5': {
+            'claim_text': 'p5 `0.9162`',
+            'evidence_document': 'docs/results/phase-1/20260825T200725Z-1333.md',
+            'evidence_text': '`0.9162105536383762`',
+        },
+        'portfolio-phase1-test-count': {
+            'claim_text': 'Phase 1 development run completed 103 tests with 0 errors or failures',
+            'evidence_document': 'docs/results/phase-1/20260825T200725Z-1333.md',
+            'evidence_text': '103 tests, 0 errors, 0 failures',
+        },
+        'portfolio-phase2-checksum-count': {
+            'claim_text': 'all 111 Phase 2 manifest entries',
+            'evidence_document': 'docs/results/phase-2/20260826T010218Z-466.md',
+            'evidence_text': 'all 111 checksum entries validated',
+        },
+        'portfolio-phase2-mission-result': {
+            'claim_text': 'returned `SUCCEEDED` for 3/3 ordered waypoints',
+            'evidence_document': 'docs/results/phase-2/20260826T010218Z-466.md',
+            'evidence_text': 'Nav2 `SUCCEEDED`; 3/3 completed',
+        },
+        'portfolio-phase2-peak-rss': {
+            'claim_text': 'peak owned-process-group RSS to `1,372,244 KiB`',
+            'evidence_document': 'docs/results/phase-2/20260826T010218Z-466.md',
+            'evidence_text': '`1,372,244 KiB`',
+        },
+        'portfolio-phase2-rtf-median': {
+            'claim_text': 'calculated real-time factor median `0.9863`',
+            'evidence_document': 'docs/results/phase-2/20260826T010218Z-466.md',
+            'evidence_text': '`0.9863029171557808`',
+        },
+        'portfolio-phase2-rtf-p5': {
+            'claim_text': 'p5 `0.9302`',
+            'evidence_document': 'docs/results/phase-2/20260826T010218Z-466.md',
+            'evidence_text': '`0.9302367113894893`',
+        },
+        'portfolio-phase2-test-count': {
+            'claim_text': 'completed 213 tests with 0 errors or failures',
+            'evidence_document': 'docs/results/phase-2/20260826T010218Z-466.md',
+            'evidence_text': '213 tests, 0 errors, 0 failures',
+        },
+    }
     final_contracts = {
         'phase3-final-acceptance': {
             'claim_document': 'README.md',
@@ -1024,12 +1088,20 @@ def validate_release_claims(repository: Path) -> dict[str, object]:
         },
     }
     observed_ids = set(ids)
+    base_ids |= set(portfolio_contracts)
     _require(
         observed_ids in (base_ids, base_ids | set(final_contracts)),
         'claim audit must contain the exact base set or exact final extension',
     )
+    claims_by_id = {claim['id']: claim for claim in claims}
+    for claim_id, contract in portfolio_contracts.items():
+        claim = claims_by_id[claim_id]
+        _require(
+            claim['claim_document'] == 'docs/portfolio.md'
+            and all(claim[key] == value for key, value in contract.items()),
+            f'portfolio claim contract changed: {claim_id}',
+        )
     if observed_ids != base_ids:
-        claims_by_id = {claim['id']: claim for claim in claims}
         for claim_id, contract in final_contracts.items():
             claim = claims_by_id[claim_id]
             _require(
@@ -1097,7 +1169,7 @@ def select_successful_run(records: object, sha: str) -> dict[str, object]:
     """Select the newest completed successful canonical workflow for one exact SHA."""
     _require(GIT_SHA.fullmatch(sha) is not None, 'remote SHA must be 40 lowercase hex characters')
     _require(isinstance(records, list), 'GitHub run response must be a list')
-    candidates: list[dict[str, Any]] = []
+    candidates: list[tuple[dict[str, Any], datetime]] = []
     for index, item in enumerate(records):
         record = _mapping(item, f'GitHub run {index}')
         if record.get('headSha') != sha:
@@ -1114,12 +1186,33 @@ def select_successful_run(records: object, sha: str) -> dict[str, object]:
         database_id = record.get('databaseId')
         _require(isinstance(database_id, int) and database_id > 0, 'successful run ID is invalid')
         created_at = record.get('createdAt')
-        _require(isinstance(created_at, str) and created_at, 'successful run timestamp is missing')
-        candidates.append(record)
+        completed_at = record.get('updatedAt')
+        _require(
+            isinstance(created_at, str)
+            and created_at.endswith('Z')
+            and isinstance(completed_at, str)
+            and completed_at.endswith('Z'),
+            'successful run timestamps are missing or noncanonical',
+        )
+        try:
+            created_timestamp = datetime.fromisoformat(created_at[:-1] + '+00:00')
+            completed_timestamp = datetime.fromisoformat(completed_at[:-1] + '+00:00')
+        except ValueError as exc:
+            raise EvidenceError('successful run timestamp is invalid') from exc
+        _require(
+            created_timestamp.tzinfo is not None
+            and created_timestamp.utcoffset() == UTC.utcoffset(created_timestamp)
+            and completed_timestamp.tzinfo is not None
+            and completed_timestamp.utcoffset() == UTC.utcoffset(completed_timestamp)
+            and completed_timestamp >= created_timestamp,
+            'successful run completion timestamp is invalid',
+        )
+        candidates.append((record, created_timestamp))
     _require(candidates, f'no successful completed RoboTest CI run exists for {sha}')
-    selected = max(candidates, key=lambda item: (item['createdAt'], item['databaseId']))
+    selected = max(candidates, key=lambda item: (item[1], item[0]['databaseId']))[0]
     return {
         'conclusion': 'success',
+        'completed_at': selected['updatedAt'],
         'created_at': selected['createdAt'],
         'head_sha': sha,
         'run_id': selected['databaseId'],

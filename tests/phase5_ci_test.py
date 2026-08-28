@@ -16,9 +16,12 @@ import math
 import os
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import zlib
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -29,6 +32,7 @@ REPOSITORY = TESTS.parent
 sys.path.insert(0, str(TESTS))
 
 import phase5_ci as phase5_module  # noqa: E402
+import phase5_portfolio_evidence as portfolio_module  # noqa: E402
 import phase5_release_docs as release_docs_module  # noqa: E402
 import phase5_release_evidence as release_module  # noqa: E402
 from phase5_ci import (  # noqa: E402
@@ -61,16 +65,25 @@ def test_phase5_docs_freeze_clean_candidate_release_order() -> None:
     document = (REPOSITORY / 'docs/testing/phase5-ci.md').read_text(encoding='utf-8')
     ordered_steps = (
         'Create and push the clean candidate commit C.',
+        "wait\n   for C's hosted `RoboTest CI` workflow to complete successfully.",
         'run the separately authorized Phase 3 campaign and\n   Phase 4 acceptance workflow',
+        'Capture P5-04/P5-05 from exact C',
         'run bare `scripts/verify_all.sh`',
-        'capture its candidate remote proof',
+        'Capture its candidate remote proof',
         'create the exact evidence-only child commit E',
         "Capture E's successful workflow",
         'Run `scripts/verify_all.sh --release-evidence`',
     )
     offsets = [document.index(step) for step in ordered_steps]
     assert offsets == sorted(offsets)
-    assert 'Do not rerun a clean-start live or bare gate after this point.' in document
+    assert 'Do not rerun a\n   clean-start live or bare gate after this point.' in document
+    for option in (
+        '--phase3-candidate-root',
+        '--phase5-portfolio-root',
+        '--phase5-portfolio-raw-proof',
+        '--phase5-portfolio-proof',
+    ):
+        assert option in document
 
 
 def test_repository_workflow_is_pinned_non_live_and_standard_runner() -> None:
@@ -163,7 +176,7 @@ def test_dependency_license_inventory_and_first_party_licenses_are_complete() ->
     assert report['package_count'] == 8
     assert report['packages'] == sorted(report['packages'])
     dependency_inventory = report['dependency_inventory']
-    assert dependency_inventory['apt_package_count'] == 42
+    assert dependency_inventory['apt_package_count'] == 43
     assert dependency_inventory['github_action_count'] == 3
     assert dependency_inventory['python_distribution_count'] == 1
     assert dependency_inventory['ros_dependency_count'] == 62
@@ -216,8 +229,10 @@ def test_license_inventory_requires_every_package_local_license(tmp_path: Path) 
 def test_release_claims_resolve_to_checked_in_evidence() -> None:
     report = validate_release_claims(REPOSITORY)
     assert report['status'] == 'PASS'
-    assert report['claim_count'] == 12
+    assert report['claim_count'] == 24
     assert report['evidence_file_count'] == 2
+    assert 'README.md' in report['verification_scope']
+    assert 'docs/portfolio.md' in report['verification_scope']
 
 
 def test_release_claim_audit_rejects_missing_evidence_text(tmp_path: Path) -> None:
@@ -225,6 +240,7 @@ def test_release_claim_audit_rejects_missing_evidence_text(tmp_path: Path) -> No
     for relative in (
         'README.md',
         'config/release-claims.json',
+        'docs/portfolio.md',
         'docs/results/phase-1/20260825T200725Z-1333.md',
         'docs/results/phase-2/20260826T010218Z-466.md',
     ):
@@ -238,6 +254,68 @@ def test_release_claim_audit_rejects_missing_evidence_text(tmp_path: Path) -> No
         encoding='utf-8',
     )
     with pytest.raises(EvidenceError, match='claim evidence text is absent'):
+        validate_release_claims(repository)
+
+
+@pytest.mark.parametrize(
+    ('field', 'replacement', 'message'),
+    [
+        (
+            'claim_document',
+            'docs/portfolio-copy.md',
+            'portfolio claim contract changed',
+        ),
+        ('claim_text', 'calculated real-time factor median `9.9999`', 'published claim text'),
+        ('evidence_text', '`9.9999999999999999`', 'claim evidence text'),
+    ],
+)
+def test_release_claim_audit_rejects_portfolio_contract_drift(
+    tmp_path: Path,
+    field: str,
+    replacement: str,
+    message: str,
+) -> None:
+    repository = tmp_path / 'repository'
+    for relative in (
+        'README.md',
+        'config/release-claims.json',
+        'docs/portfolio.md',
+        'docs/results/phase-1/20260825T200725Z-1333.md',
+        'docs/results/phase-2/20260826T010218Z-466.md',
+    ):
+        source = REPOSITORY / relative
+        destination = repository / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    audit_path = repository / 'config/release-claims.json'
+    audit = json.loads(audit_path.read_text(encoding='utf-8'))
+    claim = next(item for item in audit['claims'] if item['id'] == 'portfolio-phase1-rtf-median')
+    if field == 'claim_document':
+        shutil.copy2(repository / 'docs/portfolio.md', repository / replacement)
+    claim[field] = replacement
+    _canonical_file(audit_path, audit)
+    with pytest.raises(EvidenceError, match=message):
+        validate_release_claims(repository)
+
+
+def test_release_claim_audit_requires_portfolio_scope(tmp_path: Path) -> None:
+    repository = tmp_path / 'repository'
+    for relative in (
+        'README.md',
+        'config/release-claims.json',
+        'docs/portfolio.md',
+        'docs/results/phase-1/20260825T200725Z-1333.md',
+        'docs/results/phase-2/20260826T010218Z-466.md',
+    ):
+        source = REPOSITORY / relative
+        destination = repository / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    audit_path = repository / 'config/release-claims.json'
+    audit = json.loads(audit_path.read_text(encoding='utf-8'))
+    audit['scope'] = 'Quantitative and outcome claims published in README.md.'
+    _canonical_file(audit_path, audit)
+    with pytest.raises(EvidenceError, match='claim audit scope is missing'):
         validate_release_claims(repository)
 
 
@@ -320,13 +398,16 @@ def _run_record(
     status: str = 'completed',
     conclusion: str = 'success',
     workflow: str = 'RoboTest CI',
+    updated_at: str | None = None,
 ) -> dict[str, object]:
+    created_at = f'2026-08-26T00:00:{run_id:02d}Z'
     return {
         'conclusion': conclusion,
-        'createdAt': f'2026-08-26T00:00:{run_id:02d}Z',
+        'createdAt': created_at,
         'databaseId': run_id,
         'headSha': sha,
         'status': status,
+        'updatedAt': updated_at or created_at,
         'url': f'https://github.com/example/robotest/actions/runs/{run_id}',
         'workflowName': workflow,
     }
@@ -344,6 +425,20 @@ def test_remote_run_selection_is_exact_sha_and_newest_success() -> None:
     assert selected['run_id'] == 15
     assert selected['head_sha'] == sha
     assert selected['conclusion'] == 'success'
+    assert selected['completed_at'] == '2026-08-26T00:00:15Z'
+
+
+@pytest.mark.parametrize('updated_at', [None, 'not-a-timestamp', '2026-08-25T23:59:59Z'])
+def test_remote_run_selection_rejects_invalid_completion_timestamp(
+    updated_at: str | None,
+) -> None:
+    record = _run_record('1' * 40)
+    if updated_at is None:
+        del record['updatedAt']
+    else:
+        record['updatedAt'] = updated_at
+    with pytest.raises(EvidenceError, match='timestamp'):
+        select_successful_run([record], '1' * 40)
 
 
 @pytest.mark.parametrize(
@@ -390,6 +485,7 @@ def test_remote_summary_binds_command_repository_run_and_local_resolution(
     write_remote_summary(arguments)
     result = json.loads(output.read_text(encoding='utf-8'))
     assert result['run']['run_url'] == 'https://github.com/example/robotest/actions/runs/10'
+    assert result['run']['completed_at'] == '2026-08-26T00:00:10Z'
     assert result['provenance']['command']['argv'] == [
         'scripts/verify_phase5.sh',
         '--remote',
@@ -673,6 +769,8 @@ def test_phase5_script_has_no_implicit_mode() -> None:
     script = REPOSITORY / 'scripts/verify_phase5.sh'
     script_text = script.read_text(encoding='utf-8')
     assert 'run_check pure-python-tests 600s python3 -m pytest' in script_text
+    assert 'run_check portfolio-contract 30s' in script_text
+    assert 'createdAt,updatedAt' in script_text
     result = subprocess.run(['bash', str(script)], capture_output=True, text=True, check=False)
     assert result.returncode == 2
     assert 'There is deliberately no implicit mode.' in result.stderr
@@ -771,6 +869,10 @@ def test_failed_gate_still_finalizes_checksums_csv_and_provenance(tmp_path: Path
         (repository / directory).mkdir(parents=True, exist_ok=True)
     shutil.copy2(REPOSITORY / 'scripts/verify_phase5.sh', repository / 'scripts/verify_phase5.sh')
     shutil.copy2(TESTS / 'phase5_ci.py', repository / 'tests/phase5_ci.py')
+    shutil.copy2(
+        TESTS / 'phase5_portfolio_evidence.py',
+        repository / 'tests/phase5_portfolio_evidence.py',
+    )
     shutil.copy2(TESTS / 'phase5_release_docs.py', repository / 'tests/phase5_release_docs.py')
     shutil.copy2(REPOSITORY / 'docs/testing/phase5-ci.md', repository / 'docs/testing/phase5-ci.md')
     workflow = WORKFLOW.read_text(encoding='utf-8').replace(
@@ -1023,6 +1125,91 @@ esac
     assert aggregate['status'] == 'failed'
     assert aggregate['source']['source_unchanged'] is False
     assert 'config/source.txt' in aggregate['source']['git_status_porcelain_end']
+
+
+def _release_evidence_placeholder_arguments() -> list[str]:
+    return [
+        '--release-evidence',
+        '--local-aggregate',
+        '/tmp/local.json',
+        '--phase3-candidate-root',
+        '/tmp/phase3',
+        '--phase3-aggregate',
+        '/tmp/phase3/aggregate.json',
+        '--phase4-run-directory',
+        '/tmp/phase4',
+        '--phase4-scenario6',
+        '/tmp/phase4/scenario6.json',
+        '--phase5-portfolio-root',
+        '/tmp/portfolio',
+        '--phase5-portfolio-proof',
+        '/tmp/portfolio/proof.json',
+        '--phase5-remote-proof',
+        '/tmp/remote.json',
+        '--phase5-evidence-commit-remote-proof',
+        '/tmp/evidence-remote.json',
+    ]
+
+
+def test_verify_all_release_help_names_every_acceptance_lane() -> None:
+    result = subprocess.run(
+        ['bash', str(REPOSITORY / 'scripts/verify_all.sh'), '--help'],
+        cwd=REPOSITORY,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert 'Phase 3, Phase 4, portfolio, and public-CI' in result.stdout
+    assert '--phase5-portfolio-root <exact-path>' in result.stdout
+    assert '--phase5-portfolio-proof <exact-path>' in result.stdout
+
+
+@pytest.mark.parametrize(
+    'missing_option',
+    ['--phase5-portfolio-root', '--phase5-portfolio-proof'],
+)
+def test_verify_all_release_mode_requires_both_portfolio_arguments(
+    missing_option: str,
+) -> None:
+    arguments = _release_evidence_placeholder_arguments()
+    index = arguments.index(missing_option)
+    del arguments[index : index + 2]
+    result = subprocess.run(
+        ['bash', str(REPOSITORY / 'scripts/verify_all.sh'), *arguments],
+        cwd=REPOSITORY,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert 'Usage:' in result.stderr
+
+
+@pytest.mark.parametrize(
+    'arguments',
+    [
+        ['--release-evidence', '--phase5-portfolio-root'],
+        [
+            '--release-evidence',
+            '--phase5-portfolio-root',
+            '/tmp/one',
+            '--phase5-portfolio-root',
+            '/tmp/two',
+        ],
+    ],
+)
+def test_verify_all_release_mode_rejects_malformed_portfolio_arguments(
+    arguments: list[str],
+) -> None:
+    result = subprocess.run(
+        ['bash', str(REPOSITORY / 'scripts/verify_all.sh'), *arguments],
+        cwd=REPOSITORY,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
 
 
 def _canonical_file(path: Path, value: object, *, sidecar: bool = False) -> None:
@@ -3807,6 +3994,14 @@ def _phase3_bundle(
     (directory / 'run-result.csv').write_bytes(phase3_run_csv_bytes(result))
     (directory / 'report.md').write_text('PASS\n', encoding='utf-8')
     (directory / 'report.html').write_text('<p>PASS</p>\n', encoding='utf-8')
+    png = _phase5_fixture_png()
+    for name in (
+        'localization-error.png',
+        'measurement-summary.png',
+        'real-time-factor.png',
+        'trajectory.png',
+    ):
+        (directory / name).write_bytes(png)
     records = [
         {
             'bytes': path.stat().st_size,
@@ -4266,6 +4461,7 @@ def _remote_proof(
     sha: str,
     mode: str,
     run_id: int,
+    completed_at: str,
     created_at: str,
     checked_at: str,
 ) -> dict[str, object]:
@@ -4320,6 +4516,7 @@ def _remote_proof(
         },
         'run': {
             'conclusion': 'success',
+            'completed_at': completed_at,
             'created_at': created_at,
             'head_sha': sha,
             'run_id': run_id,
@@ -4351,6 +4548,33 @@ def _commit_all(repository: Path, message: str) -> None:
         cwd=repository,
         check=True,
     )
+
+
+def _amend_all(repository: Path) -> str:
+    subprocess.run(['git', 'add', '-A'], cwd=repository, check=True)
+    subprocess.run(
+        [
+            'git',
+            '-c',
+            'user.name=Phase5 Test',
+            '-c',
+            'user.email=phase5@example.invalid',
+            'commit',
+            '-q',
+            '--amend',
+            '--no-edit',
+            '--no-gpg-sign',
+        ],
+        cwd=repository,
+        check=True,
+    )
+    return subprocess.run(
+        ['git', 'rev-parse', 'HEAD'],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.strip()
 
 
 def _producer_collision_fixture(repository: Path) -> tuple[dict, dict, dict]:
@@ -4435,6 +4659,271 @@ def _producer_collision_fixture(repository: Path) -> tuple[dict, dict, dict]:
         )
     benchmark_binding['positive_control_scenario_sha256'] = fixture_sha
     return manifest, positive_control, benchmark_binding
+
+
+def _portfolio_replay_fixture(
+    repository: Path,
+    candidate_sha: str,
+    command: dict[str, object],
+    output: Path,
+) -> dict[str, object]:
+    """Write a producer-shaped PASS replay without executing a README command."""
+    output.mkdir(mode=0o700, parents=True)
+    output.parent.chmod(0o700)
+    output.chmod(0o700)
+    assert output.parent.lstat().st_mode & 0o7777 == 0o700
+    assert output.lstat().st_mode & 0o7777 == 0o700
+    empty_sha256 = hashlib.sha256(b'').hexdigest()
+    assignments, argv = portfolio_module._parse_replay_argv(
+        str(command['id']),
+        str(command['executable']),
+    )
+    candidate = portfolio_module.validate_candidate_contract(repository, candidate_sha)
+    allowed = list(command['allowed_tracked_changes'])
+    postcondition_payload = b'fixture postcondition\n'
+    result: dict[str, object] = {
+        'allowed_tracked_changes': allowed,
+        'authorization': command['authorization'],
+        'argv': argv,
+        'command_sha256': command['command_sha256'],
+        'documented_root': portfolio_module.DOCUMENTED_REPOSITORY,
+        'effective_checkout_policy': portfolio_module.REPLAY_MAPPING_POLICY,
+        'environment_assignments': assignments,
+        'execution_role': 'fresh_detached_candidate_worktree',
+        'expected_exit_code': command['expected_exit_code'],
+        'failure_reasons': [],
+        'id': command['id'],
+        'observed_tracked_changes': [],
+        'ordinal': command['ordinal'],
+        'postcondition_files': [
+            {
+                'bytes': len(postcondition_payload),
+                'path': path,
+                'sha256': hashlib.sha256(postcondition_payload).hexdigest(),
+            }
+            for path in allowed
+        ],
+        'repository_preflight': {
+            'effective_filter_configuration_absent': True,
+            'info_attributes_absent': True,
+            'sanitized_git_environment': True,
+            'schema_version': 1,
+        },
+        'returncode': command['expected_exit_code'],
+        'schema_version': 1,
+        'status': 'PASS',
+        'stderr': {
+            'bytes': 0,
+            'maximum_bytes': command['maximum_stderr_bytes'],
+            'observed_bytes': 0,
+            'overflow': False,
+            'path': f'documentation/{output.name}/stderr.log',
+            'sha256': empty_sha256,
+        },
+        'stdout': {
+            'bytes': 0,
+            'maximum_bytes': command['maximum_stdout_bytes'],
+            'observed_bytes': 0,
+            'overflow': False,
+            'path': f'documentation/{output.name}/stdout.log',
+            'sha256': empty_sha256,
+        },
+        'timed_out': False,
+        'wall_duration_ns': 1,
+        'worktree_head': candidate_sha,
+    }
+    for stream in ('stdout', 'stderr'):
+        portfolio_module._write_once(output / f'{stream}.log', b'', mode=0o600)
+    portfolio_module._write_json_once(
+        output / 'environment.json',
+        {
+            'forbidden_overlay_keys': list(portfolio_module.FORBIDDEN_REPLAY_ENVIRONMENT),
+            'inherited_environment': False,
+            'policy': 'env -i with an explicit non-secret allowlist',
+            'schema_version': 1,
+            'set_keys': [
+                'HOME',
+                'LANG',
+                'LC_ALL',
+                'PATH',
+                'ROS_HOME',
+                'ROS_LOG_DIR',
+                'TZ',
+                'XDG_CACHE_HOME',
+                'XDG_CONFIG_HOME',
+                'XDG_DATA_HOME',
+                'XDG_STATE_HOME',
+            ],
+        },
+    )
+    if command['id'] in portfolio_module.RUFF_REQUIRED_REPLAY_IDS:
+        tooling = {
+            'bytes': portfolio_module.RUFF_BYTES,
+            'destination': '.venv/bin/ruff',
+            'required': True,
+            'schema_version': 1,
+            'sha256': portfolio_module.RUFF_SHA256,
+            'source': '.venv/bin/ruff',
+            'version': f'ruff {portfolio_module.RUFF_VERSION}',
+        }
+    else:
+        tooling = {'required': False, 'schema_version': 1}
+    portfolio_module._write_json_once(output / 'tooling-seed.json', tooling)
+    before_tree = {
+        'allowed_modified_paths': [],
+        'candidate_tree_entry_count': candidate['candidate_tree_entry_count'],
+        'candidate_tree_listing_sha256': candidate['candidate_tree_listing_sha256'],
+        'checked_immutable_path_count': candidate['candidate_tree_entry_count'],
+        'schema_version': 1,
+        'status': 'PASS',
+    }
+    after_tree = {
+        **before_tree,
+        'allowed_modified_paths': allowed,
+        'checked_immutable_path_count': candidate['candidate_tree_entry_count'] - len(allowed),
+    }
+    before_state = {
+        'candidate_git_sha': candidate_sha,
+        'changed_tracked_paths': [],
+        'detached_head': True,
+        'git_head': candidate_sha,
+        'status_bytes': 0,
+        'status_sha256': empty_sha256,
+        'tracked_tree': before_tree,
+        'untracked_paths': [],
+    }
+    after_state = {**before_state, 'tracked_tree': after_tree}
+    portfolio_module._write_json_once(output / 'source-state-before.json', before_state)
+    portfolio_module._write_json_once(output / 'source-state-after.json', after_state)
+    portfolio_module._write_json_once(output / 'result.json', result)
+    return result
+
+
+def _portfolio_svg(path: Path, label: str) -> None:
+    path.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 540">'
+        f'<title>{label}</title><rect width="960" height="540" fill="#ffffff"/>'
+        '<path d="M 80 270 L 880 270" stroke="#111111" stroke-width="8"/>'
+        '</svg>\n',
+        encoding='utf-8',
+    )
+
+
+def _phase5_fixture_png() -> bytes:
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack('>I', len(payload))
+            + kind
+            + payload
+            + struct.pack('>I', zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    width, height = 960, 540
+    row = b'\x00' + (b'\xf4\xf4\xf4' * width)
+    return (
+        b'\x89PNG\r\n\x1a\n'
+        + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
+        + chunk(b'IDAT', zlib.compress(row * height, level=9))
+        + chunk(b'IEND', b'')
+    )
+
+
+def _finalize_portfolio_fixture(
+    repository: Path,
+    candidate_root: Path,
+    candidate_sha: str,
+) -> tuple[Path, Path, str]:
+    """Create one finalized raw portfolio attempt without executing documentation units."""
+    attempt_id = '20260826T000200Z-1'
+    original_replay = portfolio_module._replay_one_command
+    portfolio_module._replay_one_command = _portfolio_replay_fixture
+    try:
+        prepare = portfolio_module.prepare_portfolio(
+            repository,
+            candidate_sha,
+            candidate_root,
+            authorize_mutating_commands=True,
+            attempt_id=attempt_id,
+        )
+    finally:
+        portfolio_module._replay_one_command = original_replay
+    assert prepare['status'] == 'REVIEW_REQUIRED'
+    architecture_svg = repository.parent / 'architecture-fixture.svg'
+    release_flow_svg = repository.parent / 'release-flow-fixture.svg'
+    _portfolio_svg(architecture_svg, 'Architecture fixture')
+    _portfolio_svg(release_flow_svg, 'Release flow fixture')
+    candidate = portfolio_module.validate_candidate_contract(repository, candidate_sha)
+    prepared = datetime.fromisoformat(str(prepare['prepared_utc']).replace('Z', '+00:00'))
+    rendered_utc = prepared.astimezone(UTC).isoformat().replace('+00:00', 'Z')
+    reviewed_utc = rendered_utc
+    render_paths = {
+        'architecture': architecture_svg,
+        'release-flow': release_flow_svg,
+    }
+    review = {
+        'attempt_id': attempt_id,
+        'candidate_git_sha': candidate_sha,
+        'diagrams': [
+            {
+                'diagram_id': identifier,
+                'render_sha256': phase5_module.file_sha256(render_paths[identifier]),
+                'rendered_utc': rendered_utc,
+                'renderer': {
+                    'identity': 'fixture-mermaid-renderer',
+                    'mode': 'argv',
+                    'reference': ['fixture-mermaid-renderer', '--input', f'{identifier}.mmd'],
+                    'version': '1.0.0-fixture',
+                },
+                'source_sha256': next(
+                    item['source_sha256']
+                    for item in candidate['diagrams']
+                    if item['id'] == identifier
+                ),
+                'verdict': 'PASS',
+            }
+            for identifier in portfolio_module.DIAGRAM_IDS
+        ],
+        'reviewed_utc': reviewed_utc,
+        'reviewer': 'Phase 5 human fixture reviewer',
+        'schema_version': 1,
+    }
+    visual_review = repository.parent / 'portfolio-visual-review.json'
+    _canonical_file(visual_review, review)
+    finalized = portfolio_module.finalize_portfolio(
+        repository,
+        candidate_sha,
+        candidate_root,
+        attempt_id,
+        architecture_svg,
+        release_flow_svg,
+        visual_review,
+    )
+    assert finalized['status'] == 'PASS'
+    portfolio_root = repository / portfolio_module.PORTFOLIO_RAW_PREFIX / candidate_sha
+    raw_proof = repository / str(finalized['portfolio_proof_path'])
+    return portfolio_root, raw_proof, attempt_id
+
+
+def _set_local_aggregate_after_portfolio(
+    local_aggregate: Path,
+    portfolio_raw_proof: Path,
+) -> None:
+    """Place the bare aggregate deterministically after raw portfolio finalization."""
+    aggregate = json.loads(local_aggregate.read_text(encoding='utf-8'))
+    portfolio = json.loads(portfolio_raw_proof.read_text(encoding='utf-8'))
+    finalized = datetime.fromisoformat(str(portfolio['finalized_utc']).replace('Z', '+00:00'))
+    aggregate['checked_at'] = (
+        (finalized + timedelta(seconds=1)).astimezone(UTC).isoformat().replace('+00:00', 'Z')
+    )
+    _canonical_file(local_aggregate, aggregate)
+    local_aggregate.with_suffix('.SHA256SUMS').write_text(
+        f'{phase5_module.file_sha256(local_aggregate)}  {local_aggregate.name}\n',
+        encoding='ascii',
+    )
+    local_aggregate.with_suffix('.checksum-validation.txt').write_text(
+        f'{local_aggregate.name}: OK\n',
+        encoding='utf-8',
+    )
 
 
 def _build_release_fixture(tmp_path: Path) -> dict[str, Path | str]:
@@ -5039,6 +5528,33 @@ PY
         phase4_run,
         completed_utc='2026-08-26T00:01:00.000000Z',
     )
+    deferred_local_paths = (
+        phase0_version,
+        local_aggregate,
+        local_aggregate.with_suffix('.SHA256SUMS'),
+        local_aggregate.with_suffix('.checksum-validation.txt'),
+    )
+    deferred_local_payloads = {path: path.read_bytes() for path in deferred_local_paths}
+    phase0_version.write_bytes(
+        subprocess.run(
+            ['git', 'show', f'{candidate_sha}:artifacts/evidence/phase0/phase0-versions.json'],
+            cwd=repository,
+            capture_output=True,
+            check=True,
+        ).stdout
+    )
+    for path in deferred_local_paths[1:]:
+        path.unlink()
+    try:
+        portfolio_root, portfolio_raw_proof, portfolio_attempt_id = _finalize_portfolio_fixture(
+            repository,
+            candidate_root,
+            candidate_sha,
+        )
+    finally:
+        for path, payload in deferred_local_payloads.items():
+            path.write_bytes(payload)
+    _set_local_aggregate_after_portfolio(local_aggregate, portfolio_raw_proof)
 
     remote_root = repository / 'docs/results/phase-5'
     remote_path = remote_root / f'remote-{candidate_sha}.json'
@@ -5049,6 +5565,7 @@ PY
             sha=candidate_sha,
             mode='--remote',
             run_id=42,
+            completed_at='2026-08-26T00:00:30Z',
             created_at='2026-08-26T00:00:00Z',
             checked_at='2026-08-26T00:01:00+00:00',
         ),
@@ -5060,7 +5577,15 @@ PY
     remote_path.with_suffix('.checksum-validation.txt').write_text(
         f'{remote_path.name}: OK\n', encoding='utf-8'
     )
-    release_docs_module.write_release_documents(repository, aggregate_path, scenario6_path)
+    release_docs_module.write_release_documents(
+        repository,
+        aggregate_path,
+        scenario6_path,
+        candidate_root,
+        portfolio_root,
+        portfolio_raw_proof,
+    )
+    portfolio_proof = repository / portfolio_module.portfolio_projection_paths(candidate_sha)[0]
     _commit_all(repository, 'evidence')
     evidence_sha = subprocess.run(
         ['git', 'rev-parse', 'HEAD'],
@@ -5077,6 +5602,7 @@ PY
         sha=evidence_sha,
         mode='--remote-evidence-commit',
         run_id=43,
+        completed_at='2026-08-26T00:10:30Z',
         created_at='2026-08-26T00:10:00Z',
         checked_at='2026-08-26T00:11:00+00:00',
     )
@@ -5097,6 +5623,10 @@ PY
         'evidence_sha': evidence_sha,
         'local_aggregate': local_aggregate,
         'phase4_run': phase4_run,
+        'portfolio_attempt_id': portfolio_attempt_id,
+        'portfolio_proof': portfolio_proof,
+        'portfolio_raw_proof': portfolio_raw_proof,
+        'portfolio_root': portfolio_root,
         'remote': remote_path,
         'repository': repository,
         'scenario6': scenario6_path,
@@ -5750,30 +6280,44 @@ def _release_fixture(tmp_path: Path) -> dict[str, Path | str]:
     ):
         path.unlink(missing_ok=True)
 
+    subprocess.run(
+        ['git', 'switch', '--detach', '--quiet', candidate_sha],
+        cwd=repository,
+        check=True,
+    )
+    try:
+        candidate_root = repository / 'artifacts/evidence/phase3-benchmarks/candidate-1'
+        aggregate_path = _relocate_phase3_evidence(
+            repository,
+            candidate_root,
+            candidate_sha=candidate_sha,
+            old_root=old_root,
+        )
+        phase4_run = repository / 'artifacts/evidence/phase4/runs/phase4-20260826T000000Z-999'
+        scenario6_path = _relocate_phase4_evidence(
+            repository,
+            phase4_run,
+            old_root=old_root,
+        )
+        copied_portfolio_root = repository / portfolio_module.PORTFOLIO_RAW_PREFIX / candidate_sha
+        assert copied_portfolio_root.is_dir() and not copied_portfolio_root.is_symlink()
+        assert copied_portfolio_root.resolve().is_relative_to(repository.resolve())
+        shutil.rmtree(copied_portfolio_root)
+        portfolio_root, portfolio_raw_proof, portfolio_attempt_id = _finalize_portfolio_fixture(
+            repository,
+            candidate_root,
+            candidate_sha,
+        )
+    finally:
+        subprocess.run(
+            ['git', 'switch', '--detach', '--quiet', old_evidence_sha],
+            cwd=repository,
+            check=True,
+        )
+
     local_aggregate = repository / 'artifacts/evidence/phase0/verify-all.json'
     _relocate_json(local_aggregate, old_root, str(repository))
-    local_aggregate.with_suffix('.SHA256SUMS').write_text(
-        f'{phase5_module.file_sha256(local_aggregate)}  {local_aggregate.name}\n',
-        encoding='ascii',
-    )
-    local_aggregate.with_suffix('.checksum-validation.txt').write_text(
-        f'{local_aggregate.name}: OK\n',
-        encoding='utf-8',
-    )
-
-    candidate_root = repository / 'artifacts/evidence/phase3-benchmarks/candidate-1'
-    aggregate_path = _relocate_phase3_evidence(
-        repository,
-        candidate_root,
-        candidate_sha=candidate_sha,
-        old_root=old_root,
-    )
-    phase4_run = repository / 'artifacts/evidence/phase4/runs/phase4-20260826T000000Z-999'
-    scenario6_path = _relocate_phase4_evidence(
-        repository,
-        phase4_run,
-        old_root=old_root,
-    )
+    _set_local_aggregate_after_portfolio(local_aggregate, portfolio_raw_proof)
     remote_path = repository / f'docs/results/phase-5/remote-{candidate_sha}.json'
     _refresh_remote_proof(
         remote_path,
@@ -5782,6 +6326,7 @@ def _release_fixture(tmp_path: Path) -> dict[str, Path | str]:
             sha=candidate_sha,
             mode='--remote',
             run_id=42,
+            completed_at='2026-08-26T00:00:30Z',
             created_at='2026-08-26T00:00:00Z',
             checked_at='2026-08-26T00:01:00+00:00',
         ),
@@ -5801,9 +6346,21 @@ def _release_fixture(tmp_path: Path) -> dict[str, Path | str]:
         repository / f'docs/results/phase-4/{phase4_run.name}.csv',
         repository / f'docs/results/phase-4/{phase4_run.name}.json',
         repository / f'docs/results/phase-4/{phase4_run.name}.md',
+        *(
+            repository / relative
+            for relative in portfolio_module.portfolio_projection_paths(candidate_sha)
+        ),
     ):
         path.unlink(missing_ok=True)
-    release_docs_module.write_release_documents(repository, aggregate_path, scenario6_path)
+    release_docs_module.write_release_documents(
+        repository,
+        aggregate_path,
+        scenario6_path,
+        candidate_root,
+        portfolio_root,
+        portfolio_raw_proof,
+    )
+    portfolio_proof = repository / portfolio_module.portfolio_projection_paths(candidate_sha)[0]
     subprocess.run(['git', 'add', '-A'], cwd=repository, check=True)
     subprocess.run(
         [
@@ -5838,6 +6395,7 @@ def _release_fixture(tmp_path: Path) -> dict[str, Path | str]:
             sha=evidence_sha,
             mode='--remote-evidence-commit',
             run_id=43,
+            completed_at='2026-08-26T00:10:30Z',
             created_at='2026-08-26T00:10:00Z',
             checked_at='2026-08-26T00:11:00+00:00',
         ),
@@ -5854,6 +6412,10 @@ def _release_fixture(tmp_path: Path) -> dict[str, Path | str]:
         'evidence_sha': evidence_sha,
         'local_aggregate': local_aggregate,
         'phase4_run': phase4_run,
+        'portfolio_attempt_id': portfolio_attempt_id,
+        'portfolio_proof': portfolio_proof,
+        'portfolio_raw_proof': portfolio_raw_proof,
+        'portfolio_root': portfolio_root,
         'remote': remote_path,
         'repository': repository,
         'scenario6': scenario6_path,
@@ -5870,6 +6432,8 @@ def _validate_release_fixture(fixture: dict[str, Path | str]) -> dict[str, objec
         Path(fixture['aggregate']),
         Path(fixture['phase4_run']),
         Path(fixture['scenario6']),
+        Path(fixture['portfolio_root']),
+        Path(fixture['portfolio_proof']),
         Path(fixture['remote']),
         Path(fixture['evidence_remote']),
     )
@@ -5944,6 +6508,10 @@ def _release_evidence_command(fixture: dict[str, Path | str]) -> list[str]:
         str(fixture['phase4_run']),
         '--phase4-scenario6',
         str(fixture['scenario6']),
+        '--phase5-portfolio-root',
+        str(fixture['portfolio_root']),
+        '--phase5-portfolio-proof',
+        str(fixture['portfolio_proof']),
         '--phase5-remote-proof',
         str(fixture['remote']),
         '--phase5-evidence-commit-remote-proof',
@@ -5955,10 +6523,25 @@ def test_release_evidence_mode_passes_only_exact_selected_artifacts(tmp_path: Pa
     fixture = _release_fixture(tmp_path)
     report = _validate_release_fixture(fixture)
     assert report['status'] == 'PASS'
+    assert report['schema_version'] == 2
     assert report['release_eligible'] is True
     assert report['candidate_git_sha'] == fixture['candidate_sha']
     assert report['phase3']['smoke_profile_path'] == str(fixture['smoke_profile'])
     assert report['phase3']['smoke_profile_sha256'] == fixture['smoke_profile_sha256']
+    assert report['portfolio']['status'] == 'PASS'
+    assert report['portfolio']['projection_paths'] == list(
+        portfolio_module.portfolio_projection_paths(str(fixture['candidate_sha']))
+    )
+    assert report['portfolio']['attempt_id'] == fixture['portfolio_attempt_id']
+    assert datetime.fromisoformat(report['phase5']['completed_at']) <= datetime.fromisoformat(
+        report['portfolio']['prepared_utc'].replace('Z', '+00:00')
+    )
+    assert datetime.fromisoformat(report['phase4']['completed_utc']) <= datetime.fromisoformat(
+        report['portfolio']['prepared_utc'].replace('Z', '+00:00')
+    )
+    assert datetime.fromisoformat(
+        report['portfolio']['finalized_utc'].replace('Z', '+00:00')
+    ) <= datetime.fromisoformat(report['local_aggregate']['checked_at'])
     assert 'clone-local Phase 3 smoke host profile' in report['verification_scope']
     phase4_context = json.loads(
         (Path(fixture['phase4_run']) / 'context.json').read_text(encoding='utf-8')
@@ -5992,9 +6575,443 @@ def test_release_evidence_mode_passes_only_exact_selected_artifacts(tmp_path: Pa
         ).read_text(encoding='utf-8')
     )
     assert release_result['status'] == 'PASS'
+    assert release_result['schema_version'] == 2
     assert release_result['release_eligible'] is True
     assert release_result['candidate_git_sha'] == fixture['candidate_sha']
     assert not Path(fixture['call_log']).exists()
+
+
+@pytest.mark.parametrize('summary_phase', ('phase-3', 'phase-4'))
+def test_release_docs_preflights_stale_summaries_before_portfolio_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    summary_phase: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    expected_portfolio_paths = portfolio_module.portfolio_projection_paths(
+        str(fixture['candidate_sha'])
+    )
+    for relative in expected_portfolio_paths:
+        (repository / relative).unlink()
+    stale = repository / f'docs/results/{summary_phase}/stale-direct-file.txt'
+    stale.write_text('stale\n', encoding='utf-8')
+    project_calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        release_docs_module,
+        'project_portfolio',
+        lambda *arguments: project_calls.append(arguments),
+    )
+
+    with pytest.raises(EvidenceError, match='release summary directory contains stale files'):
+        release_docs_module.write_release_documents(
+            repository,
+            Path(fixture['aggregate']),
+            Path(fixture['scenario6']),
+            Path(fixture['candidate_root']),
+            Path(fixture['portfolio_root']),
+            Path(fixture['portfolio_raw_proof']),
+        )
+
+    assert project_calls == []
+    assert all(not (repository / relative).exists() for relative in expected_portfolio_paths)
+
+
+def test_release_docs_bounds_raw_portfolio_reads_before_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    expected_portfolio_paths = portfolio_module.portfolio_projection_paths(
+        str(fixture['candidate_sha'])
+    )
+    for relative in expected_portfolio_paths:
+        (repository / relative).unlink()
+    raw_projection_root = Path(fixture['portfolio_raw_proof']).parent
+    oversized = raw_projection_root / Path(expected_portfolio_paths[-1]).name
+    with oversized.open('r+b') as stream:
+        stream.truncate(release_docs_module.MAX_JSON_BYTES + 1)
+    project_calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        release_docs_module,
+        'project_portfolio',
+        lambda *arguments: project_calls.append(arguments),
+    )
+
+    with pytest.raises(EvidenceError, match='raw portfolio projection exceeds its size bound'):
+        release_docs_module.write_release_documents(
+            repository,
+            Path(fixture['aggregate']),
+            Path(fixture['scenario6']),
+            Path(fixture['candidate_root']),
+            Path(fixture['portfolio_root']),
+            Path(fixture['portfolio_raw_proof']),
+        )
+
+    assert project_calls == []
+    assert all(not (repository / relative).exists() for relative in expected_portfolio_paths)
+
+
+@pytest.mark.parametrize(
+    'failure_point',
+    ('late_validation', 'immediate_lstat', 'pre_mode_capture', 'post_mode_capture'),
+)
+def test_release_docs_rolls_back_transient_failure_and_retries_under_restrictive_umask(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_sha = str(fixture['candidate_sha'])
+    portfolio_paths = [
+        repository / relative
+        for relative in portfolio_module.portfolio_projection_paths(candidate_sha)
+    ]
+    summary_paths = [
+        repository / f'docs/results/phase-3/{Path(fixture["candidate_root"]).name}.{suffix}'
+        for suffix in ('csv', 'json', 'md')
+    ] + [
+        repository / f'docs/results/phase-4/{Path(fixture["phase4_run"]).name}.{suffix}'
+        for suffix in ('csv', 'json', 'md')
+    ]
+    for path in [*portfolio_paths, *summary_paths]:
+        path.unlink()
+    for relative in ('README.md', 'config/release-claims.json'):
+        (repository / relative).write_bytes(
+            subprocess.run(
+                ['git', 'show', f'{candidate_sha}:{relative}'],
+                cwd=repository,
+                capture_output=True,
+                check=True,
+            ).stdout
+        )
+    readme = repository / 'README.md'
+    claims = repository / 'config/release-claims.json'
+    phase5_root = repository / 'docs/results/phase-5'
+    direct_roots = [
+        repository / 'docs/results/phase-3',
+        repository / 'docs/results/phase-4',
+        phase5_root,
+    ]
+    guarded_paths = [
+        *portfolio_paths,
+        *summary_paths,
+        readme,
+        claims,
+        *(path for path in phase5_root.iterdir()),
+    ]
+
+    def before_tree() -> dict[str, object]:
+        return {
+            'directories': {
+                str(root): sorted(path.name for path in root.iterdir()) for root in direct_roots
+            },
+            'files': {
+                str(path): (
+                    None
+                    if not path.exists() and not path.is_symlink()
+                    else {
+                        'bytes': path.read_bytes(),
+                        'mode': path.stat().st_mode & 0o7777,
+                        'regular': path.is_file() and not path.is_symlink(),
+                    }
+                )
+                for path in guarded_paths
+            },
+        }
+
+    initial = before_tree()
+    original_validate = release_docs_module.validate_release_documents
+
+    def fail_after_validation(*args: object, **kwargs: object) -> dict[str, object]:
+        original_validate(*args, **kwargs)
+        raise EvidenceError('injected late release validation failure')
+
+    original_capture = release_docs_module._capture_written_file
+    capture_failed = False
+    capture_failure_labels = {
+        'pre_mode_capture': 'release transaction pre-mode',
+        'post_mode_capture': 'release transaction',
+    }
+
+    def fail_capture(
+        path: Path,
+        payload: bytes,
+        mode: int,
+        label: str,
+    ) -> release_docs_module._WrittenFile:
+        nonlocal capture_failed
+        if label == capture_failure_labels[failure_point] and not capture_failed:
+            capture_failed = True
+            raise OSError(f'injected {failure_point.replace("_", "-")} failure')
+        return original_capture(path, payload, mode, label)
+
+    immediate_lstat_target = next(
+        path for path in summary_paths if path.parent.name == 'phase-3' and path.suffix == '.json'
+    )
+    original_atomic_write = release_docs_module.atomic_write_bytes
+    original_lstat = Path.lstat
+    immediate_lstat_armed = False
+    immediate_lstat_failed = False
+
+    def arm_immediate_lstat(path: Path, payload: bytes) -> None:
+        nonlocal immediate_lstat_armed
+        original_atomic_write(path, payload)
+        if path == immediate_lstat_target:
+            immediate_lstat_armed = True
+
+    def fail_immediate_lstat(path: Path) -> os.stat_result:
+        nonlocal immediate_lstat_failed
+        if path == immediate_lstat_target and immediate_lstat_armed and not immediate_lstat_failed:
+            immediate_lstat_failed = True
+            raise OSError('injected immediate-lstat failure')
+        return original_lstat(path)
+
+    with monkeypatch.context() as patch:
+        if failure_point == 'late_validation':
+            patch.setattr(release_docs_module, 'validate_release_documents', fail_after_validation)
+            expected_failure = 'injected late release validation failure'
+        elif failure_point == 'immediate_lstat':
+            patch.setattr(release_docs_module, 'atomic_write_bytes', arm_immediate_lstat)
+            patch.setattr(Path, 'lstat', fail_immediate_lstat)
+            expected_failure = 'injected immediate-lstat failure'
+        else:
+            patch.setattr(release_docs_module, '_capture_written_file', fail_capture)
+            expected_failure = f'injected {failure_point.replace("_", "-")} failure'
+        with pytest.raises((EvidenceError, OSError), match=expected_failure):
+            release_docs_module.write_release_documents(
+                repository,
+                Path(fixture['aggregate']),
+                Path(fixture['scenario6']),
+                Path(fixture['candidate_root']),
+                Path(fixture['portfolio_root']),
+                Path(fixture['portfolio_raw_proof']),
+            )
+
+    assert before_tree() == initial
+    previous_umask = os.umask(0o077)
+    try:
+        report = release_docs_module.write_release_documents(
+            repository,
+            Path(fixture['aggregate']),
+            Path(fixture['scenario6']),
+            Path(fixture['candidate_root']),
+            Path(fixture['portfolio_root']),
+            Path(fixture['portfolio_raw_proof']),
+        )
+    finally:
+        os.umask(previous_umask)
+
+    assert report['portfolio_projection_paths'] == [
+        path.relative_to(repository).as_posix() for path in portfolio_paths
+    ]
+    assert all((path.stat().st_mode & 0o7777) == 0o644 for path in portfolio_paths)
+
+
+def test_release_evidence_rejects_raw_tracked_portfolio_mismatch(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    architecture = (
+        repository / portfolio_module.portfolio_projection_paths(str(fixture['candidate_sha']))[3]
+    )
+    architecture.write_bytes(architecture.read_bytes() + b'<!-- tracked-only drift -->\n')
+
+    with pytest.raises(EvidenceError, match='tracked portfolio projection differs from raw'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_manipulated_portfolio_validator_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    original = release_module.validate_portfolio_evidence
+
+    def manipulated(*args: object, **kwargs: object) -> dict[str, object]:
+        report = dict(original(*args, **kwargs))
+        report['projection_paths'] = [
+            *report['projection_paths'][:-1],
+            'docs/results/phase-5/attacker-selected.png',
+        ]
+        return report
+
+    monkeypatch.setattr(release_module, 'validate_portfolio_evidence', manipulated)
+    with pytest.raises(EvidenceError, match='manipulated projection contract'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_missing_portfolio_addition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    validated = release_module.validate_portfolio_evidence(
+        repository,
+        Path(fixture['portfolio_root']),
+        Path(fixture['portfolio_proof']),
+        Path(fixture['candidate_root']),
+        str(fixture['candidate_sha']),
+    )
+    missing = (
+        repository / portfolio_module.portfolio_projection_paths(str(fixture['candidate_sha']))[-1]
+    )
+    subprocess.run(['git', 'rm', '-q', '--', str(missing)], cwd=repository, check=True)
+    _amend_all(repository)
+    monkeypatch.setattr(
+        release_module,
+        'validate_portfolio_evidence',
+        lambda *_args, **_kwargs: copy.deepcopy(validated),
+    )
+
+    with pytest.raises(EvidenceError, match='outside the exact release allowlist'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_extra_evidence_commit_path(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    extra = repository / 'docs/results/phase-5/unexpected-evidence.txt'
+    extra.write_text('not selected evidence\n', encoding='utf-8')
+    _amend_all(repository)
+
+    with pytest.raises(EvidenceError, match='outside the exact release allowlist'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_executable_portfolio_projection(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    architecture = (
+        repository / portfolio_module.portfolio_projection_paths(str(fixture['candidate_sha']))[3]
+    )
+    architecture.chmod(0o755)
+    subprocess.run(
+        ['git', 'update-index', '--chmod=+x', '--', str(architecture)],
+        cwd=repository,
+        check=True,
+    )
+    _amend_all(repository)
+
+    with pytest.raises(
+        EvidenceError,
+        match='tracked portfolio projection type, link count, or mode changed',
+    ):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_portfolio_matrix_source_drift(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    matrix = repository / 'config/phase5-readme-replay.json'
+    matrix.write_bytes(matrix.read_bytes() + b'\n')
+    _amend_all(repository)
+
+    with pytest.raises(
+        EvidenceError, match='Scenario 6 result is not the exact production evaluation replay'
+    ):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_candidate_ci_completed_after_portfolio_prepare(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    proof_path = Path(fixture['remote'])
+    proof = json.loads(proof_path.read_text(encoding='utf-8'))
+    portfolio = json.loads(Path(fixture['portfolio_proof']).read_text(encoding='utf-8'))
+    prepared = datetime.fromisoformat(portfolio['prepared_utc'].replace('Z', '+00:00'))
+    proof['run']['completed_at'] = (
+        (prepared + timedelta(seconds=1)).astimezone(UTC).isoformat().replace('+00:00', 'Z')
+    )
+    proof['checked_at'] = (
+        (prepared + timedelta(seconds=2)).astimezone(UTC).isoformat().replace('+00:00', 'Z')
+    )
+    _refresh_remote_proof(proof_path, proof)
+
+    with pytest.raises(EvidenceError, match='preparation predates completed candidate CI'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_phase4_completed_after_portfolio_prepare(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    portfolio = json.loads(Path(fixture['portfolio_proof']).read_text(encoding='utf-8'))
+    prepared = datetime.fromisoformat(portfolio['prepared_utc'].replace('Z', '+00:00'))
+    completed = (prepared + timedelta(seconds=1)).astimezone(UTC).isoformat().replace('+00:00', 'Z')
+    _rebind_phase4_evidence(
+        Path(fixture['repository']),
+        Path(fixture['phase4_run']),
+        completed_utc=completed,
+    )
+
+    with pytest.raises(EvidenceError, match='preparation predates completed Phase 4 evidence'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_rejects_bare_aggregate_before_portfolio_finalize(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    aggregate_path = Path(fixture['local_aggregate'])
+    aggregate = json.loads(aggregate_path.read_text(encoding='utf-8'))
+    portfolio = json.loads(Path(fixture['portfolio_proof']).read_text(encoding='utf-8'))
+    finalized = datetime.fromisoformat(portfolio['finalized_utc'].replace('Z', '+00:00'))
+    aggregate['checked_at'] = (
+        (finalized - timedelta(seconds=1)).astimezone(UTC).isoformat().replace('+00:00', 'Z')
+    )
+    _canonical_file(aggregate_path, aggregate)
+    aggregate_path.with_suffix('.SHA256SUMS').write_text(
+        f'{phase5_module.file_sha256(aggregate_path)}  {aggregate_path.name}\n',
+        encoding='ascii',
+    )
+
+    with pytest.raises(EvidenceError, match='aggregate predates portfolio finalization'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_shell_ignores_latest_and_performs_no_network_or_verifiers(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    latest = repository / 'artifacts/evidence/phase3-benchmarks/latest'
+    assert not latest.exists() and not latest.is_symlink()
+    latest.symlink_to(tmp_path / 'deliberately-missing-latest')
+    fake_bin = tmp_path / 'fake-bin'
+    fake_bin.mkdir()
+    network_log = tmp_path / 'network.log'
+    fake_network = """#!/bin/sh
+printf '%s\\n' "$0 $*" >>"${NETWORK_LOG}"
+exit 99
+"""
+    for command in ('curl', 'gh', 'wget'):
+        executable = fake_bin / command
+        executable.write_text(fake_network, encoding='utf-8')
+        executable.chmod(0o755)
+
+    result = subprocess.run(
+        _release_evidence_command(fixture),
+        cwd=repository,
+        env=os.environ
+        | {
+            'CALL_LOG': str(fixture['call_log']),
+            'NETWORK_LOG': str(network_log),
+            'PATH': f'{fake_bin}:{os.environ["PATH"]}',
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not network_log.exists()
+    assert not Path(fixture['call_log']).exists()
+    assert latest.is_symlink()
+    assert os.readlink(latest) == str(tmp_path / 'deliberately-missing-latest')
 
 
 @pytest.mark.parametrize(
@@ -6289,7 +7306,7 @@ def test_release_fixture_clones_are_self_contained_and_reload_producers(
 def test_release_evidence_final_claim_extension_is_exact(tmp_path: Path) -> None:
     fixture = _release_fixture(tmp_path)
     report = validate_release_claims(Path(fixture['repository']))
-    assert report['claim_count'] == 15
+    assert report['claim_count'] == 27
     assert report['evidence_file_count'] == 5
 
 
@@ -6487,6 +7504,17 @@ def test_release_evidence_rejects_reduced_remote_proof_shape(tmp_path: Path) -> 
     _refresh_remote_proof(path, proof)
 
     with pytest.raises(EvidenceError, match='provenance schema changed'):
+        _validate_release_fixture(fixture)
+
+
+def test_release_evidence_requires_exact_remote_completion_timestamp(tmp_path: Path) -> None:
+    fixture = _release_fixture(tmp_path)
+    path = Path(fixture['remote'])
+    proof = json.loads(path.read_text(encoding='utf-8'))
+    del proof['run']['completed_at']
+    _refresh_remote_proof(path, proof)
+
+    with pytest.raises(EvidenceError, match='verdict or identity is invalid'):
         _validate_release_fixture(fixture)
 
 
