@@ -36,7 +36,7 @@ contact_stream:
       - path: src/robotest_sim/include/robotest_sim/contact_aggregator.hpp
         sha256: 72bf8d8844f9c1e514206e0db559f504aa6260b662b9279b7b649bcbd47675f6
       - path: src/robotest_sim/include/robotest_sim/contact_stream_gate.hpp
-        sha256: 145da14d8fcb5a6495785d6c341ad37f46ace7e514e48e4b8b846673bd550ee7
+        sha256: ffdb88d084de6bfb301354cb1d0124da35e3d2229a6ff2f0494559c88ff64763
       - path: src/robotest_sim/launch/sim.launch.py
         sha256: 42f976808a87d10e349ec9532dd16c147741da668a8eed66549b2952ca3cdcb4
       - path: src/robotest_sim/src/contact_aggregator.cpp
@@ -44,12 +44,12 @@ contact_stream:
       - path: src/robotest_sim/src/contact_aggregator_system.cpp
         sha256: 0f67b174b624b465606e5e598a5f90623e57ca510bc40622b8936b2382dda213
       - path: src/robotest_sim/src/contact_stream_gate.cpp
-        sha256: d94c901b0d96710435cca5c48e4b162f3a2e7c3aa4e0fc7f6f7ce91eefda4fb0
+        sha256: 6ba550431e03436beb8558ab9a8ebd3f915a24b1f36f69d6b719fd4a7b6fdf76
       - path: src/robotest_sim/src/contact_stream_gate_node.cpp
-        sha256: 9eddecff326b0277f1bbe5cf06efe010cbf130cf1d32acfdd5a7d923f9f0227f
+        sha256: 6c6e328019d4ca7f35e05f5fca09f577c539641b08cfdfbae8f2da55a743fc1a
       - path: src/robotest_sim/worlds/robotest_lab.sdf
         sha256: 06ae57acb82e58ebb64cacf0082e0de3a92fb8907a839c22011b8acc7acba539
-    source_inventory_sha256: fad36e1cc6d40544cdf9bb40951a9ee0f6f7ed281fc57dd5ba564ada9c0d3e66
+    source_inventory_sha256: 8c577ca230a8a1e5c4a8d281247324fd1440bd0657d98d3e1732c5d3f7fecb0e
   policy:
     active_pair_expiry_ns: 250000000
     active_pair_scope: support_robot_internal_and_countable_robot_external
@@ -169,8 +169,8 @@ support_pairs:
 - robot_collision: robotest::rear_caster_link::rear_caster_link_fixed_joint_lump__rear_caster_collision_collision
   environment_collision: ground_plane::ground_link::ground_collision
 bridge_sha256: 092bb7f3e02d2725b41023b9d579476895aa770c3f329c92cf38d196481fba6c
-contact_configuration_sha256: c2453deee02971caf02a0f759b57fcf8645b3c212291203a90483f40f6b03fb1
+contact_configuration_sha256: 730902d176c76b48c649c68997e121ab8ce96ee2d83a1a0e31e8623758346e50
 rendered_sdf_sha256: 0b3261652693ec2cc8d88924a88d6fa3fcbcdf89c556bd6684b3fbcfb1b1ed16
 robot_description_sha256: 9504b43c5d6af62d6a634bd98b615026bdf95ed9ef1120f3efd2308fad161263
 world_source_sha256: 06ae57acb82e58ebb64cacf0082e0de3a92fb8907a839c22011b8acc7acba539
-manifest_sha256: 975084d84ff8f2c6eb558d6fade140310d69417a9c7c1b7b745789e206ab27cb
+manifest_sha256: 4832bdb615e445b2f88479294bfe537acd1b14e6bbfa2440efdb5e36298af539

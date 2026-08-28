@@ -485,19 +485,36 @@ ContactGateDecision ContactStreamPolicy::observe_clock(const std::int64_t clock_
   last_clock_stamp_ns_ = clock_stamp_ns;
   if (pending_batch_.has_value()) {
     const auto pending_stamp = stamp_ns(pending_batch_->header);
-    if (!pending_stamp.has_value() ||
-      clock_stamp_ns - *pending_stamp > kMaxPendingBatchClockLagNs)
-    {
+    if (!pending_stamp.has_value()) {
+      return fatal(
+        "pending raw contact batch lost its valid simulation stamp: clock_stamp_ns=" +
+        std::to_string(clock_stamp_ns));
+    }
+    const auto pending_gap_ns = clock_stamp_ns - *pending_stamp;
+    if (pending_gap_ns > kMaxPendingBatchClockLagNs) {
+      const auto diagnostic =
+        ": clock_stamp_ns=" + std::to_string(clock_stamp_ns) +
+        ", pending_stamp_ns=" + std::to_string(*pending_stamp) +
+        ", gap_ns=" + std::to_string(pending_gap_ns) +
+        ", limit_ns=" + std::to_string(kMaxPendingBatchClockLagNs);
       if (pending_batch_->semantic_fatal) {
-        return fatal("pending semantic contact failure did not reach a closing raw stamp");
+        return fatal(
+          "pending semantic contact failure did not reach a closing raw stamp" + diagnostic);
       }
-      return fatal("pending raw contact batch did not close within 220 ms of /clock");
+      return fatal(
+        "pending raw contact batch did not close within 220 ms of /clock" + diagnostic);
     }
   }
-  if (last_raw_stamp_ns_.has_value() &&
-    clock_stamp_ns - *last_raw_stamp_ns_ > kMaxRawClockLagNs)
-  {
-    return fatal("raw contact stream is more than 220 ms behind simulation clock");
+  if (last_raw_stamp_ns_.has_value()) {
+    const auto raw_gap_ns = clock_stamp_ns - *last_raw_stamp_ns_;
+    if (raw_gap_ns > kMaxRawClockLagNs) {
+      return fatal(
+        "raw contact stream is more than 220 ms behind simulation clock: clock_stamp_ns=" +
+        std::to_string(clock_stamp_ns) + ", last_raw_stamp_ns=" +
+        std::to_string(*last_raw_stamp_ns_) + ", gap_ns=" +
+        std::to_string(raw_gap_ns) + ", limit_ns=" +
+        std::to_string(kMaxRawClockLagNs));
+    }
   }
   if (!synchronized_) {
     return decision;

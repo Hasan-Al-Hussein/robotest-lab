@@ -61,6 +61,31 @@ struct ContactGateDecision
   std::string detail;
 };
 
+namespace internal
+{
+
+// A SingleThreadedExecutor reports readiness per subscription, not per queued
+// sample. Process the bounded private history before an independently queued
+// /clock callback evaluates source liveness.
+template<typename TakeReady, typename HandleReady>
+std::size_t drain_ready_raw_contacts(
+  TakeReady && take_ready,
+  HandleReady && handle_ready)
+{
+  std::size_t drained_count = 0U;
+  while (drained_count < kRawContactQosDepth) {
+    ros_gz_interfaces::msg::Contacts message;
+    if (!take_ready(message)) {
+      break;
+    }
+    handle_ready(message);
+    ++drained_count;
+  }
+  return drained_count;
+}
+
+}  // namespace internal
+
 class ContactStreamPolicy
 {
 public:

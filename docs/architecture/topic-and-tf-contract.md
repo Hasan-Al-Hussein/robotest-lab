@@ -58,8 +58,12 @@ one nonempty complete 20 ms interval aggregate; raw contacts are never bridged
 directly to the public validation topic. The gate consumes one aggregate per
 stamp, publishes complete nonempty delivered-state snapshots with strictly
 increasing stamps, and fails closed on structural, semantic, capacity, or
-liveness violations. The final velocity bridge is ROS-to-Gazebo only. Bidirectional
-bridges are not used where direction is known.
+liveness violations. Because its `/clock` reader is independently scheduled,
+the single-threaded gate processes up to the private reader's bounded depth of
+64 already-ready raw samples before evaluating a clock liveness watermark. It
+does not wait for later data or change the 20 ms source-grid and 220 ms liveness
+limits. The final velocity bridge is ROS-to-Gazebo only. Bidirectional bridges
+are not used where direction is known.
 
 ### Command ownership by phase
 

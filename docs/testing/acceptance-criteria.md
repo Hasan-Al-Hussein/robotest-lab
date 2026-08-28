@@ -65,7 +65,11 @@ Unless a scenario below overrides a value:
 - public contact snapshot source gaps are at most **0.22 simulation seconds**
   throughout the accepted interval; the gate measures source cadence from
   causally ordered finalized raw stamps and separately detects pending/raw
-  silence;
+  silence. Before applying an independently delivered `/clock` sample to that
+  liveness check, the single-threaded gate processes at most the **64** already-ready
+  private raw samples in its bounded reader history. This scheduling reconciliation
+  does not wait for future data or relax the exact **0.02** source-grid and **0.22**
+  liveness limits; an empty or insufficient ready history still fails closed;
 - passive evidence consumers retain each callback's cached `/clock` offset as
   diagnostic telemetry, not DDS transport age or an acceptance bound, because
   the contact and `/clock` subscriptions have no causal callback order; they

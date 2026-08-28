@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstdlib>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -49,13 +50,7 @@ public:
       "internal/raw_contacts",
       raw_qos,
       [this](const ros_gz_interfaces::msg::Contacts::ConstSharedPtr message) {
-        auto decision = policy_.observe(*message);
-        if (decision.output.has_value()) {
-          publisher_->publish(std::move(*decision.output));
-        }
-        if (decision.fatal) {
-          throw std::runtime_error("contact stream gate rejected input: " + decision.detail);
-        }
+        handle_raw_contact(*message);
       });
     clock_subscription_ = create_subscription<rosgraph_msgs::msg::Clock>(
       "/clock",
@@ -66,14 +61,40 @@ public:
         }
         const auto stamp_ns = static_cast<std::int64_t>(message->clock.sec) * 1000000000LL +
         static_cast<std::int64_t>(message->clock.nanosec);
+        const auto drained_ready_raw_count = drain_ready_raw_history();
         const auto decision = policy_.observe_clock(stamp_ns);
         if (decision.fatal) {
-          throw std::runtime_error("contact stream gate watchdog failed: " + decision.detail);
+          throw std::runtime_error(
+                  "contact stream gate watchdog failed: " + decision.detail +
+                  ", drained_ready_raw_count=" + std::to_string(drained_ready_raw_count));
         }
       });
   }
 
 private:
+  void handle_raw_contact(const ros_gz_interfaces::msg::Contacts & message)
+  {
+    auto decision = policy_.observe(message);
+    if (decision.output.has_value()) {
+      publisher_->publish(std::move(*decision.output));
+    }
+    if (decision.fatal) {
+      throw std::runtime_error("contact stream gate rejected input: " + decision.detail);
+    }
+  }
+
+  std::size_t drain_ready_raw_history()
+  {
+    return internal::drain_ready_raw_contacts(
+      [this](ros_gz_interfaces::msg::Contacts & message) {
+        rclcpp::MessageInfo message_info;
+        return subscription_->take(message, message_info);
+      },
+      [this](const ros_gz_interfaces::msg::Contacts & message) {
+        handle_raw_contact(message);
+      });
+  }
+
   ContactStreamPolicy policy_;
   rclcpp::Publisher<ros_gz_interfaces::msg::Contacts>::SharedPtr publisher_;
   rclcpp::Subscription<ros_gz_interfaces::msg::Contacts>::SharedPtr subscription_;

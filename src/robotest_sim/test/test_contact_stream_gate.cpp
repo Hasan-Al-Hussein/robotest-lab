@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <deque>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -102,6 +104,18 @@ ContactGateDecision observe(
   const std::vector<Pair> & pairs)
 {
   return policy.observe(message_at(stamp_ns, pairs));
+}
+
+bool take_front(
+  std::deque<ros_gz_interfaces::msg::Contacts> & messages,
+  ros_gz_interfaces::msg::Contacts & message)
+{
+  if (messages.empty()) {
+    return false;
+  }
+  message = std::move(messages.front());
+  messages.pop_front();
+  return true;
 }
 
 std::vector<Pair> normalized_output_pairs(const ContactGateDecision & decision)
@@ -510,6 +524,132 @@ TEST(ContactStreamPolicy, ClockCanDispatchAheadOfTimelyCausalHeartbeat)
   EXPECT_EQ(heartbeat.reason, ContactForwardReason::kSteadyStateHeartbeat);
   EXPECT_EQ(heartbeat.output->header.stamp.sec, 1);
   EXPECT_EQ(heartbeat.output->header.stamp.nanosec, 200000000U);
+}
+
+TEST(ContactStreamPolicy, ReadyRawHistoryClosesBeforeOvertakingClockWatchdog)
+{
+  constexpr std::int64_t clock_stamp_ns = 1260000001LL;
+
+  ContactStreamPolicy undrained;
+  EXPECT_FALSE(observe(undrained, 1000000000LL, {{kLeftWheel, kGround}}).fatal);
+  EXPECT_FALSE(observe(undrained, 1020000000LL, {{kChassis, kWall}}).fatal);
+  const auto overtaken = undrained.observe_clock(clock_stamp_ns);
+  ASSERT_TRUE(overtaken.fatal);
+  EXPECT_NE(overtaken.detail.find("clock_stamp_ns=1260000001"), std::string::npos);
+  EXPECT_NE(overtaken.detail.find("pending_stamp_ns=1020000000"), std::string::npos);
+  EXPECT_NE(overtaken.detail.find("gap_ns=240000001"), std::string::npos);
+
+  ContactStreamPolicy drained;
+  EXPECT_FALSE(observe(drained, 1000000000LL, {{kLeftWheel, kGround}}).fatal);
+  EXPECT_FALSE(observe(drained, 1020000000LL, {{kChassis, kWall}}).fatal);
+  std::deque<ros_gz_interfaces::msg::Contacts> ready;
+  for (std::int64_t stamp_ns = 1040000000LL; stamp_ns <= 1240000000LL;
+    stamp_ns += kPrivateContactAggregatePeriodNs)
+  {
+    ready.push_back(message_at(stamp_ns, {{kChassis, kWall}}));
+  }
+  std::size_t output_count = 0U;
+  std::size_t drained_count = 0U;
+  ASSERT_NO_THROW(
+    drained_count = internal::drain_ready_raw_contacts(
+      [&ready](ros_gz_interfaces::msg::Contacts & message) {
+        return take_front(ready, message);
+      },
+      [&drained, &output_count](const ros_gz_interfaces::msg::Contacts & message) {
+        const auto decision = drained.observe(message);
+        if (decision.fatal) {
+          throw std::runtime_error(decision.detail);
+        }
+        output_count += decision.output.has_value() ? 1U : 0U;
+      }));
+  EXPECT_EQ(drained_count, 11U);
+  EXPECT_TRUE(ready.empty());
+  EXPECT_GT(output_count, 0U);
+  EXPECT_FALSE(drained.observe_clock(clock_stamp_ns).fatal);
+}
+
+TEST(ContactStreamPolicy, ReadyRawDrainPreservesGenuineSilenceFailure)
+{
+  ContactStreamPolicy policy;
+  EXPECT_FALSE(observe(policy, 1000000000LL, {{kLeftWheel, kGround}}).fatal);
+  EXPECT_FALSE(observe(policy, 1020000000LL, {{kChassis, kWall}}).fatal);
+  bool handled = false;
+  const auto drained_count = internal::drain_ready_raw_contacts(
+    [](ros_gz_interfaces::msg::Contacts &) {return false;},
+    [&handled](const ros_gz_interfaces::msg::Contacts &) {handled = true;});
+  EXPECT_EQ(drained_count, 0U);
+  EXPECT_FALSE(handled);
+
+  const auto silence = policy.observe_clock(1240000001LL);
+  ASSERT_TRUE(silence.fatal);
+  EXPECT_NE(silence.detail.find("pending raw contact batch"), std::string::npos);
+  EXPECT_NE(silence.detail.find("clock_stamp_ns=1240000001"), std::string::npos);
+  EXPECT_NE(silence.detail.find("pending_stamp_ns=1020000000"), std::string::npos);
+  EXPECT_NE(silence.detail.find("gap_ns=220000001"), std::string::npos);
+  EXPECT_NE(silence.detail.find("limit_ns=220000000"), std::string::npos);
+}
+
+TEST(ContactStreamPolicy, SemanticFailureDuringReadyRawDrainFailsClosed)
+{
+  ContactStreamPolicy policy;
+  EXPECT_FALSE(observe(policy, 1000000000LL, {{kLeftWheel, kGround}}).fatal);
+  EXPECT_FALSE(observe(policy, 1020000000LL, {{kChassis, kWall}}).fatal);
+  std::deque<ros_gz_interfaces::msg::Contacts> ready;
+  ready.push_back(message_at(
+    1040000000LL, {{"box::link::collision", "wall::link::collision"}}));
+  ready.push_back(message_at(1060000000LL, {{kChassis, kWall}}));
+
+  std::string failure_detail;
+  try {
+    static_cast<void>(internal::drain_ready_raw_contacts(
+      [&ready](ros_gz_interfaces::msg::Contacts & message) {
+        return take_front(ready, message);
+      },
+      [&policy](const ros_gz_interfaces::msg::Contacts & message) {
+        const auto decision = policy.observe(message);
+        if (decision.fatal) {
+          throw std::runtime_error(decision.detail);
+        }
+      }));
+    FAIL() << "semantic failure was not propagated by the ready-raw drain";
+  } catch (const std::runtime_error & error) {
+    failure_detail = error.what();
+  }
+  EXPECT_TRUE(ready.empty());
+  EXPECT_NE(failure_detail.find("unexpected non-robot contact pair"), std::string::npos);
+}
+
+TEST(ContactStreamPolicy, ReadyRawHistoryDrainIsBoundedByPrivateQosDepth)
+{
+  std::deque<ros_gz_interfaces::msg::Contacts> ready;
+  for (std::size_t index = 0U; index <= kRawContactQosDepth; ++index) {
+    ready.push_back(message_at(
+      1000000000LL + static_cast<std::int64_t>(index) *
+      kPrivateContactAggregatePeriodNs,
+        {{kChassis, kWall}}));
+  }
+  std::vector<std::int64_t> handled_stamps;
+  const auto handle = [&handled_stamps](const ros_gz_interfaces::msg::Contacts & message) {
+      handled_stamps.push_back(
+        static_cast<std::int64_t>(message.header.stamp.sec) * 1000000000LL +
+        static_cast<std::int64_t>(message.header.stamp.nanosec));
+    };
+  const auto take = [&ready](ros_gz_interfaces::msg::Contacts & message) {
+      return take_front(ready, message);
+    };
+
+  EXPECT_EQ(internal::drain_ready_raw_contacts(take, handle), kRawContactQosDepth);
+  ASSERT_EQ(ready.size(), 1U);
+  ASSERT_EQ(handled_stamps.size(), kRawContactQosDepth);
+  EXPECT_EQ(handled_stamps.front(), 1000000000LL);
+  EXPECT_EQ(
+    handled_stamps.back(),
+    1000000000LL + static_cast<std::int64_t>(kRawContactQosDepth - 1U) *
+    kPrivateContactAggregatePeriodNs);
+
+  EXPECT_EQ(internal::drain_ready_raw_contacts(take, handle), 1U);
+  EXPECT_TRUE(ready.empty());
+  EXPECT_EQ(handled_stamps.size(), kRawContactQosDepth + 1U);
 }
 
 TEST(ContactStreamPolicy, IrregularRawProgressKeepsCausalHeartbeatWithinGap)

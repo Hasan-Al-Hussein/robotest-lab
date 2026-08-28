@@ -144,6 +144,7 @@ MAX_CONTACT_RECORDS = 128
 MAX_CONTACT_THREAD_CONTRIBUTIONS = 128
 MAX_CMDLINE_TOTAL_BYTES = 4 * 1024 * 1024
 MAX_ANCESTRY_DEPTH = 256
+MAX_FOREIGN_DIAGNOSTIC_IDENTITIES = 8
 MINIMUM_SAMPLES = 4
 
 CANDIDATE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
@@ -255,6 +256,14 @@ class ProcessDisappearedError(ProfileError):
         self.pid = pid
 
 
+class ProcessParentChangedError(ProfileError):
+    """A structured PPID-only transition preserving the affected PID."""
+
+    def __init__(self, pid: int, label: str) -> None:
+        super().__init__('identity_changed', f'{label} ancestry changed')
+        self.pid = pid
+
+
 @dataclass(frozen=True)
 class ProcStat:
     """Fields consumed from one Linux ``/proc/*/stat`` record."""
@@ -298,6 +307,8 @@ class LatchedProcess:
 
     pid: int
     start_ticks: int
+    process_group: int
+    session: int
     comm: str
     cmdline: list[str]
     cmdline_sha256: str
@@ -1052,6 +1063,17 @@ def _stat_context(process: ProcStat) -> tuple[int, int, int, int, int]:
     )
 
 
+def _only_parent_changed(before: ProcStat, after: ProcStat) -> bool:
+    return (
+        before.pid == after.pid
+        and before.start_ticks == after.start_ticks
+        and before.process_group == after.process_group
+        and before.session == after.session
+        and before.comm == after.comm
+        and before.ppid != after.ppid
+    )
+
+
 def _read_stable_process_stat(proc_root: Path, pid: int, label: str) -> ProcStat:
     """Bracket one ancestry read so reparenting and PID reuse fail closed."""
     try:
@@ -1062,6 +1084,8 @@ def _read_stable_process_stat(proc_root: Path, pid: int, label: str) -> ProcStat
     if not _same_process(before, after):
         raise ProfileError('pid_reuse', f'{label} PID {pid} was reused')
     if _stat_context(before) != _stat_context(after):
+        if _only_parent_changed(before, after):
+            raise ProcessParentChangedError(pid, label)
         raise ProfileError('identity_changed', f'{label} ancestry changed')
     return after
 
@@ -1251,6 +1275,8 @@ def _process_descends_from_smoke_runner(
         if stable.start_ticks != current.start_ticks:
             raise ProfileError('pid_reuse', f'matching PID {current.pid} was reused')
         if _stat_context(stable) != _stat_context(current):
+            if _only_parent_changed(current, stable):
+                raise ProcessParentChangedError(current.pid, 'matching process')
             raise ProfileError('identity_changed', 'matching process ancestry changed')
         current = stable
         identity = (current.pid, current.start_ticks)
@@ -1265,6 +1291,8 @@ def _process_descends_from_smoke_runner(
         parent = _read_stable_process_stat(proc_root, current.ppid, 'matching process ancestor')
         child_after = _read_stable_process_stat(proc_root, child.pid, 'matching process')
         if _stat_context(child_after) != _stat_context(child):
+            if _only_parent_changed(child, child_after):
+                raise ProcessParentChangedError(child.pid, 'matching process')
             raise ProfileError('identity_changed', 'matching process ancestry changed')
         current = parent
     raise ProfileError('overflow', 'matching process ancestry exceeds 256 processes')
@@ -1285,6 +1313,166 @@ def _discovered_process_ended_after_ancestry_failure(
     if not _same_process(current, observed):
         raise ProfileError('pid_reuse', f'matching PID {observed.pid} was reused')
     return current.state in TERMINAL_PROCESS_STATES
+
+
+def _reparented_command_identity(proc_root: Path, pid: int) -> dict[str, Any]:
+    """Preserve command-read ENOENT so the caller can prove a terminal race."""
+    try:
+        return _command_identity(proc_root, pid)
+    except FileNotFoundError as exc:
+        raise ProcessDisappearedError(pid, 'reparented matching process') from exc
+    except ProfileError as exc:
+        if exc.kind != 'missing_identity' or not isinstance(exc.__cause__, FileNotFoundError):
+            raise
+        raise ProcessDisappearedError(pid, 'reparented matching process') from exc
+
+
+def _validate_latched_process_stat_identity(observed: ProcStat, latched: LatchedProcess) -> None:
+    if observed.start_ticks != latched.start_ticks:
+        raise ProfileError('pid_reuse', f'latched PID {observed.pid} was reused')
+    if observed.process_group != latched.process_group or observed.session != latched.session:
+        raise ProfileError(
+            'identity_changed',
+            f'latched PID {observed.pid} process group or session changed after reparenting',
+        )
+    if observed.comm != latched.comm:
+        raise ProfileError('identity_changed', f'latched PID {observed.pid} command name changed')
+
+
+def _validate_latched_process_identity(
+    proc_root: Path,
+    config: ProfileConfig,
+    observed: ProcStat,
+    latched: LatchedProcess,
+) -> None:
+    """Revalidate every immutable identity except the intentionally mutable PPID."""
+    if latched.ended_sample is not None:
+        raise ProfileError('identity_changed', f'ended PID {observed.pid} became live')
+    _validate_latched_process_stat_identity(observed, latched)
+    command = _reparented_command_identity(proc_root, observed.pid)
+    try:
+        environment = _bounded_proc_read(
+            proc_root / str(observed.pid) / 'environ',
+            ENVIRON_MAX_BYTES,
+            'reparented proc environ',
+        )
+    except FileNotFoundError as exc:
+        raise ProcessDisappearedError(observed.pid, 'reparented matching process') from exc
+    after = _read_stable_process_stat(proc_root, observed.pid, 'reparented matching process')
+    _validate_latched_process_stat_identity(after, latched)
+    if after.state in TERMINAL_PROCESS_STATES:
+        raise ProcessDisappearedError(observed.pid, 'reparented matching process')
+    if (
+        command['cmdline_sha256'] != latched.cmdline_sha256
+        or command['cmdline_size_bytes'] != latched.cmdline_size_bytes
+        or command['executable_link'] != latched.executable_link
+    ):
+        raise ProfileError(
+            'identity_changed',
+            f'latched PID {observed.pid} command identity changed after reparenting',
+        )
+    if not has_exact_environment(environment, config.ros_domain_id, config.gz_partition):
+        raise ProfileError(
+            'identity_changed', f'latched PID {observed.pid} changed isolation identity'
+        )
+
+
+def _latched_process_survived_reparenting(
+    proc_root: Path,
+    config: ProfileConfig,
+    observed: ProcStat,
+    latched: LatchedProcess | None,
+) -> bool:
+    """Keep tracking one proven target after only its parent ancestry changes."""
+    if latched is None:
+        return False
+    _validate_latched_process_identity(proc_root, config, observed, latched)
+    return True
+
+
+def _reclassify_latched_process_once(
+    proc_root: Path,
+    config: ProfileConfig,
+    observed: ProcStat,
+    latched: LatchedProcess,
+    owner: SmokeRunnerOwner,
+) -> bool | None:
+    """Resolve one ancestry race once; return ``None`` only for a proven end."""
+    try:
+        fresh = _read_stable_process_stat(proc_root, observed.pid, 'revalidated matching process')
+    except ProcessDisappearedError as exc:
+        if _discovered_process_ended_after_ancestry_failure(proc_root, observed, exc):
+            return None
+        raise
+    _validate_latched_process_stat_identity(fresh, latched)
+    if fresh.state in TERMINAL_PROCESS_STATES:
+        return None
+
+    descends_from_owner = _process_descends_from_smoke_runner(proc_root, fresh, owner)
+    try:
+        if descends_from_owner:
+            _validate_latched_process_identity(proc_root, config, fresh, latched)
+        else:
+            _latched_process_survived_reparenting(proc_root, config, fresh, latched)
+    except ProcessDisappearedError as exc:
+        if _discovered_process_ended_after_ancestry_failure(proc_root, fresh, exc):
+            return None
+        raise
+    return True
+
+
+def _classify_matching_process(
+    proc_root: Path,
+    config: ProfileConfig,
+    observed: ProcStat,
+    latched: LatchedProcess | None,
+    owner: SmokeRunnerOwner,
+) -> bool | None:
+    """Classify one exact-isolation process with at most one ancestry retry."""
+    try:
+        descends_from_owner = _process_descends_from_smoke_runner(proc_root, observed, owner)
+    except (ProcessDisappearedError, ProcessParentChangedError) as exc:
+        if latched is None or latched.ended_sample is not None:
+            raise
+        _validate_latched_process_stat_identity(observed, latched)
+        if isinstance(exc, ProcessDisappearedError) and exc.pid == observed.pid:
+            if _discovered_process_ended_after_ancestry_failure(proc_root, observed, exc):
+                return None
+            raise
+        retryable = isinstance(exc, ProcessDisappearedError) or (
+            isinstance(exc, ProcessParentChangedError) and exc.pid != owner.pid
+        )
+        if not retryable:
+            raise
+        return _reclassify_latched_process_once(proc_root, config, observed, latched, owner)
+    if descends_from_owner:
+        return True
+    try:
+        return _latched_process_survived_reparenting(proc_root, config, observed, latched)
+    except ProcessDisappearedError as exc:
+        if (
+            latched is not None
+            and latched.ended_sample is None
+            and latched.start_ticks == observed.start_ticks
+            and _discovered_process_ended_after_ancestry_failure(proc_root, observed, exc)
+        ):
+            return None
+        raise
+
+
+def _foreign_matching_message(processes: Sequence[ProcStat]) -> str:
+    selected = processes[:MAX_FOREIGN_DIAGNOSTIC_IDENTITIES]
+    identities = '; '.join(
+        f'pid={item.pid},start={item.start_ticks},ppid={item.ppid},'
+        f'pgid={item.process_group},sid={item.session}'
+        for item in selected
+    )
+    omitted = len(processes) - len(selected)
+    suffix = '' if omitted == 0 else f'; omitted={omitted}'
+    return (
+        'exact candidate isolation is shared outside the smoke runner process tree: '
+        f'{identities}{suffix}'
+    )
 
 
 def collect_anchor(
@@ -1361,6 +1549,8 @@ def _latch(proc_root: Path, pid: int, process_stat: ProcStat, index: int) -> Lat
     return LatchedProcess(
         pid=pid,
         start_ticks=process_stat.start_ticks,
+        process_group=process_stat.process_group,
+        session=process_stat.session,
         comm=process_stat.comm,
         cmdline=command['cmdline'],
         cmdline_sha256=command['cmdline_sha256'],
@@ -1482,38 +1672,29 @@ def _capture_sample(
         else:
             _revalidate_smoke_runner_owner(proc_root, state.smoke_runner_owner)
     target_matching: list[tuple[int, ProcStat]] = []
-    foreign_matching: list[int] = []
+    foreign_matching: list[ProcStat] = []
     ancestry_vanished = 0
     owner = state.smoke_runner_owner
     if matching and owner is None:
         raise ProfileError('missing_identity', 'smoke runner owner was not latched')
     for pid, process_stat in matching:
         assert owner is not None
-        try:
-            descends_from_owner = _process_descends_from_smoke_runner(
-                proc_root, process_stat, owner
-            )
-        except ProcessDisappearedError as exc:
-            latched = state.processes.get(pid)
-            if (
-                latched is None
-                or latched.start_ticks != process_stat.start_ticks
-                or latched.ended_sample is not None
-            ):
-                raise
-            if not _discovered_process_ended_after_ancestry_failure(proc_root, process_stat, exc):
-                raise
+        classification = _classify_matching_process(
+            proc_root,
+            config,
+            process_stat,
+            state.processes.get(pid),
+            owner,
+        )
+        if classification is None:
             ancestry_vanished += 1
             continue
-        if descends_from_owner:
+        if classification:
             target_matching.append((pid, process_stat))
         else:
-            foreign_matching.append(pid)
+            foreign_matching.append(process_stat)
     if foreign_matching:
-        raise ProfileError(
-            'missing_identity',
-            'exact candidate isolation is shared outside the smoke runner process tree',
-        )
+        raise ProfileError('missing_identity', _foreign_matching_message(foreign_matching))
     matching_by_pid = dict(target_matching)
     for pid, process in state.processes.items():
         try:

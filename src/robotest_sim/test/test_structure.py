@@ -328,6 +328,36 @@ def test_contact_aggregator_avoids_unbounded_raw_message_staging() -> None:
     assert 'gz::msgs::Contacts aggregate' not in post_update
 
 
+def test_contact_gate_drains_bounded_ready_raw_history_before_clock_watchdog() -> None:
+    header = (PACKAGE / 'include' / 'robotest_sim' / 'contact_stream_gate.hpp').read_text(
+        encoding='utf-8'
+    )
+    node = (PACKAGE / 'src' / 'contact_stream_gate_node.cpp').read_text(encoding='utf-8')
+    drain_helper = header.split('std::size_t drain_ready_raw_contacts(', 1)[1].split(
+        '}  // namespace internal', 1
+    )[0]
+    drain_method = node.split('  std::size_t drain_ready_raw_history()', 1)[1].split(
+        '  ContactStreamPolicy policy_;', 1
+    )[0]
+    raw_callback = node.split(
+        '    subscription_ = create_subscription<ros_gz_interfaces::msg::Contacts>', 1
+    )[1].split('    clock_subscription_ = create_subscription', 1)[0]
+    clock_callback = node.split('    clock_subscription_ = create_subscription', 1)[1].split(
+        '      });', 1
+    )[0]
+
+    assert 'drained_count < kRawContactQosDepth' in drain_helper
+    assert 'if (!take_ready(message))' in drain_helper
+    assert drain_helper.index('take_ready(message)') < drain_helper.index('handle_ready(message)')
+    assert 'handle_raw_contact(*message)' in raw_callback
+    assert 'subscription_->take(message, message_info)' in drain_method
+    assert 'handle_raw_contact(message)' in drain_method
+    assert clock_callback.index('drain_ready_raw_history()') < clock_callback.index(
+        'policy_.observe_clock(stamp_ns)'
+    )
+    assert 'drained_ready_raw_count=' in clock_callback
+
+
 def test_contact_aggregator_revalidates_locked_inventory_only_on_ecm_events() -> None:
     system = (PACKAGE / 'src' / 'contact_aggregator_system.cpp').read_text(encoding='utf-8')
     policy = (PACKAGE / 'src' / 'contact_aggregator.cpp').read_text(encoding='utf-8')
