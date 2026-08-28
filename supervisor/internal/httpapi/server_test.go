@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hasanahmed/robotest-lab/supervisor/internal/supervisor"
+	"github.com/Hasan-Al-Hussein/robotest-lab/supervisor/internal/supervisor"
 )
 
 type fakeSource struct{ ready bool }

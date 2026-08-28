@@ -1,6 +1,6 @@
 #!/usr/bin/make -f
 
-export DH_GOLANG_BUILDPKG := github.com/hasanahmed/robotest-lab/supervisor/cmd/robotest-supervisor
+export DH_GOLANG_BUILDPKG := github.com/Hasan-Al-Hussein/robotest-lab/supervisor/cmd/robotest-supervisor
 export GOFLAGS := -trimpath -buildvcs=false
 
 %:

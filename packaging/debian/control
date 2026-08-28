@@ -8,7 +8,10 @@ Build-Depends:
  golang-any,
 Standards-Version: 4.7.3
 Rules-Requires-Root: no
-XS-Go-Import-Path: github.com/hasanahmed/robotest-lab/supervisor
+Homepage: https://github.com/Hasan-Al-Hussein/robotest-lab
+Vcs-Browser: https://github.com/Hasan-Al-Hussein/robotest-lab
+Vcs-Git: https://github.com/Hasan-Al-Hussein/robotest-lab.git
+XS-Go-Import-Path: github.com/Hasan-Al-Hussein/robotest-lab/supervisor
 
 Package: robotest-supervisor
 Architecture: any

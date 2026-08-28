@@ -17,7 +17,8 @@ record the resolved version.
 
 ## Change workflow
 
-1. Work on a focused branch using the `codex/` prefix.
+1. Work on a focused branch with a short descriptive name, such as
+   `feature/<topic>` or `fix/<topic>`.
 2. Keep each commit coherent and use an imperative commit subject.
 3. Add or update tests with behavior changes.
 4. Run the narrowest relevant verifier while iterating.

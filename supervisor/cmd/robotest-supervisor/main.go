@@ -13,9 +13,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/hasanahmed/robotest-lab/supervisor/internal/config"
-	"github.com/hasanahmed/robotest-lab/supervisor/internal/httpapi"
-	"github.com/hasanahmed/robotest-lab/supervisor/internal/supervisor"
+	"github.com/Hasan-Al-Hussein/robotest-lab/supervisor/internal/config"
+	"github.com/Hasan-Al-Hussein/robotest-lab/supervisor/internal/httpapi"
+	"github.com/Hasan-Al-Hussein/robotest-lab/supervisor/internal/supervisor"
 )
 
 func main() {

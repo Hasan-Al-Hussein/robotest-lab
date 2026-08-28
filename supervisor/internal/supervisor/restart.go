@@ -6,7 +6,7 @@ package supervisor
 import (
 	"time"
 
-	"github.com/hasanahmed/robotest-lab/supervisor/internal/config"
+	"github.com/Hasan-Al-Hussein/robotest-lab/supervisor/internal/config"
 )
 
 // RestartTracker owns the bounded rolling failure window for one child.

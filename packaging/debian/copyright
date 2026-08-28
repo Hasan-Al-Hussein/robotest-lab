@@ -1,6 +1,7 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: RoboTest Supervisor
 Upstream-Contact: Hasan Ahmed <200383997+Hasan-Al-Hussein@users.noreply.github.com>
+Source: https://github.com/Hasan-Al-Hussein/robotest-lab
 
 Files: *
 Copyright: 2026 Hasan Ahmed

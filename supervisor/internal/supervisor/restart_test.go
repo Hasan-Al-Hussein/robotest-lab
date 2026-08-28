@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hasanahmed/robotest-lab/supervisor/internal/config"
+	"github.com/Hasan-Al-Hussein/robotest-lab/supervisor/internal/config"
 )
 
 func restartPolicy() config.RestartPolicy {

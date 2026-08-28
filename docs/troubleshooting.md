@@ -38,9 +38,12 @@ git rev-parse HEAD
 findmnt -T /home/hasan/robotest-lab
 ```
 
-The expected branch is `codex/robotest-lab-build`, and the repository must be
-on the WSL-native filesystem. A candidate, package, or release gate that
-requires a clean commit must stop on any tracked, untracked,
+A fresh public clone normally starts on the default `main` branch. Work on a
+different branch or detached candidate is valid only when it is deliberately
+selected and its exact `git rev-parse HEAD` value is recorded; the immutable
+SHA, not a mutable branch label, identifies qualification evidence. The
+repository must remain on the WSL-native filesystem. A candidate, package, or
+release gate that requires a clean commit must stop on any tracked, untracked,
 `assume-unchanged`, or `skip-worktree` source delta.
 
 ## Understand the exit before changing anything

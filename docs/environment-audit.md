@@ -36,7 +36,7 @@ The terms in this document are deliberate:
 | WSLg | `1.0.73.2` |
 | Default distribution | `Ubuntu-20.04` |
 | Default WSL version | 2 |
-| Host `.wslconfig` | Absent at `C:\Users\hp\.wslconfig` |
+| Host `.wslconfig` | Absent at `%UserProfile%\.wslconfig` |
 | Observed networking mode | NAT |
 
 Initial distribution state from `wsl.exe --list --verbose`:
