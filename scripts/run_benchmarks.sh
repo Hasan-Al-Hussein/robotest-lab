@@ -10,6 +10,11 @@ SCRIPT_PATH="$(readlink -f -- "$0")"
 WORKSPACE="$(cd -- "$(dirname -- "$SCRIPT_PATH")/.." && pwd -P)"
 ROBOTEST_CPUSET="${ROBOTEST_CPUSET:-0-5}"
 
+if [[ "$#" -eq 1 && ( "$1" == '--help' || "$1" == '-h' ) ]]; then
+  exec python3 "$WORKSPACE/tests/phase3_benchmark_runner.py" \
+    --workspace "$WORKSPACE" "$1"
+fi
+
 if [[ "$ROBOTEST_CPUSET" != "0-5" ]]; then
   echo 'Phase 3 candidate execution is frozen to ROBOTEST_CPUSET=0-5' >&2
   exit 2

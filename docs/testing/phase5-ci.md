@@ -43,6 +43,10 @@ command logs and a summary that explicitly records that Gazebo, hardware,
 systemd, Phase 3 campaign execution, and Phase 4 apply execution were not
 started.
 
+The pre-build Phase 3 and Phase 4 interface probes are help-only source checks.
+They do not require an installed workspace overlay; every non-help Phase 3
+benchmark mode retains the frozen CPU and repository-overlay requirements.
+
 The temporary build completes before the pure-Python stage. The gate passes
 that exact install root to release-fixture tests without sourcing the overlay;
 the overlay is sourced only for the subsequent package-test and CLI checks.

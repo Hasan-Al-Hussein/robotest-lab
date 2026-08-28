@@ -787,6 +787,49 @@ def test_phase5_script_has_no_implicit_mode() -> None:
     assert 'never start Gazebo' in help_result.stdout
 
 
+@pytest.mark.parametrize('help_flag', ['--help', '-h'])
+def test_phase3_campaign_help_is_source_only(help_flag: str) -> None:
+    script = REPOSITORY / 'scripts/run_benchmarks.sh'
+    script_text = script.read_text(encoding='utf-8')
+    help_fast_path = script_text.index('if [[ "$#" -eq 1 &&')
+    cpuset_guard = script_text.index('if [[ "$ROBOTEST_CPUSET" != "0-5" ]]')
+    install_guard = script_text.index('if [[ ! -f "$WORKSPACE/install/setup.bash" ]]')
+    assert help_fast_path < cpuset_guard < install_guard
+
+    environment = os.environ.copy()
+    environment['ROBOTEST_CPUSET'] = 'invalid-for-runtime'
+    result = subprocess.run(
+        ['bash', str(script), help_flag],
+        cwd=REPOSITORY,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ''
+    assert 'usage: phase3_benchmark_runner.py' in result.stdout
+    for mode in ('prepare', 'positive-control', 'smoke', 'campaign'):
+        assert mode in result.stdout
+
+
+def test_phase3_campaign_runtime_still_enforces_frozen_cpuset() -> None:
+    script = REPOSITORY / 'scripts/run_benchmarks.sh'
+    environment = os.environ.copy()
+    environment['ROBOTEST_CPUSET'] = 'invalid-for-runtime'
+    result = subprocess.run(
+        ['bash', str(script), '--mode', 'prepare'],
+        cwd=REPOSITORY,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert result.stdout == ''
+    assert result.stderr == 'Phase 3 candidate execution is frozen to ROBOTEST_CPUSET=0-5\n'
+
+
 def test_release_fixture_install_root_uses_explicit_absolute_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
