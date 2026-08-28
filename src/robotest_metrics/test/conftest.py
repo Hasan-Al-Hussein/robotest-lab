@@ -1007,7 +1007,10 @@ def complete_request() -> dict[str, Any]:
         },
         'targets': {
             'waypoint_count': 2,
-            'waypoints': [{'x_m': 1.0, 'y_m': 0.0}, {'x_m': 1.8, 'y_m': 0.0}],
+            'waypoints': [
+                {'x': 1.0, 'y': 0.0, 'yaw': 0.0},
+                {'x': 1.8, 'y': 0.0, 'yaw': 0.0},
+            ],
         },
         'verdict': {
             'exit_code': 0,

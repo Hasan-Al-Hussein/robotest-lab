@@ -58,9 +58,21 @@ gates. A required measurement with a failed quality gate is null with an
 explicit reason; it is never computed from the remaining prefix and presented
 as complete.
 
-CSV is a flattened one-row-per-run comparison view. Column names include units,
-for example `completion_time_sim_s`, `actual_path_length_m`, and
-`peak_rss_sum_mib`. Null JSON values become blank CSV fields, never zero.
+CSV is a bounded, flattened one-row-per-run comparison view. Scalar leaves are
+retained directly; null JSON values become blank CSV fields, never zero. Every
+JSON array is represented by a canonical descriptor containing kind
+`sequence`, its element count, and the SHA-256 of the complete canonical array.
+The reserved root columns `__robotest_projection_contract` and
+`__robotest_canonical_json_sha256` bind the row to projection contract
+`bounded_scalar_summary_v1` and to the complete canonical JSON. The CSV never
+duplicates raw sequence payloads. Scalar column names include units, for
+example `completion_time_sim_s`, `actual_path_length_m`, and
+`peak_rss_sum_mib`.
+
+This bounded projection contract applies only to per-run `run-result.csv`.
+`aggregate-result.csv` retains the existing complete dotted-key flattening,
+including canonical JSON text for arrays, for Phase 3/Phase 5 replay
+compatibility; its writer is a separate API from the per-run writer.
 
 ## Source-of-truth table
 
@@ -193,6 +205,12 @@ action-feedback transition to `current_waypoint=k`. A later leg ends at the
 next valid transition, and the final leg ends at `T_terminal`. Feedback indices
 must start at 0, remain in range, and advance monotonically without skipping an
 index. Same-index feedback repetitions do not create a new leg.
+
+Configured mission waypoints have exactly the canonical fields `{x, y, yaw}`.
+The analyzer validates finite numeric values and converts `x`/`y` once to its
+internal metre-suffixed pose representation. Unit-suffixed `{x_m, y_m}`
+configured waypoints, extra fields, booleans, and numeric strings are rejected;
+only captured `nav_msgs/msg/Path` poses use `x_m`/`y_m` internally.
 
 A `nav_msgs/msg/Path` is valid only when it:
 
@@ -365,6 +383,12 @@ closed.
 The complete positive-control fixture, including preparation, runtime gate,
 ARM wait, fresh-clock wait, motion, release, and cleanup, shares one 30 s
 steady-wall deadline. READY, ARM, and ARMED never start or reset a deadline.
+The start-pose sample may predate fixture spawn. Its recorded alignment error
+reconstructs the clock stamp at which start verification completed, which must
+satisfy
+`max(spawn response, wall observation, start sample) <= verified start <= first control`.
+It is not required to equal the later first-control stamp because READY and ARM
+occur between preparation and motion.
 
 Actuator-facing `cmd_vel` endpoints remain RELIABLE, VOLATILE, and
 KEEP_LAST(1). The independent metrics observer alone uses a bounded
@@ -648,6 +672,15 @@ inputs to that result, not independent PASS authorities. The process exit code,
 flattened CSV, and report must agree with `run-result.json`; any disagreement or
 artifact-finalization failure makes the trial fail. Aggregate reports consume
 only those 15 canonical run results.
+
+If primary artifact finalization fails, the analyzer does not copy the possibly
+oversized computed result into its failure path. It composes a fresh, compact,
+immutable-trial-context-bound result with null measurements, bounded failure
+evidence, explicit `quality.artifact_finalization` status `FAIL`, and exit code
+31, then uses the same JSON/CSV/manifest finalization path without charts. The
+replacement result's `artifact_projection_preflight` remains `PASS`: it records
+the successful preflight of that compact canonical replacement, not the failed
+primary result described by `quality.artifact_finalization`.
 
 An aggregate group requires identical scenario, target-set, metrics-contract,
 collector, source/configuration, collision-coverage, and positive-control

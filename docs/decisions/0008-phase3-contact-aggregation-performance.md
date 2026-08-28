@@ -143,6 +143,24 @@ the smoke, never controls a ROS or Gazebo process, and writes immutable
 canonical evidence plus a GNU-style sidecar below
 `artifacts/evidence/phase3/performance-profiles/`:
 
+The plugin's profile record schema is version 2. Every PASS record retains
+sorted, unique, cumulative per-Linux-TID contributions and exact aggregate
+totals for all five timing buckets plus observation, rescan, and publication
+counts. Callback migration therefore adds a contributor instead of disabling
+measurement or restarting the five-simulation-second cadence. The host profile
+binds every contributing TID through the plural `host_thread_bindings` array to
+one sampled thread identity in the exact DSO host; a missing, reused, foreign,
+or unsampled identity rejects the profile.
+
+Profiler failures are explicit bounded schema-v2 FAIL records on the retained
+stderr stream. Clock, identity, contribution-cap, counter, category, and output
+failures latch and retry emission until the stream confirms the write; they
+cannot silently disable profiling. At most 128 cumulative contact records and
+128 contributor identities are accepted. Host sampling permits at most 512
+live threads per atomic sample, 524,288 retained thread records, and a 256 MiB
+canonical profile. A sample that would exceed a bound is rejected before any
+sample or thread counter mutates.
+
 ```bash
 CANDIDATE_ID=phase3-candidate-001
 DOMAIN_BASE=100

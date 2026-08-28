@@ -33,6 +33,10 @@ from robotest_metrics.constants import (
 )
 from robotest_metrics.errors import ArtifactError
 
+CSV_PROJECTION_CONTRACT = 'bounded_scalar_summary_v1'
+CSV_PROJECTION_CONTRACT_COLUMN = '__robotest_projection_contract'
+CSV_PROJECTION_JSON_SHA256_COLUMN = '__robotest_canonical_json_sha256'
+
 
 def canonical_json_bytes(document: Any, *, trailing_newline: bool = True) -> bytes:
     """Serialize strict JSON with stable ordering and no non-finite extension values."""
@@ -141,8 +145,18 @@ def _csv_scalar(value: Any) -> str:
     return canonical_json_bytes(value, trailing_newline=False).decode('utf-8')
 
 
+def _csv_sequence_descriptor(value: list[Any] | tuple[Any, ...]) -> str:
+    return _csv_scalar(
+        {
+            'element_count': len(value),
+            'kind': 'sequence',
+            'sha256': canonical_sha256(value),
+        }
+    )
+
+
 def flatten_document(document: Mapping[str, Any]) -> dict[str, str]:
-    """Create a deterministic dotted-key, scalar-string CSV projection."""
+    """Create a deterministic dotted-key, scalar-string projection."""
     flattened: dict[str, str] = {}
 
     def visit(prefix: str, value: Any) -> None:
@@ -160,14 +174,72 @@ def flatten_document(document: Mapping[str, Any]) -> dict[str, str]:
     return flattened
 
 
-def one_row_csv_bytes(document: Mapping[str, Any]) -> bytes:
-    """Encode the complete flattened projection as one RFC-compatible CSV row."""
-    projection = flatten_document(document)
+def scalar_summary_projection(document: Mapping[str, Any]) -> dict[str, str]:
+    """Create the bounded scalar-summary CSV projection of a canonical document."""
+    if not document:
+        raise ArtifactError('CSV projection root must be a non-empty object')
+    reserved = {
+        CSV_PROJECTION_CONTRACT_COLUMN,
+        CSV_PROJECTION_JSON_SHA256_COLUMN,
+    }
+    if any(key in document for key in reserved):
+        raise ArtifactError('CSV projection root uses a reserved column name')
+    flattened: dict[str, str] = {
+        CSV_PROJECTION_CONTRACT_COLUMN: CSV_PROJECTION_CONTRACT,
+        CSV_PROJECTION_JSON_SHA256_COLUMN: canonical_sha256(document),
+    }
+
+    def visit(prefix: str, value: Any) -> None:
+        if isinstance(value, Mapping) and value:
+            for key in sorted(value):
+                if not isinstance(key, str) or not key:
+                    raise ArtifactError('CSV projection keys must be non-empty strings')
+                visit(f'{prefix}.{key}' if prefix else key, value[key])
+            return
+        if not prefix:
+            raise ArtifactError('CSV projection root must be a non-empty object')
+        if prefix in flattened:
+            raise ArtifactError(f'CSV projection column collision at {prefix!r}')
+        flattened[prefix] = (
+            _csv_sequence_descriptor(value)
+            if isinstance(value, (list, tuple))
+            else _csv_scalar(value)
+        )
+
+    visit('', document)
+    return flattened
+
+
+def _one_row_projection_bytes(projection: Mapping[str, str]) -> bytes:
     output = io.StringIO(newline='')
     writer = csv.DictWriter(output, fieldnames=sorted(projection), lineterminator='\n')
     writer.writeheader()
     writer.writerow(projection)
     return output.getvalue().encode('utf-8')
+
+
+def one_row_csv_bytes(document: Mapping[str, Any]) -> bytes:
+    """Encode the bounded per-run scalar-summary projection as one CSV row."""
+    return _one_row_projection_bytes(scalar_summary_projection(document))
+
+
+def legacy_flattened_one_row_csv_bytes(document: Mapping[str, Any]) -> bytes:
+    """Encode the complete legacy flattened projection used by aggregate CSV."""
+    return _one_row_projection_bytes(flatten_document(document))
+
+
+def _write_csv_payload_atomic(
+    payload: bytes,
+    path: str | Path,
+    maximum_bytes: int,
+) -> dict[str, Any]:
+    destination = Path(path)
+    byte_count = _atomic_write_bytes(destination, payload, maximum_bytes)
+    return {
+        'bytes': byte_count,
+        'path': str(destination),
+        'sha256': hashlib.sha256(payload).hexdigest(),
+    }
 
 
 def write_csv_atomic(
@@ -176,15 +248,22 @@ def write_csv_atomic(
     *,
     maximum_bytes: int = PER_RUN_CSV_MAX_BYTES,
 ) -> dict[str, Any]:
-    """Write the one-row CSV projection atomically."""
-    payload = one_row_csv_bytes(document)
-    destination = Path(path)
-    byte_count = _atomic_write_bytes(destination, payload, maximum_bytes)
-    return {
-        'bytes': byte_count,
-        'path': str(destination),
-        'sha256': hashlib.sha256(payload).hexdigest(),
-    }
+    """Write the bounded per-run scalar-summary CSV projection atomically."""
+    return _write_csv_payload_atomic(one_row_csv_bytes(document), path, maximum_bytes)
+
+
+def write_legacy_flattened_csv_atomic(
+    document: Mapping[str, Any],
+    path: str | Path,
+    *,
+    maximum_bytes: int,
+) -> dict[str, Any]:
+    """Write the complete legacy flattened aggregate CSV atomically."""
+    return _write_csv_payload_atomic(
+        legacy_flattened_one_row_csv_bytes(document),
+        path,
+        maximum_bytes,
+    )
 
 
 def validate_csv_projection(document: Mapping[str, Any], path: str | Path) -> None:

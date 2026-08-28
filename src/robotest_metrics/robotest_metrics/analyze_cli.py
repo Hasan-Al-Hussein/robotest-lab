@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import sys
 from collections.abc import Mapping, Sequence
@@ -40,6 +39,7 @@ from robotest_metrics.constants import PER_RUN_JSON_MAX_BYTES
 from robotest_metrics.errors import ArtifactError, MetricUnavailable
 from robotest_metrics.failure_results import (
     automatic_failure,
+    compose_artifact_finalization_failure,
     compose_infrastructure_failure,
     require_request_context_binding,
     validate_trial_context,
@@ -81,18 +81,6 @@ def _load_document(path: Path, name: str) -> Mapping[str, Any]:
     if not isinstance(document, Mapping):
         raise ArtifactError(f'{name} root must be an object')
     return document
-
-
-def _failed_result(result: Mapping[str, Any], reason: str) -> dict[str, Any]:
-    failed = copy.deepcopy(dict(result))
-    failed['events'] = []
-    quality = failed.setdefault('quality', {})
-    quality['artifact_finalization'] = {'reason': reason, 'status': 'FAIL'}
-    verdict = failed.setdefault('verdict', {})
-    verdict['automated_status'] = 'FAIL'
-    verdict['exit_code'] = 31
-    verdict['reason'] = 'artifact_finalization_failed'
-    return failed
 
 
 def _stale_outputs(output: Path) -> list[Path]:
@@ -237,8 +225,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.output_dir,
             include_charts=not infrastructure_failure,
         )
-    except ArtifactError as exc:
-        failed = _failed_result(result, str(exc))
+    except (ArtifactError, OSError) as exc:
+        reason = str(exc)
+        evidence_path = arguments.input or arguments.trial_context
+        failed = compose_artifact_finalization_failure(
+            context,
+            evidence_sha256=_failure_evidence_sha256(
+                evidence_path,
+                'artifact_finalization',
+                reason,
+            ),
+            reason=reason,
+        )
         try:
             _remove_retry_artifacts(arguments.output_dir)
             validate_document(failed, 'run-result.schema.json')
@@ -247,7 +245,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 arguments.output_dir,
                 include_charts=False,
             )
-        except ArtifactError as nested:
+        except (ArtifactError, MetricUnavailable, OSError) as nested:
             print(f'cannot finalize failed canonical verdict: {nested}', file=sys.stderr)
         print(f'metrics analysis artifact failure: {exc}', file=sys.stderr)
         return 31

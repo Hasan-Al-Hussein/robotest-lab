@@ -136,11 +136,17 @@ std::optional<std::uint64_t> thread_cpu_time_ns() noexcept
          static_cast<std::uint64_t>(value.tv_nsec);
 }
 
+std::int64_t linux_thread_id() noexcept
+{
+  static thread_local const auto linux_tid =
+    static_cast<std::int64_t>(::syscall(SYS_gettid));
+  return linux_tid;
+}
+
 std::optional<ThreadCpuTimingStart> thread_cpu_timing_start() noexcept
 {
   const auto cpu_time_ns = thread_cpu_time_ns();
-  static thread_local const auto linux_tid =
-    static_cast<std::int64_t>(::syscall(SYS_gettid));
+  const auto linux_tid = linux_thread_id();
   if (!cpu_time_ns.has_value() || linux_tid <= 0) {
     return std::nullopt;
   }
@@ -285,6 +291,9 @@ public:
     const gz::sim::UpdateInfo & info,
     const gz::sim::EntityComponentManager & ecm) override
   {
+    if (profile_.failure_pending()) {
+      emit_contact_profile_if_due(simulation_stamp_ns(info));
+    }
     if (fatal_latched_ || !bindings_locked_) {
       return;
     }
@@ -292,6 +301,9 @@ public:
     try {
       if (profile_.enabled()) {
         post_update_profiled(info, ecm);
+        if (profile_.failure_pending()) {
+          emit_contact_profile_if_due(simulation_stamp_ns(info));
+        }
         return;
       }
 
@@ -339,6 +351,9 @@ public:
       latch_fatal(
           "contact aggregator post-update failed with an unknown exception");
     }
+    if (profile_.failure_pending()) {
+      emit_contact_profile_if_due(simulation_stamp_ns(info));
+    }
   }
 
   void Reset(
@@ -378,16 +393,24 @@ private:
     const std::optional<ThreadCpuTimingStart> & start) noexcept
   {
     if (!start.has_value()) {
-      profile_.disable();
+      profile_.fail(internal::ContactProfileFailure::ClockUnavailable);
       return;
     }
-    const auto finish_ns = thread_cpu_time_ns();
-    if (!finish_ns.has_value() || *finish_ns < start->cpu_time_ns) {
-      profile_.disable();
+    const auto finish = thread_cpu_timing_start();
+    if (!finish.has_value()) {
+      profile_.fail(internal::ContactProfileFailure::ClockUnavailable);
+      return;
+    }
+    if (finish->linux_tid != start->linux_tid) {
+      profile_.fail(internal::ContactProfileFailure::InvalidThreadIdentity);
+      return;
+    }
+    if (finish->cpu_time_ns < start->cpu_time_ns) {
+      profile_.fail(internal::ContactProfileFailure::ClockRegressed);
       return;
     }
     profile_.add_timing(
-      category, *finish_ns - start->cpu_time_ns, start->linux_tid);
+      category, finish->cpu_time_ns - start->cpu_time_ns, start->linux_tid);
   }
 
   template<typename Operation>
@@ -400,7 +423,7 @@ private:
     }
     const auto start = thread_cpu_timing_start();
     if (!start.has_value()) {
-      profile_.disable();
+      profile_.fail(internal::ContactProfileFailure::ClockUnavailable);
       return operation();
     }
     try {
@@ -413,22 +436,59 @@ private:
     }
   }
 
+  void write_profile_failure_record(const std::string & record) noexcept
+  {
+    try {
+      // A prior failed write leaves the global stream failed. Clear only the
+      // stream state so a later callback can make the promised retry.
+      std::cerr.clear();
+      std::cerr << kProfilePrefix << record << std::endl;
+      if (std::cerr.good()) {
+        profile_.acknowledge_failure_emitted();
+      }
+    } catch (...) {
+      // Leave the failure pending so the next callback can retry stderr.
+    }
+  }
+
   void emit_contact_profile_if_due(const std::int64_t stamp_ns) noexcept
   {
+    if (profile_.failure_pending()) {
+      emit_pending_profile_failure(stamp_ns);
+      return;
+    }
     if (!profile_.enabled()) {
       return;
     }
     try {
       const auto record = profile_.emit_if_due(stamp_ns);
       if (record.has_value()) {
+        if (profile_.failure_pending()) {
+          write_profile_failure_record(*record);
+          return;
+        }
         std::cout << kProfilePrefix << *record << std::endl;
         if (!std::cout) {
-          profile_.disable();
+          profile_.fail(internal::ContactProfileFailure::OutputUnavailable);
+          emit_pending_profile_failure(stamp_ns);
         }
       }
     } catch (...) {
       // Diagnostics must never change contact or simulator behavior.
-      profile_.disable();
+      profile_.fail(internal::ContactProfileFailure::OutputUnavailable);
+      emit_pending_profile_failure(stamp_ns);
+    }
+  }
+
+  void emit_pending_profile_failure(const std::int64_t stamp_ns) noexcept
+  {
+    try {
+      const auto record = profile_.emit_if_due(stamp_ns);
+      if (record.has_value()) {
+        write_profile_failure_record(*record);
+      }
+    } catch (...) {
+      // Leave the failure pending so the next callback can retry stderr.
     }
   }
 
@@ -436,6 +496,10 @@ private:
     const gz::sim::UpdateInfo & info,
     const gz::sim::EntityComponentManager & ecm)
   {
+    const auto callback_linux_tid = linux_thread_id();
+    if (callback_linux_tid <= 0) {
+      profile_.fail(internal::ContactProfileFailure::InvalidThreadIdentity);
+    }
     const bool locked_binding_valid = measure_profile_category(
       internal::ContactProfileCategory::LockedBindingValidation,
       [this, &ecm]() {return validate_locked_binding_state(ecm);});
@@ -457,7 +521,7 @@ private:
       return;
     }
     if (inventory_event.second) {
-      profile_.count_rescan();
+      profile_.count_rescan(callback_linux_tid);
       const bool inventory_valid = measure_profile_category(
         internal::ContactProfileCategory::ExhaustiveEventRescan,
         [this, &ecm]() {return validate_locked_inventory(ecm);});
@@ -470,7 +534,7 @@ private:
     }
 
     const auto stamp_ns = simulation_stamp_ns(info);
-    profile_.count_observation();
+    profile_.count_observation(callback_linux_tid);
     auto decision = measure_profile_category(
       internal::ContactProfileCategory::ContactPolicyProtobuf,
       [this, &ecm, stamp_ns]() {
@@ -498,7 +562,7 @@ private:
         latch_fatal("contact aggregator failed to publish an aggregate sample");
         return;
       }
-      profile_.count_publish();
+      profile_.count_publish(callback_linux_tid);
     }
     emit_contact_profile_if_due(stamp_ns);
   }

@@ -25,8 +25,8 @@ from pathlib import Path
 from robotest_metrics.aggregation import aggregate_phase3_suite
 from robotest_metrics.artifacts import (
     require_directory_within_cap,
-    write_csv_atomic,
     write_json_atomic,
+    write_legacy_flattened_csv_atomic,
 )
 from robotest_metrics.bundle import verify_result_bundle
 from robotest_metrics.constants import AGGREGATE_DIRECTORY_MAX_BYTES
@@ -66,7 +66,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.output_dir / 'aggregate-result.json',
             maximum_bytes=AGGREGATE_DIRECTORY_MAX_BYTES,
         )
-        write_csv_atomic(
+        write_legacy_flattened_csv_atomic(
             aggregate,
             arguments.output_dir / 'aggregate-result.csv',
             maximum_bytes=AGGREGATE_DIRECTORY_MAX_BYTES,

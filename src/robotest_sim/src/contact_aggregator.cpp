@@ -282,27 +282,38 @@ ContactProfileAccumulator::ContactProfileAccumulator(
 
 bool ContactProfileAccumulator::enabled() const noexcept
 {
-  return enabled_;
+  return enabled_ && !failure_.has_value();
 }
 
-void ContactProfileAccumulator::disable() noexcept
+bool ContactProfileAccumulator::failure_pending() const noexcept
 {
-  enabled_ = false;
+  return failure_.has_value() && !failure_emitted_;
+}
+
+void ContactProfileAccumulator::fail(
+  const ContactProfileFailure failure) noexcept
+{
+  if (enabled_ && !failure_.has_value()) {
+    failure_ = failure;
+  }
+}
+
+void ContactProfileAccumulator::acknowledge_failure_emitted() noexcept
+{
+  if (failure_.has_value()) {
+    failure_emitted_ = true;
+  }
 }
 
 void ContactProfileAccumulator::lock(
   const std::int64_t simulation_stamp_ns) noexcept
 {
-  if (!enabled_ || simulation_stamp_ns < 0) {
+  if (!enabled() || simulation_stamp_ns < 0) {
     return;
   }
-  cumulative_ns_.fill(0U);
+  thread_contributions_.fill(ThreadContribution{});
+  thread_contribution_count_ = 0U;
   profile_epoch_start_sim_stamp_ns_ = simulation_stamp_ns;
-  linux_tid_.reset();
-  observation_count_ = 0U;
-  rescan_count_ = 0U;
-  publish_count_ = 0U;
-  saturated_ = false;
   locked_ = true;
   restart_cadence(simulation_stamp_ns);
 }
@@ -310,7 +321,7 @@ void ContactProfileAccumulator::lock(
 void ContactProfileAccumulator::restart_cadence(
   const std::int64_t simulation_stamp_ns) noexcept
 {
-  if (!enabled_ || !locked_ || simulation_stamp_ns < 0) {
+  if (!enabled() || !locked_ || simulation_stamp_ns < 0) {
     return;
   }
   constexpr auto maximum = std::numeric_limits<std::int64_t>::max();
@@ -326,10 +337,48 @@ void ContactProfileAccumulator::saturating_add(
   constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
   if (increment > maximum - target) {
     target = maximum;
-    saturated_ = true;
+    fail(ContactProfileFailure::CounterOverflow);
   } else {
     target += increment;
   }
+}
+
+ContactProfileAccumulator::ThreadContribution *
+ContactProfileAccumulator::contribution_for(
+  const std::int64_t linux_tid) noexcept
+{
+  if (!enabled() || !locked_) {
+    return nullptr;
+  }
+  if (linux_tid <= 0) {
+    fail(ContactProfileFailure::InvalidThreadIdentity);
+    return nullptr;
+  }
+  const auto begin = thread_contributions_.begin();
+  const auto position = std::lower_bound(
+    begin, begin + thread_contribution_count_, linux_tid,
+    [](const ThreadContribution & contribution, const std::int64_t target_tid) {
+      return contribution.linux_tid < target_tid;
+    });
+  const auto index = static_cast<std::size_t>(position - begin);
+  if (index < thread_contribution_count_ &&
+    thread_contributions_[index].linux_tid == linux_tid)
+  {
+    return &thread_contributions_[index];
+  }
+  if (thread_contribution_count_ >= thread_contributions_.size()) {
+    fail(ContactProfileFailure::ThreadContributionOverflow);
+    return nullptr;
+  }
+  for (auto move_index = thread_contribution_count_; move_index > index;
+    --move_index)
+  {
+    thread_contributions_[move_index] = thread_contributions_[move_index - 1U];
+  }
+  thread_contributions_[index] = ThreadContribution{};
+  thread_contributions_[index].linux_tid = linux_tid;
+  ++thread_contribution_count_;
+  return &thread_contributions_[index];
 }
 
 void ContactProfileAccumulator::add_timing(
@@ -337,54 +386,87 @@ void ContactProfileAccumulator::add_timing(
   const std::uint64_t elapsed_ns,
   const std::int64_t linux_tid) noexcept
 {
-  if (!enabled_ || !locked_) {
-    return;
-  }
-  if (linux_tid <= 0) {
-    disable();
-    return;
-  }
-  if (!linux_tid_.has_value()) {
-    linux_tid_ = linux_tid;
-  } else if (*linux_tid_ != linux_tid) {
-    // A single record must never combine CPU clocks from different threads.
-    disable();
+  if (!enabled() || !locked_) {
     return;
   }
   const auto index = static_cast<std::size_t>(category);
-  if (index >= cumulative_ns_.size()) {
-    disable();
+  if (index >= static_cast<std::size_t>(ContactProfileCategory::Count)) {
+    fail(ContactProfileFailure::InvalidCategory);
     return;
   }
-  saturating_add(cumulative_ns_[index], elapsed_ns);
-}
-
-void ContactProfileAccumulator::count(std::uint64_t & target) noexcept
-{
-  if (enabled_ && locked_) {
-    saturating_add(target, 1U);
+  auto * const contribution = contribution_for(linux_tid);
+  if (contribution != nullptr) {
+    saturating_add(contribution->cumulative_ns[index], elapsed_ns);
   }
 }
 
-void ContactProfileAccumulator::count_observation() noexcept
+void ContactProfileAccumulator::count(
+  std::uint64_t ThreadContribution::* const target,
+  const std::int64_t linux_tid) noexcept
 {
-  count(observation_count_);
+  auto * const contribution = contribution_for(linux_tid);
+  if (contribution != nullptr) {
+    saturating_add(contribution->*target, 1U);
+  }
 }
 
-void ContactProfileAccumulator::count_rescan() noexcept
+void ContactProfileAccumulator::count_observation(
+  const std::int64_t linux_tid) noexcept
 {
-  count(rescan_count_);
+  count(&ThreadContribution::observation_count, linux_tid);
 }
 
-void ContactProfileAccumulator::count_publish() noexcept
+void ContactProfileAccumulator::count_rescan(
+  const std::int64_t linux_tid) noexcept
 {
-  count(publish_count_);
+  count(&ThreadContribution::rescan_count, linux_tid);
+}
+
+void ContactProfileAccumulator::count_publish(
+  const std::int64_t linux_tid) noexcept
+{
+  count(&ThreadContribution::publish_count, linux_tid);
+}
+
+std::optional<std::string> ContactProfileAccumulator::emit_failure(
+  const std::int64_t simulation_stamp_ns) const
+{
+  if (!failure_.has_value() || failure_emitted_) {
+    return std::nullopt;
+  }
+  const auto failure_name = [this]() {
+      switch (*failure_) {
+        case ContactProfileFailure::ClockUnavailable:
+          return "clock_unavailable";
+        case ContactProfileFailure::ClockRegressed:
+          return "clock_regressed";
+        case ContactProfileFailure::InvalidThreadIdentity:
+          return "invalid_thread_identity";
+        case ContactProfileFailure::ThreadContributionOverflow:
+          return "thread_contribution_overflow";
+        case ContactProfileFailure::CounterOverflow:
+          return "counter_overflow";
+        case ContactProfileFailure::InvalidCategory:
+          return "invalid_category";
+        case ContactProfileFailure::OutputUnavailable:
+          return "output_unavailable";
+      }
+      return "unknown_failure";
+    }();
+  return
+    "{\"failure_kind\":\"" + std::string(failure_name) +
+    "\",\"schema_version\":2,\"sim_stamp_ns\":" +
+    std::to_string(std::max<std::int64_t>(simulation_stamp_ns, 0)) +
+    ",\"status\":\"FAIL\"}";
 }
 
 std::optional<std::string> ContactProfileAccumulator::emit_if_due(
   const std::int64_t simulation_stamp_ns)
 {
-  if (!enabled_ || !locked_ || !linux_tid_.has_value() ||
+  if (failure_pending()) {
+    return emit_failure(simulation_stamp_ns);
+  }
+  if (!enabled() || !locked_ || thread_contribution_count_ == 0U ||
     !profile_epoch_start_sim_stamp_ns_.has_value() ||
     simulation_stamp_ns < 0 || !next_emission_stamp_ns_.has_value() ||
     simulation_stamp_ns < *next_emission_stamp_ns_)
@@ -406,15 +488,32 @@ std::optional<std::string> ContactProfileAccumulator::emit_if_due(
       scheduled_stamp_ns + intervals * kContactProfileEmissionPeriodNs;
   }
 
+  std::array<std::uint64_t,
+    static_cast<std::size_t>(ContactProfileCategory::Count)> totals{};
+  std::uint64_t observation_count = 0U;
+  std::uint64_t rescan_count = 0U;
+  std::uint64_t publish_count = 0U;
+  for (std::size_t index = 0U; index < thread_contribution_count_; ++index) {
+    const auto & contribution = thread_contributions_[index];
+    for (std::size_t category = 0U; category < totals.size(); ++category) {
+      saturating_add(totals[category], contribution.cumulative_ns[category]);
+    }
+    saturating_add(observation_count, contribution.observation_count);
+    saturating_add(rescan_count, contribution.rescan_count);
+    saturating_add(publish_count, contribution.publish_count);
+  }
   std::uint64_t measured_total_ns = 0U;
-  for (const auto elapsed_ns : cumulative_ns_) {
+  for (const auto elapsed_ns : totals) {
     saturating_add(measured_total_ns, elapsed_ns);
   }
-  const auto category = [this](const ContactProfileCategory value) {
-      return cumulative_ns_[static_cast<std::size_t>(value)];
+  if (failure_pending()) {
+    return emit_failure(simulation_stamp_ns);
+  }
+  const auto category = [&totals](const ContactProfileCategory value) {
+      return totals[static_cast<std::size_t>(value)];
     };
   std::string record;
-  record.reserve(640U);
+  record.reserve(640U + thread_contribution_count_ * 320U);
   record += "{\"cached_event_state_check_ns\":" +
     std::to_string(category(ContactProfileCategory::CachedEventStateCheck));
   record += ",\"clock_id\":\"CLOCK_THREAD_CPUTIME_ID\"";
@@ -422,20 +521,54 @@ std::optional<std::string> ContactProfileAccumulator::emit_if_due(
     std::to_string(category(ContactProfileCategory::ContactPolicyProtobuf));
   record += ",\"exhaustive_event_rescan_ns\":" +
     std::to_string(category(ContactProfileCategory::ExhaustiveEventRescan));
-  record += ",\"linux_tid\":" + std::to_string(*linux_tid_);
   record += ",\"locked_binding_validation_ns\":" +
     std::to_string(category(ContactProfileCategory::LockedBindingValidation));
   record += ",\"measured_total_ns\":" + std::to_string(measured_total_ns);
-  record += ",\"observation_count\":" + std::to_string(observation_count_);
+  record += ",\"observation_count\":" + std::to_string(observation_count);
   record += ",\"profile_epoch_start_sim_stamp_ns\":" +
     std::to_string(*profile_epoch_start_sim_stamp_ns_);
-  record += ",\"publish_count\":" + std::to_string(publish_count_);
+  record += ",\"publish_count\":" + std::to_string(publish_count);
   record += ",\"publish_ns\":" +
     std::to_string(category(ContactProfileCategory::Publish));
-  record += ",\"rescan_count\":" + std::to_string(rescan_count_);
-  record += saturated_ ? ",\"saturated\":true" : ",\"saturated\":false";
-  record += ",\"schema_version\":1";
-  record += ",\"sim_stamp_ns\":" + std::to_string(simulation_stamp_ns) + "}";
+  record += ",\"rescan_count\":" + std::to_string(rescan_count);
+  record += ",\"saturated\":false";
+  record += ",\"schema_version\":2";
+  record += ",\"sim_stamp_ns\":" + std::to_string(simulation_stamp_ns);
+  record += ",\"status\":\"PASS\",\"thread_contributions\":[";
+  for (std::size_t index = 0U; index < thread_contribution_count_; ++index) {
+    const auto & contribution = thread_contributions_[index];
+    std::uint64_t contribution_total_ns = 0U;
+    for (const auto elapsed_ns : contribution.cumulative_ns) {
+      saturating_add(contribution_total_ns, elapsed_ns);
+    }
+    if (failure_pending()) {
+      return emit_failure(simulation_stamp_ns);
+    }
+    const auto contribution_category =
+      [&contribution](const ContactProfileCategory value) {
+        return contribution.cumulative_ns[static_cast<std::size_t>(value)];
+      };
+    if (index != 0U) {
+      record += ",";
+    }
+    record += "{\"cached_event_state_check_ns\":" + std::to_string(
+      contribution_category(ContactProfileCategory::CachedEventStateCheck));
+    record += ",\"contact_policy_protobuf_ns\":" + std::to_string(
+      contribution_category(ContactProfileCategory::ContactPolicyProtobuf));
+    record += ",\"exhaustive_event_rescan_ns\":" + std::to_string(
+      contribution_category(ContactProfileCategory::ExhaustiveEventRescan));
+    record += ",\"linux_tid\":" + std::to_string(contribution.linux_tid);
+    record += ",\"locked_binding_validation_ns\":" + std::to_string(
+      contribution_category(ContactProfileCategory::LockedBindingValidation));
+    record += ",\"measured_total_ns\":" + std::to_string(contribution_total_ns);
+    record += ",\"observation_count\":" +
+      std::to_string(contribution.observation_count);
+    record += ",\"publish_count\":" + std::to_string(contribution.publish_count);
+    record += ",\"publish_ns\":" +
+      std::to_string(contribution_category(ContactProfileCategory::Publish));
+    record += ",\"rescan_count\":" + std::to_string(contribution.rescan_count) + "}";
+  }
+  record += "]}";
   return record;
 }
 

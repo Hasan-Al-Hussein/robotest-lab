@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import ast
 from collections.abc import Callable, Mapping, Sequence
+import copy
 import csv
 from dataclasses import dataclass, field
 import datetime
@@ -46,13 +47,15 @@ CANONICAL_SAMPLE_PERIOD_S = 0.5
 CANONICAL_MAX_DURATION_S = 480.0
 FULL_STACK_CLOSE_TIMEOUT_S = 15.0
 CONTACT_PROFILE_PREFIX = b'ROBOTEST_CONTACT_PROFILE '
+CSV_PROJECTION_CONTRACT = 'bounded_scalar_summary_v1'
+CSV_PROJECTION_CONTRACT_COLUMN = '__robotest_projection_contract'
+CSV_PROJECTION_JSON_SHA256_COLUMN = '__robotest_canonical_json_sha256'
 CONTACT_PROFILE_KEYS = frozenset(
     {
         'cached_event_state_check_ns',
         'clock_id',
         'contact_policy_protobuf_ns',
         'exhaustive_event_rescan_ns',
-        'linux_tid',
         'locked_binding_validation_ns',
         'measured_total_ns',
         'observation_count',
@@ -63,6 +66,36 @@ CONTACT_PROFILE_KEYS = frozenset(
         'saturated',
         'schema_version',
         'sim_stamp_ns',
+        'status',
+        'thread_contributions',
+    }
+)
+CONTACT_PROFILE_FAILURE_KEYS = frozenset(
+    {'failure_kind', 'schema_version', 'sim_stamp_ns', 'status'}
+)
+CONTACT_PROFILE_FAILURE_KINDS = frozenset(
+    {
+        'clock_regressed',
+        'clock_unavailable',
+        'counter_overflow',
+        'invalid_category',
+        'invalid_thread_identity',
+        'output_unavailable',
+        'thread_contribution_overflow',
+    }
+)
+CONTACT_THREAD_CONTRIBUTION_KEYS = frozenset(
+    {
+        'cached_event_state_check_ns',
+        'contact_policy_protobuf_ns',
+        'exhaustive_event_rescan_ns',
+        'linux_tid',
+        'locked_binding_validation_ns',
+        'measured_total_ns',
+        'observation_count',
+        'publish_count',
+        'publish_ns',
+        'rescan_count',
     }
 )
 CONTACT_BUCKET_KEYS = (
@@ -80,6 +113,13 @@ CONTACT_MONOTONIC_KEYS = (
     'rescan_count',
     'sim_stamp_ns',
 )
+CONTACT_CONTRIBUTION_MONOTONIC_KEYS = (
+    *CONTACT_BUCKET_KEYS,
+    'measured_total_ns',
+    'observation_count',
+    'publish_count',
+    'rescan_count',
+)
 UINT64_MAX = 2**64 - 1
 INT64_MAX = 2**63 - 1
 
@@ -90,16 +130,18 @@ ENVIRON_MAX_BYTES = 1024 * 1024
 CMDLINE_MAX_BYTES = 1024 * 1024
 RENDERER_MAX_BYTES = 16 * 1024 * 1024
 BINARY_MAX_BYTES = 256 * 1024 * 1024
-OUTPUT_MAX_BYTES = 32 * 1024 * 1024
+OUTPUT_MAX_BYTES = 256 * 1024 * 1024
 MAX_PROC_ENTRIES = 32768
 MAX_PROCESSES = 1024
 MAX_THREADS_PER_PROCESS = 4096
 MAX_THREAD_IDENTITIES = 16384
-MAX_THREAD_RECORDS = 65536
+MAX_LIVE_THREADS_PER_SAMPLE = 512
+MAX_THREAD_RECORDS = 524288
 MAX_SAMPLES = 2048
 MAX_LINE_BYTES = 65536
 MAX_RENDERER_LINES = 256
 MAX_CONTACT_RECORDS = 128
+MAX_CONTACT_THREAD_CONTRIBUTIONS = 128
 MAX_CMDLINE_TOTAL_BYTES = 4 * 1024 * 1024
 MAX_ANCESTRY_DEPTH = 256
 MINIMUM_SAMPLES = 4
@@ -175,6 +217,7 @@ PROFILE_LIMIT_KEYS = frozenset(
         'maximum_process_identities',
         'maximum_retained_cmdline_bytes',
         'maximum_samples',
+        'maximum_live_threads_per_sample',
         'maximum_thread_identities',
         'maximum_thread_records',
         'sample_period_s',
@@ -762,14 +805,14 @@ def validated_config(arguments: argparse.Namespace) -> ProfileConfig:
         raise ProfileError('invalid_argument', 'Gazebo partition is not path-safe')
     if not 0 <= arguments.ros_domain_id <= 232:
         raise ProfileError('invalid_argument', 'ROS domain ID must be in [0, 232]')
-    for label, value, minimum, maximum in (
-        ('startup timeout', arguments.startup_timeout_s, 1.0, 600.0),
-        ('sample period', arguments.sample_period_s, 0.1, 2.0),
-        ('maximum duration', arguments.max_duration_s, 5.0, 900.0),
+    for label, value, expected in (
+        ('startup timeout', arguments.startup_timeout_s, CANONICAL_STARTUP_TIMEOUT_S),
+        ('sample period', arguments.sample_period_s, CANONICAL_SAMPLE_PERIOD_S),
+        ('maximum duration', arguments.max_duration_s, CANONICAL_MAX_DURATION_S),
     ):
-        if not math.isfinite(value) or not minimum <= value <= maximum:
+        if not math.isfinite(value) or value != expected:
             raise ProfileError(
-                'invalid_argument', f'{label} must be finite and in [{minimum:g}, {maximum:g}]'
+                'invalid_argument', f'{label} must be the canonical value {expected:g}'
             )
     try:
         workspace = arguments.workspace.resolve(strict=True)
@@ -1369,9 +1412,11 @@ def _sample_threads(
                 'cpu_delta_ticks': delta,
             }
         )
+    if len(records) > MAX_THREAD_RECORDS - state.thread_records:
+        raise ProfileError(
+            'overflow', f'profile exceeds {MAX_THREAD_RECORDS:,} thread sample records'
+        )
     state.thread_records += len(records)
-    if state.thread_records > MAX_THREAD_RECORDS:
-        raise ProfileError('overflow', 'profile exceeds 65,536 thread sample records')
     try:
         after = _read_stat(root / 'stat')
     except FileNotFoundError:
@@ -1393,7 +1438,7 @@ def _sample_threads(
     }
 
 
-def capture_sample(
+def _capture_sample(
     proc_root: Path,
     config: ProfileConfig,
     anchor: Mapping[str, Any],
@@ -1472,6 +1517,7 @@ def capture_sample(
             ):
                 raise ProfileError('identity_changed', 'anchor DSO mapping became incomplete')
     process_samples = []
+    sample_thread_records = 0
     vanished = 0
     for pid in sorted(state.processes):
         process = state.processes[pid]
@@ -1481,6 +1527,12 @@ def capture_sample(
         if sampled is None:
             vanished += 1
         else:
+            sample_thread_records += sampled['thread_count']
+            if sample_thread_records > MAX_LIVE_THREADS_PER_SAMPLE:
+                raise ProfileError(
+                    'overflow',
+                    f'profile sample exceeds {MAX_LIVE_THREADS_PER_SAMPLE:,} live threads',
+                )
             process_samples.append(sampled)
     anchor_alive = state.processes[anchor_pid].ended_sample is None
     target_alive = any(process.ended_sample is None for process in state.processes.values())
@@ -1497,6 +1549,50 @@ def capture_sample(
             'processes': process_samples,
         }
     )
+    return target_alive
+
+
+def capture_sample(
+    proc_root: Path,
+    config: ProfileConfig,
+    anchor: Mapping[str, Any],
+    state: ProfileState,
+    monotonic_ns: Callable[[], int] = time.monotonic_ns,
+    wall_time_ns: Callable[[], int] = time.time_ns,
+) -> bool:
+    """Atomically capture one sample without exposing partially updated state."""
+    working = ProfileState(
+        processes=copy.deepcopy(state.processes),
+        samples=list(state.samples),
+        last_thread_ticks=dict(state.last_thread_ticks),
+        thread_start_by_tid=dict(state.thread_start_by_tid),
+        thread_names=dict(state.thread_names),
+        thread_delta_ticks=dict(state.thread_delta_ticks),
+        process_delta_ticks=dict(state.process_delta_ticks),
+        cmdline_bytes=state.cmdline_bytes,
+        thread_records=state.thread_records,
+        cadence_overruns=state.cadence_overruns,
+        smoke_runner_owner=state.smoke_runner_owner,
+    )
+    target_alive = _capture_sample(
+        proc_root,
+        config,
+        anchor,
+        working,
+        monotonic_ns,
+        wall_time_ns,
+    )
+    state.processes = working.processes
+    state.samples = working.samples
+    state.last_thread_ticks = working.last_thread_ticks
+    state.thread_start_by_tid = working.thread_start_by_tid
+    state.thread_names = working.thread_names
+    state.thread_delta_ticks = working.thread_delta_ticks
+    state.process_delta_ticks = working.process_delta_ticks
+    state.cmdline_bytes = working.cmdline_bytes
+    state.thread_records = working.thread_records
+    state.cadence_overruns = working.cadence_overruns
+    state.smoke_runner_owner = working.smoke_runner_owner
     return target_alive
 
 
@@ -1579,19 +1675,36 @@ def collect_renderer(
 
 
 def validate_contact_profile_records(records: Sequence[Mapping[str, Any]]) -> None:
-    """Validate the frozen cumulative CLOCK_THREAD_CPUTIME_ID record contract."""
+    """Validate cumulative migration-safe CLOCK_THREAD_CPUTIME_ID records."""
     if not records:
         raise ProfileError('missing_identity', 'contact profile record sequence is empty')
     previous: Mapping[str, Any] | None = None
+    previous_contributions: dict[int, Mapping[str, Any]] = {}
     for index, record in enumerate(records):
+        if record.get('status') == 'FAIL':
+            if (
+                set(record) != CONTACT_PROFILE_FAILURE_KEYS
+                or type(record.get('schema_version')) is not int
+                or record.get('schema_version') != 2
+                or type(record.get('sim_stamp_ns')) is not int
+                or not 0 <= record['sim_stamp_ns'] <= INT64_MAX
+                or record.get('failure_kind') not in CONTACT_PROFILE_FAILURE_KINDS
+            ):
+                raise ProfileError('missing_identity', 'contact profile failure record is invalid')
+            raise ProfileError(
+                'incomplete_profile',
+                f'contact profile producer reported {record["failure_kind"]}',
+            )
         if set(record) != CONTACT_PROFILE_KEYS:
             raise ProfileError('missing_identity', f'contact profile record {index} keys differ')
-        if type(record['schema_version']) is not int or record['schema_version'] != 1:
+        if (
+            record.get('status') != 'PASS'
+            or type(record['schema_version']) is not int
+            or record['schema_version'] != 2
+        ):
             raise ProfileError('missing_identity', 'contact profile schema version differs')
         if record['clock_id'] != 'CLOCK_THREAD_CPUTIME_ID':
             raise ProfileError('missing_identity', 'contact profile clock ID differs')
-        if type(record['linux_tid']) is not int or not 1 <= record['linux_tid'] <= INT64_MAX:
-            raise ProfileError('missing_identity', 'contact profile Linux TID is invalid')
         if record['saturated'] is not False:
             raise ProfileError('overflow', 'contact profile counter saturation was reported')
         for field_name in CONTACT_MONOTONIC_KEYS:
@@ -1605,16 +1718,68 @@ def validate_contact_profile_records(records: Sequence[Mapping[str, Any]]) -> No
         measured = sum(record[field_name] for field_name in CONTACT_BUCKET_KEYS)
         if measured > UINT64_MAX or record['measured_total_ns'] != measured:
             raise ProfileError('missing_identity', 'contact measured total does not reconcile')
+        contributions = record.get('thread_contributions')
+        if (
+            not isinstance(contributions, list)
+            or not 1 <= len(contributions) <= MAX_CONTACT_THREAD_CONTRIBUTIONS
+        ):
+            raise ProfileError('missing_identity', 'contact thread contributions are invalid')
+        current_contributions: dict[int, Mapping[str, Any]] = {}
+        aggregate = {field_name: 0 for field_name in CONTACT_CONTRIBUTION_MONOTONIC_KEYS}
+        order: list[int] = []
+        for contribution_index, contribution in enumerate(contributions):
+            if (
+                not isinstance(contribution, Mapping)
+                or set(contribution) != CONTACT_THREAD_CONTRIBUTION_KEYS
+            ):
+                raise ProfileError(
+                    'missing_identity',
+                    f'contact thread contribution {contribution_index} keys differ',
+                )
+            linux_tid = contribution.get('linux_tid')
+            if type(linux_tid) is not int or not 1 <= linux_tid <= INT64_MAX:
+                raise ProfileError('missing_identity', 'contact profile Linux TID is invalid')
+            order.append(linux_tid)
+            for field_name in CONTACT_CONTRIBUTION_MONOTONIC_KEYS:
+                value = contribution[field_name]
+                if type(value) is not int or not 0 <= value <= UINT64_MAX:
+                    raise ProfileError(
+                        'missing_identity',
+                        f'contact thread contribution {field_name} is invalid',
+                    )
+                aggregate[field_name] += value
+                if aggregate[field_name] > UINT64_MAX:
+                    raise ProfileError('overflow', 'contact contribution aggregate overflowed')
+            contribution_measured = sum(
+                contribution[field_name] for field_name in CONTACT_BUCKET_KEYS
+            )
+            if (
+                contribution_measured > UINT64_MAX
+                or contribution['measured_total_ns'] != contribution_measured
+            ):
+                raise ProfileError(
+                    'missing_identity', 'contact thread measured total does not reconcile'
+                )
+            prior_contribution = previous_contributions.get(linux_tid)
+            if prior_contribution is not None and any(
+                contribution[field_name] < prior_contribution[field_name]
+                for field_name in CONTACT_CONTRIBUTION_MONOTONIC_KEYS
+            ):
+                raise ProfileError('missing_identity', 'contact thread contribution regressed')
+            current_contributions[linux_tid] = contribution
+        if order != sorted(order) or len(order) != len(set(order)):
+            raise ProfileError('missing_identity', 'contact thread contributions are not sorted')
+        if not previous_contributions.keys() <= current_contributions.keys():
+            raise ProfileError('identity_changed', 'contact thread contribution disappeared')
+        if any(record[field_name] != aggregate[field_name] for field_name in aggregate):
+            raise ProfileError('missing_identity', 'contact contribution totals do not reconcile')
         epoch = record['profile_epoch_start_sim_stamp_ns']
         if record['sim_stamp_ns'] < epoch + 5_000_000_000:
             message = 'contact profile record precedes first due stamp'
             raise ProfileError('missing_identity', message)
         if previous is not None:
-            if (
-                record['linux_tid'] != previous['linux_tid']
-                or epoch != previous['profile_epoch_start_sim_stamp_ns']
-            ):
-                raise ProfileError('identity_changed', 'contact profile epoch or TID changed')
+            if epoch != previous['profile_epoch_start_sim_stamp_ns']:
+                raise ProfileError('identity_changed', 'contact profile epoch changed')
             if record['sim_stamp_ns'] - previous['sim_stamp_ns'] < 5_000_000_000:
                 raise ProfileError('missing_identity', 'contact profile cadence is too short')
             for field_name in CONTACT_MONOTONIC_KEYS:
@@ -1623,6 +1788,7 @@ def validate_contact_profile_records(records: Sequence[Mapping[str, Any]]) -> No
                         'missing_identity', f'contact profile {field_name} regressed'
                     )
         previous = record
+        previous_contributions = current_contributions
 
 
 def parse_contact_profile_logs(run_dir: Path) -> dict[str, Any]:
@@ -1808,10 +1974,10 @@ def reconcile_contact_log_sources(
             raise ProfileError('identity_changed', f'full-stack {stream_name} changed after close')
 
 
-def bind_contact_profile_thread(
+def bind_contact_profile_threads(
     contact: Mapping[str, Any], anchor: Mapping[str, Any], state: ProfileState
-) -> dict[str, Any]:
-    """Bind the in-plugin Linux TID to one sampled thread in the DSO host."""
+) -> list[dict[str, Any]]:
+    """Bind every in-plugin Linux TID to one sampled thread in the DSO host."""
     record = contact.get('last_valid_cumulative_record')
     anchor_pid = anchor.get('pid')
     anchor_start = anchor.get('start_ticks')
@@ -1821,41 +1987,51 @@ def bind_contact_profile_thread(
         or type(anchor_start) is not int
     ):
         raise ProfileError('missing_identity', 'contact/anchor thread identity is incomplete')
-    linux_tid = record.get('linux_tid')
-    if type(linux_tid) is not int:
-        raise ProfileError('missing_identity', 'contact profile Linux TID is invalid')
-    tid_identity = (anchor_pid, anchor_start, linux_tid)
-    thread_start = state.thread_start_by_tid.get(tid_identity)
-    if thread_start is None:
-        raise ProfileError(
-            'missing_identity',
-            'contact profile Linux TID was not sampled in the DSO host',
+    contributions = record.get('thread_contributions')
+    if not isinstance(contributions, list):
+        raise ProfileError('missing_identity', 'contact profile thread contributions are absent')
+    bindings = []
+    for contribution in contributions:
+        if not isinstance(contribution, Mapping) or type(contribution.get('linux_tid')) is not int:
+            raise ProfileError('missing_identity', 'contact profile Linux TID is invalid')
+        linux_tid = contribution['linux_tid']
+        tid_identity = (anchor_pid, anchor_start, linux_tid)
+        thread_start = state.thread_start_by_tid.get(tid_identity)
+        if thread_start is None:
+            raise ProfileError(
+                'missing_identity',
+                'contact profile Linux TID was not sampled in the DSO host',
+            )
+        identity = (*tid_identity, thread_start)
+        comm = state.thread_names.get(identity)
+        if not isinstance(comm, str):
+            raise ProfileError('missing_identity', 'contact profile host thread name is absent')
+        sample_indexes = [
+            sample['index']
+            for sample in state.samples
+            for process in sample['processes']
+            if process['pid'] == anchor_pid and process['start_ticks'] == anchor_start
+            for thread in process['threads']
+            if thread['tid'] == linux_tid and thread['start_ticks'] == thread_start
+        ]
+        if not sample_indexes:
+            raise ProfileError('missing_identity', 'contact profile host thread has no samples')
+        bindings.append(
+            {
+                'anchor_pid': anchor_pid,
+                'anchor_start_ticks': anchor_start,
+                'linux_tid': linux_tid,
+                'thread_start_ticks': thread_start,
+                'comm': comm,
+                'first_sample_index': min(sample_indexes),
+                'last_sample_index': max(sample_indexes),
+                'sample_count': len(sample_indexes),
+                'sampled_cpu_delta_ticks': state.thread_delta_ticks.get(identity, 0),
+            }
         )
-    identity = (*tid_identity, thread_start)
-    comm = state.thread_names.get(identity)
-    if not isinstance(comm, str):
-        raise ProfileError('missing_identity', 'contact profile host thread name is absent')
-    sample_indexes = [
-        sample['index']
-        for sample in state.samples
-        for process in sample['processes']
-        if process['pid'] == anchor_pid and process['start_ticks'] == anchor_start
-        for thread in process['threads']
-        if thread['tid'] == linux_tid and thread['start_ticks'] == thread_start
-    ]
-    if not sample_indexes:
-        raise ProfileError('missing_identity', 'contact profile host thread has no samples')
-    return {
-        'anchor_pid': anchor_pid,
-        'anchor_start_ticks': anchor_start,
-        'linux_tid': linux_tid,
-        'thread_start_ticks': thread_start,
-        'comm': comm,
-        'first_sample_index': min(sample_indexes),
-        'last_sample_index': max(sample_indexes),
-        'sample_count': len(sample_indexes),
-        'sampled_cpu_delta_ticks': state.thread_delta_ticks.get(identity, 0),
-    }
+    if len(bindings) > MAX_CONTACT_THREAD_CONTRIBUTIONS:
+        raise ProfileError('overflow', 'contact host-thread bindings exceed the bound')
+    return bindings
 
 
 def _process_lifecycles(state: ProfileState) -> list[dict[str, Any]]:
@@ -2168,19 +2344,28 @@ def _validate_profile_candidate(
     }
 
 
-def _validate_profile_limits(value: object) -> None:
-    limits = _profile_mapping(value, 'profile limits', PROFILE_LIMIT_KEYS)
-    expected = {
-        'startup_timeout_s': CANONICAL_STARTUP_TIMEOUT_S,
-        'sample_period_s': CANONICAL_SAMPLE_PERIOD_S,
-        'maximum_duration_s': CANONICAL_MAX_DURATION_S,
+def _profile_limits(config: ProfileConfig | None = None) -> dict[str, int | float]:
+    return {
+        'startup_timeout_s': (
+            CANONICAL_STARTUP_TIMEOUT_S if config is None else config.startup_timeout_s
+        ),
+        'sample_period_s': CANONICAL_SAMPLE_PERIOD_S if config is None else config.sample_period_s,
+        'maximum_duration_s': (
+            CANONICAL_MAX_DURATION_S if config is None else config.max_duration_s
+        ),
         'maximum_output_bytes': OUTPUT_MAX_BYTES,
         'maximum_samples': MAX_SAMPLES,
         'maximum_process_identities': MAX_PROCESSES,
+        'maximum_live_threads_per_sample': MAX_LIVE_THREADS_PER_SAMPLE,
         'maximum_thread_identities': MAX_THREAD_IDENTITIES,
         'maximum_thread_records': MAX_THREAD_RECORDS,
         'maximum_retained_cmdline_bytes': MAX_CMDLINE_TOTAL_BYTES,
     }
+
+
+def _validate_profile_limits(value: object) -> None:
+    limits = _profile_mapping(value, 'profile limits', PROFILE_LIMIT_KEYS)
+    expected = _profile_limits()
     if limits != expected:
         raise ProfileError('invalid_profile', 'profile limits differ from canonical bounds')
 
@@ -2552,7 +2737,7 @@ def _relocate_contact_paths(
             raise ProfileError('identity_changed', 'contact source path differs')
         current_sources.append(item)
     relocated['sources'] = current_sources
-    relocated.pop('host_thread_binding', None)
+    relocated.pop('host_thread_bindings', None)
     return relocated
 
 
@@ -2562,9 +2747,9 @@ def _validate_contact_profile(
     candidate_root: Path,
     recorded_candidate: Path,
     full_stack: Mapping[str, Any],
-) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+) -> tuple[Mapping[str, Any], Sequence[Mapping[str, Any]]]:
     keys = {
-        'host_thread_binding',
+        'host_thread_bindings',
         'last_valid_cumulative_record',
         'present',
         'selected_source',
@@ -2598,22 +2783,29 @@ def _validate_contact_profile(
         ).items()
     }
     reconcile_contact_log_sources(parsed, {'streams': current_streams})
-    binding = _profile_mapping(
-        contact.get('host_thread_binding'),
-        'contact host-thread binding',
-        {
-            'anchor_pid',
-            'anchor_start_ticks',
-            'comm',
-            'first_sample_index',
-            'last_sample_index',
-            'linux_tid',
-            'sample_count',
-            'sampled_cpu_delta_ticks',
-            'thread_start_ticks',
-        },
+    binding_keys = {
+        'anchor_pid',
+        'anchor_start_ticks',
+        'comm',
+        'first_sample_index',
+        'last_sample_index',
+        'linux_tid',
+        'sample_count',
+        'sampled_cpu_delta_ticks',
+        'thread_start_ticks',
+    }
+    bindings = _profile_list(
+        contact.get('host_thread_bindings'),
+        'contact host-thread bindings',
+        MAX_CONTACT_THREAD_CONTRIBUTIONS,
     )
-    return contact, binding
+    if not bindings:
+        raise ProfileError('invalid_profile', 'contact host-thread bindings are empty')
+    parsed_bindings = [
+        _profile_mapping(item, f'contact host-thread binding {index}', binding_keys)
+        for index, item in enumerate(bindings)
+    ]
+    return contact, parsed_bindings
 
 
 def _validate_host_sample(value: object, label: str) -> None:
@@ -2781,6 +2973,7 @@ def _validate_sampling(
         processes = _profile_list(
             sample.get('processes'), f'profile sample {index} processes', MAX_PROCESSES
         )
+        sample_thread_records = 0
         _profile_int(
             sample.get('process_count'),
             f'profile sample {index} process count',
@@ -2822,6 +3015,9 @@ def _validate_sampling(
             )
             if process.get('thread_count') != len(threads):
                 raise ProfileError('invalid_profile', 'sample thread count does not reconcile')
+            sample_thread_records += len(threads)
+            if sample_thread_records > MAX_LIVE_THREADS_PER_SAMPLE:
+                raise ProfileError('invalid_profile', 'sample exceeds the live-thread bound')
             _profile_int(
                 process.get('threads_vanished_during_sample'),
                 'sample vanished thread count',
@@ -3069,51 +3265,57 @@ def _validate_process_lifecycles(
         raise ProfileError('invalid_profile', 'retained command-line bytes do not reconcile')
 
 
-def _validate_contact_thread_binding(
-    binding: Mapping[str, Any],
+def _validate_contact_thread_bindings(
+    bindings: Sequence[Mapping[str, Any]],
     contact: Mapping[str, Any],
     anchor: Mapping[str, Any],
     sampling: Mapping[str, Any],
 ) -> None:
-    for field_name, minimum in (
-        ('anchor_pid', 1),
-        ('anchor_start_ticks', 0),
-        ('linux_tid', 1),
-        ('thread_start_ticks', 0),
-        ('first_sample_index', 0),
-        ('last_sample_index', 0),
-        ('sample_count', 1),
-        ('sampled_cpu_delta_ticks', 0),
-    ):
-        _profile_int(binding.get(field_name), f'contact binding {field_name}', minimum)
-    _profile_string(binding.get('comm'), 'contact binding command name')
     record = _profile_mapping(
         contact.get('last_valid_cumulative_record'), 'last contact profile record'
     )
-    linux_tid = _profile_int(record.get('linux_tid'), 'contact profile Linux TID', 1)
-    anchor_id = (anchor['pid'], anchor['start_ticks'])
-    candidates = [
-        identity
-        for identity in sampling['thread_samples']
-        if identity[:2] == anchor_id and identity[2] == linux_tid
+    contributions = _profile_list(
+        record.get('thread_contributions'),
+        'contact profile thread contributions',
+        MAX_CONTACT_THREAD_CONTRIBUTIONS,
+    )
+    linux_tids = [
+        _profile_int(
+            _profile_mapping(item, f'contact thread contribution {index}').get('linux_tid'),
+            'contact profile Linux TID',
+            1,
+        )
+        for index, item in enumerate(contributions)
     ]
-    if len(candidates) != 1:
-        raise ProfileError('identity_changed', 'contact thread does not bind uniquely')
-    identity = candidates[0]
-    indexes = sampling['thread_samples'][identity]
-    expected = {
-        'anchor_pid': anchor['pid'],
-        'anchor_start_ticks': anchor['start_ticks'],
-        'linux_tid': linux_tid,
-        'thread_start_ticks': identity[3],
-        'comm': sampling['thread_names'][identity],
-        'first_sample_index': min(indexes),
-        'last_sample_index': max(indexes),
-        'sample_count': len(indexes),
-        'sampled_cpu_delta_ticks': sampling['thread_delta_totals'].get(identity, 0),
-    }
-    if binding != expected:
-        raise ProfileError('identity_changed', 'contact host-thread binding does not reconcile')
+    if len(bindings) != len(linux_tids):
+        raise ProfileError('identity_changed', 'contact host-thread binding count differs')
+    anchor_id = (anchor['pid'], anchor['start_ticks'])
+    expected_bindings = []
+    for linux_tid in linux_tids:
+        candidates = [
+            identity
+            for identity in sampling['thread_samples']
+            if identity[:2] == anchor_id and identity[2] == linux_tid
+        ]
+        if len(candidates) != 1:
+            raise ProfileError('identity_changed', 'contact thread does not bind uniquely')
+        identity = candidates[0]
+        indexes = sampling['thread_samples'][identity]
+        expected_bindings.append(
+            {
+                'anchor_pid': anchor['pid'],
+                'anchor_start_ticks': anchor['start_ticks'],
+                'linux_tid': linux_tid,
+                'thread_start_ticks': identity[3],
+                'comm': sampling['thread_names'][identity],
+                'first_sample_index': min(indexes),
+                'last_sample_index': max(indexes),
+                'sample_count': len(indexes),
+                'sampled_cpu_delta_ticks': sampling['thread_delta_totals'].get(identity, 0),
+            }
+        )
+    if list(bindings) != expected_bindings:
+        raise ProfileError('identity_changed', 'contact host-thread bindings do not reconcile')
 
 
 def _metrics_result_caps(workspace: Path) -> dict[str, int]:
@@ -3175,8 +3377,30 @@ def _csv_scalar(value: Any) -> str:
     )
 
 
+def _csv_sequence_descriptor(value: list[Any] | tuple[Any, ...]) -> str:
+    descriptor = {
+        'element_count': len(value),
+        'kind': 'sequence',
+        'sha256': hashlib.sha256(canonical_json_bytes(value)).hexdigest(),
+    }
+    return _csv_scalar(descriptor)
+
+
 def _one_row_csv_bytes(document: Mapping[str, Any]) -> bytes:
-    flattened: dict[str, str] = {}
+    if not document:
+        raise ProfileError('invalid_profile', 'CSV projection root is empty')
+    reserved = {
+        CSV_PROJECTION_CONTRACT_COLUMN,
+        CSV_PROJECTION_JSON_SHA256_COLUMN,
+    }
+    if any(key in document for key in reserved):
+        raise ProfileError('invalid_profile', 'CSV projection root uses a reserved column')
+    flattened: dict[str, str] = {
+        CSV_PROJECTION_CONTRACT_COLUMN: CSV_PROJECTION_CONTRACT,
+        CSV_PROJECTION_JSON_SHA256_COLUMN: hashlib.sha256(
+            canonical_json_bytes(document)
+        ).hexdigest(),
+    }
 
     def visit(prefix: str, value: Any) -> None:
         if isinstance(value, Mapping) and value:
@@ -3187,7 +3411,13 @@ def _one_row_csv_bytes(document: Mapping[str, Any]) -> bytes:
             return
         if not prefix:
             raise ProfileError('invalid_profile', 'CSV projection root is empty')
-        flattened[prefix] = _csv_scalar(value)
+        if prefix in flattened:
+            raise ProfileError('invalid_profile', f'CSV projection column collision at {prefix!r}')
+        flattened[prefix] = (
+            _csv_sequence_descriptor(value)
+            if isinstance(value, (list, tuple))
+            else _csv_scalar(value)
+        )
 
     visit('', document)
     output = io.StringIO(newline='')
@@ -3557,7 +3787,7 @@ def validate_campaign_smoke_profile(
         anchor=anchor,
         profile_started_monotonic_ns=started_monotonic_ns,
     )
-    contact, contact_binding = _validate_contact_profile(
+    contact, contact_bindings = _validate_contact_profile(
         profile.get('contact_profile'),
         candidate_root=current_candidate,
         recorded_candidate=candidate['recorded_candidate'],
@@ -3596,7 +3826,7 @@ def validate_campaign_smoke_profile(
         anchor=anchor,
         retained_cmdline_bytes=profile['sampling'].get('retained_cmdline_bytes'),
     )
-    _validate_contact_thread_binding(contact_binding, contact, anchor, sampling)
+    _validate_contact_thread_bindings(contact_bindings, contact, anchor, sampling)
     group_leader_identities = [
         identity
         for identity, indexes in sampling['process_samples'].items()
@@ -3751,7 +3981,7 @@ class SmokeHostProfiler:
         if contact['present'] is not True:
             raise ProfileError('missing_identity', 'canonical contact profile record is absent')
         reconcile_contact_log_sources(contact, full_stack)
-        contact['host_thread_binding'] = bind_contact_profile_thread(contact, anchor, self.state)
+        contact['host_thread_bindings'] = bind_contact_profile_threads(contact, anchor, self.state)
         return {
             'schema_version': SCHEMA_VERSION,
             'producer': PRODUCER,
@@ -3766,17 +3996,7 @@ class SmokeHostProfiler:
             'contact_profile': contact,
             'full_stack_process': full_stack,
             'host_clock_ticks_per_second': ticks_per_second,
-            'limits': {
-                'startup_timeout_s': self.config.startup_timeout_s,
-                'sample_period_s': self.config.sample_period_s,
-                'maximum_duration_s': self.config.max_duration_s,
-                'maximum_output_bytes': OUTPUT_MAX_BYTES,
-                'maximum_samples': MAX_SAMPLES,
-                'maximum_process_identities': MAX_PROCESSES,
-                'maximum_thread_identities': MAX_THREAD_IDENTITIES,
-                'maximum_thread_records': MAX_THREAD_RECORDS,
-                'maximum_retained_cmdline_bytes': MAX_CMDLINE_TOTAL_BYTES,
-            },
+            'limits': _profile_limits(self.config),
             'process_lifecycles': _process_lifecycles(self.state),
             'sampling': {
                 'sample_count': len(self.state.samples),
@@ -3806,6 +4026,7 @@ def _failure_document(
         'candidate_id': config.candidate_id,
         'candidate': identity,
         'failure': {'kind': error.kind, 'message': str(error).replace('\x00', '?')[:1024]},
+        'limits': _profile_limits(config),
     }
     if profiler is not None:
         document['partial_profile'] = {

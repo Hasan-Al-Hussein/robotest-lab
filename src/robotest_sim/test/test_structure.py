@@ -451,16 +451,27 @@ def test_contact_profiler_is_opt_in_bounded_and_wired_to_exact_categories() -> N
     profiled_path = system.split('  void post_update_profiled(', 1)[1].split(
         '  void latch_fatal(', 1
     )[0]
+    failure_writer = system.split('  void write_profile_failure_record(', 1)[1].split(
+        '  void emit_contact_profile_if_due(', 1
+    )[0]
     emission = system.split('  void emit_contact_profile_if_due(', 1)[1].split(
         '  void post_update_profiled(', 1
     )[0]
 
     assert 'kContactProfileEmissionPeriodNs = 5000000000LL' in header
+    assert 'kContactProfileMaxThreadContributions = 128U' in header
     assert 'constexpr char kProfileEnvironment[] = "ROBOTEST_CONTACT_PROFILE";' in system
     assert 'constexpr char kProfilePrefix[] = "ROBOTEST_CONTACT_PROFILE ";' in system
     assert 'clock_gettime(CLOCK_THREAD_CPUTIME_ID' in system
     assert '::syscall(SYS_gettid)' in system
     assert 'if (profile_.enabled())' in post_update
+    assert 'if (profile_.failure_pending())' in post_update
+    assert post_update.index('if (profile_.failure_pending())') < post_update.index(
+        'if (fatal_latched_ || !bindings_locked_)'
+    )
+    assert post_update.index('if (profile_.failure_pending())') < post_update.index(
+        'if (profile_.enabled())'
+    )
     assert 'post_update_profiled(info, ecm);' in post_update
     assert post_update.index('post_update_profiled(info, ecm);') < post_update.index(
         'validate_locked_binding_state(ecm)'
@@ -472,12 +483,25 @@ def test_contact_profiler_is_opt_in_bounded_and_wired_to_exact_categories() -> N
         'count_observation',
         'count_rescan',
         'count_publish',
-        'emit_contact_profile_if_due',
     ):
         assert profiler_only_symbol not in post_update
     assert 'std::cout << kProfilePrefix << *record << std::endl;' in emission
+    assert emission.count('write_profile_failure_record(*record);') == 2
+    assert 'std::cerr.clear();' in failure_writer
+    assert 'std::cerr << kProfilePrefix << record << std::endl;' in failure_writer
+    assert 'if (std::cerr.good())' in failure_writer
+    assert 'profile_.acknowledge_failure_emitted();' in failure_writer
+    assert failure_writer.index('std::cerr.clear();') < failure_writer.index(
+        'std::cerr << kProfilePrefix << record << std::endl;'
+    )
+    assert failure_writer.index('if (std::cerr.good())') < failure_writer.index(
+        'profile_.acknowledge_failure_emitted();'
+    )
+    assert emission.index('if (profile_.failure_pending())') < emission.index(
+        'if (!profile_.enabled())'
+    )
     assert 'catch (...)' in emission
-    assert 'profile_.disable();' in emission
+    assert 'profile_.fail(internal::ContactProfileFailure::OutputUnavailable);' in emission
 
     exact_wiring = (
         ('LockedBindingValidation', 'validate_locked_binding_state(ecm)'),
@@ -496,7 +520,6 @@ def test_contact_profiler_is_opt_in_bounded_and_wired_to_exact_categories() -> N
         'clock_id',
         'contact_policy_protobuf_ns',
         'exhaustive_event_rescan_ns',
-        'linux_tid',
         'locked_binding_validation_ns',
         'measured_total_ns',
         'observation_count',
@@ -507,8 +530,11 @@ def test_contact_profiler_is_opt_in_bounded_and_wired_to_exact_categories() -> N
         'saturated',
         'schema_version',
         'sim_stamp_ns',
+        'status',
+        'thread_contributions',
     )
-    positions = [policy.index(f'\\"{key}\\"') for key in canonical_keys]
+    pass_record = policy.split('record.reserve(640U', 1)[1]
+    positions = [pass_record.index(f'\\"{key}\\"') for key in canonical_keys]
     assert positions == sorted(positions)
 
 

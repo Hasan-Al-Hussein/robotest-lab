@@ -1043,18 +1043,27 @@ def _phase3_contact_profile_record(*, linux_tid: int, step: int) -> dict[str, ob
         'locked_binding_validation_ns': 10 + step,
         'publish_ns': 50 + step,
     }
+    contribution = {
+        **buckets,
+        'linux_tid': linux_tid,
+        'measured_total_ns': sum(buckets.values()),
+        'observation_count': 2 + step,
+        'publish_count': 1 + step,
+        'rescan_count': 1 + step,
+    }
     return {
         **buckets,
         'clock_id': 'CLOCK_THREAD_CPUTIME_ID',
-        'linux_tid': linux_tid,
         'measured_total_ns': sum(buckets.values()),
         'observation_count': 2 + step,
         'profile_epoch_start_sim_stamp_ns': 1_000,
         'publish_count': 1 + step,
         'rescan_count': 1 + step,
         'saturated': False,
-        'schema_version': 1,
+        'schema_version': 2,
         'sim_stamp_ns': 5_000_001_000 + step * 5_000_000_000,
+        'status': 'PASS',
+        'thread_contributions': [contribution],
     }
 
 
@@ -1321,7 +1330,7 @@ def _write_phase3_smoke_profile_fixture(
     )
     contact = profiler.parse_contact_profile_logs(candidate_root / 'smoke')
     profiler.reconcile_contact_log_sources(contact, full_stack)
-    contact['host_thread_binding'] = profiler.bind_contact_profile_thread(contact, anchor, state)
+    contact['host_thread_bindings'] = profiler.bind_contact_profile_threads(contact, anchor, state)
     renderer_path.parent.mkdir(parents=True, exist_ok=True)
     renderer_baseline = profiler._renderer_baseline(renderer_path)
     renderer_path.write_bytes(b'Device Name: llvmpipe deterministic fixture\n')
@@ -1338,17 +1347,7 @@ def _write_phase3_smoke_profile_fixture(
         'finished_utc': profiler._utc(profile_finished_epoch_ns),
         'full_stack_process': full_stack,
         'host_clock_ticks_per_second': 100,
-        'limits': {
-            'maximum_duration_s': profiler.CANONICAL_MAX_DURATION_S,
-            'maximum_output_bytes': profiler.OUTPUT_MAX_BYTES,
-            'maximum_process_identities': profiler.MAX_PROCESSES,
-            'maximum_retained_cmdline_bytes': profiler.MAX_CMDLINE_TOTAL_BYTES,
-            'maximum_samples': profiler.MAX_SAMPLES,
-            'maximum_thread_identities': profiler.MAX_THREAD_IDENTITIES,
-            'maximum_thread_records': profiler.MAX_THREAD_RECORDS,
-            'sample_period_s': profiler.CANONICAL_SAMPLE_PERIOD_S,
-            'startup_timeout_s': profiler.CANONICAL_STARTUP_TIMEOUT_S,
-        },
+        'limits': profiler._profile_limits(config),
         'process_lifecycles': profiler._process_lifecycles(state),
         'producer': profiler.PRODUCER,
         'profile_started_boot_ticks': 0,
@@ -3224,9 +3223,9 @@ def _phase3_bundle(
     mission['targets'] = {
         'waypoint_count': 3,
         'waypoints': [
-            {'x_m': 1.0, 'y_m': 0.0},
-            {'x_m': 2.0, 'y_m': 0.0},
-            {'x_m': 3.0, 'y_m': 0.0},
+            {'x': 1.0, 'y': 0.0, 'yaw': 0.0},
+            {'x': 2.0, 'y': 0.0, 'yaw': 0.0},
+            {'x': 3.0, 'y': 0.0, 'yaw': 0.0},
         ],
     }
     mission['identity'].update(
@@ -3743,6 +3742,7 @@ def _phase3_bundle(
     )
     _canonical_file(run_root / 'analysis-request.json', analysis_request, sidecar=True)
     from robotest_metrics.analysis import analyze_run
+    from robotest_metrics.artifacts import one_row_csv_bytes as phase3_run_csv_bytes
 
     result = analyze_run(analysis_request)
     assert result['verdict']['automated_status'] == 'PASS', {
@@ -3751,7 +3751,7 @@ def _phase3_bundle(
     }
     result_path = directory / 'run-result.json'
     _canonical_file(result_path, result)
-    (directory / 'run-result.csv').write_bytes(release_module._one_row_csv_bytes(result))
+    (directory / 'run-result.csv').write_bytes(phase3_run_csv_bytes(result))
     (directory / 'report.md').write_text('PASS\n', encoding='utf-8')
     (directory / 'report.html').write_text('<p>PASS</p>\n', encoding='utf-8')
     records = [
@@ -3781,10 +3781,12 @@ def _phase3_bundle(
 
 
 def _refresh_phase3_bundle(directory: Path) -> str:
+    from robotest_metrics.artifacts import one_row_csv_bytes as phase3_run_csv_bytes
+
     result_path = directory / 'run-result.json'
     result = json.loads(result_path.read_text(encoding='utf-8'))
     _canonical_file(result_path, result)
-    (directory / 'run-result.csv').write_bytes(release_module._one_row_csv_bytes(result))
+    (directory / 'run-result.csv').write_bytes(phase3_run_csv_bytes(result))
     artifacts = [
         path
         for path in sorted(directory.iterdir())
@@ -4408,7 +4410,14 @@ def _build_release_fixture(tmp_path: Path) -> dict[str, Path | str]:
             )
             for egg_link in site_packages.glob('*.egg-link'):
                 egg_link.unlink()
-            shutil.copytree(python_source, site_packages / package)
+            installed_python = site_packages / package
+            if installed_python.exists():
+                if installed_python.is_symlink() or not installed_python.is_dir():
+                    raise RuntimeError(
+                        f'installed Python package is not a regular directory: {installed_python}'
+                    )
+                shutil.rmtree(installed_python)
+            shutil.copytree(python_source, installed_python)
     for name in ('.editorconfig', '.gitattributes', 'LICENSE', 'README.md', 'pyproject.toml'):
         shutil.copy2(REPOSITORY / name, repository / name)
     gate_fixture_source = Path(sys.executable).resolve(strict=True)
@@ -5103,10 +5112,10 @@ def _rebind_phase3_smoke_profile_outputs(
         - profile['profile_started_monotonic_ns']
     )
     profile['full_stack_process'] = full_stack
-    host_thread_binding = profile['contact_profile']['host_thread_binding']
+    host_thread_bindings = profile['contact_profile']['host_thread_bindings']
     contact = profiler.parse_contact_profile_logs(candidate_root / 'smoke')
     profiler.reconcile_contact_log_sources(contact, full_stack)
-    contact['host_thread_binding'] = host_thread_binding
+    contact['host_thread_bindings'] = host_thread_bindings
     profile['contact_profile'] = contact
     _canonical_file(profile_path, profile, sidecar=True)
     binding = profiler.validate_campaign_smoke_profile(repository, candidate_root, candidate_id)
@@ -5147,10 +5156,10 @@ def _relocate_phase3_smoke_profile(
     )
     full_stack['pre_smoke_outputs_absent'] = True
     profile['full_stack_process'] = full_stack
-    host_thread_binding = profile['contact_profile']['host_thread_binding']
+    host_thread_bindings = profile['contact_profile']['host_thread_bindings']
     contact = profiler.parse_contact_profile_logs(candidate_root / 'smoke')
     profiler.reconcile_contact_log_sources(contact, full_stack)
-    contact['host_thread_binding'] = host_thread_binding
+    contact['host_thread_bindings'] = host_thread_bindings
     profile['contact_profile'] = contact
     _canonical_file(profile_path, profile, sidecar=True)
     assert old_root.encode() not in profile_path.read_bytes()

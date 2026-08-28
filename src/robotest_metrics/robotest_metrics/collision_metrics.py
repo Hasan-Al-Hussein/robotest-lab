@@ -1567,9 +1567,11 @@ def _positive_control_evidence(
         reverse_start_stamp=reverse_start_stamp,
         final_zero_stamp=final_zero_stamp,
     )
+    verified_start_clock_stamp = start_stamp + start_alignment
     if (
-        response_stamp > control_started_stamp
-        or start_stamp > control_started_stamp
+        not max(response_stamp, wall_stamp, start_stamp)
+        <= verified_start_clock_stamp
+        <= control_started_stamp
         or commands[0]['collector_sequence']
         <= max(response_sequence, wall_sequence, start_sequence)
         or first_contact_sequence
@@ -1577,7 +1579,6 @@ def _positive_control_evidence(
             command['collector_sequence'] for command in commands if command['phase'] == 'FORWARD'
         )
         + 2
-        or start_stamp + start_alignment != control_started_stamp
     ):
         raise MetricUnavailable('positive-control setup/control sequence does not reconcile')
     cleanup = positive_control.get('cleanup')

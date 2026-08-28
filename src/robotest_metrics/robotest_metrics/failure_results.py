@@ -246,3 +246,31 @@ def compose_infrastructure_failure(
             'threshold_checks': threshold_checks,
         },
     }
+
+
+def compose_artifact_finalization_failure(
+    context: Mapping[str, Any],
+    *,
+    evidence_sha256: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Compose a compact context-bound verdict for failed artifact finalization."""
+    bounded_reason = _bounded_reason(reason)
+    result = compose_infrastructure_failure(
+        context,
+        {
+            'evidence_sha256': evidence_sha256,
+            'exit_code': 31,
+            'kind': 'artifact_finalization',
+            'reason': bounded_reason,
+            'stage': 'artifact_finalization',
+            'wall_timed_out': False,
+        },
+    )
+    result['quality']['artifact_finalization'] = {
+        'reason': bounded_reason,
+        'status': 'FAIL',
+    }
+    result['verdict']['exit_code'] = 31
+    result['verdict']['reason'] = 'artifact_finalization_failed'
+    return result

@@ -547,10 +547,10 @@ TEST(ContactAggregatorProfile,
     internal::ContactProfileCategory::ContactPolicyProtobuf, 40U, linux_tid);
   profile.add_timing(
     internal::ContactProfileCategory::Publish, 50U, linux_tid);
-  profile.count_observation();
-  profile.count_observation();
-  profile.count_rescan();
-  profile.count_publish();
+  profile.count_observation(linux_tid);
+  profile.count_observation(linux_tid);
+  profile.count_rescan(linux_tid);
+  profile.count_publish(linux_tid);
 
   EXPECT_FALSE(profile.emit_if_due(
       lock_stamp_ns + internal::kContactProfileEmissionPeriodNs - 1)
@@ -564,7 +564,6 @@ TEST(ContactAggregatorProfile,
     "\"clock_id\":\"CLOCK_THREAD_CPUTIME_ID\","
     "\"contact_policy_protobuf_ns\":40,"
     "\"exhaustive_event_rescan_ns\":30,"
-    "\"linux_tid\":4321,"
     "\"locked_binding_validation_ns\":10,"
     "\"measured_total_ns\":150,"
     "\"observation_count\":2,"
@@ -573,8 +572,20 @@ TEST(ContactAggregatorProfile,
     "\"publish_ns\":50,"
     "\"rescan_count\":1,"
     "\"saturated\":false,"
-    "\"schema_version\":1,"
-    "\"sim_stamp_ns\":5000001000}");
+    "\"schema_version\":2,"
+    "\"sim_stamp_ns\":5000001000,"
+    "\"status\":\"PASS\","
+    "\"thread_contributions\":[{"
+    "\"cached_event_state_check_ns\":20,"
+    "\"contact_policy_protobuf_ns\":40,"
+    "\"exhaustive_event_rescan_ns\":30,"
+    "\"linux_tid\":4321,"
+    "\"locked_binding_validation_ns\":10,"
+    "\"measured_total_ns\":150,"
+    "\"observation_count\":2,"
+    "\"publish_count\":1,"
+    "\"publish_ns\":50,"
+    "\"rescan_count\":1}]}");
   EXPECT_FALSE(profile.emit_if_due(
       lock_stamp_ns + internal::kContactProfileEmissionPeriodNs)
     .has_value());
@@ -589,9 +600,9 @@ TEST(ContactAggregatorProfile,
     internal::ContactProfileCategory::ContactPolicyProtobuf, 4U, linux_tid);
   profile.add_timing(
     internal::ContactProfileCategory::Publish, 5U, linux_tid);
-  profile.count_observation();
-  profile.count_rescan();
-  profile.count_publish();
+  profile.count_observation(linux_tid);
+  profile.count_rescan(linux_tid);
+  profile.count_publish(linux_tid);
   const auto second = profile.emit_if_due(
     lock_stamp_ns + 2 * internal::kContactProfileEmissionPeriodNs);
   ASSERT_TRUE(second.has_value());
@@ -601,7 +612,6 @@ TEST(ContactAggregatorProfile,
     "\"clock_id\":\"CLOCK_THREAD_CPUTIME_ID\","
     "\"contact_policy_protobuf_ns\":44,"
     "\"exhaustive_event_rescan_ns\":33,"
-    "\"linux_tid\":4321,"
     "\"locked_binding_validation_ns\":11,"
     "\"measured_total_ns\":165,"
     "\"observation_count\":3,"
@@ -610,8 +620,20 @@ TEST(ContactAggregatorProfile,
     "\"publish_ns\":55,"
     "\"rescan_count\":2,"
     "\"saturated\":false,"
-    "\"schema_version\":1,"
-    "\"sim_stamp_ns\":10000001000}");
+    "\"schema_version\":2,"
+    "\"sim_stamp_ns\":10000001000,"
+    "\"status\":\"PASS\","
+    "\"thread_contributions\":[{"
+    "\"cached_event_state_check_ns\":22,"
+    "\"contact_policy_protobuf_ns\":44,"
+    "\"exhaustive_event_rescan_ns\":33,"
+    "\"linux_tid\":4321,"
+    "\"locked_binding_validation_ns\":11,"
+    "\"measured_total_ns\":165,"
+    "\"observation_count\":3,"
+    "\"publish_count\":2,"
+    "\"publish_ns\":55,"
+    "\"rescan_count\":2}]}");
 }
 
 TEST(ContactAggregatorProfile, SimulationTimeJumpNeverProducesABurst) {
@@ -640,26 +662,41 @@ TEST(ContactAggregatorProfile, SimulationTimeJumpNeverProducesABurst) {
     .has_value());
 }
 
-TEST(ContactAggregatorProfile, DisabledOrMixedThreadStateCannotEmit) {
+TEST(ContactAggregatorProfile, DisabledStateCannotEmitAndThreadMigrationIsRetained) {
   internal::ContactProfileAccumulator disabled(false);
   disabled.lock(0);
   disabled.add_timing(
     internal::ContactProfileCategory::Publish, 1U, 7);
-  disabled.count_observation();
+  disabled.count_observation(7);
   EXPECT_FALSE(disabled.emit_if_due(
       internal::kContactProfileEmissionPeriodNs)
     .has_value());
 
-  internal::ContactProfileAccumulator mixed_thread(true);
-  mixed_thread.lock(0);
-  mixed_thread.add_timing(
-    internal::ContactProfileCategory::LockedBindingValidation, 1U, 7);
-  mixed_thread.add_timing(
+  internal::ContactProfileAccumulator migrated(true);
+  migrated.lock(0);
+  migrated.add_timing(
     internal::ContactProfileCategory::CachedEventStateCheck, 1U, 8);
-  EXPECT_FALSE(mixed_thread.enabled());
-  EXPECT_FALSE(mixed_thread.emit_if_due(
+  migrated.count_observation(8);
+  EXPECT_TRUE(migrated.emit_if_due(
       internal::kContactProfileEmissionPeriodNs)
     .has_value());
+  migrated.add_timing(
+    internal::ContactProfileCategory::LockedBindingValidation, 1U, 7);
+  migrated.count_observation(7);
+  EXPECT_FALSE(migrated.emit_if_due(
+      internal::kContactProfileEmissionPeriodNs + 1)
+    .has_value());
+  EXPECT_TRUE(migrated.enabled());
+  const auto record = migrated.emit_if_due(
+    2 * internal::kContactProfileEmissionPeriodNs);
+  ASSERT_TRUE(record.has_value());
+  const auto first = record->find("\"linux_tid\":7");
+  const auto second = record->find("\"linux_tid\":8");
+  EXPECT_NE(first, std::string::npos);
+  EXPECT_NE(second, std::string::npos);
+  EXPECT_LT(first, second);
+  EXPECT_NE(record->find("\"measured_total_ns\":2"), std::string::npos);
+  EXPECT_NE(record->find("\"observation_count\":2"), std::string::npos);
 }
 
 TEST(ContactAggregatorProfile, NewEpochClearsCountersTimingsAndThreadIdentity) {
@@ -667,12 +704,12 @@ TEST(ContactAggregatorProfile, NewEpochClearsCountersTimingsAndThreadIdentity) {
   profile.lock(100);
   profile.add_timing(
     internal::ContactProfileCategory::LockedBindingValidation, 99U, 7);
-  profile.count_observation();
-  profile.count_rescan();
+  profile.count_observation(7);
+  profile.count_rescan(7);
 
   profile.lock(200);
   profile.add_timing(internal::ContactProfileCategory::Publish, 3U, 8);
-  profile.count_publish();
+  profile.count_publish(8);
   const auto record = profile.emit_if_due(
     200 + internal::kContactProfileEmissionPeriodNs);
   ASSERT_TRUE(record.has_value());
@@ -687,7 +724,7 @@ TEST(ContactAggregatorProfile, NewEpochClearsCountersTimingsAndThreadIdentity) {
   EXPECT_EQ(record->find("\"linux_tid\":7"), std::string::npos);
 }
 
-TEST(ContactAggregatorProfile, SaturationIsExplicitAndNeverWraps) {
+TEST(ContactAggregatorProfile, CounterOverflowIsAnExplicitFailureRecord) {
   internal::ContactProfileAccumulator profile(true);
   profile.lock(0);
   constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
@@ -698,10 +735,70 @@ TEST(ContactAggregatorProfile, SaturationIsExplicitAndNeverWraps) {
   const auto record = profile.emit_if_due(
     internal::kContactProfileEmissionPeriodNs);
   ASSERT_TRUE(record.has_value());
-  EXPECT_NE(
-    record->find("\"measured_total_ns\":" + std::to_string(maximum)),
-    std::string::npos);
-  EXPECT_NE(record->find("\"saturated\":true"), std::string::npos);
+  EXPECT_EQ(
+    *record,
+    "{\"failure_kind\":\"counter_overflow\",\"schema_version\":2,"
+    "\"sim_stamp_ns\":5000000000,\"status\":\"FAIL\"}");
+  EXPECT_TRUE(profile.failure_pending());
+  EXPECT_EQ(profile.emit_if_due(2),
+    std::optional<std::string>(
+      "{\"failure_kind\":\"counter_overflow\",\"schema_version\":2,"
+      "\"sim_stamp_ns\":2,\"status\":\"FAIL\"}"));
+  profile.acknowledge_failure_emitted();
+  EXPECT_FALSE(profile.failure_pending());
+  EXPECT_FALSE(profile.emit_if_due(2).has_value());
+}
+
+TEST(ContactAggregatorProfile, EveryFailureKindIsCanonicalAndFirstFailureWins) {
+  const std::array<std::pair<internal::ContactProfileFailure, const char *>, 7U>
+  cases{{
+    {internal::ContactProfileFailure::ClockUnavailable, "clock_unavailable"},
+    {internal::ContactProfileFailure::ClockRegressed, "clock_regressed"},
+    {internal::ContactProfileFailure::InvalidThreadIdentity,
+      "invalid_thread_identity"},
+    {internal::ContactProfileFailure::ThreadContributionOverflow,
+      "thread_contribution_overflow"},
+    {internal::ContactProfileFailure::CounterOverflow, "counter_overflow"},
+    {internal::ContactProfileFailure::InvalidCategory, "invalid_category"},
+    {internal::ContactProfileFailure::OutputUnavailable, "output_unavailable"},
+  }};
+  for (const auto & [failure, name] : cases) {
+    SCOPED_TRACE(name);
+    internal::ContactProfileAccumulator profile(true);
+    profile.lock(0);
+    profile.fail(failure);
+    profile.fail(internal::ContactProfileFailure::OutputUnavailable);
+    const auto record = profile.emit_if_due(11);
+    ASSERT_TRUE(record.has_value());
+    EXPECT_EQ(
+      *record,
+      "{\"failure_kind\":\"" + std::string(name) +
+      "\",\"schema_version\":2,\"sim_stamp_ns\":11,\"status\":\"FAIL\"}");
+    EXPECT_TRUE(profile.failure_pending());
+    profile.acknowledge_failure_emitted();
+    EXPECT_FALSE(profile.failure_pending());
+  }
+}
+
+TEST(ContactAggregatorProfile, ThreadContributionOverflowIsExplicitAndBounded) {
+  internal::ContactProfileAccumulator profile(true);
+  profile.lock(0);
+  for (std::size_t index = 0U;
+    index <= internal::kContactProfileMaxThreadContributions; ++index)
+  {
+    profile.add_timing(
+      internal::ContactProfileCategory::LockedBindingValidation,
+      1U,
+      static_cast<std::int64_t>(index + 1U));
+  }
+
+  const auto record = profile.emit_if_due(9);
+  ASSERT_TRUE(record.has_value());
+  EXPECT_EQ(
+    *record,
+    "{\"failure_kind\":\"thread_contribution_overflow\","
+    "\"schema_version\":2,\"sim_stamp_ns\":9,\"status\":\"FAIL\"}");
+  EXPECT_TRUE(profile.failure_pending());
 }
 
 TEST(ContactAggregatorPolicy,

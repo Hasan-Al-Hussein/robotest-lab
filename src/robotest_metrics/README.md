@@ -77,7 +77,7 @@ missing, malformed, schema-invalid, context-mismatched, or analytically
 invalid, the analyzer itself converts that observation into the same canonical
 infrastructure-failure result. The runner never authors a run verdict.
 
-The command writes canonical `run-result.json`, its exact flattened one-row
+The command writes canonical `run-result.json`, its exact bounded scalar-summary
 `run-result.csv` projection, source-hash-bound `report.md` and `report.html`,
 up to four PNG charts, `run-artifacts.manifest.json`, and the exact detached
 sidecar `run-artifacts.manifest.json.sha256`. The manifest hashes and sizes
@@ -85,9 +85,12 @@ every output except itself and its sidecar; its sidecar is exactly
 `<64 lowercase hex>  run-artifacts.manifest.json\n`. The analyzer then rereads
 the manifest, sidecar, canonical result, CSV projection, hashes, path set, and
 caps before returning. This avoids any result self-hash or predicted-size
-cycle. JSON null becomes a blank CSV field. Reports and charts read only the
-finalized canonical JSON. Exit `0` is a Phase 3 PASS, `30` is a valid canonical
-FAIL, `31` is artifact-finalization failure, `32` is a schema-valid canonical
+cycle. Scalar leaves remain direct CSV fields, JSON null becomes blank, and
+each JSON array becomes a canonical count-and-hash descriptor under projection
+contract `bounded_scalar_summary_v1`; the complete JSON SHA-256 binds the row.
+Reports and charts read only the finalized canonical JSON. Exit `0` is a
+Phase 3 PASS, `30` is a valid canonical FAIL, `31` is artifact-finalization
+failure, `32` is a schema-valid canonical
 infrastructure FAIL written at the ordered trial index, `33` rejects stale
 output artifacts without overwriting them, and `34` means no verdict could be
 safely composed because the immutable trial context or invocation was invalid.

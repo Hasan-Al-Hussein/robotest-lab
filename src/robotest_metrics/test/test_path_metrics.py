@@ -143,7 +143,10 @@ def test_per_leg_first_plan_and_replan_chains_are_independent() -> None:
     result = analyze_plans(
         plans,
         feedback,
-        [{'x_m': 2.0, 'y_m': 0.0}, {'x_m': 4.0, 'y_m': 0.0}],
+        [
+            {'x': 2.0, 'y': 0.0, 'yaw': 0.0},
+            {'x': 4.0, 'y': 0.0, 'yaw': 0.0},
+        ],
         0,
         20,
     )
@@ -152,6 +155,29 @@ def test_per_leg_first_plan_and_replan_chains_are_independent() -> None:
     assert result['replan_count'] == 2
     assert [leg['replan_count'] for leg in result['leg_results']] == [1, 1]
     assert result['leg_results'][1]['initial_plan']['collector_sequence'] == 11
+
+
+@pytest.mark.parametrize(
+    'waypoint',
+    [
+        {'x_m': 2.0, 'y_m': 0.0},
+        {'x': '2.0', 'y': 0.0, 'yaw': 0.0},
+        {'x': 2.0, 'y': 0.0, 'yaw': 0.0, 'frame_id': 'map'},
+    ],
+)
+def test_configured_waypoints_require_exact_canonical_mission_pose(
+    waypoint: dict[str, object],
+) -> None:
+    feedback = [{'collector_sequence': 1, 'current_waypoint': 0, 'stamp_ns': 0}]
+
+    with pytest.raises(MetricUnavailable, match=r'exactly x, y, and yaw|finite number'):
+        analyze_plans(
+            [_plan(1, 2, [0.0, 2.0])],
+            feedback,
+            [waypoint],
+            0,
+            20,
+        )
 
 
 def test_equal_stamp_plan_before_feedback_remains_in_previous_leg_diagnostics() -> None:
@@ -163,7 +189,10 @@ def test_equal_stamp_plan_before_feedback_remains_in_previous_leg_diagnostics() 
     result = analyze_plans(
         plans,
         feedback,
-        [{'x_m': 2.0, 'y_m': 0.0}, {'x_m': 4.0, 'y_m': 0.0}],
+        [
+            {'x': 2.0, 'y': 0.0, 'yaw': 0.0},
+            {'x': 4.0, 'y': 0.0, 'yaw': 0.0},
+        ],
         0,
         20,
     )
@@ -188,7 +217,10 @@ def test_ambiguous_feedback_and_missing_leg_fail_closed(
         analyze_plans(
             [_plan(1, 2, [0.0, 1.0])],
             feedback,
-            [{'x_m': 1.0, 'y_m': 0.0}, {'x_m': 2.0, 'y_m': 0.0}],
+            [
+                {'x': 1.0, 'y': 0.0, 'yaw': 0.0},
+                {'x': 2.0, 'y': 0.0, 'yaw': 0.0},
+            ],
             0,
             20,
         )

@@ -21,11 +21,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import robotest_metrics.analyze_cli as analyze_cli_module
 from robotest_metrics.analysis import analyze_run
 from robotest_metrics.analyze_cli import main as analyze_main
 from robotest_metrics.artifacts import canonical_sha256
 from robotest_metrics.bundle import verify_result_bundle
-from robotest_metrics.errors import MetricUnavailable
+from robotest_metrics.errors import ArtifactError, MetricUnavailable
+from robotest_metrics.failure_results import compose_artifact_finalization_failure
 from robotest_metrics.schema_validation import validate_document
 
 
@@ -332,6 +334,133 @@ def test_analysis_cli_writes_matching_bundle_and_refuses_stale_outputs(
     manifest = verify_result_bundle(output)
     assert manifest['identity']['run_result_sha256'] == canonical_sha256(result)
     assert analyze_main(arguments) == 33
+
+
+@pytest.mark.parametrize(
+    'failure_exception',
+    (
+        ArtifactError('forced primary projection overflow'),
+        OSError('forced primary filesystem failure'),
+    ),
+    ids=('artifact-error', 'os-error'),
+)
+def test_analysis_cli_finalization_failure_uses_compact_context_bound_result(
+    tmp_path: Path,
+    analysis_request: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    failure_exception: Exception,
+) -> None:
+    request_path = tmp_path / 'request.json'
+    request_path.write_text(json.dumps(analysis_request), encoding='utf-8')
+    context_path = tmp_path / 'trial-context.json'
+    context_path.write_text(json.dumps(_trial_context(analysis_request)), encoding='utf-8')
+    output = tmp_path / 'result'
+    original_write_result_pair = analyze_cli_module.write_result_pair
+    attempt_count = 0
+
+    def fail_first_result_pair(result: object, output_directory: Path) -> object:
+        nonlocal attempt_count
+        attempt_count += 1
+        if attempt_count == 1:
+            raise failure_exception
+        return original_write_result_pair(result, output_directory)
+
+    monkeypatch.setattr(analyze_cli_module, 'write_result_pair', fail_first_result_pair)
+
+    assert (
+        analyze_main(
+            [
+                '--input',
+                str(request_path),
+                '--output-dir',
+                str(output),
+                '--trial-context',
+                str(context_path),
+            ]
+        )
+        == 31
+    )
+
+    assert attempt_count == 2
+    result = json.loads((output / 'run-result.json').read_text(encoding='utf-8'))
+    validate_document(result, 'run-result.schema.json')
+    assert result['identity'] == analysis_request['identity']
+    assert result['targets'] == analysis_request['targets']
+    assert result['measurements']['actual_path_length_m'] is None
+    assert 'actual_path' not in result['measurements']
+    assert result['events'][0]['kind'] == 'artifact_finalization'
+    assert result['quality']['infrastructure_failure']['exit_code'] == 31
+    assert result['quality']['infrastructure_failure']['stage'] == 'artifact_finalization'
+    assert result['quality']['artifact_projection_preflight'] == 'PASS'
+    assert result['quality']['artifact_finalization'] == {
+        'reason': str(failure_exception),
+        'status': 'FAIL',
+    }
+    assert result['verdict']['automated_status'] == 'FAIL'
+    assert result['verdict']['exit_code'] == 31
+    assert result['verdict']['reason'] == 'artifact_finalization_failed'
+    assert (output / 'run-result.json').stat().st_size < 100_000
+    verify_result_bundle(output)
+
+
+def test_analysis_cli_nested_finalization_oserror_returns_exit_31(
+    tmp_path: Path,
+    analysis_request: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    request_path = tmp_path / 'request.json'
+    request_path.write_text(json.dumps(analysis_request), encoding='utf-8')
+    context_path = tmp_path / 'trial-context.json'
+    context_path.write_text(json.dumps(_trial_context(analysis_request)), encoding='utf-8')
+    output = tmp_path / 'result'
+    attempt_count = 0
+
+    def fail_every_result_pair(result: object, output_directory: Path) -> object:
+        del result, output_directory
+        nonlocal attempt_count
+        attempt_count += 1
+        raise OSError('forced persistent filesystem failure')
+
+    monkeypatch.setattr(analyze_cli_module, 'write_result_pair', fail_every_result_pair)
+
+    assert (
+        analyze_main(
+            [
+                '--input',
+                str(request_path),
+                '--output-dir',
+                str(output),
+                '--trial-context',
+                str(context_path),
+            ]
+        )
+        == 31
+    )
+    assert attempt_count == 2
+    stderr = capsys.readouterr().err
+    assert (
+        'cannot finalize failed canonical verdict: forced persistent filesystem failure' in stderr
+    )
+    assert 'metrics analysis artifact failure: forced persistent filesystem failure' in stderr
+
+
+def test_artifact_finalization_failure_record_has_bounded_exact_shape(
+    analysis_request: dict[str, object],
+) -> None:
+    result = compose_artifact_finalization_failure(
+        _trial_context(analysis_request),
+        evidence_sha256='a' * 64,
+        reason='é' * 3_000,
+    )
+
+    record = result['quality']['artifact_finalization']
+    assert set(record) == {'reason', 'status'}
+    assert record['status'] == 'FAIL'
+    assert record['reason'].endswith('...')
+    assert len(record['reason'].encode('utf-8')) <= 4_096
+    assert record['reason'] == result['quality']['infrastructure_failure']['reason']
+    validate_document(result, 'run-result.schema.json')
 
 
 def test_analysis_cli_preserves_canceled_null_completion_as_functional_failure(

@@ -25,6 +25,7 @@ namespace internal
 {
 
 inline constexpr std::int64_t kContactProfileEmissionPeriodNs = 5000000000LL;
+inline constexpr std::size_t kContactProfileMaxThreadContributions = 128U;
 
 enum class ContactProfileCategory : std::size_t
 {
@@ -36,41 +37,62 @@ enum class ContactProfileCategory : std::size_t
   Count = 5U,
 };
 
+enum class ContactProfileFailure : std::size_t
+{
+  ClockUnavailable = 0U,
+  ClockRegressed = 1U,
+  InvalidThreadIdentity = 2U,
+  ThreadContributionOverflow = 3U,
+  CounterOverflow = 4U,
+  InvalidCategory = 5U,
+  OutputUnavailable = 6U,
+};
+
 /// Fixed-size cumulative state behind the optional live attribution log.
 class ContactProfileAccumulator {
 public:
   explicit ContactProfileAccumulator(bool enabled = false) noexcept;
 
   bool enabled() const noexcept;
-  void disable() noexcept;
+  bool failure_pending() const noexcept;
+  void fail(ContactProfileFailure failure) noexcept;
+  void acknowledge_failure_emitted() noexcept;
   void lock(std::int64_t simulation_stamp_ns) noexcept;
   void restart_cadence(std::int64_t simulation_stamp_ns) noexcept;
   void add_timing(
     ContactProfileCategory category,
     std::uint64_t elapsed_ns,
     std::int64_t linux_tid) noexcept;
-  void count_observation() noexcept;
-  void count_rescan() noexcept;
-  void count_publish() noexcept;
+  void count_observation(std::int64_t linux_tid) noexcept;
+  void count_rescan(std::int64_t linux_tid) noexcept;
+  void count_publish(std::int64_t linux_tid) noexcept;
   std::optional<std::string> emit_if_due(std::int64_t simulation_stamp_ns);
 
 private:
-  void saturating_add(
-    std::uint64_t & target,
-    std::uint64_t increment) noexcept;
-  void count(std::uint64_t & target) noexcept;
+  struct ThreadContribution
+  {
+    std::array<std::uint64_t,
+      static_cast<std::size_t>(ContactProfileCategory::Count)> cumulative_ns{};
+    std::int64_t linux_tid{0};
+    std::uint64_t observation_count{0U};
+    std::uint64_t rescan_count{0U};
+    std::uint64_t publish_count{0U};
+  };
 
-  std::array<std::uint64_t,
-    static_cast<std::size_t>(ContactProfileCategory::Count)> cumulative_ns_{};
+  ThreadContribution * contribution_for(std::int64_t linux_tid) noexcept;
+  void saturating_add(std::uint64_t & target, std::uint64_t increment) noexcept;
+  void count(std::uint64_t ThreadContribution::* target, std::int64_t linux_tid) noexcept;
+  std::optional<std::string> emit_failure(std::int64_t simulation_stamp_ns) const;
+
+  std::array<ThreadContribution, kContactProfileMaxThreadContributions>
+  thread_contributions_{};
+  std::size_t thread_contribution_count_{0U};
   std::optional<std::int64_t> next_emission_stamp_ns_;
   std::optional<std::int64_t> profile_epoch_start_sim_stamp_ns_;
-  std::optional<std::int64_t> linux_tid_;
-  std::uint64_t observation_count_{0U};
-  std::uint64_t rescan_count_{0U};
-  std::uint64_t publish_count_{0U};
+  std::optional<ContactProfileFailure> failure_;
   bool enabled_{false};
   bool locked_{false};
-  bool saturated_{false};
+  bool failure_emitted_{false};
 };
 
 }  // namespace internal

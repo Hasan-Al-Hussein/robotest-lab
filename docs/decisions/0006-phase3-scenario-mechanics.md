@@ -110,6 +110,10 @@ It uses the unmodified world and map. It must prove three ordered completed
 waypoints, zero qualified collisions, the common timeouts, and path efficiency
 of at least `0.75`. The planned reference is the cumulative first valid plan
 for each feedback-derived leg; it is not the first plan of the whole mission.
+Configured waypoint evidence is accepted only in the mission schema's exact
+`{x, y, yaw}` shape with finite JSON numbers. The analyzer converts `x` and `y`
+once to its internal metre-suffixed pose representation; configured
+`{x_m, y_m}` values, numeric strings, booleans, and extra fields fail closed.
 
 ## Scenario 2: static obstacle replan
 
@@ -470,6 +474,12 @@ zero-probe waits, motion, release, and cleanup. The runner's READY wait is
 process wrapper, so it cannot terminate bounded cleanup first. READY, ARM, and
 ARMED do not start or reset any deadline.
 
+The retained start sample may predate spawn. Its alignment error reconstructs
+the clock at start verification and must satisfy
+`max(spawn response, wall observation, start sample) <= verified start <= first control`.
+It need not equal first control because the stationary READY/ARM protocol occurs
+after preparation.
+
 The expected non-excluded pair is the coverage manifest's exact rendered
 chassis collision and
 `phase3_contact_control_wall::link::collision`. At least one retained public
@@ -606,6 +616,20 @@ orchestrator alone atomically writes the canonical per-trial
 is the sole per-trial benchmark verdict. A succeeded action with a scenario,
 collision, fault, quality, cap, checksum, cleanup, or mutation failure remains
 a failed trial.
+
+The per-run CSV retains scalar leaves and represents each JSON array by a
+canonical `{kind: sequence, element_count, sha256}` descriptor. Reserved root
+columns bind projection contract `bounded_scalar_summary_v1` and the SHA-256 of
+the complete canonical JSON, so the 1 MiB comparison view does not duplicate
+the JSON's bounded raw sequences. If primary artifact finalization fails, exit
+31 is finalized from a fresh compact immutable-context-bound FAIL result; the
+failure path never deep-copies the oversized measurements or component traces.
+Its explicit `quality.artifact_finalization` record is `FAIL`; the replacement
+result's schema-required projection preflight is `PASS` because the compact
+replacement itself was successfully preflighted and finalized.
+The bounded scalar-summary contract is per-run only. Aggregate CSV retains the
+legacy complete dotted-key projection, including full canonical array values,
+through a separate aggregate writer so Phase 5 replay bytes do not drift.
 
 Aggregate reports consume exactly the 15 canonical JSON files in suite-index
 order. For finite values sorted ascending as `x_1...x_n`:

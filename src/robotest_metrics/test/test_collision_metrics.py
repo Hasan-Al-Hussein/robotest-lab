@@ -443,6 +443,45 @@ def test_positive_control_requires_frozen_ground_truth_start_proof() -> None:
         validate_collision_qualification(manifest, positive, binding)
 
 
+def test_positive_control_start_verification_may_precede_armed_control() -> None:
+    manifest, positive, binding = collision_fixture()
+    observed_start = positive['control']['observed_robot_start']
+    observed_start['alignment_error_ns'] = 50_000_000
+    positive['control']['setup']['observed_robot_start'] = copy.deepcopy(observed_start)
+    _rebind_positive_control(positive, binding)
+
+    assert validate_collision_qualification(manifest, positive, binding)['status'] == 'PASS'
+
+
+@pytest.mark.parametrize(
+    'mutation',
+    [
+        lambda positive: positive['control']['observed_robot_start'].__setitem__(
+            'alignment_error_ns', 101_000_000
+        ),
+        lambda positive: positive['control']['setup']['spawn'].__setitem__(
+            'response_stamp_ns', 975_000_000
+        ),
+        lambda positive: positive['control']['setup']['observed_wall'].__setitem__(
+            'stamp_ns', 975_000_000
+        ),
+    ],
+)
+def test_positive_control_start_verification_is_ordered_with_preparation_and_control(
+    mutation: Any,
+) -> None:
+    manifest, positive, binding = collision_fixture()
+    positive['control']['observed_robot_start']['alignment_error_ns'] = 50_000_000
+    mutation(positive)
+    positive['control']['setup']['observed_robot_start'] = copy.deepcopy(
+        positive['control']['observed_robot_start']
+    )
+    _rebind_positive_control(positive, binding)
+
+    with pytest.raises(MetricUnavailable, match='setup/control sequence'):
+        validate_collision_qualification(manifest, positive, binding)
+
+
 @pytest.mark.parametrize(
     ('path', 'value'),
     [
@@ -614,7 +653,7 @@ def test_positive_control_default_wall_asset_ignores_evidence_path_redirection(
         ),
         (
             lambda positive, _manifest: positive['control']['observed_robot_start'].__setitem__(
-                'alignment_error_ns', 0
+                'alignment_error_ns', 200_000_000
             ),
             'setup/control sequence',
         ),

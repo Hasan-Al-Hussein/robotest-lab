@@ -8,10 +8,14 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import importlib.util
+import io
+import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 import pytest
@@ -167,9 +171,9 @@ def _config_arguments(config) -> argparse.Namespace:
         build_binding=config.build_binding,
         ros_domain_id=config.ros_domain_id,
         gz_partition=config.gz_partition,
-        startup_timeout_s=10.0,
-        sample_period_s=0.5,
-        max_duration_s=100.0,
+        startup_timeout_s=profiler.CANONICAL_STARTUP_TIMEOUT_S,
+        sample_period_s=profiler.CANONICAL_SAMPLE_PERIOD_S,
+        max_duration_s=profiler.CANONICAL_MAX_DURATION_S,
     )
 
 
@@ -313,26 +317,43 @@ def _update_cpu(root: Path, pid: int, ticks: int, start: int = 100, group: int =
     (root / 'task' / str(pid) / 'stat').write_text(value, encoding='ascii')
 
 
-def _contact_record(step: int = 0) -> dict:
-    buckets = {
-        'cached_event_state_check_ns': 20 + step,
-        'contact_policy_protobuf_ns': 40 + step,
-        'exhaustive_event_rescan_ns': 30 + step,
-        'locked_binding_validation_ns': 10 + step,
-        'publish_ns': 50 + step,
+def _contact_record(step: int = 0, linux_tids: tuple[int, ...] = (101,)) -> dict:
+    contributions = []
+    for offset, linux_tid in enumerate(linux_tids):
+        buckets = {
+            'cached_event_state_check_ns': 20 + step + offset,
+            'contact_policy_protobuf_ns': 40 + step + offset,
+            'exhaustive_event_rescan_ns': 30 + step + offset,
+            'locked_binding_validation_ns': 10 + step + offset,
+            'publish_ns': 50 + step + offset,
+        }
+        contributions.append(
+            {
+                **buckets,
+                'linux_tid': linux_tid,
+                'measured_total_ns': sum(buckets.values()),
+                'observation_count': 2 + step + offset,
+                'publish_count': 1 + step + offset,
+                'rescan_count': 1 + step + offset,
+            }
+        )
+    totals = {
+        field: sum(contribution[field] for contribution in contributions)
+        for field in profiler.CONTACT_CONTRIBUTION_MONOTONIC_KEYS
     }
     return {
-        **buckets,
+        **{field: totals[field] for field in profiler.CONTACT_BUCKET_KEYS},
         'clock_id': 'CLOCK_THREAD_CPUTIME_ID',
-        'linux_tid': 101,
-        'measured_total_ns': sum(buckets.values()),
-        'observation_count': 2 + step,
+        'measured_total_ns': totals['measured_total_ns'],
+        'observation_count': totals['observation_count'],
         'profile_epoch_start_sim_stamp_ns': 1000,
-        'publish_count': 1 + step,
-        'rescan_count': 1 + step,
+        'publish_count': totals['publish_count'],
+        'rescan_count': totals['rescan_count'],
         'saturated': False,
-        'schema_version': 1,
+        'schema_version': 2,
         'sim_stamp_ns': 5_000_001_000 + step * 5_000_000_000,
+        'status': 'PASS',
+        'thread_contributions': contributions,
     }
 
 
@@ -634,6 +655,56 @@ def test_contact_parser_selects_last_fully_valid_cumulative_record(tmp_path: Pat
     assert evidence['last_valid_cumulative_record'] == last
 
 
+def test_contact_profile_accepts_sorted_migration_and_reconciles_every_thread() -> None:
+    first = _contact_record()
+    migrated = _contact_record(1, (101, 202))
+
+    profiler.validate_contact_profile_records((first, migrated))
+
+    assert [contribution['linux_tid'] for contribution in migrated['thread_contributions']] == [
+        101,
+        202,
+    ]
+
+
+@pytest.mark.parametrize('mutation', ('unsorted', 'duplicate', 'disappeared', 'bad_total'))
+def test_contact_profile_rejects_hostile_thread_contribution_sequences(mutation: str) -> None:
+    first = _contact_record(0, (101, 202))
+    second = _contact_record(1, (101, 202))
+    if mutation == 'unsorted':
+        second['thread_contributions'].reverse()
+    elif mutation == 'duplicate':
+        second['thread_contributions'][1]['linux_tid'] = 101
+    elif mutation == 'disappeared':
+        second = _contact_record(1, (101,))
+    elif mutation == 'bad_total':
+        second['cached_event_state_check_ns'] += 1
+    else:  # pragma: no cover - exhaustive table guard
+        raise AssertionError(mutation)
+
+    with pytest.raises(profiler.ProfileError):
+        profiler.validate_contact_profile_records((first, second))
+
+
+def test_contact_parser_surfaces_explicit_producer_failure(tmp_path: Path) -> None:
+    config, _plugin, _producer = _fixture_config(tmp_path)
+    failure = {
+        'failure_kind': 'thread_contribution_overflow',
+        'schema_version': 2,
+        'sim_stamp_ns': 1,
+        'status': 'FAIL',
+    }
+    _full_stack_files(config, (failure,))
+    process_dir = config.candidate_root / 'smoke/processes'
+    stdout = process_dir / 'full_stack.stdout.log'
+    stderr = process_dir / 'full_stack.stderr.log'
+    stderr.write_bytes(stdout.read_bytes())
+    stdout.write_bytes(b'')
+
+    with pytest.raises(profiler.ProfileError, match='thread_contribution_overflow'):
+        profiler.parse_contact_profile_logs(config.candidate_root / 'smoke')
+
+
 def test_contact_parser_caps_cumulative_record_count(tmp_path: Path) -> None:
     config, _plugin, _producer = _fixture_config(tmp_path)
     records = tuple(_contact_record(index) for index in range(profiler.MAX_CONTACT_RECORDS + 1))
@@ -649,7 +720,7 @@ def test_contact_parser_caps_cumulative_record_count(tmp_path: Path) -> None:
         lambda record: record.update(extra=1),
         lambda record: record.update(schema_version=True),
         lambda record: record.update(clock_id='CLOCK_MONOTONIC'),
-        lambda record: record.update(linux_tid=0),
+        lambda record: record['thread_contributions'][0].update(linux_tid=0),
         lambda record: record.update(saturated=True),
         lambda record: record.update(measured_total_ns=999),
         lambda record: record.update(sim_stamp_ns=4_000_000_000),
@@ -678,9 +749,15 @@ def test_contact_sequence_rejects_identity_cadence_or_counter_regression(
 ) -> None:
     first = _contact_record()
     second = _contact_record(1)
-    second[field] = value
+    if field == 'linux_tid':
+        second['thread_contributions'][0]['linux_tid'] = value
+    else:
+        second[field] = value
+        if field in profiler.CONTACT_CONTRIBUTION_MONOTONIC_KEYS:
+            second['thread_contributions'][0][field] = value
     if field == 'publish_ns':
         second['measured_total_ns'] = sum(second[key] for key in profiler.CONTACT_BUCKET_KEYS)
+        second['thread_contributions'][0]['measured_total_ns'] = second['measured_total_ns']
 
     with pytest.raises(profiler.ProfileError):
         profiler.validate_contact_profile_records((first, second))
@@ -739,22 +816,25 @@ def test_contact_linux_tid_must_bind_to_a_sampled_anchor_thread(tmp_path: Path) 
     identity = _static_identity(config, producer)
     proc_root = tmp_path / 'proc'
     _host_proc(proc_root)
-    _make_process(proc_root, 101, plugin)
+    root = _make_process(proc_root, 101, plugin)
+    (root / 'task/202').mkdir()
+    (root / 'task/202/stat').write_text(_stat_text(202, start=200), encoding='ascii')
     anchor, _count = profiler.discover_anchor(
         proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
     )
     state = profiler.ProfileState()
     profiler.capture_sample(proc_root, config, anchor, state)
-    record = _contact_record()
+    record = _contact_record(linux_tids=(101, 202))
     contact = {'last_valid_cumulative_record': record}
 
-    binding = profiler.bind_contact_profile_thread(contact, anchor, state)
+    bindings = profiler.bind_contact_profile_threads(contact, anchor, state)
 
-    assert binding['anchor_pid'] == 101
-    assert binding['linux_tid'] == 101
-    record['linux_tid'] = 999
+    assert bindings[0]['anchor_pid'] == 101
+    assert bindings[0]['linux_tid'] == 101
+    assert bindings[1]['linux_tid'] == 202
+    record['thread_contributions'][1]['linux_tid'] = 999
     with pytest.raises(profiler.ProfileError, match='not sampled in the DSO host'):
-        profiler.bind_contact_profile_thread(contact, anchor, state)
+        profiler.bind_contact_profile_threads(contact, anchor, state)
 
 
 def test_capture_fails_closed_on_thread_record_overflow(
@@ -769,9 +849,65 @@ def test_capture_fails_closed_on_thread_record_overflow(
         proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
     )
     monkeypatch.setattr(profiler, 'MAX_THREAD_RECORDS', 0)
+    state = profiler.ProfileState()
 
     with pytest.raises(profiler.ProfileError, match='thread sample records'):
-        profiler.capture_sample(proc_root, config, anchor, profiler.ProfileState())
+        profiler.capture_sample(proc_root, config, anchor, state)
+
+    assert state == profiler.ProfileState()
+
+
+def test_capture_atomically_rejects_more_than_512_live_threads(tmp_path: Path) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    root = _make_process(proc_root, 101, plugin)
+    for tid in range(102, 102 + profiler.MAX_LIVE_THREADS_PER_SAMPLE):
+        (root / 'task' / str(tid)).mkdir()
+        thread_stat = root / 'task' / str(tid) / 'stat'
+        thread_stat.write_text(_stat_text(tid, start=tid), encoding='ascii')
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    state = profiler.ProfileState()
+
+    with pytest.raises(profiler.ProfileError, match='exceeds 512 live threads'):
+        profiler.capture_sample(proc_root, config, anchor, state)
+
+    assert state == profiler.ProfileState()
+
+
+def test_production_shaped_sampling_crosses_old_record_cap_without_overflow(
+    tmp_path: Path,
+) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    root = _make_process(proc_root, 101, plugin)
+    for tid in range(102, 501):
+        (root / 'task' / str(tid)).mkdir()
+        thread_stat = root / 'task' / str(tid) / 'stat'
+        thread_stat.write_text(_stat_text(tid, start=tid), encoding='ascii')
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    state = profiler.ProfileState()
+
+    for index in range(164):
+        assert profiler.capture_sample(
+            proc_root,
+            config,
+            anchor,
+            state,
+            monotonic_ns=lambda index=index: index * 500_000_000,
+            wall_time_ns=lambda index=index: 1_800_000_000_000_000_000 + index * 500_000_000,
+        )
+
+    assert state.thread_records == 65_600
+    assert state.thread_records > 65_536
+    assert state.thread_records < profiler.MAX_THREAD_RECORDS
 
 
 def test_capture_caps_aggregate_retained_command_lines(
@@ -1292,7 +1428,7 @@ def test_profiler_completes_deterministically_without_live_ros(tmp_path: Path) -
     assert document['sampling']['totals']['threads'][0]['cpu_ticks'] == 15
     assert document['renderer']['post_start_segment_mode'] == 'appended'
     assert document['contact_profile']['selected_source_valid_record_count'] == 2
-    assert document['contact_profile']['host_thread_binding']['linux_tid'] == 101
+    assert document['contact_profile']['host_thread_bindings'][0]['linux_tid'] == 101
     assert document['full_stack_process']['group_confirmed_empty'] is True
 
 
@@ -1890,6 +2026,89 @@ def test_campaign_profile_validator_replays_result_schema_and_csv(tmp_path: Path
         )
 
 
+def test_phase3_run_csv_mirror_uses_bounded_scalar_summary_contract() -> None:
+    document = {
+        'events': [{'kind': 'one'}, {'kind': 'two'}],
+        'measurements': {'collision_count': 0},
+    }
+
+    rows = list(csv.DictReader(io.StringIO(profiler._one_row_csv_bytes(document).decode())))
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row[profiler.CSV_PROJECTION_CONTRACT_COLUMN] == profiler.CSV_PROJECTION_CONTRACT
+    assert (
+        row[profiler.CSV_PROJECTION_JSON_SHA256_COLUMN]
+        == __import__('hashlib').sha256(profiler.canonical_json_bytes(document)).hexdigest()
+    )
+    assert json.loads(row['events']) == {
+        'element_count': 2,
+        'kind': 'sequence',
+        'sha256': __import__('hashlib')
+        .sha256(profiler.canonical_json_bytes(document['events']))
+        .hexdigest(),
+    }
+    assert row['measurements.collision_count'] == '0'
+
+
+def test_phase3_run_csv_mirror_matches_clone_local_production_bytes() -> None:
+    document = {
+        'events': [{'kind': 'one'}, {'kind': 'two'}],
+        'measurements': {'collision_count': 0, 'optional': None},
+    }
+    metrics_source = TEST_DIR.parent / 'src/robotest_metrics'
+    environment = dict(os.environ)
+    environment['PYTHONPATH'] = str(metrics_source)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            '-c',
+            (
+                'import json,sys; '
+                'from robotest_metrics.artifacts import one_row_csv_bytes; '
+                'sys.stdout.buffer.write(one_row_csv_bytes(json.load(sys.stdin)))'
+            ),
+        ],
+        input=profiler.canonical_json_bytes(document),
+        capture_output=True,
+        check=True,
+        env=environment,
+    )
+
+    assert profiler._one_row_csv_bytes(document) == completed.stdout
+
+
+def test_phase3_run_csv_mirror_bounds_large_sequence_payloads() -> None:
+    document = {
+        'events': [{'payload': 'e' * 600, 'stamp_ns': index} for index in range(1_500)],
+        'measurements': {
+            'samples': [{'payload': 's' * 600, 'stamp_ns': index} for index in range(1_500)]
+        },
+    }
+
+    assert len(profiler.canonical_json_bytes(document)) > 1_048_576
+    assert len(profiler._one_row_csv_bytes(document)) < 1_048_576
+
+
+@pytest.mark.parametrize(
+    'reserved_name',
+    [
+        profiler.CSV_PROJECTION_CONTRACT_COLUMN,
+        profiler.CSV_PROJECTION_JSON_SHA256_COLUMN,
+    ],
+)
+def test_phase3_run_csv_mirror_rejects_reserved_root_columns(
+    reserved_name: str,
+) -> None:
+    with pytest.raises(profiler.ProfileError, match='reserved column'):
+        profiler._one_row_csv_bytes({reserved_name: 'forged'})
+
+
+def test_phase3_run_csv_mirror_rejects_dotted_column_collision() -> None:
+    with pytest.raises(profiler.ProfileError, match='column collision'):
+        profiler._one_row_csv_bytes({'a': {'b': []}, 'a.b': []})
+
+
 def test_metrics_result_caps_match_the_clone_local_production_contract(tmp_path: Path) -> None:
     config, _plugin, _producer = _fixture_config(tmp_path)
 
@@ -1937,6 +2156,52 @@ def test_validated_config_freezes_ignored_output_outside_candidate(tmp_path: Pat
         / f'{config.candidate_id}-smoke-profile.json'
     )
     assert not frozen.output_path.is_relative_to(config.candidate_root)
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    (
+        ('startup_timeout_s', 179.0),
+        ('sample_period_s', 0.6),
+        ('max_duration_s', 479.0),
+    ),
+)
+def test_validated_config_rejects_noncanonical_timing(
+    tmp_path: Path, field: str, value: float
+) -> None:
+    config, _plugin, _producer = _fixture_config(tmp_path)
+    arguments = _config_arguments(config)
+    setattr(arguments, field, value)
+
+    with pytest.raises(profiler.ProfileError, match='canonical value'):
+        profiler.validated_config(arguments)
+
+
+def test_thread_and_output_caps_cover_canonical_512_thread_duration() -> None:
+    maximum_captures = (
+        __import__('math').ceil(
+            profiler.CANONICAL_MAX_DURATION_S / profiler.CANONICAL_SAMPLE_PERIOD_S
+        )
+        + 1
+    )
+
+    assert maximum_captures * profiler.MAX_LIVE_THREADS_PER_SAMPLE <= (profiler.MAX_THREAD_RECORDS)
+    assert profiler.MAX_THREAD_RECORDS * 512 <= profiler.OUTPUT_MAX_BYTES
+
+
+def test_failure_document_records_effective_limits(tmp_path: Path) -> None:
+    config, _plugin, _producer = _fixture_config(tmp_path)
+    document = profiler._failure_document(
+        config,
+        profiler.ProfileError('overflow', 'fixture overflow'),
+        None,
+        None,
+    )
+
+    assert document['limits'] == profiler._profile_limits(config)
+    assert document['limits']['maximum_live_threads_per_sample'] == 512
+    assert document['limits']['maximum_thread_records'] == 524_288
+    assert document['limits']['maximum_output_bytes'] == 256 * 1024 * 1024
 
 
 @pytest.mark.parametrize(

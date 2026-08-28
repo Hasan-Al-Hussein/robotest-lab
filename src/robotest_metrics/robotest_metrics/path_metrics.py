@@ -277,6 +277,28 @@ def _feedback_transitions(
     return transitions
 
 
+def _normalize_configured_waypoints(
+    waypoints: Sequence[Mapping[str, Any]],
+) -> list[dict[str, float]]:
+    """Convert exact mission poses to the metric module's unit-suffixed shape."""
+    normalized: list[dict[str, float]] = []
+    required_fields = {'x', 'y', 'yaw'}
+    for index, waypoint in enumerate(waypoints):
+        if not isinstance(waypoint, Mapping) or set(waypoint) != required_fields:
+            raise MetricUnavailable(f'waypoints[{index}] must contain exactly x, y, and yaw')
+        coordinates: dict[str, float] = {}
+        for source_name, target_name in (('x', 'x_m'), ('y', 'y_m'), ('yaw', 'yaw_rad')):
+            value = waypoint.get(source_name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise MetricUnavailable(f'waypoints[{index}].{source_name} must be a finite number')
+            coordinates[target_name] = require_finite(
+                value,
+                f'waypoints[{index}].{source_name}',
+            )
+        normalized.append(coordinates)
+    return normalized
+
+
 def analyze_plans(
     plans: Sequence[Mapping[str, Any]],
     feedback: Sequence[Mapping[str, Any]],
@@ -289,7 +311,8 @@ def analyze_plans(
     end = require_int(terminal_action_stamp_ns, 'terminal_action_stamp_ns')
     if end <= start:
         raise MetricUnavailable('terminal action stamp must be after accepted goal stamp')
-    transitions = _feedback_transitions(feedback, len(waypoints), start, end)
+    normalized_waypoints = _normalize_configured_waypoints(waypoints)
+    transitions = _feedback_transitions(feedback, len(normalized_waypoints), start, end)
     starts: list[tuple[int, int]] = [(start, -1)]
     starts.extend(
         (transition['stamp_ns'], transition['collector_sequence'])
@@ -297,7 +320,7 @@ def analyze_plans(
         if transition['current_waypoint'] > 0
     )
     ends = [*starts[1:], (end, _TERMINAL_SEQUENCE)]
-    per_leg: list[list[dict[str, Any]]] = [[] for _ in waypoints]
+    per_leg: list[list[dict[str, Any]]] = [[] for _ in normalized_waypoints]
     diagnostics: list[dict[str, Any]] = []
     previous_order: tuple[int, int] | None = None
     for plan_index, plan in enumerate(plans):
@@ -326,7 +349,7 @@ def analyze_plans(
                 raise MetricUnavailable('plan poses must be a list')
             length = plan_length_m(poses)
             geometry_hash = plan_geometry_hash(frame_id, poses)
-            endpoint_error = planar_distance(poses[-1], waypoints[leg_index])
+            endpoint_error = planar_distance(poses[-1], normalized_waypoints[leg_index])
             if endpoint_error > PLAN_GOAL_TOLERANCE_M:
                 raise MetricUnavailable('plan endpoint does not match feedback-derived waypoint')
         except MetricUnavailable as exc:
