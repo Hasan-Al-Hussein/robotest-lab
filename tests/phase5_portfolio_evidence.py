@@ -33,7 +33,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from phase5_ci import (
     EvidenceError,
@@ -90,6 +90,11 @@ MAX_RESULT_ARTIFACT_BYTES = 32 * 1024 * 1024
 MAX_PNG_BYTES = 4 * 1024 * 1024
 MAX_SVG_BYTES = 2 * 1024 * 1024
 MAX_REPLAY_LOG_BYTES = 8 * 1024 * 1024
+MAX_PROCESS_TABLE_ENTRIES = 65_536
+PROCESS_GROUP_TERM_GRACE_S = 2.0
+PROCESS_GROUP_KILL_GRACE_S = 5.0
+PROCESS_GROUP_POLL_INTERVAL_S = 0.01
+QUIESCENT_PROCESS_STATES = frozenset({'X', 'Z', 'x'})
 REPLAY_MAPPING_POLICY = (
     'Validate the frozen documented-root assertion, then execute only the second '
     'line with cwd set to a fresh detached candidate worktree.'
@@ -179,6 +184,16 @@ REPLAY_TIMEOUTS = {
     'phase4-static': 14_400,
     'phase5-local': 14_400,
 }
+
+
+class _ProcessIdentity(NamedTuple):
+    pid: int
+    command: str
+    state: str
+    parent_pid: int
+    process_group_id: int
+    session_id: int
+    start_ticks: int
 
 
 def _require(condition: bool, message: str) -> None:
@@ -1235,27 +1250,224 @@ def _parse_replay_argv(command_id: str, executable: str) -> tuple[dict[str, str]
     return assignments, argv
 
 
-def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is None:
-        with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGTERM)
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=5)
+def _read_process_identity(pid: int, proc_root: Path = Path('/proc')) -> _ProcessIdentity:
+    _require(_exact_integer(pid) and pid > 0, 'replay process PID is invalid')
+    path = proc_root / str(pid) / 'stat'
     try:
-        os.killpg(process.pid, 0)
+        with path.open('rb', buffering=0) as stream:
+            payload = stream.read(16_385)
+    except (FileNotFoundError, ProcessLookupError):
+        raise
+    except OSError as exc:
+        raise EvidenceError(f'cannot read replay process identity for PID {pid}') from exc
+    _require(len(payload) <= 16_384, f'replay process identity exceeds byte cap: PID {pid}')
+    opening = payload.find(b'(')
+    closing = payload.rfind(b') ')
+    _require(opening > 0 and closing > opening, f'replay process identity is malformed: PID {pid}')
+    try:
+        pid_text = payload[:opening].strip().decode('ascii')
+        fields = payload[closing + 2 :].decode('ascii').split()
+    except UnicodeError as exc:
+        raise EvidenceError(f'replay process identity fields are not ASCII: PID {pid}') from exc
+    _require(len(fields) >= 20, f'replay process identity is truncated: PID {pid}')
+    try:
+        observed_pid = int(pid_text)
+        state = fields[0]
+        identity = _ProcessIdentity(
+            pid=observed_pid,
+            command=payload[opening + 1 : closing].decode('utf-8', errors='replace'),
+            state=state,
+            parent_pid=int(fields[1]),
+            process_group_id=int(fields[2]),
+            session_id=int(fields[3]),
+            start_ticks=int(fields[19]),
+        )
+    except ValueError as exc:
+        raise EvidenceError(f'replay process identity has a non-integer field: PID {pid}') from exc
+    _require(
+        identity.pid == pid and len(identity.state) == 1 and identity.start_ticks > 0,
+        f'replay process identity fields are invalid: PID {pid}',
+    )
+    return identity
+
+
+def _pin_process_group(
+    process: subprocess.Popen[bytes], proc_root: Path = Path('/proc')
+) -> _ProcessIdentity:
+    identity = _read_process_identity(process.pid, proc_root)
+    _require(
+        identity.pid == identity.process_group_id == identity.session_id,
+        'replay process is not its exact process-group and session leader',
+    )
+    return identity
+
+
+def _process_group_members(
+    leader: _ProcessIdentity, proc_root: Path = Path('/proc')
+) -> list[_ProcessIdentity]:
+    members: list[_ProcessIdentity] = []
+    inspected = 0
+    try:
+        entries = proc_root.iterdir()
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            inspected += 1
+            _require(
+                inspected <= MAX_PROCESS_TABLE_ENTRIES,
+                'process table exceeds replay cleanup scan cap',
+            )
+            try:
+                identity = _read_process_identity(int(entry.name), proc_root)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if identity.process_group_id != leader.process_group_id:
+                continue
+            _require(
+                identity.session_id == leader.session_id,
+                'replay process group crossed its pinned session identity',
+            )
+            members.append(identity)
+    except OSError as exc:
+        raise EvidenceError('cannot scan replay process group membership') from exc
+    members.sort(key=lambda item: item.pid)
+    pinned = [item for item in members if item.pid == leader.pid]
+    _require(
+        len(pinned) == 1
+        and pinned[0].process_group_id == leader.process_group_id
+        and pinned[0].session_id == leader.session_id
+        and pinned[0].start_ticks == leader.start_ticks,
+        'replay process-group leader identity changed before cleanup',
+    )
+    return members
+
+
+def _live_process_group_members(
+    leader: _ProcessIdentity, proc_root: Path = Path('/proc')
+) -> list[_ProcessIdentity]:
+    return [
+        identity
+        for identity in _process_group_members(leader, proc_root)
+        if identity.state not in QUIESCENT_PROCESS_STATES
+    ]
+
+
+def _stable_live_process_group_members(leader: _ProcessIdentity) -> list[_ProcessIdentity]:
+    live = _live_process_group_members(leader)
+    if live:
+        return live
+    time.sleep(PROCESS_GROUP_POLL_INTERVAL_S)
+    return _live_process_group_members(leader)
+
+
+def _leader_exited_without_reaping(leader: _ProcessIdentity) -> bool:
+    try:
+        status = os.waitid(
+            os.P_PID,
+            leader.pid,
+            os.WEXITED | os.WNOHANG | os.WNOWAIT,
+        )
+    except ChildProcessError as exc:
+        raise EvidenceError('replay process leader was reaped before group cleanup') from exc
+    return status is not None
+
+
+def _wait_for_leader_exit(leader: _ProcessIdentity, deadline: float) -> bool:
+    while not _leader_exited_without_reaping(leader):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return False
+        time.sleep(min(PROCESS_GROUP_POLL_INTERVAL_S, remaining))
+    return True
+
+
+def _signal_process_group(leader: _ProcessIdentity, signum: int) -> None:
+    current = _read_process_identity(leader.pid)
+    _require(
+        current.pid == leader.pid
+        and current.process_group_id == leader.process_group_id
+        and current.session_id == leader.session_id
+        and current.start_ticks == leader.start_ticks,
+        'replay process-group leader identity changed before signal',
+    )
+    try:
+        os.killpg(leader.process_group_id, signum)
     except ProcessLookupError:
         return
     except PermissionError as exc:
-        raise EvidenceError('cannot prove replay process group cleanup') from exc
+        raise EvidenceError('cannot signal pinned replay process group') from exc
+
+
+def _wait_for_process_group_quiescence(
+    leader: _ProcessIdentity, deadline: float
+) -> list[_ProcessIdentity]:
+    empty_scan_seen = False
+    while True:
+        live = _live_process_group_members(leader)
+        if not live:
+            if empty_scan_seen:
+                return []
+            empty_scan_seen = True
+        else:
+            empty_scan_seen = False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return live if live else _live_process_group_members(leader)
+        time.sleep(min(PROCESS_GROUP_POLL_INTERVAL_S, remaining))
+
+
+def _cleanup_unpinned_process_group(process: subprocess.Popen[bytes]) -> None:
+    signal_error: PermissionError | None = None
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
-        return
-    raise EvidenceError('replay process group survived command completion')
+        pass
+    except PermissionError as exc:
+        signal_error = exc
+    try:
+        process.wait(timeout=PROCESS_GROUP_KILL_GRACE_S)
+    except subprocess.TimeoutExpired as exc:
+        raise EvidenceError('unvalidated replay process group did not terminate') from exc
+    if signal_error is not None:
+        raise EvidenceError('cannot clean unvalidated replay process group') from signal_error
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[bytes],
+    leader: _ProcessIdentity,
+    *,
+    forced_cleanup: bool,
+) -> None:
+    normal_survivor = False
+    if not forced_cleanup:
+        normal_survivor = not _wait_for_leader_exit(
+            leader, time.monotonic() + PROCESS_GROUP_TERM_GRACE_S
+        )
+
+    live = _stable_live_process_group_members(leader)
+    term_sent = bool(live)
+    if live:
+        normal_survivor = normal_survivor or not forced_cleanup
+        _signal_process_group(leader, signal.SIGTERM)
+        live = _wait_for_process_group_quiescence(
+            leader, time.monotonic() + PROCESS_GROUP_TERM_GRACE_S
+        )
+    if term_sent:
+        _signal_process_group(leader, signal.SIGKILL)
+        live = _wait_for_process_group_quiescence(
+            leader, time.monotonic() + PROCESS_GROUP_KILL_GRACE_S
+        )
+    if live:
+        with suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=0)
+        raise EvidenceError('replay process group survived bounded SIGKILL cleanup')
+
+    try:
+        process.wait(timeout=PROCESS_GROUP_KILL_GRACE_S)
+    except subprocess.TimeoutExpired as exc:
+        raise EvidenceError('replay process leader survived quiescent group cleanup') from exc
+    if normal_survivor:
+        raise EvidenceError('replay process group survived normal command completion')
 
 
 def _run_bounded(
@@ -1282,24 +1494,31 @@ def _run_bounded(
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
-    _require(process.stdout is not None and process.stderr is not None, 'replay pipes unavailable')
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
-    selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
     retained = {'stdout': bytearray(), 'stderr': bytearray()}
     observed = {'stdout': 0, 'stderr': 0}
     limits = {'stdout': stdout_limit, 'stderr': stderr_limit}
     overflow = {'stdout': False, 'stderr': False}
     timed_out = False
     deadline = time.monotonic() + timeout_seconds
+    leader: _ProcessIdentity | None = None
+    selector: selectors.BaseSelector | None = None
+    interrupted = False
     try:
+        leader = _pin_process_group(process)
+        _require(
+            process.stdout is not None and process.stderr is not None,
+            'replay pipes unavailable',
+        )
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
+        selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
                 break
             events = selector.select(min(remaining, 0.25))
-            if not events and process.poll() is not None:
+            if not events and _leader_exited_without_reaping(leader):
                 events = selector.select(0)
                 if not events:
                     break
@@ -1316,17 +1535,20 @@ def _run_bounded(
                     overflow[stream] = True
             if any(overflow.values()):
                 break
+    except BaseException:
+        interrupted = True
+        raise
     finally:
-        selector.close()
-        if timed_out or any(overflow.values()):
-            _terminate_process_group(process)
+        if selector is not None:
+            selector.close()
+        if leader is None:
+            _cleanup_unpinned_process_group(process)
         else:
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                _terminate_process_group(process)
-            else:
-                _terminate_process_group(process)
+            _terminate_process_group(
+                process,
+                leader,
+                forced_cleanup=interrupted or timed_out or any(overflow.values()),
+            )
     return {
         'argv': list(argv),
         'elapsed_wall_ns': time.monotonic_ns() - started,

@@ -10,11 +10,13 @@ import ast
 import json
 import os
 import shutil
+import signal
 import socket
 import stat
 import struct
 import subprocess
 import sys
+import textwrap
 import zlib
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -1152,6 +1154,434 @@ def test_bounded_runner_terminates_timed_out_process_group(tmp_path: Path) -> No
     )
     assert result['timed_out'] is True
     assert result['returncode'] is not None
+
+
+def _write_process_stat(
+    proc_root: Path,
+    pid: int,
+    *,
+    command: bytes = b'replay',
+    state: str = 'S',
+    parent_pid: int = 1,
+    process_group_id: int | None = None,
+    session_id: int | None = None,
+    start_ticks: int = 100,
+) -> None:
+    process_group_id = pid if process_group_id is None else process_group_id
+    session_id = pid if session_id is None else session_id
+    fields = [
+        state,
+        str(parent_pid),
+        str(process_group_id),
+        str(session_id),
+        *(['0'] * 15),
+        str(start_ticks),
+    ]
+    process_root = proc_root / str(pid)
+    process_root.mkdir(parents=True, exist_ok=True)
+    process_root.joinpath('stat').write_bytes(
+        str(pid).encode('ascii')
+        + b' ('
+        + command
+        + b') '
+        + ' '.join(fields).encode('ascii')
+        + b'\n'
+    )
+
+
+def test_process_identity_parses_non_ascii_parenthesized_command(tmp_path: Path) -> None:
+    _write_process_stat(tmp_path, 101, command=b'odd-\xff) name', start_ticks=999)
+    identity = portfolio_module._read_process_identity(101, tmp_path)
+    assert identity == portfolio_module._ProcessIdentity(
+        pid=101,
+        command='odd-\ufffd) name',
+        state='S',
+        parent_pid=1,
+        process_group_id=101,
+        session_id=101,
+        start_ticks=999,
+    )
+    assert portfolio_module._pin_process_group(SimpleNamespace(pid=101), tmp_path) == identity
+
+
+@pytest.mark.parametrize('state', sorted(portfolio_module.QUIESCENT_PROCESS_STATES))
+def test_process_group_scan_treats_kernel_terminal_states_as_quiescent(
+    tmp_path: Path, state: str
+) -> None:
+    _write_process_stat(tmp_path, 101, state='Z', start_ticks=999)
+    _write_process_stat(
+        tmp_path,
+        102,
+        state=state,
+        parent_pid=101,
+        process_group_id=101,
+        session_id=101,
+        start_ticks=1_000,
+    )
+    leader = portfolio_module._pin_process_group(SimpleNamespace(pid=101), tmp_path)
+    assert portfolio_module._live_process_group_members(leader, tmp_path) == []
+
+    _write_process_stat(
+        tmp_path,
+        102,
+        state='S',
+        parent_pid=101,
+        process_group_id=101,
+        session_id=101,
+        start_ticks=1_000,
+    )
+    live_pids = [
+        item.pid for item in portfolio_module._live_process_group_members(leader, tmp_path)
+    ]
+    assert live_pids == [102]
+
+
+def test_process_group_scan_rejects_reused_leader_identity(tmp_path: Path) -> None:
+    _write_process_stat(tmp_path, 101, state='Z', start_ticks=999)
+    leader = portfolio_module._pin_process_group(SimpleNamespace(pid=101), tmp_path)
+    _write_process_stat(tmp_path, 101, state='Z', start_ticks=1_000)
+    with pytest.raises(EvidenceError, match='leader identity changed'):
+        portfolio_module._process_group_members(leader, tmp_path)
+
+
+def test_process_group_signal_revalidates_identity_before_numeric_pgid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader = portfolio_module._ProcessIdentity(101, 'leader', 'S', 1, 101, 101, 999)
+    reused = leader._replace(start_ticks=1_000)
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(portfolio_module, '_read_process_identity', lambda _pid: reused)
+    monkeypatch.setattr(
+        portfolio_module.os,
+        'killpg',
+        lambda process_group_id, signum: signals.append((process_group_id, signum)),
+    )
+    with pytest.raises(EvidenceError, match='identity changed before signal'):
+        portfolio_module._signal_process_group(leader, signal.SIGTERM)
+    assert signals == []
+
+
+def test_initial_empty_group_scan_rechecks_and_cleans_late_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader = portfolio_module._ProcessIdentity(101, 'leader', 'Z', 1, 101, 101, 999)
+    child = portfolio_module._ProcessIdentity(102, 'child', 'S', 1, 101, 101, 1_000)
+    initial_scans = iter(([], [child]))
+    events: list[str] = []
+
+    def live_members(_leader: object) -> list[portfolio_module._ProcessIdentity]:
+        events.append('initial-scan')
+        return next(initial_scans)
+
+    monkeypatch.setattr(portfolio_module, '_wait_for_leader_exit', lambda *_args: True)
+    monkeypatch.setattr(portfolio_module, '_live_process_group_members', live_members)
+    monkeypatch.setattr(portfolio_module.time, 'sleep', lambda _seconds: None)
+    monkeypatch.setattr(
+        portfolio_module,
+        '_signal_process_group',
+        lambda _leader, signum: events.append(f'signal-{signum}'),
+    )
+    monkeypatch.setattr(
+        portfolio_module,
+        '_wait_for_process_group_quiescence',
+        lambda _leader, _deadline: events.append('post-signal-scan') or [],
+    )
+
+    def wait(timeout: float) -> int:
+        events.append(f'reap-{int(timeout)}')
+        return 0
+
+    with pytest.raises(EvidenceError, match='survived normal command completion'):
+        portfolio_module._terminate_process_group(
+            SimpleNamespace(pid=101, wait=wait), leader, forced_cleanup=False
+        )
+    assert events == [
+        'initial-scan',
+        'initial-scan',
+        f'signal-{signal.SIGTERM}',
+        'post-signal-scan',
+        f'signal-{signal.SIGKILL}',
+        'post-signal-scan',
+        'reap-5',
+    ]
+
+
+def test_forced_process_group_cleanup_orders_term_kill_then_reap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader = portfolio_module._ProcessIdentity(101, 'leader', 'S', 1, 101, 101, 999)
+    child = portfolio_module._ProcessIdentity(102, 'child', 'S', 101, 101, 101, 1_000)
+    events: list[tuple[str, int | None]] = []
+    scans = iter(([child], []))
+
+    def wait(timeout: float) -> int:
+        events.append(('reap', int(timeout)))
+        return -signal.SIGKILL
+
+    monkeypatch.setattr(portfolio_module, '_live_process_group_members', lambda _leader: [child])
+    monkeypatch.setattr(
+        portfolio_module,
+        '_signal_process_group',
+        lambda _leader, signum: events.append(('signal', signum)),
+    )
+
+    def scan(_leader: object, _deadline: float) -> list[portfolio_module._ProcessIdentity]:
+        events.append(('scan', None))
+        return next(scans)
+
+    monkeypatch.setattr(portfolio_module, '_wait_for_process_group_quiescence', scan)
+    portfolio_module._terminate_process_group(
+        SimpleNamespace(pid=101, wait=wait), leader, forced_cleanup=True
+    )
+    assert events == [
+        ('signal', signal.SIGTERM),
+        ('scan', None),
+        ('signal', signal.SIGKILL),
+        ('scan', None),
+        ('reap', int(portfolio_module.PROCESS_GROUP_KILL_GRACE_S)),
+    ]
+
+
+def test_persistent_live_process_group_fails_after_kill_grace_before_best_effort_reap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader = portfolio_module._ProcessIdentity(101, 'leader', 'Z', 1, 101, 101, 999)
+    child = portfolio_module._ProcessIdentity(102, 'child', 'D', 101, 101, 101, 1_000)
+    events: list[tuple[str, int | None]] = []
+
+    monkeypatch.setattr(portfolio_module, '_live_process_group_members', lambda _leader: [child])
+    monkeypatch.setattr(
+        portfolio_module,
+        '_signal_process_group',
+        lambda _leader, signum: events.append(('signal', signum)),
+    )
+
+    def scan(_leader: object, _deadline: float) -> list[portfolio_module._ProcessIdentity]:
+        events.append(('scan', None))
+        return [child]
+
+    def wait(timeout: float) -> int:
+        events.append(('reap', int(timeout)))
+        return -signal.SIGKILL
+
+    monkeypatch.setattr(portfolio_module, '_wait_for_process_group_quiescence', scan)
+    with pytest.raises(EvidenceError, match='survived bounded SIGKILL cleanup'):
+        portfolio_module._terminate_process_group(
+            SimpleNamespace(pid=101, wait=wait), leader, forced_cleanup=True
+        )
+    assert events == [
+        ('signal', signal.SIGTERM),
+        ('scan', None),
+        ('signal', signal.SIGKILL),
+        ('scan', None),
+        ('reap', 0),
+    ]
+
+
+def test_normal_exit_with_live_group_member_cleans_then_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader = portfolio_module._ProcessIdentity(101, 'leader', 'Z', 1, 101, 101, 999)
+    child = portfolio_module._ProcessIdentity(102, 'child', 'S', 1, 101, 101, 1_000)
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        portfolio_module,
+        '_wait_for_leader_exit',
+        lambda _leader, _deadline: events.append('leader-exit') or True,
+    )
+    monkeypatch.setattr(portfolio_module, '_live_process_group_members', lambda _leader: [child])
+    monkeypatch.setattr(
+        portfolio_module,
+        '_signal_process_group',
+        lambda _leader, signum: events.append(f'signal-{signum}'),
+    )
+    monkeypatch.setattr(
+        portfolio_module,
+        '_wait_for_process_group_quiescence',
+        lambda _leader, _deadline: events.append('scan') or [],
+    )
+
+    def wait(timeout: float) -> int:
+        events.append(f'reap-{int(timeout)}')
+        return 0
+
+    with pytest.raises(EvidenceError, match='survived normal command completion'):
+        portfolio_module._terminate_process_group(
+            SimpleNamespace(pid=101, wait=wait), leader, forced_cleanup=False
+        )
+    assert events == [
+        'leader-exit',
+        f'signal-{signal.SIGTERM}',
+        'scan',
+        f'signal-{signal.SIGKILL}',
+        'scan',
+        'reap-5',
+    ]
+
+
+def test_runner_cleans_process_when_selector_setup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created: list[subprocess.Popen[bytes]] = []
+    real_popen = subprocess.Popen
+
+    def capture_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        process = real_popen(*args, **kwargs)
+        created.append(process)
+        return process
+
+    class FailingSelector:
+        def register(self, *_args: object) -> None:
+            raise OSError('selector setup failed')
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(portfolio_module.subprocess, 'Popen', capture_popen)
+    monkeypatch.setattr(portfolio_module.selectors, 'DefaultSelector', FailingSelector)
+    with pytest.raises(OSError, match='selector setup failed'):
+        portfolio_module._run_bounded(
+            ['/bin/sh', '-c', 'sleep 30'],
+            cwd=tmp_path,
+            environment={'PATH': '/usr/bin:/bin'},
+            timeout_seconds=5,
+            stdout_limit=1024,
+            stderr_limit=1024,
+        )
+    assert len(created) == 1
+    assert created[0].returncode is not None
+    assert created[0].stdout is not None and created[0].stderr is not None
+    created[0].stdout.close()
+    created[0].stderr.close()
+
+
+def test_runner_handles_adopted_zombies_and_term_ignoring_descendants(tmp_path: Path) -> None:
+    probe_source = textwrap.dedent(
+        r"""
+        import ctypes
+        import os
+        import signal
+        import sys
+        import textwrap
+        import time
+        from pathlib import Path
+
+        sys.path.insert(0, sys.argv[1])
+        import phase5_portfolio_evidence as module
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        assert libc.prctl(36, 1, 0, 0, 0) == 0, ctypes.get_errno()
+        work = Path(sys.argv[2])
+
+        def run(argv, timeout_seconds=1):
+            return module._run_bounded(
+                argv,
+                cwd=work,
+                environment={'PATH': '/usr/bin:/bin'},
+                timeout_seconds=timeout_seconds,
+                stdout_limit=1024,
+                stderr_limit=1024,
+            )
+
+        def reap_adopted():
+            deadline = time.monotonic() + 3
+            while True:
+                try:
+                    pid, _ = os.waitpid(-1, os.WNOHANG)
+                except ChildProcessError:
+                    return
+                if pid > 0:
+                    continue
+                assert time.monotonic() < deadline, 'adopted child was not quiescent'
+                time.sleep(0.01)
+
+        exact = run(['/bin/sh', '-c', 'sleep 30 & wait'])
+        assert exact['timed_out'] is True
+        assert exact['returncode'] is not None
+        reap_adopted()
+
+        ignore_term_source = textwrap.dedent(
+            '''
+            import os
+            import signal
+            import time
+
+            read_fd, write_fd = os.pipe()
+            child = os.fork()
+            if child == 0:
+                os.close(read_fd)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                os.write(write_fd, b'1')
+                os.close(write_fd)
+                time.sleep(30)
+            else:
+                os.close(write_fd)
+                assert os.read(read_fd, 1) == b'1'
+                os.close(read_fd)
+                signal.signal(signal.SIGTERM, lambda *_args: os._exit(0))
+                time.sleep(30)
+            '''
+        )
+        sent = []
+        original_signal_group = module._signal_process_group
+
+        def record_signal_group(leader, signum):
+            sent.append(signum)
+            original_signal_group(leader, signum)
+
+        module._signal_process_group = record_signal_group
+        try:
+            ignored = run(['/usr/bin/python3', '-c', ignore_term_source])
+        finally:
+            module._signal_process_group = original_signal_group
+        assert ignored['timed_out'] is True
+        assert sent == [signal.SIGTERM, signal.SIGKILL], sent
+        reap_adopted()
+
+        leaked_child_source = textwrap.dedent(
+            '''
+            import os
+            import signal
+            import time
+
+            read_fd, write_fd = os.pipe()
+            child = os.fork()
+            if child == 0:
+                os.close(read_fd)
+                devnull = os.open('/dev/null', os.O_RDWR)
+                os.dup2(devnull, 1)
+                os.dup2(devnull, 2)
+                if devnull > 2:
+                    os.close(devnull)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                os.write(write_fd, b'1')
+                os.close(write_fd)
+                time.sleep(30)
+            else:
+                os.close(write_fd)
+                assert os.read(read_fd, 1) == b'1'
+                os.close(read_fd)
+            '''
+        )
+        try:
+            run(['/usr/bin/python3', '-c', leaked_child_source], timeout_seconds=5)
+        except module.EvidenceError as exc:
+            assert 'survived normal command completion' in str(exc), str(exc)
+        else:
+            raise AssertionError('normal command leaked a live group member without failure')
+        reap_adopted()
+        """
+    )
+    probe = subprocess.run(
+        ['/usr/bin/python3', '-c', probe_source, str(TESTS), str(tmp_path)],
+        check=False,
+        capture_output=True,
+        env={'PATH': '/usr/bin:/bin', 'PYTHONDONTWRITEBYTECODE': '1'},
+        text=True,
+        timeout=20,
+    )
+    assert probe.returncode == 0, f'stdout:\n{probe.stdout}\nstderr:\n{probe.stderr}'
 
 
 def test_replay_rejects_staged_tracked_mutation_outside_allowlist(tmp_path: Path) -> None:
