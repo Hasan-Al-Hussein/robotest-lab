@@ -48,8 +48,10 @@ They do not require an installed workspace overlay; every non-help Phase 3
 benchmark mode retains the frozen CPU and repository-overlay requirements.
 
 The temporary build completes before the pure-Python stage. The gate passes
-that exact install root to release-fixture tests without sourcing the overlay;
-the overlay is sourced only for the subsequent package-test and CLI checks.
+that exact install root to release-fixture tests and its exact sibling
+build/install root to compiled-binary binding tests, without sourcing the
+overlay; the overlay is sourced only for the subsequent package-test and CLI
+checks.
 
 Every local or hosted run records the exact argument vector and starting
 working directory, Git state, a first-party source snapshot, platform and tool

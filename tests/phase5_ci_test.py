@@ -774,7 +774,8 @@ def test_phase5_script_has_no_implicit_mode() -> None:
     pure_tests = script_text.index('run_check pure-python-tests 2700s')
     colcon_tests = script_text.index('run_check colcon-test 1500s')
     assert fixture_build < pure_tests < overlay_source < colcon_tests
-    assert 'env ROBOTEST_PHASE5_FIXTURE_INSTALL_ROOT="${WORK_ROOT}/install"' in script_text
+    assert 'env ROBOTEST_PHASE5_BUILD_INSTALL_ROOT="${WORK_ROOT}"' in script_text
+    assert 'ROBOTEST_PHASE5_FIXTURE_INSTALL_ROOT="${WORK_ROOT}/install"' in script_text
     assert 'run_check portfolio-contract 30s' in script_text
     assert 'createdAt,updatedAt' in script_text
     result = subprocess.run(['bash', str(script)], capture_output=True, text=True, check=False)

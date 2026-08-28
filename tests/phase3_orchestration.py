@@ -2959,12 +2959,31 @@ def contact_gate_source_inventory(workspace: Path) -> dict[str, Any]:
     }
 
 
-def contact_gate_build_install_binding(workspace: Path) -> dict[str, Any]:
+def contact_gate_build_install_binding(
+    workspace: Path,
+    *,
+    build_install_root: Path | None = None,
+) -> dict[str, Any]:
     """Bind the compiled contact gate build artifact to its installed ELF."""
     try:
         workspace_root = workspace.resolve(strict=True)
-        build_path = (workspace_root / CONTACT_GATE_BUILD_PATH).resolve(strict=True)
-        installed_declared_path = workspace_root / CONTACT_GATE_INSTALLED_PATH
+    except OSError as exc:
+        raise EvidenceError('contact stream gate source workspace is unavailable') from exc
+    artifact_root = workspace_root
+    if build_install_root is not None:
+        if not build_install_root.is_absolute():
+            raise EvidenceError('contact stream gate build/install root must be absolute')
+        if build_install_root.is_symlink():
+            raise EvidenceError('contact stream gate build/install root must not be a symlink')
+        try:
+            artifact_root = build_install_root.resolve(strict=True)
+        except OSError as exc:
+            raise EvidenceError('contact stream gate build/install root is unavailable') from exc
+        if not artifact_root.is_dir():
+            raise EvidenceError('contact stream gate build/install root must be a directory')
+    try:
+        build_path = (artifact_root / CONTACT_GATE_BUILD_PATH).resolve(strict=True)
+        installed_declared_path = artifact_root / CONTACT_GATE_INSTALLED_PATH
         installed_path = installed_declared_path.resolve(strict=True)
     except OSError as exc:
         raise EvidenceError('contact stream gate build/install artifact is missing') from exc
@@ -2973,8 +2992,8 @@ def contact_gate_build_install_binding(workspace: Path) -> dict[str, Any]:
     if not os.access(build_path, os.X_OK) or not os.access(installed_path, os.X_OK):
         raise EvidenceError('contact stream gate build/install artifact is not executable')
     try:
-        build_relative = build_path.relative_to(workspace_root).as_posix()
-        installed_relative = installed_path.relative_to(workspace_root).as_posix()
+        build_relative = build_path.relative_to(artifact_root).as_posix()
+        installed_relative = installed_path.relative_to(artifact_root).as_posix()
     except ValueError as exc:
         raise EvidenceError(
             'contact stream gate build/install artifact escapes the workspace'
@@ -2997,7 +3016,7 @@ def contact_gate_build_install_binding(workspace: Path) -> dict[str, Any]:
     installed_build_id = _elf_build_id(installed_path)
     if build_id != installed_build_id:
         raise EvidenceError('contact stream gate build/install ELF build IDs differ')
-    source_inventory_sha256 = canonical_sha256(contact_gate_source_inventory(workspace))
+    source_inventory_sha256 = canonical_sha256(contact_gate_source_inventory(workspace_root))
     build_embedded_source = _elf_embedded_source_inventory_sha256(build_path)
     installed_embedded_source = _elf_embedded_source_inventory_sha256(installed_path)
     build_embedded_source_match = build_embedded_source == source_inventory_sha256

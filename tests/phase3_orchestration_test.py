@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 from itertools import pairwise
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -55,6 +56,8 @@ assert RUNTIME_GATE_SPEC is not None and RUNTIME_GATE_SPEC.loader is not None
 runtime_gate = importlib.util.module_from_spec(RUNTIME_GATE_SPEC)
 sys.modules[RUNTIME_GATE_SPEC.name] = runtime_gate
 RUNTIME_GATE_SPEC.loader.exec_module(runtime_gate)
+
+PHASE5_BUILD_INSTALL_ROOT_ENV = 'ROBOTEST_PHASE5_BUILD_INSTALL_ROOT'
 
 
 @pytest.mark.parametrize(
@@ -1452,15 +1455,17 @@ def test_contact_gate_tagged_digest_extraction_is_distinct_and_chunk_safe(
 def test_contact_gate_build_install_rejects_same_build_id_with_appended_byte(
     tmp_path: Path,
 ) -> None:
+    source_workspace = tmp_path / 'source'
+    artifact_workspace = tmp_path / 'artifacts'
     for relative in orchestration.CONTACT_GATE_SOURCE_PATHS:
-        source = tmp_path / relative
+        source = source_workspace / relative
         source.parent.mkdir(parents=True, exist_ok=True)
         source.write_text(f'{relative}\n', encoding='utf-8')
     inventory_sha256 = orchestration.canonical_sha256(
-        orchestration.contact_gate_source_inventory(tmp_path)
+        orchestration.contact_gate_source_inventory(source_workspace)
     )
-    build = tmp_path / 'build/robotest_sim/contact_stream_gate'
-    installed = tmp_path / 'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
+    build = artifact_workspace / 'build/robotest_sim/contact_stream_gate'
+    installed = artifact_workspace / 'install/robotest_sim/lib/robotest_sim/contact_stream_gate'
     build.parent.mkdir(parents=True)
     installed.parent.mkdir(parents=True)
     tagged_elf = Path(sys.executable).read_bytes() + (
@@ -1471,7 +1476,10 @@ def test_contact_gate_build_install_rejects_same_build_id_with_appended_byte(
     build.write_bytes(tagged_elf)
     shutil.copymode(sys.executable, build)
     shutil.copy2(build, installed)
-    binding = orchestration.contact_gate_build_install_binding(tmp_path)
+    binding = orchestration.contact_gate_build_install_binding(
+        source_workspace,
+        build_install_root=artifact_workspace,
+    )
     assert binding['build_install_sha256_match'] is True
     assert binding['installed_declared_is_symlink'] is False
     assert binding['build_install_samefile'] is False
@@ -1484,7 +1492,55 @@ def test_contact_gate_build_install_rejects_same_build_id_with_appended_byte(
         build
     ) == orchestration._elf_embedded_source_inventory_sha256(installed)
     with pytest.raises(orchestration.EvidenceError, match='hashes differ'):
-        orchestration.contact_gate_build_install_binding(tmp_path)
+        orchestration.contact_gate_build_install_binding(
+            source_workspace,
+            build_install_root=artifact_workspace,
+        )
+
+
+@pytest.mark.parametrize('root_kind', ['relative', 'missing', 'file', 'symlink'])
+def test_contact_gate_build_install_rejects_invalid_override_root(
+    tmp_path: Path,
+    root_kind: str,
+) -> None:
+    source_workspace = tmp_path / 'source'
+    source_workspace.mkdir()
+    if root_kind == 'relative':
+        artifact_workspace = Path('relative-artifacts')
+    elif root_kind == 'missing':
+        artifact_workspace = tmp_path / 'missing-artifacts'
+    elif root_kind == 'file':
+        artifact_workspace = tmp_path / 'artifact-file'
+        artifact_workspace.write_text('not a directory\n', encoding='utf-8')
+    else:
+        target = tmp_path / 'artifact-target'
+        target.mkdir()
+        artifact_workspace = tmp_path / 'artifact-symlink'
+        artifact_workspace.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(orchestration.EvidenceError, match='build/install root'):
+        orchestration.contact_gate_build_install_binding(
+            source_workspace,
+            build_install_root=artifact_workspace,
+        )
+
+
+def test_contact_gate_build_install_rejects_artifact_escape(tmp_path: Path) -> None:
+    source_workspace = tmp_path / 'source'
+    source_workspace.mkdir()
+    artifact_workspace = tmp_path / 'artifacts'
+    build = artifact_workspace / orchestration.CONTACT_GATE_BUILD_PATH
+    installed = artifact_workspace / orchestration.CONTACT_GATE_INSTALLED_PATH
+    build.parent.mkdir(parents=True)
+    installed.parent.mkdir(parents=True)
+    build.symlink_to(Path(sys.executable))
+    installed.symlink_to(build)
+
+    with pytest.raises(orchestration.EvidenceError, match='escapes the workspace'):
+        orchestration.contact_gate_build_install_binding(
+            source_workspace,
+            build_install_root=artifact_workspace,
+        )
 
 
 def _contact_gate_binary_analysis_schema() -> dict[str, object]:
@@ -1499,9 +1555,16 @@ def _contact_gate_binary_analysis_schema() -> dict[str, object]:
     return {**gate_schema, '$defs': schema['$defs']}
 
 
+def _current_contact_gate_build_install_binding() -> dict[str, object]:
+    configured_root = os.environ.get(PHASE5_BUILD_INSTALL_ROOT_ENV)
+    return orchestration.contact_gate_build_install_binding(
+        Path(__file__).parents[1],
+        build_install_root=None if configured_root is None else Path(configured_root),
+    )
+
+
 def test_current_contact_gate_build_binding_matches_analysis_schema() -> None:
-    workspace = Path(__file__).parents[1]
-    binding = orchestration.contact_gate_build_install_binding(workspace)
+    binding = _current_contact_gate_build_install_binding()
     assert binding['installed_declared_is_symlink'] is True
     assert binding['build_install_samefile'] is True
     assert binding['installed_path'] == orchestration.CONTACT_GATE_BUILD_PATH
@@ -1523,7 +1586,7 @@ def test_contact_gate_analysis_schema_rejects_symlink_binding_tampering(
     field: str,
     value: object,
 ) -> None:
-    binding = orchestration.contact_gate_build_install_binding(Path(__file__).parents[1])
+    binding = _current_contact_gate_build_install_binding()
     binding[field] = value
     assert list(Draft202012Validator(_contact_gate_binary_analysis_schema()).iter_errors(binding))
 

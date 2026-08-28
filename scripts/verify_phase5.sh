@@ -535,7 +535,8 @@ run_check colcon-build 1200s \
     --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
 
 run_check pure-python-tests 2700s \
-  env ROBOTEST_PHASE5_FIXTURE_INSTALL_ROOT="${WORK_ROOT}/install" \
+  env ROBOTEST_PHASE5_BUILD_INSTALL_ROOT="${WORK_ROOT}" \
+  ROBOTEST_PHASE5_FIXTURE_INSTALL_ROOT="${WORK_ROOT}/install" \
   python3 -m pytest -q "${PYTEST_FILES[@]}"
 
 set +u
