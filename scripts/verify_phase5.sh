@@ -507,7 +507,6 @@ run_check bash-syntax 60s bash -n "${SHELL_FILES[@]}"
 run_check shellcheck 180s shellcheck --severity=warning "${SHELL_FILES[@]}"
 run_check ruff-check 180s "${RUFF}" check "${PROJECT_ROOT}/tests" "${PROJECT_ROOT}/src"
 run_check ruff-format 180s "${RUFF}" format --check "${PROJECT_ROOT}/tests" "${PROJECT_ROOT}/src"
-run_check pure-python-tests 2700s python3 -m pytest -q "${PYTEST_FILES[@]}"
 
 run_check phase3-static-interface 30s bash "${SCRIPT_DIR}/verify_phase3.sh" --help
 run_check phase3-campaign-interface 30s bash "${SCRIPT_DIR}/run_benchmarks.sh" --help
@@ -534,6 +533,10 @@ run_check colcon-build 1200s \
     --symlink-install \
     --event-handlers console_cohesion+ \
     --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+run_check pure-python-tests 2700s \
+  env ROBOTEST_PHASE5_FIXTURE_INSTALL_ROOT="${WORK_ROOT}/install" \
+  python3 -m pytest -q "${PYTEST_FILES[@]}"
 
 set +u
 # shellcheck disable=SC1090

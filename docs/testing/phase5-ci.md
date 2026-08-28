@@ -43,6 +43,10 @@ command logs and a summary that explicitly records that Gazebo, hardware,
 systemd, Phase 3 campaign execution, and Phase 4 apply execution were not
 started.
 
+The temporary build completes before the pure-Python stage. The gate passes
+that exact install root to release-fixture tests without sourcing the overlay;
+the overlay is sourced only for the subsequent package-test and CLI checks.
+
 Every local or hosted run records the exact argument vector and starting
 working directory, Git state, a first-party source snapshot, platform and tool
 versions, a JSON summary, and a matching one-row CSV. Finalization writes an

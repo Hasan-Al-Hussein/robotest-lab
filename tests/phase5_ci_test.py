@@ -55,6 +55,7 @@ from phase5_ci import (  # noqa: E402
 from phase5_release_evidence import validate_release_evidence  # noqa: E402
 
 WORKFLOW = REPOSITORY / '.github/workflows/robotest-ci.yml'
+PHASE5_FIXTURE_INSTALL_ROOT_ENV = 'ROBOTEST_PHASE5_FIXTURE_INSTALL_ROOT'
 
 _RELEASE_FIXTURE_TEMPLATE_DIRECTORY: tempfile.TemporaryDirectory | None = None
 _RELEASE_FIXTURE_TEMPLATE: dict[str, Path | str] | None = None
@@ -768,7 +769,12 @@ def test_local_summary_keeps_live_and_remote_claims_out_of_scope(tmp_path: Path)
 def test_phase5_script_has_no_implicit_mode() -> None:
     script = REPOSITORY / 'scripts/verify_phase5.sh'
     script_text = script.read_text(encoding='utf-8')
-    assert 'run_check pure-python-tests 2700s python3 -m pytest' in script_text
+    fixture_build = script_text.index('run_check colcon-build 1200s')
+    overlay_source = script_text.index('source "${WORK_ROOT}/install/setup.bash"')
+    pure_tests = script_text.index('run_check pure-python-tests 2700s')
+    colcon_tests = script_text.index('run_check colcon-test 1500s')
+    assert fixture_build < pure_tests < overlay_source < colcon_tests
+    assert 'env ROBOTEST_PHASE5_FIXTURE_INSTALL_ROOT="${WORK_ROOT}/install"' in script_text
     assert 'run_check portfolio-contract 30s' in script_text
     assert 'createdAt,updatedAt' in script_text
     result = subprocess.run(['bash', str(script)], capture_output=True, text=True, check=False)
@@ -779,6 +785,46 @@ def test_phase5_script_has_no_implicit_mode() -> None:
     )
     assert help_result.returncode == 0
     assert 'never start Gazebo' in help_result.stdout
+
+
+def test_release_fixture_install_root_uses_explicit_absolute_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_root = tmp_path / 'install'
+    install_root.mkdir()
+    monkeypatch.setenv(PHASE5_FIXTURE_INSTALL_ROOT_ENV, str(install_root))
+    assert _release_fixture_install_root() == install_root.resolve(strict=True)
+
+
+def test_release_fixture_install_root_rejects_relative_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(PHASE5_FIXTURE_INSTALL_ROOT_ENV, 'install')
+    with pytest.raises(RuntimeError, match='must be absolute'):
+        _release_fixture_install_root()
+
+
+def test_release_fixture_install_root_rejects_missing_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(PHASE5_FIXTURE_INSTALL_ROOT_ENV, str(tmp_path / 'missing'))
+    with pytest.raises(RuntimeError, match='is unavailable'):
+        _release_fixture_install_root()
+
+
+def test_release_fixture_install_root_rejects_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_root = tmp_path / 'install'
+    install_root.mkdir()
+    alias = tmp_path / 'install-alias'
+    alias.symlink_to(install_root, target_is_directory=True)
+    monkeypatch.setenv(PHASE5_FIXTURE_INSTALL_ROOT_ENV, str(alias))
+    with pytest.raises(RuntimeError, match='must not be a symlink'):
+        _release_fixture_install_root()
 
 
 def test_phase5_ci_mode_cannot_be_claimed_outside_github_actions() -> None:
@@ -4930,6 +4976,27 @@ def _set_local_aggregate_after_portfolio(
     )
 
 
+def _release_fixture_install_root() -> Path:
+    configured = os.environ.get(PHASE5_FIXTURE_INSTALL_ROOT_ENV)
+    if configured is None:
+        candidate = REPOSITORY / 'install'
+    else:
+        if not configured or configured.strip() != configured:
+            raise RuntimeError(f'{PHASE5_FIXTURE_INSTALL_ROOT_ENV} is invalid')
+        candidate = Path(configured)
+    if not candidate.is_absolute():
+        raise RuntimeError(f'{PHASE5_FIXTURE_INSTALL_ROOT_ENV} must be absolute')
+    if candidate.is_symlink():
+        raise RuntimeError(f'{PHASE5_FIXTURE_INSTALL_ROOT_ENV} must not be a symlink')
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError(f'{PHASE5_FIXTURE_INSTALL_ROOT_ENV} is unavailable') from error
+    if not resolved.is_dir():
+        raise RuntimeError(f'{PHASE5_FIXTURE_INSTALL_ROOT_ENV} must be a directory')
+    return resolved
+
+
 def _build_release_fixture(tmp_path: Path) -> dict[str, Path | str]:
     repository = tmp_path / 'repository'
     repository.mkdir()
@@ -4937,14 +5004,18 @@ def _build_release_fixture(tmp_path: Path) -> dict[str, Path | str]:
     ignored = shutil.ignore_patterns('__pycache__', '.pytest_cache', '*.pyc')
     for directory in ('config', 'docs', 'packaging', 'scenarios', 'scripts', 'supervisor', 'tests'):
         shutil.copytree(REPOSITORY / directory, repository / directory, ignore=ignored)
+    fixture_install_root = _release_fixture_install_root()
     for package in release_module.PHASE3_RUNTIME_PACKAGES:
         shutil.copytree(
             REPOSITORY / f'src/{package}',
             repository / f'src/{package}',
             ignore=ignored,
         )
+        installed_package = fixture_install_root / package
+        if not installed_package.is_dir() or installed_package.is_symlink():
+            raise RuntimeError(f'missing regular installed fixture package: {package}')
         shutil.copytree(
-            REPOSITORY / f'install/{package}',
+            installed_package,
             repository / f'install/{package}',
             symlinks=False,
             ignore=ignored,
