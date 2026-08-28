@@ -1545,6 +1545,257 @@ def test_contact_drain_requires_strict_snapshot_and_clock_catch_up() -> None:
     assert state.evidence()['clock_minus_qualifying_contact_ns'] == 220_000_000
 
 
+def _exact_contact_gate_graph_observation() -> dict[str, Any]:
+    return {
+        'gate_node_present': True,
+        'public_publisher_count': 1,
+        'public_publishers': [
+            {
+                'node': runtime_observer.CONTACT_GATE_NODE,
+                'topic_type': runtime_observer.CONTACT_MESSAGE_TYPE,
+            }
+        ],
+    }
+
+
+def test_contact_gate_graph_transient_mismatch_converges_to_exact_pass() -> None:
+    mismatch = {
+        'gate_node_present': False,
+        'public_publisher_count': 0,
+        'public_publishers': [],
+    }
+    exact = _exact_contact_gate_graph_observation()
+    observations = iter((mismatch, exact))
+    spin_timeouts: list[float] = []
+    checked_pids: list[int | None] = []
+
+    def pid_alive(pid: int | None) -> bool:
+        checked_pids.append(pid)
+        return True
+
+    result = runtime_observer._wait_for_contact_gate_convergence(
+        drain_complete=lambda: True,
+        observe_graph=observations.__next__,
+        spin_once=spin_timeouts.append,
+        watch_pid=42,
+        deadline_ns=1,
+        monotonic_ns=lambda: 0,
+        pid_alive=pid_alive,
+    )
+
+    assert result == exact
+    assert spin_timeouts == [
+        runtime_observer.CONTACT_GRAPH_SPIN_TIMEOUT_S,
+        runtime_observer.CONTACT_GRAPH_SPIN_TIMEOUT_S,
+    ]
+    assert checked_pids == [42] * 8
+
+
+def test_contact_gate_graph_observation_captures_exact_decision_fields() -> None:
+    queried_topics: list[str] = []
+
+    def publishers(topic: str) -> list[SimpleNamespace]:
+        queried_topics.append(topic)
+        return [
+            SimpleNamespace(
+                node_namespace='/robotest/',
+                node_name='contact_stream_gate',
+                topic_type=runtime_observer.CONTACT_MESSAGE_TYPE,
+            )
+        ]
+
+    node = SimpleNamespace(
+        get_publishers_info_by_topic=publishers,
+        get_node_names_and_namespaces=lambda: [('contact_stream_gate', '/robotest')],
+    )
+
+    observation = runtime_observer._contact_gate_graph_observation(node)
+
+    assert queried_topics == [runtime_observer.CONTACT_TOPIC]
+    assert observation == _exact_contact_gate_graph_observation()
+    assert runtime_observer._contact_gate_graph_exact(observation)
+
+
+def test_contact_gate_graph_persistent_mismatch_fails_with_exact_last_evidence() -> None:
+    first = {
+        'gate_node_present': False,
+        'public_publisher_count': 0,
+        'public_publishers': [],
+    }
+    last = {
+        'gate_node_present': True,
+        'public_publisher_count': 1,
+        'public_publishers': [
+            {
+                'node': '/robotest/wrong_contact_gate',
+                'topic_type': 'example_interfaces/msg/String',
+            }
+        ],
+    }
+    observations = iter((first, last))
+    observed_count = 0
+
+    def observe_graph() -> dict[str, Any]:
+        nonlocal observed_count
+        observation = next(observations)
+        observed_count += 1
+        return observation
+
+    with pytest.raises(orchestration.EvidenceError) as raised:
+        runtime_observer._wait_for_contact_gate_convergence(
+            drain_complete=lambda: True,
+            observe_graph=observe_graph,
+            spin_once=lambda _timeout: None,
+            watch_pid=42,
+            deadline_ns=2,
+            monotonic_ns=lambda: observed_count,
+            pid_alive=lambda _pid: True,
+        )
+
+    expected = (
+        orchestration.canonical_json_bytes(
+            {
+                'graph_attempt_count': 2,
+                'last_observation': last,
+            }
+        )
+        .decode('utf-8')
+        .removesuffix('\n')
+    )
+    assert str(raised.value) == (
+        f'contact stream gate did not converge through terminal drain: {expected}'
+    )
+
+
+def test_contact_gate_graph_convergence_remains_watch_pid_fail_closed() -> None:
+    with pytest.raises(
+        orchestration.EvidenceError,
+        match='watched stack exited before terminal contact drain',
+    ):
+        runtime_observer._wait_for_contact_gate_convergence(
+            drain_complete=lambda: True,
+            observe_graph=lambda: {},
+            spin_once=lambda _timeout: pytest.fail('must not spin after watched stack exit'),
+            watch_pid=42,
+            deadline_ns=1,
+            monotonic_ns=lambda: 0,
+            pid_alive=lambda _pid: False,
+        )
+
+
+def test_contact_gate_graph_death_during_spin_cannot_pass() -> None:
+    alive = True
+
+    def spin_once(_timeout: float) -> None:
+        nonlocal alive
+        alive = False
+
+    with pytest.raises(
+        orchestration.EvidenceError,
+        match='watched stack exited before terminal contact drain',
+    ):
+        runtime_observer._wait_for_contact_gate_convergence(
+            drain_complete=lambda: pytest.fail('must recheck watch PID after spin'),
+            observe_graph=lambda: pytest.fail('must not observe after watched stack exit'),
+            spin_once=spin_once,
+            watch_pid=42,
+            deadline_ns=1,
+            monotonic_ns=lambda: 0,
+            pid_alive=lambda _pid: alive,
+        )
+
+
+def test_contact_gate_graph_deadline_during_spin_cannot_pass() -> None:
+    now_ns = 0
+
+    def spin_once(_timeout: float) -> None:
+        nonlocal now_ns
+        now_ns = 1
+
+    with pytest.raises(
+        orchestration.EvidenceError,
+        match='contact drain wall timeout expired',
+    ):
+        runtime_observer._wait_for_contact_gate_convergence(
+            drain_complete=lambda: pytest.fail('must recheck deadline after spin'),
+            observe_graph=lambda: pytest.fail('must not observe after deadline'),
+            spin_once=spin_once,
+            watch_pid=42,
+            deadline_ns=1,
+            monotonic_ns=lambda: now_ns,
+            pid_alive=lambda _pid: True,
+        )
+
+
+def test_contact_gate_graph_shutdown_during_spin_cannot_pass() -> None:
+    running = True
+
+    def spin_once(_timeout: float) -> None:
+        nonlocal running
+        running = False
+
+    with pytest.raises(
+        orchestration.EvidenceError,
+        match='contact drain wall timeout expired',
+    ):
+        runtime_observer._wait_for_contact_gate_convergence(
+            drain_complete=lambda: pytest.fail('must recheck runtime after spin'),
+            observe_graph=lambda: pytest.fail('must not observe after runtime shutdown'),
+            spin_once=spin_once,
+            watch_pid=42,
+            deadline_ns=1,
+            monotonic_ns=lambda: 0,
+            pid_alive=lambda _pid: True,
+            keep_running=lambda: running,
+        )
+
+
+def test_contact_gate_graph_death_during_observation_cannot_pass_exact() -> None:
+    alive = True
+
+    def observe_graph() -> dict[str, Any]:
+        nonlocal alive
+        alive = False
+        return _exact_contact_gate_graph_observation()
+
+    with pytest.raises(
+        orchestration.EvidenceError,
+        match='watched stack exited before terminal contact drain',
+    ):
+        runtime_observer._wait_for_contact_gate_convergence(
+            drain_complete=lambda: True,
+            observe_graph=observe_graph,
+            spin_once=lambda _timeout: None,
+            watch_pid=42,
+            deadline_ns=1,
+            monotonic_ns=lambda: 0,
+            pid_alive=lambda _pid: alive,
+        )
+
+
+def test_contact_gate_graph_deadline_during_observation_cannot_pass_exact() -> None:
+    now_ns = 0
+
+    def observe_graph() -> dict[str, Any]:
+        nonlocal now_ns
+        now_ns = 1
+        return _exact_contact_gate_graph_observation()
+
+    with pytest.raises(
+        orchestration.EvidenceError,
+        match='contact drain wall timeout expired',
+    ):
+        runtime_observer._wait_for_contact_gate_convergence(
+            drain_complete=lambda: True,
+            observe_graph=observe_graph,
+            spin_once=lambda _timeout: None,
+            watch_pid=42,
+            deadline_ns=1,
+            monotonic_ns=lambda: now_ns,
+            pid_alive=lambda _pid: True,
+        )
+
+
 def test_contact_drain_source_gap_and_clock_lag_boundaries() -> None:
     pair = frozenset({('robot::link::collision', 'wall::link::collision')})
     accepted = runtime_observer.ContactDrainObserver(100_000_000)

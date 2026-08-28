@@ -950,6 +950,210 @@ def test_capture_tracks_the_whole_runner_owned_process_set_until_empty(tmp_path:
     assert all(process.ended_sample is not None for process in state.processes.values())
 
 
+def test_capture_counts_latched_process_vanishing_during_ancestry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    _make_process(proc_root, 101, plugin)
+    child = _make_process(proc_root, 102, plugin, maps_plugin=False, start=200)
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    state = profiler.ProfileState()
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    original_discover = profiler.discover_matching
+
+    def discover_then_remove(*args):
+        matches = original_discover(*args)
+        shutil.rmtree(child)
+        return matches
+
+    monkeypatch.setattr(profiler, 'discover_matching', discover_then_remove)
+
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    assert state.processes[102].ended_sample == 1
+    assert state.samples[-1]['processes_vanished_during_sample'] == 1
+
+
+@pytest.mark.parametrize(
+    ('ppid', 'group', 'session'),
+    (
+        (50, 50, 50),
+        (1, 303, 303),
+    ),
+)
+def test_capture_rejects_unlatched_process_vanishing_before_ownership_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ppid: int,
+    group: int,
+    session: int,
+) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    _make_process(proc_root, 101, plugin)
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    state = profiler.ProfileState()
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    before = copy.deepcopy(state)
+    new_process = _make_process(
+        proc_root,
+        303,
+        plugin,
+        maps_plugin=False,
+        start=300,
+        ppid=ppid,
+        group=group,
+        session=session,
+    )
+    original_discover = profiler.discover_matching
+
+    def discover_then_remove(*args):
+        matches = original_discover(*args)
+        shutil.rmtree(new_process)
+        return matches
+
+    monkeypatch.setattr(profiler, 'discover_matching', discover_then_remove)
+
+    with pytest.raises(profiler.ProfileError, match='matching process disappeared'):
+        profiler.capture_sample(proc_root, config, anchor, state)
+    assert state == before
+
+
+def test_capture_counts_same_identity_becoming_terminal_during_ancestry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    _make_process(proc_root, 101, plugin)
+    child = _make_process(proc_root, 102, plugin, maps_plugin=False, start=200)
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    state = profiler.ProfileState()
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    original_read = profiler._read_stable_process_stat
+    raced = False
+
+    def become_terminal(procfs: Path, pid: int, label: str):
+        nonlocal raced
+        if pid == 102 and label == 'matching process' and not raced:
+            raced = True
+            terminal = _stat_text(102, state='Z', start=200)
+            (child / 'stat').write_text(terminal, encoding='ascii')
+            (child / 'task/102/stat').write_text(terminal, encoding='ascii')
+            raise profiler.ProcessDisappearedError(pid, label)
+        return original_read(procfs, pid, label)
+
+    monkeypatch.setattr(profiler, '_read_stable_process_stat', become_terminal)
+
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    assert state.processes[102].ended_sample == 1
+    assert state.samples[-1]['processes_vanished_during_sample'] == 1
+
+
+def test_capture_keeps_live_ancestry_disappearance_uncertainty_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    _make_process(proc_root, 101, plugin)
+    _make_process(proc_root, 102, plugin, maps_plugin=False, start=200)
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    state = profiler.ProfileState()
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    before = copy.deepcopy(state)
+    original_read = profiler._read_stable_process_stat
+    raced = False
+
+    def report_disappearance(procfs: Path, pid: int, label: str):
+        nonlocal raced
+        if pid == 102 and label == 'matching process' and not raced:
+            raced = True
+            raise profiler.ProcessDisappearedError(pid, label)
+        return original_read(procfs, pid, label)
+
+    monkeypatch.setattr(profiler, '_read_stable_process_stat', report_disappearance)
+
+    with pytest.raises(profiler.ProfileError, match='matching process disappeared'):
+        profiler.capture_sample(proc_root, config, anchor, state)
+    assert state == before
+
+
+def test_capture_keeps_ancestor_disappearance_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    _make_process(proc_root, 101, plugin)
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    state = profiler.ProfileState()
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    before = copy.deepcopy(state)
+    original_read = profiler._read_stable_process_stat
+
+    def lose_ancestor(procfs: Path, pid: int, label: str):
+        if pid == 50 and label == 'matching process ancestor':
+            raise profiler.ProcessDisappearedError(pid, label)
+        return original_read(procfs, pid, label)
+
+    monkeypatch.setattr(profiler, '_read_stable_process_stat', lose_ancestor)
+
+    with pytest.raises(profiler.ProfileError, match='matching process ancestor disappeared'):
+        profiler.capture_sample(proc_root, config, anchor, state)
+    assert state == before
+
+
+def test_capture_keeps_raced_pid_reuse_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    _make_process(proc_root, 101, plugin)
+    child = _make_process(proc_root, 102, plugin, maps_plugin=False, start=200)
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    state = profiler.ProfileState()
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    before = copy.deepcopy(state)
+    original_read = profiler._read_stable_process_stat
+    raced = False
+
+    def reuse_pid(procfs: Path, pid: int, label: str):
+        nonlocal raced
+        if pid == 102 and label == 'matching process' and not raced:
+            raced = True
+            (child / 'stat').write_text(_stat_text(102, start=999), encoding='ascii')
+            raise profiler.ProcessDisappearedError(pid, label)
+        return original_read(procfs, pid, label)
+
+    monkeypatch.setattr(profiler, '_read_stable_process_stat', reuse_pid)
+
+    with pytest.raises(profiler.ProfileError, match='matching PID 102 was reused'):
+        profiler.capture_sample(proc_root, config, anchor, state)
+    assert state == before
+
+
 @pytest.mark.parametrize('terminal_state', ('X', 'Z'))
 def test_capture_stable_terminal_child_as_ended(tmp_path: Path, terminal_state: str) -> None:
     config, plugin, producer = _fixture_config(tmp_path)

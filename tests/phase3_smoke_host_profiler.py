@@ -247,6 +247,14 @@ class ProfileError(RuntimeError):
         self.kind = kind
 
 
+class ProcessDisappearedError(ProfileError):
+    """A structured procfs disappearance preserving the affected PID."""
+
+    def __init__(self, pid: int, label: str) -> None:
+        super().__init__('missing_identity', f'{label} disappeared')
+        self.pid = pid
+
+
 @dataclass(frozen=True)
 class ProcStat:
     """Fields consumed from one Linux ``/proc/*/stat`` record."""
@@ -1050,7 +1058,7 @@ def _read_stable_process_stat(proc_root: Path, pid: int, label: str) -> ProcStat
         before = _read_stat(proc_root / str(pid) / 'stat')
         after = _read_stat(proc_root / str(pid) / 'stat')
     except FileNotFoundError as exc:
-        raise ProfileError('missing_identity', f'{label} disappeared') from exc
+        raise ProcessDisappearedError(pid, label) from exc
     if not _same_process(before, after):
         raise ProfileError('pid_reuse', f'{label} PID {pid} was reused')
     if _stat_context(before) != _stat_context(after):
@@ -1262,6 +1270,23 @@ def _process_descends_from_smoke_runner(
     raise ProfileError('overflow', 'matching process ancestry exceeds 256 processes')
 
 
+def _discovered_process_ended_after_ancestry_failure(
+    proc_root: Path,
+    observed: ProcStat,
+    error: ProcessDisappearedError,
+) -> bool:
+    """Confirm only an observed process's own terminal race as benign."""
+    if error.pid != observed.pid:
+        return False
+    try:
+        current = _read_stat(proc_root / str(observed.pid) / 'stat')
+    except FileNotFoundError:
+        return True
+    if not _same_process(current, observed):
+        raise ProfileError('pid_reuse', f'matching PID {observed.pid} was reused')
+    return current.state in TERMINAL_PROCESS_STATES
+
+
 def collect_anchor(
     proc_root: Path, pid: int, observed: ProcStat, plugin: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -1458,12 +1483,29 @@ def _capture_sample(
             _revalidate_smoke_runner_owner(proc_root, state.smoke_runner_owner)
     target_matching: list[tuple[int, ProcStat]] = []
     foreign_matching: list[int] = []
+    ancestry_vanished = 0
     owner = state.smoke_runner_owner
     if matching and owner is None:
         raise ProfileError('missing_identity', 'smoke runner owner was not latched')
     for pid, process_stat in matching:
         assert owner is not None
-        if _process_descends_from_smoke_runner(proc_root, process_stat, owner):
+        try:
+            descends_from_owner = _process_descends_from_smoke_runner(
+                proc_root, process_stat, owner
+            )
+        except ProcessDisappearedError as exc:
+            latched = state.processes.get(pid)
+            if (
+                latched is None
+                or latched.start_ticks != process_stat.start_ticks
+                or latched.ended_sample is not None
+            ):
+                raise
+            if not _discovered_process_ended_after_ancestry_failure(proc_root, process_stat, exc):
+                raise
+            ancestry_vanished += 1
+            continue
+        if descends_from_owner:
             target_matching.append((pid, process_stat))
         else:
             foreign_matching.append(pid)
@@ -1518,7 +1560,7 @@ def _capture_sample(
                 raise ProfileError('identity_changed', 'anchor DSO mapping became incomplete')
     process_samples = []
     sample_thread_records = 0
-    vanished = 0
+    vanished = ancestry_vanished
     for pid in sorted(state.processes):
         process = state.processes[pid]
         if process.ended_sample is not None:
@@ -1526,6 +1568,8 @@ def _capture_sample(
         sampled = _sample_threads(proc_root, process, index, state)
         if sampled is None:
             vanished += 1
+            if vanished > MAX_PROCESSES:
+                raise ProfileError('overflow', 'sample vanished process count exceeds bound')
         else:
             sample_thread_records += sampled['thread_count']
             if sample_thread_records > MAX_LIVE_THREADS_PER_SAMPLE:

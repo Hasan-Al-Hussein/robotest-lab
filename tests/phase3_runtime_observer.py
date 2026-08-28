@@ -16,7 +16,7 @@ public snapshot strictly beyond terminal + 0.25 s to a caught-up /clock sample.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from itertools import islice
 from numbers import Integral
 import os
@@ -27,6 +27,7 @@ import uuid
 
 from phase3_orchestration import (
     atomic_write_json,
+    canonical_json_bytes,
     canonical_sha256,
     EvidenceError,
     lifecycle_schedule,
@@ -43,6 +44,8 @@ VALID_STATUSES = ACTIVE_STATUSES | TERMINAL_STATUSES
 ARM_REQUEST = b'arm-next-new-goal\n'
 CONTACT_TOPIC = '/robotest/validation/contacts'
 CONTACT_GATE_NODE = '/robotest/contact_stream_gate'
+CONTACT_MESSAGE_TYPE = 'ros_gz_interfaces/msg/Contacts'
+CONTACT_GRAPH_SPIN_TIMEOUT_S = 0.05
 CONTACT_RELEASE_GAP_NS = 250_000_000
 CONTACT_HEARTBEAT_NS = 200_000_000
 CONTACT_MAX_PUBLIC_GAP_NS = 220_000_000
@@ -317,6 +320,94 @@ class ContactDrainObserver:
         }
 
 
+def _contact_gate_graph_observation(node: Any) -> dict[str, Any]:
+    """Capture every graph field used by the exact contact-gate decision."""
+    publishers = []
+    for endpoint in node.get_publishers_info_by_topic(CONTACT_TOPIC):
+        namespace = endpoint.node_namespace.rstrip('/')
+        publishers.append(
+            {
+                'node': f'{namespace}/{endpoint.node_name}'.replace('//', '/'),
+                'topic_type': endpoint.topic_type,
+            }
+        )
+    publishers.sort(key=lambda endpoint: (endpoint['node'], endpoint['topic_type']))
+    graph_nodes = {
+        f'{namespace.rstrip("/")}/{name}'.replace('//', '/')
+        for name, namespace in node.get_node_names_and_namespaces()
+    }
+    return {
+        'gate_node_present': CONTACT_GATE_NODE in graph_nodes,
+        'public_publisher_count': len(publishers),
+        'public_publishers': publishers,
+    }
+
+
+def _contact_gate_graph_exact(observation: Mapping[str, Any]) -> bool:
+    return observation == {
+        'gate_node_present': True,
+        'public_publisher_count': 1,
+        'public_publishers': [
+            {
+                'node': CONTACT_GATE_NODE,
+                'topic_type': CONTACT_MESSAGE_TYPE,
+            }
+        ],
+    }
+
+
+def _wait_for_contact_gate_convergence(
+    *,
+    drain_complete: Callable[[], bool],
+    observe_graph: Callable[[], dict[str, Any]],
+    spin_once: Callable[[float], None],
+    watch_pid: int | None,
+    deadline_ns: int,
+    monotonic_ns: Callable[[], int] = time.monotonic_ns,
+    pid_alive: Callable[[int | None], bool] = _pid_alive,
+    keep_running: Callable[[], bool] = lambda: True,
+) -> dict[str, Any]:
+    """Wait for terminal drain and an exact graph snapshot under one deadline."""
+    graph_attempt_count = 0
+    last_mismatch: dict[str, Any] | None = None
+
+    def wait_open() -> bool:
+        running = keep_running()
+        watched_process_alive = pid_alive(watch_pid)
+        within_deadline = monotonic_ns() < deadline_ns
+        if not watched_process_alive:
+            raise EvidenceError('watched stack exited before terminal contact drain')
+        return running and within_deadline
+
+    while wait_open():
+        spin_once(CONTACT_GRAPH_SPIN_TIMEOUT_S)
+        if not wait_open():
+            break
+        if not drain_complete():
+            continue
+        if not wait_open():
+            break
+        observation = observe_graph()
+        graph_attempt_count += 1
+        exact = _contact_gate_graph_exact(observation)
+        if not exact:
+            last_mismatch = observation
+        if not wait_open():
+            break
+        if exact:
+            return observation
+    if last_mismatch is not None:
+        mismatch = {
+            'graph_attempt_count': graph_attempt_count,
+            'last_observation': last_mismatch,
+        }
+        detail = canonical_json_bytes(mismatch).decode('utf-8').removesuffix('\n')
+        raise EvidenceError(
+            f'contact stream gate did not converge through terminal drain: {detail}'
+        )
+    raise EvidenceError('contact drain wall timeout expired')
+
+
 def _run_goal_observer(arguments: argparse.Namespace) -> int:
     import rclpy
     from action_msgs.msg import GoalStatusArray
@@ -518,45 +609,30 @@ def _run_contact_drain_observer(arguments: argparse.Namespace) -> int:
     started_ns = time.monotonic_ns()
     deadline_ns = started_ns + int(arguments.wall_timeout_s * 1_000_000_000)
     try:
-        while rclpy.ok() and time.monotonic_ns() < deadline_ns:
-            if not _pid_alive(arguments.watch_pid):
-                raise EvidenceError('watched stack exited before terminal contact drain')
-            executor.spin_once(timeout_sec=0.05)
-            if node.machine.complete():
-                publisher_endpoints = node.get_publishers_info_by_topic(CONTACT_TOPIC)
-                publisher_nodes = []
-                for endpoint in publisher_endpoints:
-                    namespace = endpoint.node_namespace.rstrip('/')
-                    node_name = f'{namespace}/{endpoint.node_name}'.replace('//', '/')
-                    publisher_nodes.append(node_name)
-                publisher_nodes.sort()
-                graph_nodes = {
-                    f'{namespace.rstrip("/")}/{name}'.replace('//', '/')
-                    for name, namespace in node.get_node_names_and_namespaces()
-                }
-                if (
-                    len(publisher_endpoints) != 1
-                    or publisher_nodes != [CONTACT_GATE_NODE]
-                    or publisher_endpoints[0].topic_type != 'ros_gz_interfaces/msg/Contacts'
-                    or CONTACT_GATE_NODE not in graph_nodes
-                ):
-                    raise EvidenceError(
-                        'contact stream gate did not survive through terminal drain'
-                    )
-                evidence = node.machine.evidence()
-                evidence.update(
-                    {
-                        'gate_node_present': True,
-                        'public_publisher_nodes': publisher_nodes,
-                    }
-                )
-                atomic_write_json(
-                    arguments.output,
-                    evidence,
-                    sidecar=True,
-                )
-                return 0
-        raise EvidenceError('contact drain wall timeout expired')
+        observation = _wait_for_contact_gate_convergence(
+            drain_complete=node.machine.complete,
+            observe_graph=lambda: _contact_gate_graph_observation(node),
+            spin_once=lambda timeout: executor.spin_once(timeout_sec=timeout),
+            watch_pid=arguments.watch_pid,
+            deadline_ns=deadline_ns,
+            pid_alive=_pid_alive,
+            keep_running=rclpy.ok,
+        )
+        evidence = node.machine.evidence()
+        evidence.update(
+            {
+                'gate_node_present': True,
+                'public_publisher_nodes': [
+                    endpoint['node'] for endpoint in observation['public_publishers']
+                ],
+            }
+        )
+        atomic_write_json(
+            arguments.output,
+            evidence,
+            sidecar=True,
+        )
+        return 0
     finally:
         executor.remove_node(node)
         node.destroy_node()
