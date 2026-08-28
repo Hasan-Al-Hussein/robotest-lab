@@ -15,6 +15,7 @@
 """Focused in-process ROS graph adapter tests."""
 
 import hashlib
+import inspect
 import json
 import time
 import uuid
@@ -23,10 +24,12 @@ from types import SimpleNamespace
 
 import pytest
 import rclpy
+import robotest_scenarios.scenario_controller as scenario_controller
 from action_msgs.msg import GoalStatus, GoalStatusArray
 from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, ReliabilityPolicy
+from rclpy.exceptions import ParameterImmutableException
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from robotest_scenarios.artifacts import canonical_json_bytes, write_canonical_json
 from robotest_scenarios.constants import (
     ACTION_STATUS_TOPIC,
@@ -66,6 +69,14 @@ def _clock(stamp_ns: int) -> Clock:
     message = Clock()
     message.clock.sec, message.clock.nanosec = divmod(stamp_ns, 1_000_000_000)
     return message
+
+
+def _local_clock_endpoint_gids(node: scenario_controller.Node) -> tuple[bytes, ...]:
+    return tuple(
+        bytes(info.endpoint_gid)
+        for info in node.get_subscriptions_info_by_topic('/clock')
+        if info.node_name == node.get_name() and info.node_namespace == node.get_namespace()
+    )
 
 
 def _status(raw_uuid: bytes, stamp_ns: int, status_code: int) -> GoalStatusArray:
@@ -1003,6 +1014,384 @@ def test_scenario_controller_binds_only_one_post_ready_uuid() -> None:
     finally:
         node.destroy_node()
         rclpy.try_shutdown()
+
+
+def test_scenario_controller_fuses_one_exact_clock_reader_before_guarded_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_ros_stamps: list[int] = []
+    original_on_clock = ScenarioControllerNode._on_clock
+
+    def on_clock_after_time_source(node: ScenarioControllerNode, message: Clock) -> None:
+        observed_ros_stamps.append(int(node.get_clock().now().nanoseconds))
+        original_on_clock(node, message)
+
+    monkeypatch.setattr(ScenarioControllerNode, '_on_clock', on_clock_after_time_source)
+    _init_ros()
+    document = load_scenario(str(REPOSITORY / 'scenarios' / 'phase3_s1_baseline.yaml'))
+    node = ScenarioControllerNode(document)
+    try:
+        clock_subscriptions = [item for item in node.subscriptions if item.topic_name == '/clock']
+        assert clock_subscriptions == [node.clock_subscription]
+        clock_subscription = node.clock_subscription
+        clock_endpoint_gids = _local_clock_endpoint_gids(node)
+        assert len(clock_endpoint_gids) == 1
+        clock_qos = node.clock_subscription.qos_profile
+        assert clock_qos.history == HistoryPolicy.KEEP_LAST
+        assert clock_qos.depth == 1
+        assert clock_qos.reliability == ReliabilityPolicy.BEST_EFFORT
+        assert clock_qos.durability == DurabilityPolicy.VOLATILE
+        assert node.get_parameter('use_sim_time').value is True
+        rejected = node.set_parameters(
+            [scenario_controller.Parameter('use_sim_time', value=False)]
+        )[0]
+        assert rejected.successful is False
+        assert 'read-only' in rejected.reason
+        assert node.get_parameter('use_sim_time').value is True
+        unset = node.set_parameters(
+            [
+                scenario_controller.Parameter(
+                    'use_sim_time',
+                    type_=scenario_controller.Parameter.Type.NOT_SET,
+                )
+            ]
+        )[0]
+        assert unset.successful is False
+        assert 'read-only' in unset.reason
+        assert node.get_parameter('use_sim_time').value is True
+        assert node.clock_subscription is clock_subscription
+        assert [item for item in node.subscriptions if item.topic_name == '/clock'] == [
+            clock_subscription
+        ]
+        assert _local_clock_endpoint_gids(node) == clock_endpoint_gids
+        assert 'create_subscription(\n            Clock' not in inspect.getsource(
+            ScenarioControllerNode.__init__
+        )
+
+        node.clock_subscription.callback(_clock(1_000_000_000))
+        node.clock_subscription.callback(_clock(1_050_000_000))
+        node.clock_subscription.callback(_clock(1_000_000_000))
+
+        assert observed_ros_stamps == [1_000_000_000, 1_050_000_000, 1_000_000_000]
+        assert node.get_clock().now().nanoseconds == 1_000_000_000
+        assert node.clock_first_stamp_ns == 1_000_000_000
+        assert node.clock_sample_count == 2
+        assert node.clock_max_gap_ns == 50_000_000
+        assert node.clock_regression_count == 1
+        assert isinstance(node.fatal_error, ProtocolError)
+        assert str(node.fatal_error) == 'simulation clock regressed'
+        assert node.protocol_error_count == 1
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_scenario_use_sim_time_cannot_be_undeclared() -> None:
+    _init_ros()
+    document = load_scenario(str(REPOSITORY / 'scenarios' / 'phase3_s1_baseline.yaml'))
+    node = ScenarioControllerNode(document)
+    try:
+        assert node.describe_parameter('use_sim_time').read_only is True
+        with pytest.raises(ParameterImmutableException, match='use_sim_time'):
+            node.undeclare_parameter('use_sim_time')
+        assert node.get_parameter('use_sim_time').value is True
+        assert [item for item in node.subscriptions if item.topic_name == '/clock'] == [
+            node.clock_subscription
+        ]
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_scenario_clock_fusion_fails_closed_on_endpoint_or_qos_mismatch() -> None:
+    exact_qos = QoSProfile(
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        durability=DurabilityPolicy.VOLATILE,
+    )
+    exact = SimpleNamespace(
+        topic_name='/clock',
+        msg_type=Clock,
+        qos_profile=exact_qos,
+        callback=lambda _: None,
+    )
+
+    with pytest.raises(RuntimeError, match='exactly one /clock subscription; found 0'):
+        scenario_controller._fuse_time_source_clock_subscription(
+            SimpleNamespace(subscriptions=[]), '/clock', lambda _: None
+        )
+    with pytest.raises(RuntimeError, match='exactly one /clock subscription; found 2'):
+        scenario_controller._fuse_time_source_clock_subscription(
+            SimpleNamespace(subscriptions=[exact, exact]), '/clock', lambda _: None
+        )
+
+    wrong_qos = SimpleNamespace(
+        topic_name='/clock',
+        msg_type=Clock,
+        qos_profile=QoSProfile(depth=2, reliability=ReliabilityPolicy.BEST_EFFORT),
+        callback=lambda _: None,
+    )
+    with pytest.raises(RuntimeError, match=r'BEST_EFFORT KEEP_LAST\(1\) VOLATILE'):
+        scenario_controller._fuse_time_source_clock_subscription(
+            SimpleNamespace(subscriptions=[wrong_qos]), '/clock', lambda _: None
+        )
+
+    wrong_type = SimpleNamespace(
+        topic_name='/clock',
+        msg_type=object,
+        qos_profile=exact_qos,
+        callback=lambda _: None,
+    )
+    with pytest.raises(RuntimeError, match='rosgraph_msgs/msg/Clock'):
+        scenario_controller._fuse_time_source_clock_subscription(
+            SimpleNamespace(subscriptions=[wrong_type]), '/clock', lambda _: None
+        )
+
+
+def test_scenario_clock_fusion_does_not_cross_time_source_failure_boundary() -> None:
+    events: list[str] = []
+    exact_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+
+    def failed_time_source(_message: Clock) -> None:
+        events.append('time_source')
+        raise RuntimeError('time source failed')
+
+    subscription = SimpleNamespace(
+        topic_name='/clock',
+        msg_type=Clock,
+        qos_profile=exact_qos,
+        callback=failed_time_source,
+    )
+    scenario_controller._fuse_time_source_clock_subscription(
+        SimpleNamespace(subscriptions=[subscription]),
+        '/clock',
+        lambda _message: events.append('evidence'),
+    )
+
+    with pytest.raises(RuntimeError, match='time source failed'):
+        subscription.callback(Clock())
+    assert events == ['time_source']
+
+
+def test_scenario_constructor_destroys_node_when_clock_fusion_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destroyed_names: list[str] = []
+    original_destroy_node = scenario_controller.Node.destroy_node
+
+    def fail_fusion(*_args: object) -> None:
+        raise RuntimeError('clock fusion failed')
+
+    def record_destroy(node: scenario_controller.Node) -> None:
+        destroyed_names.append(node.get_name())
+        original_destroy_node(node)
+
+    monkeypatch.setattr(scenario_controller, '_fuse_time_source_clock_subscription', fail_fusion)
+    monkeypatch.setattr(scenario_controller.Node, 'destroy_node', record_destroy)
+    _init_ros()
+    document = load_scenario(str(REPOSITORY / 'scenarios' / 'phase3_s1_baseline.yaml'))
+    try:
+        with pytest.raises(RuntimeError, match='clock fusion failed'):
+            ScenarioControllerNode(document)
+        assert destroyed_names == ['scenario_controller']
+    finally:
+        rclpy.try_shutdown()
+
+
+@pytest.mark.parametrize(
+    'executor_failure',
+    ('construction', 'add', 'add_and_shutdown_false', 'add_and_shutdown_raise'),
+)
+def test_scenario_app_cleans_node_after_executor_setup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    executor_failure: str,
+) -> None:
+    document = load_scenario(str(REPOSITORY / 'scenarios' / 'phase3_s1_baseline.yaml'))
+    app = ScenarioControllerApp(
+        document=document,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        identity={},
+        wall_timeout_s=1.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    calls: list[str] = []
+
+    class FakeNode:
+        def __init__(self) -> None:
+            self.bound_uuid = None
+            self.context = object()
+            self.terminal_status = None
+
+        @staticmethod
+        def begin_cleanup() -> None:
+            calls.append('begin_cleanup')
+
+        @staticmethod
+        def destroy_node() -> None:
+            calls.append('destroy_node')
+
+    node = FakeNode()
+
+    class FakeExecutor:
+        def __init__(self, *, context: object) -> None:
+            assert context is node.context
+            calls.append('executor_constructed')
+            if executor_failure == 'construction':
+                raise RuntimeError('executor construction failed')
+
+        @staticmethod
+        def add_node(added_node: object) -> bool:
+            assert added_node is node
+            calls.append('add_node')
+            return False
+
+        @staticmethod
+        def remove_node(_removed_node: object) -> None:
+            pytest.fail('a refused node must not be removed')
+
+        @staticmethod
+        def shutdown(*, timeout_sec: float) -> bool:
+            assert timeout_sec == 1.0
+            calls.append('executor_shutdown')
+            if executor_failure == 'add_and_shutdown_raise':
+                raise RuntimeError('shutdown exploded')
+            return executor_failure != 'add_and_shutdown_false'
+
+    monkeypatch.setattr(scenario_controller, 'ScenarioControllerNode', lambda _document: node)
+    monkeypatch.setattr(scenario_controller, 'SingleThreadedExecutor', FakeExecutor)
+    monkeypatch.setattr(scenario_controller.rclpy, 'init', lambda **_: calls.append('rclpy_init'))
+    monkeypatch.setattr(
+        scenario_controller.rclpy,
+        'try_shutdown',
+        lambda: calls.append('rclpy_shutdown'),
+    )
+    monkeypatch.setattr(app, '_workflow', lambda: pytest.fail('workflow must not start'))
+
+    assert app.run() == 22
+    expected = ['rclpy_init', 'executor_constructed', 'begin_cleanup']
+    if executor_failure != 'construction':
+        expected.insert(2, 'add_node')
+        expected.append('executor_shutdown')
+    expected.extend(('destroy_node', 'rclpy_shutdown'))
+    assert calls == expected
+    if executor_failure.startswith('add_and_shutdown'):
+        failure = (
+            'executor shutdown failed: shutdown exploded'
+            if executor_failure.endswith('raise')
+            else 'executor shutdown did not complete'
+        )
+        assert f'scenario_controller: teardown warning: {failure}' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('executor_shutdown_outcome', ('false', 'none', 'raise'))
+def test_scenario_app_rejects_incomplete_executor_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    executor_shutdown_outcome: str,
+) -> None:
+    document = load_scenario(str(REPOSITORY / 'scenarios' / 'phase3_s1_baseline.yaml'))
+    app = ScenarioControllerApp(
+        document=document,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        identity={},
+        wall_timeout_s=1.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    calls: list[str] = []
+
+    class FakeNode:
+        def __init__(self) -> None:
+            self.context = object()
+
+        @staticmethod
+        def begin_cleanup() -> None:
+            calls.append('begin_cleanup')
+
+        @staticmethod
+        def destroy_node() -> None:
+            calls.append('destroy_node')
+
+    node = FakeNode()
+
+    class FakeExecutor:
+        def __init__(self, *, context: object) -> None:
+            assert context is node.context
+            calls.append('executor_constructed')
+
+        @staticmethod
+        def add_node(added_node: object) -> bool:
+            assert added_node is node
+            calls.append('add_node')
+            return True
+
+        @staticmethod
+        def remove_node(removed_node: object) -> None:
+            assert removed_node is node
+            calls.append('remove_node')
+
+        @staticmethod
+        def shutdown(*, timeout_sec: float) -> bool | None:
+            assert timeout_sec == 1.0
+            calls.append('executor_shutdown')
+            if executor_shutdown_outcome == 'raise':
+                raise RuntimeError('shutdown exploded')
+            if executor_shutdown_outcome == 'false':
+                return False
+            return None
+
+    monkeypatch.setattr(scenario_controller, 'ScenarioControllerNode', lambda _document: node)
+    monkeypatch.setattr(scenario_controller, 'SingleThreadedExecutor', FakeExecutor)
+    monkeypatch.setattr(scenario_controller.rclpy, 'init', lambda **_: calls.append('rclpy_init'))
+    monkeypatch.setattr(
+        scenario_controller.rclpy,
+        'try_shutdown',
+        lambda: calls.append('rclpy_shutdown'),
+    )
+    monkeypatch.setattr(app, '_workflow', lambda: calls.append('workflow'))
+    monkeypatch.setattr(app, '_cleanup_actor', lambda: calls.append('cleanup_actor'))
+
+    def result(error: object) -> tuple[dict[str, object], int]:
+        assert error is None
+        calls.append('result')
+        return {}, 0
+
+    monkeypatch.setattr(app, '_result', result)
+    monkeypatch.setattr(scenario_controller, 'package_schema_path', lambda _name: Path('schema'))
+    monkeypatch.setattr(scenario_controller, 'load_schema', lambda _path: {})
+    monkeypatch.setattr(
+        scenario_controller,
+        'write_canonical_json',
+        lambda *_args, **_kwargs: calls.append('write_result'),
+    )
+
+    failure = (
+        'executor shutdown failed: shutdown exploded'
+        if executor_shutdown_outcome == 'raise'
+        else 'executor shutdown did not complete'
+    )
+    with pytest.raises(InfrastructureError, match=failure):
+        app.run()
+    assert calls == [
+        'rclpy_init',
+        'executor_constructed',
+        'add_node',
+        'workflow',
+        'begin_cleanup',
+        'cleanup_actor',
+        'result',
+        'write_result',
+        'remove_node',
+        'executor_shutdown',
+        'destroy_node',
+        'rclpy_shutdown',
+    ]
 
 
 def test_scenario_controller_rejects_post_terminal_status_regression() -> None:

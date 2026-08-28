@@ -744,6 +744,7 @@ def test_phase3_graph_pair_rejects_unallowed_auxiliary_node(tmp_path: Path) -> N
 def test_phase3_runtime_graph_node_join_is_exact(tmp_path: Path) -> None:
     pre_mission, _mission = _valid_phase3_graph_pair(tmp_path)
     runtime_gate = {
+        'fused_clock_subscriber_ownership_pass': True,
         'mode': 'candidate',
         'nodes': sorted(
             [
@@ -757,6 +758,10 @@ def test_phase3_runtime_graph_node_join_is_exact(tmp_path: Path) -> None:
     }
 
     assert orchestration.validate_phase3_runtime_graph_node_join(runtime_gate, pre_mission)
+    runtime_gate['fused_clock_subscriber_ownership_pass'] = False
+    with pytest.raises(orchestration.EvidenceError, match='envelope is invalid'):
+        orchestration.validate_phase3_runtime_graph_node_join(runtime_gate, pre_mission)
+    runtime_gate['fused_clock_subscriber_ownership_pass'] = True
     runtime_gate['nodes'].remove('/robotest/controller_server')
     with pytest.raises(orchestration.EvidenceError, match='do not match'):
         orchestration.validate_phase3_runtime_graph_node_join(runtime_gate, pre_mission)

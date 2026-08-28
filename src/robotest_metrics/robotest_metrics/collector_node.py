@@ -23,6 +23,7 @@ import struct
 import sys
 import time
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from itertools import islice
 from pathlib import Path
 from typing import Any
@@ -35,10 +36,13 @@ from nav2_msgs.action import FollowWaypoints
 from nav2_msgs.msg import CollisionMonitorState
 from nav_msgs.msg import Odometry
 from nav_msgs.msg import Path as NavPath
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.serialization import serialize_message
+from rclpy.subscription import Subscription
 from rclpy.utilities import remove_ros_args
 from ros_gz_interfaces.msg import Contacts, WorldStatistics
 from rosgraph_msgs.msg import Clock
@@ -68,6 +72,48 @@ def _qos(depth: int, *, reliable: bool) -> QoSProfile:
         reliability=(ReliabilityPolicy.RELIABLE if reliable else ReliabilityPolicy.BEST_EFFORT),
         durability=DurabilityPolicy.VOLATILE,
     )
+
+
+def _fuse_time_source_clock_subscription(
+    node: Node,
+    topic: str,
+    evidence_callback: Callable[[Clock], None],
+) -> Subscription:
+    clock_subscriptions = [
+        subscription for subscription in node.subscriptions if subscription.topic_name == topic
+    ]
+    if len(clock_subscriptions) != 1:
+        raise RuntimeError(
+            f'use_sim_time must create exactly one {topic} subscription; '
+            f'found {len(clock_subscriptions)}'
+        )
+    subscription = clock_subscriptions[0]
+    if subscription.msg_type is not Clock:
+        raise RuntimeError(f'use_sim_time {topic} subscription must use rosgraph_msgs/msg/Clock')
+    if subscription.qos_profile != _qos(1, reliable=False):
+        raise RuntimeError(
+            f'use_sim_time {topic} subscription must use BEST_EFFORT KEEP_LAST(1) VOLATILE QoS'
+        )
+    time_source_callback = subscription.callback
+
+    def fused_callback(message: Clock) -> None:
+        time_source_callback(message)
+        evidence_callback(message)
+
+    subscription.callback = fused_callback
+    return subscription
+
+
+def _require_use_sim_time(parameters: list[Parameter]) -> SetParametersResult:
+    for parameter in parameters:
+        if parameter.name == 'use_sim_time' and (
+            parameter.type_ != Parameter.Type.BOOL or parameter.value is not True
+        ):
+            return SetParametersResult(
+                successful=False,
+                reason='use_sim_time must remain true while the fused /clock reader is active',
+            )
+    return SetParametersResult(successful=True)
 
 
 def _time_ns(value: Any) -> int:
@@ -303,6 +349,25 @@ class MetricsCollectorNode(Node):
             'metrics_collector',
             parameter_overrides=[Parameter('use_sim_time', value=True)],
         )
+        try:
+            self.set_descriptor(
+                'use_sim_time',
+                ParameterDescriptor(
+                    type=Parameter.Type.BOOL.value,
+                    description='Required by the fused /clock reader',
+                    read_only=True,
+                ),
+            )
+            self.clock_subscription = _fuse_time_source_clock_subscription(
+                self,
+                '/clock',
+                self._on_clock,
+            )
+            self.add_on_set_parameters_callback(_require_use_sim_time)
+        except BaseException:
+            with suppress(BaseException):
+                self.destroy_node()
+            raise
         self.core = CollectorCore()
         self.contact_progress_path = contact_progress_path
         self.command_progress_path = command_progress_path
@@ -312,7 +377,6 @@ class MetricsCollectorNode(Node):
         self.latest_retained_contact_stamp_ns: int | None = None
         self.pre_clock_contact_message_count = 0
         self.latest_clock_ns: int | None = None
-        self._subscribe(Clock, '/clock', self._on_clock, _qos(1, reliable=False))
         self._subscribe(
             Odometry,
             'validation/ground_truth',
@@ -584,6 +648,7 @@ def _parser() -> argparse.ArgumentParser:
 def _wait_for_startup_ready(
     node: MetricsCollectorNode,
     *,
+    executor: SingleThreadedExecutor,
     deadline: float,
     stop_file: Path,
 ) -> bool:
@@ -591,7 +656,7 @@ def _wait_for_startup_ready(
     while rclpy.ok() and not stop_file.exists() and not node.startup_ready:
         if time.monotonic() >= deadline:
             return False
-        rclpy.spin_once(node, timeout_sec=0.1)
+        executor.spin_once(timeout_sec=0.1)
     return rclpy.ok() and node.startup_ready
 
 
@@ -640,6 +705,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
     rclpy.init(args=raw_arguments)
     node: MetricsCollectorNode | None = None
+    executor: SingleThreadedExecutor | None = None
+    executor_node_added = False
+    artifact_failure = False
     timed_out = False
     runtime_interrupted = False
     started_wall_ns = time.monotonic_ns()
@@ -649,9 +717,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             command_progress_path=arguments.command_progress_file,
             command_progress_run_id=arguments.command_progress_run_id,
         )
+        executor = SingleThreadedExecutor(context=node.context)
+        if not executor.add_node(node):
+            raise RuntimeError('metrics collector executor refused the node')
+        executor_node_added = True
         deadline = time.monotonic() + arguments.wall_timeout_s
         startup_ready = _wait_for_startup_ready(
             node,
+            executor=executor,
             deadline=deadline,
             stop_file=arguments.stop_file,
         )
@@ -671,7 +744,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if time.monotonic() >= deadline:
                     timed_out = True
                     break
-                rclpy.spin_once(node, timeout_sec=0.1)
+                executor.spin_once(timeout_sec=0.1)
         elif rclpy.ok() and not arguments.stop_file.exists():
             timed_out = True
         runtime_interrupted = not rclpy.ok() and not arguments.stop_file.exists()
@@ -692,13 +765,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         write_json_atomic(capture, arguments.output)
     except ArtifactError as exc:
+        artifact_failure = True
         print(f'metrics collector artifact error: {exc}', file=sys.stderr)
         return 22
     finally:
+        pending_exception = sys.exc_info()[0] is not None
+        teardown_failures: list[str] = []
+        if executor is not None:
+            if node is not None and executor_node_added:
+                try:
+                    executor.remove_node(node)
+                except Exception as exc:
+                    teardown_failures.append(f'executor remove failed: {exc}')
+            try:
+                if executor.shutdown(timeout_sec=1.0) is not True:
+                    teardown_failures.append('executor shutdown did not complete')
+            except Exception as exc:
+                teardown_failures.append(f'executor shutdown failed: {exc}')
         if node is not None:
-            node.destroy_node()
+            try:
+                node.destroy_node()
+            except Exception as exc:
+                teardown_failures.append(f'node destruction failed: {exc}')
         if rclpy.ok():
-            rclpy.shutdown()
+            try:
+                rclpy.shutdown()
+            except Exception as exc:
+                teardown_failures.append(f'rclpy shutdown failed: {exc}')
+        if teardown_failures:
+            detail = '; '.join(teardown_failures)
+            if pending_exception or artifact_failure:
+                print(f'metrics collector teardown warning: {detail}', file=sys.stderr)
+            else:
+                raise RuntimeError(detail)
     if timed_out:
         return 20
     if runtime_interrupted:

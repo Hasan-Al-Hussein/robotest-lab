@@ -128,7 +128,7 @@ class _GraphEndpoint:
 
 
 _TOPIC_TYPES = {
-    '/clock': 'rosgraph_msgs/msg/Clock',
+    '/clock': runtime_gate.CLOCK_MESSAGE_TYPE,
     '/robotest/cmd_vel': 'geometry_msgs/msg/Twist',
     '/robotest/cmd_vel_behavior_unused': 'geometry_msgs/msg/Twist',
     '/robotest/cmd_vel_nav': 'geometry_msgs/msg/Twist',
@@ -267,6 +267,7 @@ class _CandidateGraph:
         for topic, nodes in runtime_gate.CANDIDATE_EXPECTED_CONTACT_SUBSCRIBERS.items():
             subscriber_nodes.setdefault(topic, set()).update(nodes)
         for topic, nodes in {
+            '/clock': runtime_gate.CANDIDATE_FUSED_CLOCK_SUBSCRIBERS,
             '/robotest/validation/contacts': {'/robotest/metrics_collector'},
             '/robotest/validation/ground_truth': {
                 '/robotest/metrics_collector',
@@ -404,6 +405,13 @@ def test_candidate_graph_accepts_four_distinct_entity_pose_publishers() -> None:
     assert passed
     assert set(evidence['publisher_ownership']) == set(runtime_gate.CANDIDATE_EXPECTED_PUBLISHERS)
     assert all(evidence['publisher_ownership'].values())
+    assert evidence['fused_clock_subscriber_ownership_pass']
+    clock_subscribers = evidence['topics']['/clock']['subscribers']
+    assert {subscriber['node'] for subscriber in clock_subscribers} == (
+        runtime_gate.CANDIDATE_FUSED_CLOCK_SUBSCRIBERS
+    )
+    assert len(clock_subscribers) == len(runtime_gate.CANDIDATE_FUSED_CLOCK_SUBSCRIBERS)
+    assert len({subscriber['gid'] for subscriber in clock_subscribers}) == len(clock_subscribers)
     entity_publishers = evidence['topics']['/robotest/validation/scenario_entity_poses'][
         'publishers'
     ]
@@ -413,6 +421,72 @@ def test_candidate_graph_accepts_four_distinct_entity_pose_publishers() -> None:
         'tf2_msgs/msg/TFMessage'
     }
     assert len({publisher['gid'] for publisher in entity_publishers}) == 4
+
+
+@pytest.mark.parametrize(
+    ('node_name', 'mutation'),
+    (
+        ('/robotest/metrics_collector', 'missing'),
+        ('/robotest/scenario_controller', 'missing'),
+        ('/robotest/metrics_collector', 'duplicate'),
+        ('/robotest/scenario_controller', 'duplicate'),
+        ('/robotest/metrics_collector', 'wrong_type'),
+        ('/robotest/scenario_controller', 'wrong_type'),
+        ('/robotest/metrics_collector', 'malformed_gid'),
+        ('/robotest/scenario_controller', 'cross_subscriber_duplicate_gid'),
+    ),
+)
+def test_candidate_graph_rejects_invalid_fused_clock_reader(
+    node_name: str,
+    mutation: str,
+) -> None:
+    graph = _CandidateGraph()
+    clock_subscribers = graph.subscribers['/clock']
+    matching = next(
+        endpoint
+        for endpoint in clock_subscribers
+        if f'{endpoint.node_namespace}/{endpoint.node_name}' == node_name
+    )
+    next_gid = (
+        max(
+            int.from_bytes(endpoint.endpoint_gid, byteorder='big')
+            for endpoints in (*graph.publishers.values(), *graph.subscribers.values())
+            for endpoint in endpoints
+        )
+        + 1
+    )
+    if mutation == 'missing':
+        clock_subscribers.remove(matching)
+    elif mutation == 'duplicate':
+        clock_subscribers.append(
+            _GraphEndpoint(
+                '/clock',
+                node_name,
+                runtime_gate.CLOCK_MESSAGE_TYPE,
+                next_gid,
+            )
+        )
+    elif mutation == 'wrong_type':
+        matching.topic_type = 'std_msgs/msg/String'
+    elif mutation == 'malformed_gid':
+        matching.endpoint_gid = b'\xab'
+    else:
+        assert mutation == 'cross_subscriber_duplicate_gid'
+        other_reader = _GraphEndpoint(
+            '/clock',
+            '/robotest/amcl',
+            runtime_gate.CLOCK_MESSAGE_TYPE,
+            next_gid,
+        )
+        clock_subscribers.append(other_reader)
+        matching.endpoint_gid = other_reader.endpoint_gid
+
+    passed, evidence = runtime_gate._candidate_evaluation(graph)
+
+    assert not passed
+    assert evidence['fused_clock_subscriber_ownership_pass'] is False
+    assert evidence['qos_contract_pass'] is True
+    assert all(evidence['publisher_ownership'].values())
 
 
 @pytest.mark.parametrize('publisher_count', (3, 5))

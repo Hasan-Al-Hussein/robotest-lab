@@ -29,6 +29,34 @@ the samples and its `build-binding.json` supplies the clean Git identity.
 These are non-candidate diagnostic runs. They establish a repeatable
 performance problem, not an accepted baseline result.
 
+A later immutable diagnostic smoke, `phase3-bdf220a-001`, was bound to clean
+Git revision `bdf220adadd31bdca4782f697d0b274b7a55fd29`. Its 1,332 valid
+intervals produced a calculated RTF median of `0.7454219259800696` and p5 of
+`0.39448131683228504`, still below the unchanged `0.80` and `0.50` limits.
+The smoke's metrics capture retained 34,282 explicit clock observations; the
+scenario result retained 35,791. Its runtime gate recorded two distinct
+BEST_EFFORT, VOLATILE `/clock` subscriber endpoints for each of
+`/robotest/metrics_collector` and `/robotest/scenario_controller`.
+
+The associated host profile is explicitly incomplete because one sampled
+thread vanished before its `/proc` record could be read. Its retained partial
+samples are diagnostic only. Within those samples, the metrics-collector
+process leader accumulated 83.42 CPU-seconds and the scenario-controller
+process leader accumulated 54.61 CPU-seconds. Static inspection then showed
+that both Python nodes enabled `use_sim_time`, whose rclpy `TimeSource` owns a
+BEST_EFFORT `KEEP_LAST(1)` `/clock` subscription, and also created a second
+subscription solely for repository evidence.
+
+A bounded local 2,000-message collector benchmark isolated that duplication:
+the two-reader node used 1.437 process CPU-seconds, while a one-reader variant
+used 0.786 process CPU-seconds and produced the same collector-core clock
+count. A separate 5,000-iteration zero-time spin benchmark measured 2.3788
+process CPU-seconds for repeated convenience `rclpy.spin_once` calls and
+2.2094 for one dedicated executor, an estimated 2.8-second saving at the
+smoke's spin volume. These local measurements motivate a controlled internal
+change; they do not prove a whole-stack RTF improvement or repair the failed
+profile.
+
 The strongest current correlation is the RTF reduction after the source-bound
 aggregator entered the Phase 3 stack, with a full entity/SDF inventory scan on
 every 2 ms step as a plausible hot path. That is not causal proof. The
@@ -108,6 +136,36 @@ latches the system fatal and emits Stop; the system fatal is deliberately not
 cleared by the Gazebo Reset callback, so live recovery requires a clean stack
 restart rather than silent continuation.
 
+### Single-reader Python clock observation
+
+The metrics collector and scenario controller keep `use_sim_time=true` and
+retain every existing clock count, gap, duplicate, regression, and readiness
+rule. Immediately after the base rclpy node constructor returns, each node
+locates the exactly one public `node.subscriptions` entry for `/clock` that
+`TimeSource` created. It fails construction unless that entry has message type
+`rosgraph_msgs/msg/Clock` and exactly BEST_EFFORT, VOLATILE `KEEP_LAST(1)`
+QoS. The subscription remains strongly referenced by the node.
+
+The existing callback is replaced with a one-message wrapper. The wrapper
+first invokes the captured public subscription callback so all attached ROS
+clocks advance, then invokes the repository evidence callback. It does not
+inspect or depend on rclpy's private `TimeSource._clock_sub`. Scenario evidence
+still runs through the existing guarded callback, including cleanup-mode and
+fatal-error behavior; metrics evidence exceptions remain visible to the
+executor. Before fusion, the existing `use_sim_time` descriptor is replaced
+with a statically typed, read-only boolean descriptor. Runtime attempts to
+unset, disable, or directly undeclare it are rejected before the TimeSource
+parameter callback can destroy or replace the fused reader. Thus each node
+owns one `/clock` DDS reader without changing the clock publisher, message
+rate, evidence semantics, or acceptance thresholds.
+
+The metrics collector also creates one context-bound
+`SingleThreadedExecutor`, requires that adding the node succeeds, and uses the
+same executor during startup and steady-state collection. It removes the node
+and shuts the executor down once during finalization. This bounded executor
+lifecycle is a companion reduction; the measured duplicate-reader cost is the
+primary optimization.
+
 ## Required measurement
 
 No performance conclusion may be written from static inspection or the four
@@ -131,6 +189,16 @@ historical captures. Before this revision can qualify Phase 3:
    metric and evidence gate, including median RTF >=0.80 and p5 >=0.50. A
    contact, source-binding, cleanup, resource, or performance failure rejects
    the candidate and requires diagnosis before any repeated campaign.
+
+The next runtime gate must show exactly one `/clock` subscriber endpoint for
+each fused Python node. Unit tests must prove the exact message type and QoS,
+TimeSource-before-evidence callback order, ROS-clock and evidence updates from
+the one callback, fail-closed discovery and read-only set/undeclare parameter
+boundaries, preserved scenario guard behavior, visible metrics errors, and the
+collector executor's single add/remove/shutdown lifecycle. The fresh capture
+remains responsible for proving that all published clock samples needed by the
+unchanged evidence contract are observed; neither the local callback benchmark
+nor a static endpoint count qualifies the candidate.
 
 The one required profiling run uses the repository-owned passive profiler and
 the contact system's exact opt-in environment flag. Run the complete block
@@ -237,7 +305,22 @@ when the isolated optimization met its keep threshold.
 The design removes repeated exhaustive work while retaining fail-closed
 structural validation and physics-step contact fidelity. It adds explicit
 tests for event selection, locked identity validation, interval-union
-overflow, fatal latching, and reset clearing.
+overflow, fatal latching, and reset clearing. It also removes one redundant
+high-rate DDS reader from each of the two Python observers while retaining
+rclpy simulated time and repository clock evidence in the same ordered
+callback.
+
+The collector change alters the collector-configuration and Phase 3 source-tree
+bindings; the scenario change alters its installed-module source binding and
+the Phase 3 source-tree binding; this ADR alters both the source-configuration
+and source-tree bindings. The package manifests now declare the direct
+`rcl_interfaces` dependency used by the read-only descriptor and parameter
+rejection callback, and the dependency-license inventory records its audited
+Jazzy manifest. There is no public interface change, no apt-package addition,
+and no generated manifest is rewritten in this change. Existing build
+bindings, runtime gates, profiles,
+positive controls, and smokes remain immutable; a clean commit must regenerate
+the applicable bindings and hashes before new live evidence is collected.
 
 No existing result becomes valid, and no release or Phase 5 claim is expanded.
 Until the required profile, positive control, and fresh candidate smoke pass,

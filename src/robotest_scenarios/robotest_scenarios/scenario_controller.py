@@ -22,6 +22,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -35,6 +36,7 @@ from geometry_msgs.msg import Pose
 from nav2_msgs.action import FollowWaypoints
 from nav_msgs.msg import Odometry
 from nav_msgs.msg import Path as PathMessage
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -45,6 +47,7 @@ from rclpy.qos import (
     ReliabilityPolicy,
     qos_profile_action_status_default,
 )
+from rclpy.subscription import Subscription
 from rclpy.utilities import remove_ros_args
 from ros_gz_interfaces.srv import DeleteEntity, SetEntityPose, SpawnEntity
 from rosgraph_msgs.msg import Clock
@@ -201,6 +204,54 @@ def _pose_message(target: PoseTarget | dict[str, Any]) -> Pose:
     return pose
 
 
+def _fuse_time_source_clock_subscription(
+    node: Node,
+    topic: str,
+    evidence_callback: Callable[[Clock], None],
+) -> Subscription:
+    clock_subscriptions = [
+        subscription for subscription in node.subscriptions if subscription.topic_name == topic
+    ]
+    if len(clock_subscriptions) != 1:
+        raise RuntimeError(
+            f'use_sim_time must create exactly one {topic} subscription; '
+            f'found {len(clock_subscriptions)}'
+        )
+    subscription = clock_subscriptions[0]
+    if subscription.msg_type is not Clock:
+        raise RuntimeError(f'use_sim_time {topic} subscription must use rosgraph_msgs/msg/Clock')
+    expected_qos = QoSProfile(
+        history=HistoryPolicy.KEEP_LAST,
+        depth=1,
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        durability=DurabilityPolicy.VOLATILE,
+    )
+    if subscription.qos_profile != expected_qos:
+        raise RuntimeError(
+            f'use_sim_time {topic} subscription must use BEST_EFFORT KEEP_LAST(1) VOLATILE QoS'
+        )
+    time_source_callback = subscription.callback
+
+    def fused_callback(message: Clock) -> None:
+        time_source_callback(message)
+        evidence_callback(message)
+
+    subscription.callback = fused_callback
+    return subscription
+
+
+def _require_use_sim_time(parameters: list[Parameter]) -> SetParametersResult:
+    for parameter in parameters:
+        if parameter.name == 'use_sim_time' and (
+            parameter.type_ != Parameter.Type.BOOL or parameter.value is not True
+        ):
+            return SetParametersResult(
+                successful=False,
+                reason='use_sim_time must remain true while the fused /clock reader is active',
+            )
+    return SetParametersResult(successful=True)
+
+
 class ScenarioControllerNode(Node):
     """ROS graph adapter with bounded callback evidence."""
 
@@ -210,6 +261,28 @@ class ScenarioControllerNode(Node):
             parameter_overrides=[Parameter('use_sim_time', value=True)],
             automatically_declare_parameters_from_overrides=True,
         )
+        self.fatal_error: RobotestScenarioError | None = None
+        self.cleanup_mode = False
+        self.protocol_error_count = 0
+        try:
+            self.set_descriptor(
+                'use_sim_time',
+                ParameterDescriptor(
+                    type=Parameter.Type.BOOL.value,
+                    description='Required by the fused /clock reader',
+                    read_only=True,
+                ),
+            )
+            self.clock_subscription = _fuse_time_source_clock_subscription(
+                self,
+                CLOCK_TOPIC,
+                self._guard(self._on_clock, allow_during_cleanup=True),
+            )
+            self.add_on_set_parameters_callback(_require_use_sim_time)
+        except BaseException:
+            with suppress(BaseException):
+                self.destroy_node()
+            raise
         self.document = document
         self.sequence = 0
         self.current_sim_stamp_ns = 0
@@ -263,9 +336,6 @@ class ScenarioControllerNode(Node):
         self.post_delete_entity_message_count = 0
         self.post_delete_entity_latest_sim_stamp_ns: int | None = None
         self.first_spawn_observation: ActorPoseEvidence | None = None
-        self.fatal_error: RobotestScenarioError | None = None
-        self.cleanup_mode = False
-        self.protocol_error_count = 0
         self.status = PrefixBuffer[dict[str, Any]]('status', STATUS_CAPACITY)
         self.feedback = PrefixBuffer[dict[str, Any]]('feedback', FEEDBACK_CAPACITY)
         self.plans = PrefixBuffer[dict[str, Any]]('plans', PLAN_CAPACITY)
@@ -289,18 +359,6 @@ class ScenarioControllerNode(Node):
             depth=10,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
-        )
-        clock_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.VOLATILE,
-        )
-        self.clock_subscription = self.create_subscription(
-            Clock,
-            CLOCK_TOPIC,
-            self._guard(self._on_clock, allow_during_cleanup=True),
-            clock_qos,
         )
         self.status_subscription = self.create_subscription(
             GoalStatusArray,
@@ -1905,12 +1963,15 @@ class ScenarioControllerApp:
         """Execute, clean up, finalize evidence, and return a stable exit code."""
         error: RobotestScenarioError | None = None
         initialized = False
+        executor_node_added = False
         try:
             rclpy.init(args=list(self.raw_ros_args))
             initialized = True
             self.node = ScenarioControllerNode(self.document)
-            self.executor = SingleThreadedExecutor()
-            self.executor.add_node(self.node)
+            self.executor = SingleThreadedExecutor(context=self.node.context)
+            if not self.executor.add_node(self.node):
+                raise InfrastructureError('scenario controller executor refused the node')
+            executor_node_added = True
             self._workflow()
         except RobotestScenarioError as exc:
             error = exc
@@ -1925,31 +1986,60 @@ class ScenarioControllerApp:
             if self._bound_goal_needs_cancel():
                 self._cancel_bound_goal_once()
         finally:
-            if self.node is not None and self.executor is not None:
-                self.node.begin_cleanup()
-                try:
-                    self._cleanup_actor()
-                except RobotestScenarioError as cleanup_error:
-                    if error is None:
-                        error = cleanup_error
-                result, exit_code = self._result(error)
-                try:
-                    schema = load_schema(package_schema_path('scenario-result.schema.json'))
-                    write_canonical_json(self.output_path, result, schema=schema)
-                except ArtifactError as artifact_error:
-                    print(f'scenario_controller: artifact error: {artifact_error}', file=sys.stderr)
-                    exit_code = int(ExitCode.ARTIFACT_ERROR)
-                self.executor.remove_node(self.node)
-                self.executor.shutdown(timeout_sec=1.0)
-                self.node.destroy_node()
-            else:
-                exit_code = (
-                    int(error.exit_code)
-                    if error is not None
-                    else int(ExitCode.INFRASTRUCTURE_ERROR)
-                )
-            if initialized:
-                rclpy.try_shutdown()
+            try:
+                if self.node is not None and self.executor is not None and executor_node_added:
+                    self.node.begin_cleanup()
+                    try:
+                        self._cleanup_actor()
+                    except RobotestScenarioError as cleanup_error:
+                        if error is None:
+                            error = cleanup_error
+                    result, exit_code = self._result(error)
+                    try:
+                        schema = load_schema(package_schema_path('scenario-result.schema.json'))
+                        write_canonical_json(self.output_path, result, schema=schema)
+                    except ArtifactError as artifact_error:
+                        print(
+                            f'scenario_controller: artifact error: {artifact_error}',
+                            file=sys.stderr,
+                        )
+                        exit_code = int(ExitCode.ARTIFACT_ERROR)
+                else:
+                    exit_code = (
+                        int(error.exit_code)
+                        if error is not None
+                        else int(ExitCode.INFRASTRUCTURE_ERROR)
+                    )
+            finally:
+                pending_exception = sys.exc_info()[0] is not None
+                teardown_failures: list[str] = []
+                if self.executor is not None:
+                    if self.node is not None and executor_node_added:
+                        try:
+                            self.executor.remove_node(self.node)
+                        except Exception as exc:
+                            teardown_failures.append(f'executor remove failed: {exc}')
+                    try:
+                        if self.executor.shutdown(timeout_sec=1.0) is not True:
+                            teardown_failures.append('executor shutdown did not complete')
+                    except Exception as exc:
+                        teardown_failures.append(f'executor shutdown failed: {exc}')
+                if self.node is not None:
+                    try:
+                        self.node.destroy_node()
+                    except Exception as exc:
+                        teardown_failures.append(f'node destruction failed: {exc}')
+                if initialized:
+                    try:
+                        rclpy.try_shutdown()
+                    except Exception as exc:
+                        teardown_failures.append(f'rclpy shutdown failed: {exc}')
+                if teardown_failures:
+                    detail = '; '.join(teardown_failures)
+                    if pending_exception or error is not None:
+                        print(f'scenario_controller: teardown warning: {detail}', file=sys.stderr)
+                    else:
+                        raise InfrastructureError(detail)
         return exit_code
 
     def _bound_goal_needs_cancel(self) -> bool:

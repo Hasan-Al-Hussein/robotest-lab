@@ -26,6 +26,7 @@ MAX_ENDPOINTS = 4096
 COMMAND_MESSAGE_TYPE = 'geometry_msgs/msg/Twist'
 CONTACT_MESSAGE_TYPE = 'ros_gz_interfaces/msg/Contacts'
 CONTACT_TOPICS = ('/robotest/internal/raw_contacts', '/robotest/validation/contacts')
+ENDPOINT_GID_PATTERN = re.compile(r'^[0-9a-f]{32}$')
 MAX_ATTEMPTS = 4096
 MAX_PROC_ENTRIES = 65_536
 MAX_PROC_MAPS_BYTES = 8 * 1024 * 1024
@@ -89,6 +90,12 @@ VALIDATION_TOPICS = (
     '/robotest/validation/world_stats',
 )
 
+CLOCK_MESSAGE_TYPE = 'rosgraph_msgs/msg/Clock'
+CANDIDATE_FUSED_CLOCK_SUBSCRIBERS = {
+    '/robotest/metrics_collector',
+    '/robotest/scenario_controller',
+}
+
 QOS_CONTRACTS: dict[str, tuple[str, str, int]] = {
     '/clock': ('BEST_EFFORT', 'VOLATILE', 1),
     '/robotest/map': ('RELIABLE', 'TRANSIENT_LOCAL', 1),
@@ -140,7 +147,7 @@ POSITIVE_REQUIRED_NODE_NAMES = {
 }
 
 AUTHORITATIVE_PUBLISHER_CONTRACTS: dict[str, tuple[set[str], str, int]] = {
-    '/clock': ({'/robotest/parameter_bridge'}, 'rosgraph_msgs/msg/Clock', 1),
+    '/clock': ({'/robotest/parameter_bridge'}, CLOCK_MESSAGE_TYPE, 1),
     '/robotest/validation/ground_truth': (
         {'/robotest/parameter_bridge'},
         'nav_msgs/msg/Odometry',
@@ -1080,6 +1087,27 @@ def _exact_endpoint_owners(
     )
 
 
+def _fused_clock_subscriber_ownership(clock_evidence: Mapping[str, Any]) -> bool:
+    """Require exact global GIDs and one Clock reader for each fused Python observer."""
+    subscribers = clock_evidence['subscribers']
+    all_endpoints = [*clock_evidence['publishers'], *subscribers]
+    all_gids = [endpoint['gid'] for endpoint in all_endpoints]
+    if not all_gids or any(ENDPOINT_GID_PATTERN.fullmatch(gid) is None for gid in all_gids):
+        return False
+    if len(set(all_gids)) != len(all_gids):
+        return False
+    fused_endpoints = [
+        endpoint
+        for endpoint in subscribers
+        if endpoint['node'] in CANDIDATE_FUSED_CLOCK_SUBSCRIBERS
+    ]
+    return _exact_endpoint_owners(
+        fused_endpoints,
+        CANDIDATE_FUSED_CLOCK_SUBSCRIBERS,
+        expected_type=CLOCK_MESSAGE_TYPE,
+    )
+
+
 def _authoritative_publisher_ownership(
     topics: Mapping[str, dict[str, Any]],
 ) -> dict[str, bool]:
@@ -1248,6 +1276,7 @@ def _candidate_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
         )
         for topic, expected in CANDIDATE_EXPECTED_CONTACT_SUBSCRIBERS.items()
     }
+    fused_clock_subscriber_ownership_pass = _fused_clock_subscriber_ownership(topics['/clock'])
     cmd_owner_pass = publisher_ownership['/robotest/cmd_vel']
     autonomy_leaks: list[dict[str, str]] = []
     for topic in VALIDATION_TOPICS:
@@ -1293,6 +1322,7 @@ def _candidate_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
         and all(publisher_ownership.values())
         and all(command_subscriber_ownership.values())
         and all(contact_subscriber_ownership.values())
+        and fused_clock_subscriber_ownership_pass
         and not autonomy_leaks
         and namespace_pass
         and qos_pass
@@ -1306,6 +1336,7 @@ def _candidate_evaluation(node: Any) -> tuple[bool, dict[str, Any]]:
         'exact_static_qos_depth_contract': {
             topic: evidence['expected'] for topic, evidence in topics.items()
         },
+        'fused_clock_subscriber_ownership_pass': fused_clock_subscriber_ownership_pass,
         'legacy_fault_service_absent': legacy_service_absent,
         'mode': 'candidate',
         'namespace_isolation_pass': namespace_pass,

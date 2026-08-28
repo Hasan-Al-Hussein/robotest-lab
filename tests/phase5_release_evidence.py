@@ -32,6 +32,7 @@ CANDIDATE_ID = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
 PHASE4_RUN_ID = re.compile(r'^phase4-[0-9]{8}T[0-9]{6}Z-[0-9]+$')
 GITHUB_REPOSITORY = re.compile(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
 SHA256_LINE = re.compile(r'^(?P<sha>[0-9a-f]{64})  (?P<path>[^\r\n]+)$')
+PHASE3_ENDPOINT_GID_PATTERN = re.compile(r'^[0-9a-f]{32}$')
 MAX_JSON_BYTES = 16 * 1024 * 1024
 PHASE4_JSON_MAX_BYTES = 32 * 1024 * 1024
 PHASE3_RESULT_JSON_MAX_BYTES = 32 * 1024 * 1024
@@ -212,6 +213,7 @@ PHASE3_CANDIDATE_RUNTIME_GATE_KEYS = {
     'contact_subscriber_ownership',
     'elapsed_wall_s',
     'exact_static_qos_depth_contract',
+    'fused_clock_subscriber_ownership_pass',
     'legacy_fault_service_absent',
     'mode',
     'namespace_isolation_pass',
@@ -1826,8 +1828,7 @@ def _phase3_runtime_gate_endpoint(raw_endpoint: object, label: str) -> dict[str,
         and isinstance(endpoint.get('durability'), str)
         and endpoint['durability']
         and isinstance(endpoint.get('gid'), str)
-        and re.fullmatch(r'(?:[0-9a-f]{2})+', endpoint['gid']) is not None
-        and len(endpoint['gid']) <= 512
+        and PHASE3_ENDPOINT_GID_PATTERN.fullmatch(endpoint['gid']) is not None
         and isinstance(endpoint.get('node'), str)
         and endpoint['node'].startswith('/')
         and isinstance(endpoint.get('topic_type'), str)
@@ -2608,6 +2609,7 @@ def _validate_phase3_graph_prerequisites(
         and initial_gate.get('verdict') == 'PASS'
         and type(initial_gate.get('bounded_depth_live_proven_for_all_endpoints')) is bool
         and initial_gate.get('cmd_vel_owner_pass') is True
+        and initial_gate.get('fused_clock_subscriber_ownership_pass') is True
         and initial_gate.get('legacy_fault_service_absent') is True
         and initial_gate.get('namespace_isolation_pass') is True
         and initial_gate.get('qos_contract_pass') is True
@@ -2629,6 +2631,15 @@ def _validate_phase3_graph_prerequisites(
         expected_topics=runtime_gate_source.QOS_CONTRACTS,
     )
     initial_topics = initial_topic_replay['topics']
+    expected_fused_clock_subscriber_ownership = (
+        runtime_gate_source._fused_clock_subscriber_ownership(initial_topics['/clock'])
+    )
+    _require(
+        expected_fused_clock_subscriber_ownership
+        and initial_gate.get('fused_clock_subscriber_ownership_pass')
+        is expected_fused_clock_subscriber_ownership,
+        'Phase 3 candidate fused /clock subscriber ownership failed',
+    )
     authoritative_publisher_ownership = runtime_gate_source._authoritative_publisher_ownership(
         initial_topics
     )

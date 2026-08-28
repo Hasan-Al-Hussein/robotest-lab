@@ -1491,6 +1491,7 @@ def validate_phase3_runtime_graph_node_join(
         runtime_gate.get('producer') != 'robotest_phase3/runtime_gate'
         or _require_int(runtime_gate.get('schema_version'), 'Phase 3 runtime gate schema') != 1
         or runtime_gate.get('mode') != 'candidate'
+        or runtime_gate.get('fused_clock_subscriber_ownership_pass') is not True
         or runtime_gate.get('verdict') != 'PASS'
     ):
         raise EvidenceError('Phase 3 runtime gate envelope is invalid')

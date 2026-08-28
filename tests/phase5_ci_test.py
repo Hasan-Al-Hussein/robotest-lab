@@ -166,7 +166,7 @@ def test_dependency_license_inventory_and_first_party_licenses_are_complete() ->
     assert dependency_inventory['apt_package_count'] == 42
     assert dependency_inventory['github_action_count'] == 3
     assert dependency_inventory['python_distribution_count'] == 1
-    assert dependency_inventory['ros_dependency_count'] == 61
+    assert dependency_inventory['ros_dependency_count'] == 62
     assert dependency_inventory['rosdep_system_dependency_count'] == 6
     assert 'Direct repository declarations only' in report['verification_scope']
 
@@ -1584,7 +1584,7 @@ def _candidate_runtime_gate_graph_fixture(runtime_gate: object) -> dict[str, dic
     }
     assert set(topic_types) == set(runtime_gate.QOS_CONTRACTS)
     expected_subscribers = {
-        '/clock': {'/robotest/metrics_collector'},
+        '/clock': set(runtime_gate.CANDIDATE_FUSED_CLOCK_SUBSCRIBERS),
         '/robotest/internal/raw_contacts': {'/robotest/contact_stream_gate'},
         '/robotest/validation/contacts': {'/robotest/metrics_collector'},
         '/robotest/validation/ground_truth': {'/robotest/metrics_collector'},
@@ -1715,12 +1715,17 @@ def _candidate_runtime_gate_graph_fixture(runtime_gate: object) -> dict[str, dic
     assert all(publisher_ownership.values())
     assert all(command_subscriber_ownership.values())
     assert all(contact_subscriber_ownership.values())
+    fused_clock_subscriber_ownership_pass = runtime_gate._fused_clock_subscriber_ownership(
+        topics['/clock']
+    )
+    assert fused_clock_subscriber_ownership_pass
     return {
         'command_subscriber_ownership': command_subscriber_ownership,
         'contact_subscriber_ownership': contact_subscriber_ownership,
         'exact_static_qos_depth_contract': {
             topic: evidence['expected'] for topic, evidence in topics.items()
         },
+        'fused_clock_subscriber_ownership_pass': fused_clock_subscriber_ownership_pass,
         'publisher_ownership': publisher_ownership,
         'topics': topics,
     }
@@ -2156,6 +2161,9 @@ def _write_phase3_contact_gate_reobservation(
                 'elapsed_wall_s': 0.5,
                 'exact_static_qos_depth_contract': candidate_graph[
                     'exact_static_qos_depth_contract'
+                ],
+                'fused_clock_subscriber_ownership_pass': candidate_graph[
+                    'fused_clock_subscriber_ownership_pass'
                 ],
                 'legacy_fault_service_absent': True,
                 'mode': 'candidate',
@@ -7584,6 +7592,101 @@ def test_release_evidence_rejects_rebound_phase3_qos_introspection_inconsistency
 
 
 @pytest.mark.parametrize(
+    ('node_name', 'mutation', 'expected_error'),
+    (
+        (
+            '/robotest/metrics_collector',
+            'missing',
+            'fused /clock subscriber ownership failed',
+        ),
+        (
+            '/robotest/scenario_controller',
+            'missing',
+            'fused /clock subscriber ownership failed',
+        ),
+        (
+            '/robotest/metrics_collector',
+            'duplicate',
+            'fused /clock subscriber ownership failed',
+        ),
+        (
+            '/robotest/scenario_controller',
+            'duplicate',
+            'fused /clock subscriber ownership failed',
+        ),
+        (
+            '/robotest/metrics_collector',
+            'wrong_type',
+            'fused /clock subscriber ownership failed',
+        ),
+        (
+            '/robotest/scenario_controller',
+            'wrong_type',
+            'fused /clock subscriber ownership failed',
+        ),
+        (
+            '/robotest/metrics_collector',
+            'malformed_gid',
+            'not an exact runtime-gate endpoint record',
+        ),
+        (
+            '/robotest/scenario_controller',
+            'cross_subscriber_duplicate_gid',
+            'fused /clock subscriber ownership failed',
+        ),
+    ),
+)
+def test_release_evidence_rejects_invalid_fused_clock_reader(
+    tmp_path: Path,
+    node_name: str,
+    mutation: str,
+    expected_error: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    run_root = candidate_root / 'smoke'
+    gate_path = run_root / 'runtime-gate.json'
+    gate = json.loads(gate_path.read_text(encoding='utf-8'))
+    clock = gate['topics']['/clock']
+    subscriber = next(item for item in clock['subscribers'] if item['node'] == node_name)
+    subscriber_check = next(
+        item
+        for item in clock['qos_checks']
+        if item['side'] == 'subscriber' and item['node'] == node_name
+    )
+    if mutation == 'missing':
+        clock['subscribers'].remove(subscriber)
+        clock['qos_checks'].remove(subscriber_check)
+    elif mutation == 'duplicate':
+        duplicate = copy.deepcopy(subscriber)
+        duplicate['gid'] = ('a' if node_name.endswith('metrics_collector') else 'b') * 32
+        clock['subscribers'].append(duplicate)
+        clock['qos_checks'].append(copy.deepcopy(subscriber_check))
+    elif mutation == 'wrong_type':
+        subscriber['topic_type'] = 'std_msgs/msg/String'
+    elif mutation == 'malformed_gid':
+        subscriber['gid'] = 'ab'
+    else:
+        assert mutation == 'cross_subscriber_duplicate_gid'
+        other_reader = copy.deepcopy(subscriber)
+        other_reader.update({'gid': 'c' * 32, 'node': '/robotest/amcl'})
+        clock['subscribers'].append(other_reader)
+        subscriber['gid'] = other_reader['gid']
+        other_check = copy.deepcopy(subscriber_check)
+        other_check['node'] = other_reader['node']
+        clock['qos_checks'].append(other_check)
+    if mutation in {'duplicate', 'wrong_type', 'cross_subscriber_duplicate_gid'}:
+        clock['subscribers'].sort(key=lambda item: (item['node'], item['topic_type']))
+        clock['qos_checks'].sort(key=lambda item: (item['side'], item['node']))
+    _canonical_file(gate_path, gate, sidecar=True)
+    _rebind_phase3_smoke_runtime_gate(repository, candidate_root, run_root)
+
+    with pytest.raises(EvidenceError, match=expected_error):
+        _validate_release_fixture(fixture)
+
+
+@pytest.mark.parametrize(
     'case',
     ['cross_authoritative_gid', 'rogue_publisher', 'wrong_contact_type'],
 )
@@ -7740,15 +7843,16 @@ def test_release_evidence_rejects_cascaded_phase3_unknown_endpoint_node(
     gate_path = run_root / 'runtime-gate.json'
     gate = json.loads(gate_path.read_text(encoding='utf-8'))
     clock = gate['topics']['/clock']
-    subscriber = clock['subscribers'][0]
-    previous_node = subscriber['node']
-    subscriber['node'] = '/robotest/forged_unknown_node'
-    subscriber_check = next(
-        check
-        for check in clock['qos_checks']
-        if check['side'] == 'subscriber' and check['node'] == previous_node
+    subscriber = copy.deepcopy(clock['subscribers'][0])
+    subscriber.update({'gid': 'e' * 32, 'node': '/robotest/forged_unknown_node'})
+    clock['subscribers'].append(subscriber)
+    clock['subscribers'].sort(key=lambda item: (item['node'], item['topic_type']))
+    subscriber_check = copy.deepcopy(
+        next(check for check in clock['qos_checks'] if check['side'] == 'subscriber')
     )
     subscriber_check['node'] = subscriber['node']
+    clock['qos_checks'].append(subscriber_check)
+    clock['qos_checks'].sort(key=lambda item: (item['side'], item['node']))
     _canonical_file(gate_path, gate, sidecar=True)
     _rebind_phase3_smoke_runtime_gate(repository, candidate_root, run_root)
 
