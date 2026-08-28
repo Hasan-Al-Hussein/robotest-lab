@@ -286,6 +286,14 @@ class ProcStat:
         return self.utime_ticks + self.stime_ticks
 
 
+ThreadSampleUpdate = tuple[
+    tuple[int, int, int, int],
+    tuple[int, int, int],
+    ProcStat,
+    int | None,
+]
+
+
 @dataclass(frozen=True)
 class ProfileConfig:
     """Frozen inputs and paths for one smoke profile."""
@@ -1606,7 +1614,7 @@ def _sample_threads(
     if len(tids) > MAX_THREADS_PER_PROCESS:
         raise ProfileError('overflow', f'PID {process.pid} exceeds 4,096 threads')
     records: list[dict[str, Any]] = []
-    updates: list[tuple[tuple[int, int, int, int], tuple[int, int, int], ProcStat, int | None]] = []
+    updates: list[ThreadSampleUpdate] = []
     new_identities: set[tuple[int, int, int, int]] = set()
     vanished = 0
     for tid in tids:
