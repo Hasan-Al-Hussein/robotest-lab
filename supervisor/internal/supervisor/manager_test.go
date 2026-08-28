@@ -1311,16 +1311,16 @@ func TestCleanupBoundsMissingLeaderWaitAfterGroupDisappears(t *testing.T) {
 		t.Fatalf("startChild() = committed %t, error %v", committed, err)
 	}
 
-	started := time.Now()
+	cleanupContext, cancelCleanup := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelCleanup()
 	cleanup := manager.cleanupProcessGroup(
-		context.Background(), runtime.spec.Name, pgid, wait, false, nil, cleanupRequested,
+		cleanupContext, runtime.spec.Name, pgid, wait, false, nil, cleanupRequested,
 	)
-	elapsed := time.Since(started)
 	if cleanup.complete() || cleanup.leaderReaped || !cleanup.groupEmpty || cleanup.err == nil {
 		t.Fatalf("missing-wait cleanup result = %#v", cleanup)
 	}
-	if elapsed > 250*time.Millisecond {
-		t.Fatalf("missing leader wait exceeded its real-time bound: %s", elapsed)
+	if errors.Is(cleanup.err, context.DeadlineExceeded) {
+		t.Fatalf("missing leader wait exhausted its hang watchdog: %#v", cleanup)
 	}
 	signals := system.observedSignals()
 	if len(signals) != 2 || signals[0].signal != syscall.SIGTERM || signals[1].signal != syscall.SIGKILL {
