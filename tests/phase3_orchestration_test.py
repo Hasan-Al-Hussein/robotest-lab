@@ -1332,6 +1332,67 @@ def test_contact_gate_reobservation_binds_build_and_rejects_rebound(
     )
     assert evidence['stable_identity'] is True
 
+    for invalid_cmdline_sha256 in (True, 3, 'not-a-sha256'):
+        malformed_cmdline = copy.deepcopy(document)
+        malformed_cmdline['contact_gate_binary_attestation']['live_cmdline_sha256'] = (
+            invalid_cmdline_sha256
+        )
+        orchestration.atomic_write_json(initial_path, malformed_cmdline, sidecar=True)
+        orchestration.atomic_write_json(final_path, malformed_cmdline, sidecar=True)
+        with pytest.raises(
+            orchestration.EvidenceError,
+            match=r'initial\.live_cmdline_sha256 must be a lowercase SHA-256',
+        ):
+            orchestration.reconcile_contact_gate_reobservation(
+                initial_path,
+                final_path,
+                build_binding=build_binding,
+                expected_domain_id=100,
+                expected_gz_partition='robotest_p3_candidate_trial',
+            )
+
+    final_malformed_cmdline = copy.deepcopy(document)
+    final_malformed_cmdline['contact_gate_binary_attestation']['live_cmdline_sha256'] = 'f' * 63
+    orchestration.atomic_write_json(initial_path, document, sidecar=True)
+    orchestration.atomic_write_json(final_path, final_malformed_cmdline, sidecar=True)
+    with pytest.raises(
+        orchestration.EvidenceError,
+        match=r'final\.live_cmdline_sha256 must be a lowercase SHA-256',
+    ):
+        orchestration.reconcile_contact_gate_reobservation(
+            initial_path,
+            final_path,
+            build_binding=build_binding,
+            expected_domain_id=100,
+            expected_gz_partition='robotest_p3_candidate_trial',
+        )
+
+    orchestration.atomic_write_json(initial_path, document, sidecar=True)
+    mapping_count_drift = copy.deepcopy(document)
+    mapping_count_drift['contact_aggregator_binary_attestation']['live_mapping_count'] = 6
+    orchestration.atomic_write_json(final_path, mapping_count_drift, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='process/DSO identity changed'):
+        orchestration.reconcile_contact_gate_reobservation(
+            initial_path,
+            final_path,
+            build_binding=build_binding,
+            expected_domain_id=100,
+            expected_gz_partition='robotest_p3_candidate_trial',
+        )
+
+    installed_size_drift = copy.deepcopy(document)
+    installed_size_drift['contact_aggregator_binary_attestation']['installed_size_bytes'] += 1
+    orchestration.atomic_write_json(final_path, installed_size_drift, sidecar=True)
+    with pytest.raises(orchestration.EvidenceError, match='process/DSO identity changed'):
+        orchestration.reconcile_contact_gate_reobservation(
+            initial_path,
+            final_path,
+            build_binding=build_binding,
+            expected_domain_id=100,
+            expected_gz_partition='robotest_p3_candidate_trial',
+        )
+
+    orchestration.atomic_write_json(final_path, document, sidecar=True)
     rebound = copy.deepcopy(document)
     rebound['contact_gate_binary_attestation']['live_start_ticks'] = 1235
     orchestration.atomic_write_json(final_path, rebound, sidecar=True)

@@ -5653,6 +5653,7 @@ def reconcile_contact_gate_reobservation(
             'build_sha256',
             'installed_embedded_source_inventory_sha256',
             'installed_sha256',
+            'live_cmdline_sha256',
             'live_embedded_source_inventory_sha256',
             'live_executable_sha256',
             'source_inventory_sha256',
@@ -5708,10 +5709,14 @@ def reconcile_contact_gate_reobservation(
     if any(initial.get(field) != final.get(field) for field in stable_fields):
         raise EvidenceError('contact gate process/binary identity changed before final drain')
     initial_aggregator, final_aggregator = aggregator_observations
-    if initial_aggregator.get('stable_identity') != final_aggregator.get(
-        'stable_identity'
-    ) or initial_aggregator.get('stable_identity_sha256') != final_aggregator.get(
-        'stable_identity_sha256'
+    if (
+        any(
+            initial_aggregator.get(field) != final_aggregator.get(field)
+            for field in ('installed_size_bytes', 'live_mapping_count')
+        )
+        or initial_aggregator.get('stable_identity') != final_aggregator.get('stable_identity')
+        or initial_aggregator.get('stable_identity_sha256')
+        != final_aggregator.get('stable_identity_sha256')
     ):
         raise EvidenceError('contact aggregator process/DSO identity changed before final drain')
     return {

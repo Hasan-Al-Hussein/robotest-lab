@@ -1900,6 +1900,52 @@ def _write_phase3_recovered_lifecycle_timeout_gate(
     return _write_phase3_final_launch_log_gate(repository, run_root)
 
 
+def _fixture_contact_gate_cmdline_sha256(installed_path: Path) -> str:
+    """Model launch_ros argv without claiming its ephemeral params path is replayable."""
+    argv = (
+        str(installed_path),
+        '--ros-args',
+        '-r',
+        '__node:=contact_stream_gate',
+        '-r',
+        '__ns:=/robotest',
+        '--params-file',
+        str(installed_path.parent / 'phase5-fixture-launch-params.yaml'),
+    )
+    return hashlib.sha256(('\0'.join(argv) + '\0').encode()).hexdigest()
+
+
+def _fixture_contact_aggregator_mapping_identity(
+    installed_path: Path,
+    *,
+    device: int,
+    inode: int,
+    orchestration: object,
+) -> tuple[int, str]:
+    """Model and hash a realistic ELF mapping using the production record shape."""
+    base_address = 0x7F00_0000_0000
+    segment_layout = (
+        ('r--p', 0x0000),
+        ('r-xp', 0x1000),
+        ('r--p', 0x2000),
+        ('r--p', 0x3000),
+        ('rw-p', 0x4000),
+    )
+    records = [
+        {
+            'address_end': base_address + ((index + 1) * 0x1000),
+            'address_start': base_address + (index * 0x1000),
+            'device': device,
+            'inode': inode,
+            'offset': offset,
+            'path': str(installed_path),
+            'permissions': permissions,
+        }
+        for index, (permissions, offset) in enumerate(segment_layout)
+    ]
+    return len(records), orchestration.canonical_sha256(records)
+
+
 def _write_phase3_contact_gate_reobservation(
     repository: Path,
     directory: Path,
@@ -1950,9 +1996,7 @@ def _write_phase3_contact_gate_reobservation(
         'installed_regular_executable': True,
         'installed_sha256': frozen['installed_sha256'],
         'launch_root_pid': launch_pid,
-        'live_cmdline_sha256': hashlib.sha256(
-            f'{installed_path}\0--ros-args\0'.encode()
-        ).hexdigest(),
+        'live_cmdline_sha256': _fixture_contact_gate_cmdline_sha256(installed_path),
         'live_device': installed_stat.st_dev,
         'live_elf_build_id': frozen['installed_elf_build_id'],
         'live_embedded_source_inventory_match': True,
@@ -1982,6 +2026,14 @@ def _write_phase3_contact_gate_reobservation(
     }
     live_executable_path = str(Path(sys.executable).resolve(strict=True))
     live_mapping_paths = [str(aggregator_installed_path)]
+    live_mapping_count, live_mapping_fingerprint_sha256 = (
+        _fixture_contact_aggregator_mapping_identity(
+            aggregator_installed_path,
+            device=aggregator_installed_stat.st_dev,
+            inode=aggregator_installed_stat.st_ino,
+            orchestration=orchestration,
+        )
+    )
     aggregator_attestation = {
         **frozen_aggregator,
         'attestation_method': 'proc_maps_exact_device_inode',
@@ -2005,16 +2057,9 @@ def _write_phase3_contact_gate_reobservation(
         'live_installed_build_id_match': True,
         'live_installed_inode_match': True,
         'live_installed_sha256_match': True,
-        'live_mapping_count': len(live_mapping_paths),
+        'live_mapping_count': live_mapping_count,
         'live_mapping_device': aggregator_installed_stat.st_dev,
-        'live_mapping_fingerprint_sha256': hashlib.sha256(
-            (
-                f'{aggregator_installed_stat.st_dev}:'
-                f'{aggregator_installed_stat.st_ino}:'
-                f'{aggregator_installed_stat.st_size}:'
-                f'{aggregator_installed_path}'
-            ).encode()
-        ).hexdigest(),
+        'live_mapping_fingerprint_sha256': live_mapping_fingerprint_sha256,
         'live_mapping_has_executable': True,
         'live_mapping_has_offset_zero': True,
         'live_mapping_inode': aggregator_installed_stat.st_ino,
@@ -5186,9 +5231,7 @@ def _rebind_phase3_gate_attestation_workspace(
         {
             'installed_device': gate_stat.st_dev,
             'installed_inode': gate_stat.st_ino,
-            'live_cmdline_sha256': hashlib.sha256(
-                f'{gate_path}\0--ros-args\0'.encode()
-            ).hexdigest(),
+            'live_cmdline_sha256': _fixture_contact_gate_cmdline_sha256(gate_path),
             'live_device': gate_stat.st_dev,
             'live_executable_link': str(gate_path),
             'live_executable_path': str(gate_path),
@@ -5201,19 +5244,19 @@ def _rebind_phase3_gate_attestation_workspace(
     aggregator_path = (repository / aggregator_binding['installed_path']).resolve(strict=True)
     aggregator_stat = aggregator_path.stat()
     mapping_paths = [str(aggregator_path)]
-    mapping_fingerprint = hashlib.sha256(
-        (
-            f'{aggregator_stat.st_dev}:{aggregator_stat.st_ino}:'
-            f'{aggregator_stat.st_size}:{aggregator_path}'
-        ).encode()
-    ).hexdigest()
+    mapping_count, mapping_fingerprint = _fixture_contact_aggregator_mapping_identity(
+        aggregator_path,
+        device=aggregator_stat.st_dev,
+        inode=aggregator_stat.st_ino,
+        orchestration=orchestration,
+    )
     aggregator_attestation = gate['contact_aggregator_binary_attestation']
     aggregator_attestation.update(
         {
             'installed_device': aggregator_stat.st_dev,
             'installed_inode': aggregator_stat.st_ino,
             'installed_size_bytes': aggregator_stat.st_size,
-            'live_mapping_count': 1,
+            'live_mapping_count': mapping_count,
             'live_mapping_device': aggregator_stat.st_dev,
             'live_mapping_fingerprint_sha256': mapping_fingerprint,
             'live_mapping_inode': aggregator_stat.st_ino,
@@ -9058,9 +9101,6 @@ def test_release_evidence_rejects_rebound_foreign_runtime_gate_workspace_paths(
             foreign_path = repository.parent / 'foreign/build/robotest_sim/contact_stream_gate'
             attestation['live_executable_link'] = str(foreign_path)
             attestation['live_executable_path'] = str(foreign_path)
-            attestation['live_cmdline_sha256'] = hashlib.sha256(
-                f'{foreign_path}\0--ros-args\0'.encode()
-            ).hexdigest()
         else:
             attestation = gate['contact_aggregator_binary_attestation']
             foreign_path = (
@@ -9068,13 +9108,6 @@ def test_release_evidence_rejects_rebound_foreign_runtime_gate_workspace_paths(
                 / 'foreign/build/robotest_sim/librobotest_contact_aggregator_system.so'
             )
             attestation['live_mapping_paths'] = [str(foreign_path)]
-            attestation['live_mapping_fingerprint_sha256'] = hashlib.sha256(
-                (
-                    f'{attestation["live_mapping_device"]}:'
-                    f'{attestation["live_mapping_inode"]}:'
-                    f'{attestation["installed_size_bytes"]}:{foreign_path}'
-                ).encode()
-            ).hexdigest()
             stable_identity = {
                 field: attestation[field]
                 for field in orchestration.CONTACT_AGGREGATOR_STABLE_IDENTITY_FIELDS
@@ -9086,6 +9119,151 @@ def test_release_evidence_rejects_rebound_foreign_runtime_gate_workspace_paths(
 
     with pytest.raises(EvidenceError, match='attestation is not bound to this workspace'):
         _validate_release_fixture(fixture)
+
+
+def test_release_workspace_gate_binding_accepts_launch_argv_and_multisegment_dso(
+    tmp_path: Path,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    positive_directory = candidate_root / 'positive-control'
+    build_binding = json.loads((candidate_root / 'build-binding.json').read_text(encoding='utf-8'))
+    gate_path = (repository / build_binding['contact_gate_binary']['installed_path']).resolve(
+        strict=True
+    )
+    legacy_cmdline_sha256 = hashlib.sha256(f'{gate_path}\0--ros-args\0'.encode()).hexdigest()
+
+    for gate_name in ('runtime-gate.json', 'contact-stream-final-gate.json'):
+        gate = json.loads((positive_directory / gate_name).read_text(encoding='utf-8'))
+        gate_attestation = gate['contact_gate_binary_attestation']
+        aggregator_attestation = gate['contact_aggregator_binary_attestation']
+        assert gate_attestation['live_cmdline_sha256'] == (
+            _fixture_contact_gate_cmdline_sha256(gate_path)
+        )
+        assert gate_attestation['live_cmdline_sha256'] != legacy_cmdline_sha256
+        assert aggregator_attestation['live_mapping_count'] == 5
+        assert len(aggregator_attestation['live_mapping_paths']) == 1
+        release_module._validate_positive_gate_workspace_paths(
+            gate,
+            repository=repository,
+            build_binding=build_binding,
+            label=f'fixture {gate_name}',
+        )
+
+
+@pytest.mark.parametrize(
+    'case',
+    [
+        'malformed_gate_cmdline_sha256',
+        'malformed_mapping_fingerprint_sha256',
+        'mapping_count_zero',
+        'mapping_count_boolean',
+        'mapping_count_non_integer',
+        'mapping_count_above_bound',
+        'mapping_path_drift',
+        'mapping_identity_drift',
+        'mapping_fingerprint_stable_mismatch',
+    ],
+)
+def test_release_workspace_gate_binding_rejects_invalid_attestation(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    build_binding = json.loads((candidate_root / 'build-binding.json').read_text(encoding='utf-8'))
+    gate = json.loads(
+        (candidate_root / 'positive-control/runtime-gate.json').read_text(encoding='utf-8')
+    )
+    gate_attestation = gate['contact_gate_binary_attestation']
+    aggregator_attestation = gate['contact_aggregator_binary_attestation']
+    stable_identity = aggregator_attestation['stable_identity']
+
+    if case == 'malformed_gate_cmdline_sha256':
+        gate_attestation['live_cmdline_sha256'] = 'not-a-sha256'
+    elif case == 'malformed_mapping_fingerprint_sha256':
+        aggregator_attestation['live_mapping_fingerprint_sha256'] = 'not-a-sha256'
+        stable_identity['live_mapping_fingerprint_sha256'] = 'not-a-sha256'
+    elif case == 'mapping_count_zero':
+        aggregator_attestation['live_mapping_count'] = 0
+    elif case == 'mapping_count_boolean':
+        aggregator_attestation['live_mapping_count'] = True
+    elif case == 'mapping_count_non_integer':
+        aggregator_attestation['live_mapping_count'] = '5'
+    elif case == 'mapping_count_above_bound':
+        aggregator_attestation['live_mapping_count'] = 65
+    elif case == 'mapping_path_drift':
+        foreign_path = repository.parent / 'foreign/librobotest_contact_aggregator_system.so'
+        aggregator_attestation['live_mapping_paths'] = [str(foreign_path)]
+        stable_identity['live_mapping_paths'] = [str(foreign_path)]
+    elif case == 'mapping_identity_drift':
+        forged_inode = int(aggregator_attestation['installed_inode']) + 1
+        aggregator_attestation['installed_inode'] = forged_inode
+        aggregator_attestation['live_mapping_inode'] = forged_inode
+        stable_identity['installed_inode'] = forged_inode
+        stable_identity['live_mapping_inode'] = forged_inode
+    else:
+        stable_identity['live_mapping_fingerprint_sha256'] = 'f' * 64
+
+    with pytest.raises(EvidenceError, match='attestation is not bound to this workspace'):
+        release_module._validate_positive_gate_workspace_paths(
+            gate,
+            repository=repository,
+            build_binding=build_binding,
+            label='forged fixture gate',
+        )
+
+
+@pytest.mark.parametrize(
+    ('case', 'message'),
+    [
+        ('gate_cmdline', 'contact gate process/binary identity changed before final drain'),
+        (
+            'mapping_fingerprint',
+            'contact aggregator process/DSO identity changed before final drain',
+        ),
+    ],
+)
+def test_phase3_reobservation_rejects_valid_digest_identity_drift(
+    tmp_path: Path,
+    case: str,
+    message: str,
+) -> None:
+    fixture = _release_fixture(tmp_path)
+    repository = Path(fixture['repository'])
+    candidate_root = Path(fixture['candidate_root'])
+    positive_directory = candidate_root / 'positive-control'
+    final_gate_path = positive_directory / 'contact-stream-final-gate.json'
+    final_gate = json.loads(final_gate_path.read_text(encoding='utf-8'))
+    orchestration = release_module._load_repository_module(
+        repository,
+        'tests/phase3_orchestration.py',
+        'Phase 3 gate digest drift fixture',
+    )
+
+    if case == 'gate_cmdline':
+        final_gate['contact_gate_binary_attestation']['live_cmdline_sha256'] = 'f' * 64
+    else:
+        aggregator_attestation = final_gate['contact_aggregator_binary_attestation']
+        aggregator_attestation['live_mapping_fingerprint_sha256'] = 'f' * 64
+        aggregator_attestation['stable_identity']['live_mapping_fingerprint_sha256'] = 'f' * 64
+        aggregator_attestation['stable_identity_sha256'] = orchestration.canonical_sha256(
+            aggregator_attestation['stable_identity']
+        )
+    _canonical_file(final_gate_path, final_gate, sidecar=True)
+    build_binding = json.loads((candidate_root / 'build-binding.json').read_text(encoding='utf-8'))
+    plan = json.loads((candidate_root / 'suite-plan.json').read_text(encoding='utf-8'))
+
+    with pytest.raises(orchestration.EvidenceError, match=message):
+        orchestration.reconcile_contact_gate_reobservation(
+            positive_directory / 'runtime-gate.json',
+            final_gate_path,
+            build_binding=build_binding,
+            expected_domain_id=plan['positive_control']['ros_domain_id'],
+            expected_gz_partition=plan['positive_control']['gz_partition'],
+        )
 
 
 @pytest.mark.parametrize('field', ['source', 'install', 'source_install'])

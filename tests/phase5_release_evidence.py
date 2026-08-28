@@ -1095,6 +1095,7 @@ def _validate_positive_gate_workspace_paths(
         gate.get('contact_gate_binary_attestation'),
         f'{label} contact gate attestation',
     )
+    gate_cmdline_sha256 = gate_attestation.get('live_cmdline_sha256')
     _require(
         gate_attestation.get('live_executable_path') == str(gate_path)
         and gate_attestation.get('live_executable_link') == str(gate_path)
@@ -1103,8 +1104,8 @@ def _validate_positive_gate_workspace_paths(
         and gate_attestation.get('live_size_bytes') == gate_stat.st_size
         and gate_attestation.get('installed_device') == gate_stat.st_dev
         and gate_attestation.get('installed_inode') == gate_stat.st_ino
-        and gate_attestation.get('live_cmdline_sha256')
-        == hashlib.sha256(f'{gate_path}\0--ros-args\0'.encode()).hexdigest(),
+        and isinstance(gate_cmdline_sha256, str)
+        and re.fullmatch(r'[0-9a-f]{64}', gate_cmdline_sha256) is not None,
         f'{label} contact gate attestation is not bound to this workspace',
     )
 
@@ -1119,12 +1120,8 @@ def _validate_positive_gate_workspace_paths(
         f'{label} contact aggregator attestation',
     )
     expected_mapping_paths = [str(aggregator_path)]
-    expected_fingerprint = hashlib.sha256(
-        (
-            f'{aggregator_stat.st_dev}:{aggregator_stat.st_ino}:'
-            f'{aggregator_stat.st_size}:{aggregator_path}'
-        ).encode()
-    ).hexdigest()
+    mapping_count = aggregator_attestation.get('live_mapping_count')
+    mapping_fingerprint = aggregator_attestation.get('live_mapping_fingerprint_sha256')
     stable_identity = _mapping(
         aggregator_attestation.get('stable_identity'),
         f'{label} contact aggregator stable identity',
@@ -1133,17 +1130,19 @@ def _validate_positive_gate_workspace_paths(
         aggregator_attestation.get('installed_device') == aggregator_stat.st_dev
         and aggregator_attestation.get('installed_inode') == aggregator_stat.st_ino
         and aggregator_attestation.get('installed_size_bytes') == aggregator_stat.st_size
-        and aggregator_attestation.get('live_mapping_count') == 1
+        and _exact_integer(mapping_count)
+        and 1 <= mapping_count <= 64
         and aggregator_attestation.get('live_mapping_device') == aggregator_stat.st_dev
         and aggregator_attestation.get('live_mapping_inode') == aggregator_stat.st_ino
         and aggregator_attestation.get('live_mapping_paths') == expected_mapping_paths
-        and aggregator_attestation.get('live_mapping_fingerprint_sha256') == expected_fingerprint
+        and isinstance(mapping_fingerprint, str)
+        and re.fullmatch(r'[0-9a-f]{64}', mapping_fingerprint) is not None
         and stable_identity.get('installed_device') == aggregator_stat.st_dev
         and stable_identity.get('installed_inode') == aggregator_stat.st_ino
         and stable_identity.get('live_mapping_device') == aggregator_stat.st_dev
         and stable_identity.get('live_mapping_inode') == aggregator_stat.st_ino
         and stable_identity.get('live_mapping_paths') == expected_mapping_paths
-        and stable_identity.get('live_mapping_fingerprint_sha256') == expected_fingerprint,
+        and stable_identity.get('live_mapping_fingerprint_sha256') == mapping_fingerprint,
         f'{label} contact aggregator attestation is not bound to this workspace',
     )
 
