@@ -32,6 +32,11 @@ Both modes are limited to L0-L2 evidence:
   workers; and
 - installed CLI `--help` smoke checks that do not start a ROS graph.
 
+The pure-Python stage has a **2,700-second** wall bound. That check-level bound
+is 15 minutes below the workflow's fixed 60-minute job ceiling; only a complete
+hosted run proves the end-to-end workflow budget, including setup and the
+checks before and after pytest.
+
 The fresh build uses temporary build, install, and log bases, then removes
 only that owned temporary directory. The evidence directory retains bounded
 command logs and a summary that explicitly records that Gazebo, hardware,

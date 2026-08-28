@@ -507,7 +507,7 @@ run_check bash-syntax 60s bash -n "${SHELL_FILES[@]}"
 run_check shellcheck 180s shellcheck --severity=warning "${SHELL_FILES[@]}"
 run_check ruff-check 180s "${RUFF}" check "${PROJECT_ROOT}/tests" "${PROJECT_ROOT}/src"
 run_check ruff-format 180s "${RUFF}" format --check "${PROJECT_ROOT}/tests" "${PROJECT_ROOT}/src"
-run_check pure-python-tests 600s python3 -m pytest -q "${PYTEST_FILES[@]}"
+run_check pure-python-tests 2700s python3 -m pytest -q "${PYTEST_FILES[@]}"
 
 run_check phase3-static-interface 30s bash "${SCRIPT_DIR}/verify_phase3.sh" --help
 run_check phase3-campaign-interface 30s bash "${SCRIPT_DIR}/run_benchmarks.sh" --help

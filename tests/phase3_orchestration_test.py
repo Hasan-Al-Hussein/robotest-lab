@@ -2218,8 +2218,11 @@ def _contact_control_arm_protocol_fixture() -> dict[str, object]:
     }
 
 
-def test_command_delivery_probe_protocol_matches_authoritative_source() -> None:
+def test_command_delivery_probe_protocol_matches_authoritative_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Keep the standalone orchestrator projection identical to the driver."""
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[1] / 'src/robotest_scenarios'))
     from robotest_scenarios.provenance import contact_control_arm_protocol
 
     protocol = contact_control_arm_protocol()

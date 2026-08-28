@@ -768,7 +768,7 @@ def test_local_summary_keeps_live_and_remote_claims_out_of_scope(tmp_path: Path)
 def test_phase5_script_has_no_implicit_mode() -> None:
     script = REPOSITORY / 'scripts/verify_phase5.sh'
     script_text = script.read_text(encoding='utf-8')
-    assert 'run_check pure-python-tests 600s python3 -m pytest' in script_text
+    assert 'run_check pure-python-tests 2700s python3 -m pytest' in script_text
     assert 'run_check portfolio-contract 30s' in script_text
     assert 'createdAt,updatedAt' in script_text
     result = subprocess.run(['bash', str(script)], capture_output=True, text=True, check=False)
@@ -921,9 +921,13 @@ def test_failed_gate_still_finalizes_checksums_csv_and_provenance(tmp_path: Path
     )
 
     script = repository / 'scripts/verify_phase5.sh'
+    local_environment = os.environ.copy()
+    for variable in ('GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITHUB_SHA'):
+        local_environment.pop(variable, None)
     result = subprocess.run(
         ['bash', str(script), '--local'],
         cwd=repository,
+        env=local_environment,
         capture_output=True,
         text=True,
         check=False,
