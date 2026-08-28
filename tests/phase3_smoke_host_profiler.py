@@ -22,6 +22,7 @@ import copy
 import csv
 from dataclasses import dataclass, field
 import datetime
+import errno
 import hashlib
 import io
 import json
@@ -50,6 +51,7 @@ CONTACT_PROFILE_PREFIX = b'ROBOTEST_CONTACT_PROFILE '
 CSV_PROJECTION_CONTRACT = 'bounded_scalar_summary_v1'
 CSV_PROJECTION_CONTRACT_COLUMN = '__robotest_projection_contract'
 CSV_PROJECTION_JSON_SHA256_COLUMN = '__robotest_canonical_json_sha256'
+PROCFS_DISAPPEARANCE_ERRNOS = frozenset({errno.ENOENT, errno.ESRCH})
 CONTACT_PROFILE_KEYS = frozenset(
     {
         'cached_event_state_check_ns',
@@ -364,14 +366,18 @@ def canonical_json_bytes(document: Any) -> bytes:
     return (text + '\n').encode()
 
 
+def _procfs_entry_disappeared(error: OSError) -> bool:
+    return error.errno in PROCFS_DISAPPEARANCE_ERRNOS
+
+
 def _bounded_proc_read(path: Path, maximum: int, label: str) -> bytes:
     """Read one procfs pseudo-file under an explicit byte cap."""
     try:
         with path.open('rb') as source:
             payload = source.read(maximum + 1)
-    except FileNotFoundError:
-        raise
     except OSError as exc:
+        if _procfs_entry_disappeared(exc):
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path) from exc
         raise ProfileError('incomplete_profile', f'cannot read {label}: {path}: {exc}') from exc
     if len(payload) > maximum:
         raise ProfileError('overflow', f'{label} exceeds {maximum} bytes: {path}')
@@ -1041,9 +1047,17 @@ def _plugin_maps(proc_root: Path, pid: int, plugin: Mapping[str, Any]) -> list[d
 
 def _command_identity(proc_root: Path, pid: int) -> dict[str, Any]:
     payload = _bounded_proc_read(proc_root / str(pid) / 'cmdline', CMDLINE_MAX_BYTES, 'cmdline')
+    executable_path = proc_root / str(pid) / 'exe'
     try:
-        executable_link = os.readlink(proc_root / str(pid) / 'exe')
+        executable_link = os.readlink(executable_path)
     except OSError as exc:
+        if _procfs_entry_disappeared(exc):
+            disappeared = FileNotFoundError(
+                errno.ENOENT, os.strerror(errno.ENOENT), executable_path
+            )
+            raise ProfileError('missing_identity', f'cannot read PID {pid} executable') from (
+                disappeared
+            )
         raise ProfileError('missing_identity', f'cannot read PID {pid} executable') from exc
     return {
         'cmdline': [item.decode(errors='replace') for item in payload.split(b'\0') if item],
@@ -1316,13 +1330,20 @@ def _discovered_process_ended_after_ancestry_failure(
 
 
 def _reparented_command_identity(proc_root: Path, pid: int) -> dict[str, Any]:
-    """Preserve command-read ENOENT so the caller can prove a terminal race."""
+    """Preserve command-read disappearance so the caller can prove a terminal race."""
     try:
         return _command_identity(proc_root, pid)
     except FileNotFoundError as exc:
+        if not _procfs_entry_disappeared(exc):
+            raise
         raise ProcessDisappearedError(pid, 'reparented matching process') from exc
     except ProfileError as exc:
-        if exc.kind != 'missing_identity' or not isinstance(exc.__cause__, FileNotFoundError):
+        cause = exc.__cause__
+        if (
+            exc.kind != 'missing_identity'
+            or not isinstance(cause, OSError)
+            or not _procfs_entry_disappeared(cause)
+        ):
             raise
         raise ProcessDisappearedError(pid, 'reparented matching process') from exc
 
@@ -1576,15 +1597,17 @@ def _sample_threads(
         return None
     try:
         tids = sorted(int(path.name) for path in (root / 'task').iterdir() if path.name.isdigit())
-    except FileNotFoundError:
-        process.ended_sample = index
-        return None
     except OSError as exc:
+        if _procfs_entry_disappeared(exc):
+            process.ended_sample = index
+            return None
         message = f'cannot enumerate PID {process.pid} threads'
         raise ProfileError('incomplete_profile', message) from exc
     if len(tids) > MAX_THREADS_PER_PROCESS:
         raise ProfileError('overflow', f'PID {process.pid} exceeds 4,096 threads')
     records: list[dict[str, Any]] = []
+    updates: list[tuple[tuple[int, int, int, int], tuple[int, int, int], ProcStat, int | None]] = []
+    new_identities: set[tuple[int, int, int, int]] = set()
     vanished = 0
     for tid in tids:
         try:
@@ -1594,8 +1617,8 @@ def _sample_threads(
             continue
         identity = (process.pid, process.start_ticks, tid, thread.start_ticks)
         tid_identity = (process.pid, process.start_ticks, tid)
-        prior_start = state.thread_start_by_tid.setdefault(tid_identity, thread.start_ticks)
-        if prior_start != thread.start_ticks:
+        prior_start = state.thread_start_by_tid.get(tid_identity)
+        if prior_start is not None and prior_start != thread.start_ticks:
             raise ProfileError('pid_reuse', f'thread {process.pid}/{tid} was reused')
         if thread.pid != tid:
             message = f'thread stat PID differs for {process.pid}/{tid}'
@@ -1604,16 +1627,11 @@ def _sample_threads(
         if prior is not None and thread.cpu_ticks < prior:
             raise ProfileError('pid_reuse', f'thread {process.pid}/{tid} CPU ticks regressed')
         delta = None if prior is None else thread.cpu_ticks - prior
-        state.last_thread_ticks[identity] = thread.cpu_ticks
-        state.thread_names[identity] = thread.comm
-        if delta is not None:
-            state.thread_delta_ticks[identity] = state.thread_delta_ticks.get(identity, 0) + delta
-            process_identity = (process.pid, process.start_ticks)
-            state.process_delta_ticks[process_identity] = (
-                state.process_delta_ticks.get(process_identity, 0) + delta
-            )
-        if len(state.last_thread_ticks) > MAX_THREAD_IDENTITIES:
+        if identity not in state.last_thread_ticks:
+            new_identities.add(identity)
+        if len(state.last_thread_ticks) + len(new_identities) > MAX_THREAD_IDENTITIES:
             raise ProfileError('overflow', 'profile exceeds 16,384 thread identities')
+        updates.append((identity, tid_identity, thread, delta))
         records.append(
             {
                 'tid': tid,
@@ -1631,7 +1649,6 @@ def _sample_threads(
         raise ProfileError(
             'overflow', f'profile exceeds {MAX_THREAD_RECORDS:,} thread sample records'
         )
-    state.thread_records += len(records)
     try:
         after = _read_stat(root / 'stat')
     except FileNotFoundError:
@@ -1642,6 +1659,22 @@ def _sample_threads(
     if after.state in TERMINAL_PROCESS_STATES:
         process.ended_sample = index
         return None
+    process_identity = (process.pid, process.start_ticks)
+    process_delta = 0
+    has_process_delta = False
+    for identity, tid_identity, thread, delta in updates:
+        state.thread_start_by_tid[tid_identity] = thread.start_ticks
+        state.last_thread_ticks[identity] = thread.cpu_ticks
+        state.thread_names[identity] = thread.comm
+        if delta is not None:
+            state.thread_delta_ticks[identity] = state.thread_delta_ticks.get(identity, 0) + delta
+            process_delta += delta
+            has_process_delta = True
+    if has_process_delta:
+        state.process_delta_ticks[process_identity] = (
+            state.process_delta_ticks.get(process_identity, 0) + process_delta
+        )
+    state.thread_records += len(records)
     return {
         'pid': process.pid,
         'start_ticks': process.start_ticks,

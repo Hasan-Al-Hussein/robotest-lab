@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import errno
 import importlib.util
 import io
 import json
@@ -810,10 +811,12 @@ def test_capture_fails_closed_on_pid_reuse(tmp_path: Path) -> None:
     )
     state = profiler.ProfileState()
     assert profiler.capture_sample(proc_root, config, anchor, state)
+    before = copy.deepcopy(state)
     _update_cpu(root, 101, 20, start=999)
 
     with pytest.raises(profiler.ProfileError, match='reused'):
         profiler.capture_sample(proc_root, config, anchor, state)
+    assert state == before
 
 
 def test_capture_fails_closed_on_thread_tid_reuse(tmp_path: Path) -> None:
@@ -827,10 +830,291 @@ def test_capture_fails_closed_on_thread_tid_reuse(tmp_path: Path) -> None:
     )
     state = profiler.ProfileState()
     assert profiler.capture_sample(proc_root, config, anchor, state)
+    before = copy.deepcopy(state)
     (root / 'task/101/stat').write_text(_stat_text(101, start=999), encoding='ascii')
 
     with pytest.raises(profiler.ProfileError, match='thread 101/101 was reused'):
         profiler.capture_sample(proc_root, config, anchor, state)
+    assert state == before
+
+
+@pytest.mark.parametrize('disappearance_errno', (errno.ENOENT, errno.ESRCH))
+def test_sample_threads_marks_process_ended_when_initial_stat_disappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    disappearance_errno: int,
+) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    root = _make_process(proc_root, 101, plugin)
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    state = profiler.ProfileState()
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    before = copy.deepcopy(state)
+    process_stat = root / 'stat'
+    real_open = Path.open
+
+    def disappear_on_initial_process_stat(self, mode='r', *arguments, **keywords):
+        if self == process_stat and mode == 'rb':
+            raise OSError(
+                disappearance_errno,
+                os.strerror(disappearance_errno),
+                self,
+            )
+        return real_open(self, mode, *arguments, **keywords)
+
+    monkeypatch.setattr(Path, 'open', disappear_on_initial_process_stat)
+
+    assert profiler._sample_threads(proc_root, state.processes[101], 1, state) is None
+
+    assert state.processes[101].ended_sample == 1
+    assert state.thread_records == before.thread_records
+    assert state.last_thread_ticks == before.last_thread_ticks
+    assert state.thread_start_by_tid == before.thread_start_by_tid
+    assert state.thread_names == before.thread_names
+    assert state.thread_delta_ticks == before.thread_delta_ticks
+    assert state.process_delta_ticks == before.process_delta_ticks
+
+
+@pytest.mark.parametrize('disappearance_errno', (errno.ENOENT, errno.ESRCH))
+def test_capture_counts_thread_stat_disappearance_without_partial_thread_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    disappearance_errno: int,
+) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    root = _make_process(proc_root, 101, plugin)
+    vanished_stat = root / 'task/202/stat'
+    vanished_stat.parent.mkdir()
+    vanished_stat.write_text(_stat_text(202, start=200), encoding='ascii')
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    real_open = Path.open
+
+    def disappear_on_thread_stat(self, mode='r', *arguments, **keywords):
+        if self == vanished_stat and mode == 'rb':
+            raise OSError(
+                disappearance_errno,
+                os.strerror(disappearance_errno),
+                self,
+            )
+        return real_open(self, mode, *arguments, **keywords)
+
+    monkeypatch.setattr(Path, 'open', disappear_on_thread_stat)
+    state = profiler.ProfileState()
+
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+
+    sample = state.samples[-1]
+    process_sample = sample['processes'][0]
+    assert sample['anchor_alive'] is True
+    assert sample['processes_vanished_during_sample'] == 0
+    assert process_sample['thread_count'] == 1
+    assert process_sample['threads_vanished_during_sample'] == 1
+    assert [thread['tid'] for thread in process_sample['threads']] == [101]
+    assert state.thread_records == 1
+    assert all(identity[2] != 202 for identity in state.last_thread_ticks)
+    assert all(identity[2] != 202 for identity in state.thread_names)
+    assert all(identity[2] != 202 for identity in state.thread_delta_ticks)
+    assert all(identity[2] != 202 for identity in state.thread_start_by_tid)
+
+
+@pytest.mark.parametrize('disappearance_errno', (errno.ENOENT, errno.ESRCH))
+def test_capture_marks_process_ended_when_task_enumeration_disappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    disappearance_errno: int,
+) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    root = _make_process(proc_root, 101, plugin)
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    task_root = root / 'task'
+    real_iterdir = Path.iterdir
+
+    def disappear_on_task_enumeration(self):
+        if self == task_root:
+            raise OSError(
+                disappearance_errno,
+                os.strerror(disappearance_errno),
+                self,
+            )
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, 'iterdir', disappear_on_task_enumeration)
+    state = profiler.ProfileState()
+
+    assert profiler.capture_sample(proc_root, config, anchor, state) is False
+
+    sample = state.samples[-1]
+    assert state.processes[101].ended_sample == 0
+    assert sample['anchor_alive'] is False
+    assert sample['target_process_set_alive'] is False
+    assert sample['process_count'] == 0
+    assert sample['processes_vanished_during_sample'] == 1
+    assert state.thread_records == 0
+    assert state.last_thread_ticks == {}
+    assert state.thread_start_by_tid == {}
+
+
+@pytest.mark.parametrize('disappearance_errno', (errno.ENOENT, errno.ESRCH))
+def test_sample_threads_discards_staged_updates_when_final_stat_disappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    disappearance_errno: int,
+) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    root = _make_process(proc_root, 101, plugin)
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    state = profiler.ProfileState()
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    _update_cpu(root, 101, 20)
+    before = copy.deepcopy(state)
+    process_stat = root / 'stat'
+    real_open = Path.open
+    process_stat_reads = 0
+
+    def disappear_on_final_process_stat(self, mode='r', *arguments, **keywords):
+        nonlocal process_stat_reads
+        if self == process_stat and mode == 'rb':
+            process_stat_reads += 1
+            if process_stat_reads == 2:
+                raise OSError(
+                    disappearance_errno,
+                    os.strerror(disappearance_errno),
+                    self,
+                )
+        return real_open(self, mode, *arguments, **keywords)
+
+    monkeypatch.setattr(Path, 'open', disappear_on_final_process_stat)
+
+    assert profiler._sample_threads(proc_root, state.processes[101], 1, state) is None
+
+    assert process_stat_reads == 2
+    assert state.processes[101].ended_sample == 1
+    assert state.thread_records == before.thread_records
+    assert state.last_thread_ticks == before.last_thread_ticks
+    assert state.thread_start_by_tid == before.thread_start_by_tid
+    assert state.thread_names == before.thread_names
+    assert state.thread_delta_ticks == before.thread_delta_ticks
+    assert state.process_delta_ticks == before.process_delta_ticks
+
+
+@pytest.mark.parametrize(
+    ('error_type', 'error_number'),
+    (
+        (PermissionError, errno.EPERM),
+        (OSError, errno.EIO),
+        (FileNotFoundError, errno.EIO),
+    ),
+)
+def test_capture_keeps_non_disappearance_thread_stat_errors_fatal_and_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[OSError],
+    error_number: int,
+) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    root = _make_process(proc_root, 101, plugin)
+    denied_stat = root / 'task/202/stat'
+    denied_stat.parent.mkdir()
+    denied_stat.write_text(_stat_text(202, start=200), encoding='ascii')
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    real_open = Path.open
+
+    def fail_thread_stat(self, mode='r', *arguments, **keywords):
+        if self == denied_stat and mode == 'rb':
+            raise error_type(error_number, os.strerror(error_number), self)
+        return real_open(self, mode, *arguments, **keywords)
+
+    monkeypatch.setattr(Path, 'open', fail_thread_stat)
+    state = profiler.ProfileState()
+
+    with pytest.raises(profiler.ProfileError, match='cannot read proc stat'):
+        profiler.capture_sample(proc_root, config, anchor, state)
+
+    assert state == profiler.ProfileState()
+
+
+def test_capture_keeps_malformed_thread_stat_fatal_and_atomic(tmp_path: Path) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    root = _make_process(proc_root, 101, plugin)
+    malformed_stat = root / 'task/202/stat'
+    malformed_stat.parent.mkdir()
+    malformed_stat.write_text('not a proc stat record\n', encoding='ascii')
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    state = profiler.ProfileState()
+
+    with pytest.raises(profiler.ProfileError, match='malformed proc stat'):
+        profiler.capture_sample(proc_root, config, anchor, state)
+
+    assert state == profiler.ProfileState()
+
+
+@pytest.mark.parametrize(
+    ('error_type', 'error_number'),
+    (
+        (PermissionError, errno.EACCES),
+        (OSError, errno.EIO),
+        (FileNotFoundError, errno.EIO),
+    ),
+)
+def test_capture_keeps_non_disappearance_task_enumeration_errors_fatal_and_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[OSError],
+    error_number: int,
+) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    root = _make_process(proc_root, 101, plugin)
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    task_root = root / 'task'
+    real_iterdir = Path.iterdir
+
+    def fail_task_enumeration(self):
+        if self == task_root:
+            raise error_type(error_number, os.strerror(error_number), self)
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, 'iterdir', fail_task_enumeration)
+    state = profiler.ProfileState()
+
+    with pytest.raises(profiler.ProfileError, match='cannot enumerate PID 101 threads'):
+        profiler.capture_sample(proc_root, config, anchor, state)
+
+    assert state == profiler.ProfileState()
 
 
 def test_contact_linux_tid_must_bind_to_a_sampled_anchor_thread(tmp_path: Path) -> None:
@@ -1184,7 +1468,7 @@ def test_capture_counts_reparented_process_exiting_during_cmdline_read(
     def exit_on_cmdline(path: Path, maximum: int, label: str) -> bytes:
         if path == child / 'cmdline':
             shutil.rmtree(child)
-            raise FileNotFoundError(path)
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
         return original_read(path, maximum, label)
 
     monkeypatch.setattr(profiler, '_bounded_proc_read', exit_on_cmdline)
@@ -1239,6 +1523,43 @@ def test_capture_counts_reparented_process_becoming_terminal_during_executable_r
     assert state.samples[-1]['processes_vanished_during_sample'] == 1
 
 
+def test_capture_counts_reparented_process_exiting_during_executable_esrch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, plugin, producer = _fixture_config(tmp_path)
+    identity = _static_identity(config, producer)
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    _make_process(proc_root, 101, plugin)
+    child = _make_process(proc_root, 102, plugin, maps_plugin=False, start=200)
+    anchor, _count = profiler.discover_anchor(
+        proc_root, config.ros_domain_id, config.gz_partition, identity['plugin']
+    )
+    state = profiler.ProfileState()
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    _replace_process_stat(
+        child,
+        102,
+        start=200,
+        ppid=1,
+        group=50,
+        session=50,
+    )
+    original_readlink = profiler.os.readlink
+
+    def exit_on_executable_read(path: Path) -> str:
+        if path == child / 'exe':
+            shutil.rmtree(child)
+            raise ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH), path)
+        return original_readlink(path)
+
+    monkeypatch.setattr(profiler.os, 'readlink', exit_on_executable_read)
+
+    assert profiler.capture_sample(proc_root, config, anchor, state) is True
+    assert state.processes[102].ended_sample == 1
+    assert state.samples[-1]['processes_vanished_during_sample'] == 1
+
+
 def test_capture_keeps_live_reparented_executable_enoent_fatal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1266,7 +1587,7 @@ def test_capture_keeps_live_reparented_executable_enoent_fatal(
 
     def report_missing_executable(path: Path) -> str:
         if path == child / 'exe':
-            raise FileNotFoundError(path)
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
         return original_readlink(path)
 
     monkeypatch.setattr(profiler.os, 'readlink', report_missing_executable)
@@ -1276,8 +1597,19 @@ def test_capture_keeps_live_reparented_executable_enoent_fatal(
     assert state == before
 
 
-def test_capture_keeps_live_reparented_executable_permission_error_fatal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ('error_type', 'error_number'),
+    (
+        (PermissionError, errno.EACCES),
+        (OSError, errno.EIO),
+        (FileNotFoundError, errno.EIO),
+    ),
+)
+def test_capture_keeps_live_reparented_executable_non_disappearance_error_fatal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[OSError],
+    error_number: int,
 ) -> None:
     config, plugin, producer = _fixture_config(tmp_path)
     identity = _static_identity(config, producer)
@@ -1303,7 +1635,7 @@ def test_capture_keeps_live_reparented_executable_permission_error_fatal(
 
     def deny_executable_read(path: Path) -> str:
         if path == child / 'exe':
-            raise PermissionError(path)
+            raise error_type(error_number, os.strerror(error_number), path)
         return original_readlink(path)
 
     monkeypatch.setattr(profiler.os, 'readlink', deny_executable_read)
