@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import copy
 import csv
 import hashlib
@@ -786,6 +787,37 @@ def test_phase5_script_has_no_implicit_mode() -> None:
     )
     assert help_result.returncode == 0
     assert 'never start Gazebo' in help_result.stdout
+
+
+@pytest.mark.parametrize(
+    ('relative_path', 'required_ignores'),
+    [
+        ('src/robotest_metrics/test/ament_flake8.ini', {'B902', 'CNL100'}),
+        ('src/robotest_missions/test/ament_flake8.ini', {'B902', 'CNL100'}),
+        ('src/robotest_navigation/test/ament_flake8.ini', {'B902', 'CNL100'}),
+        ('src/robotest_scenarios/test/ament_flake8.ini', {'B902', 'CNL100'}),
+    ],
+)
+def test_ament_flake8_configs_ignore_conflicting_runner_plugins(
+    relative_path: str,
+    required_ignores: set[str],
+) -> None:
+    config_path = REPOSITORY / relative_path
+    parser = configparser.ConfigParser()
+    assert parser.read(config_path, encoding='utf-8') == [str(config_path)]
+    ignored_codes = {
+        code.strip() for code in parser['flake8']['extend-ignore'].split(',') if code.strip()
+    }
+    assert required_ignores <= ignored_codes
+
+    if 'robotest_navigation' in relative_path:
+        cmake = (REPOSITORY / 'src/robotest_navigation/CMakeLists.txt').read_text(encoding='utf-8')
+        config_binding = cmake.index(
+            'set(ament_cmake_flake8_CONFIG_FILE '
+            '"${CMAKE_CURRENT_SOURCE_DIR}/test/ament_flake8.ini")'
+        )
+        lint_registration = cmake.index('ament_lint_auto_find_test_dependencies()')
+        assert config_binding < lint_registration
 
 
 @pytest.mark.parametrize('help_flag', ['--help', '-h'])
