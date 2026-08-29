@@ -19,7 +19,7 @@ import sys
 import textwrap
 import zlib
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2026,7 +2026,22 @@ def _prepared_finalize_fixture(tmp_path: Path) -> dict[str, object]:
     }
 
 
-def _finalize_fixture(fixture: dict[str, object]) -> dict[str, object]:
+def _portfolio_fixture_datetime(now_utc: datetime) -> type[datetime]:
+    """Return a datetime class whose realtime sample is fixture-controlled."""
+    if now_utc.tzinfo is None:
+        raise ValueError('portfolio fixture time must be timezone-aware')
+    fixed_utc = now_utc.astimezone(UTC)
+
+    class _PortfolioFixtureDateTime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            del cls
+            return fixed_utc.replace(tzinfo=None) if tz is None else fixed_utc.astimezone(tz)
+
+    return _PortfolioFixtureDateTime
+
+
+def _call_finalize_fixture(fixture: dict[str, object]) -> dict[str, object]:
     return portfolio_module.finalize_portfolio(
         Path(fixture['repository']),
         str(fixture['candidate_sha']),
@@ -2036,6 +2051,22 @@ def _finalize_fixture(fixture: dict[str, object]) -> dict[str, object]:
         Path(fixture['release_flow_svg']),
         Path(fixture['review_path']),
     )
+
+
+def _finalize_fixture(fixture: dict[str, object]) -> dict[str, object]:
+    attempt = Path(fixture['attempt'])
+    prepare = _read_json(attempt / 'prepare-report.json')
+    prepared_utc = datetime.fromisoformat(str(prepare['prepared_utc']).replace('Z', '+00:00'))
+    fixture_finalized = prepared_utc + timedelta(microseconds=1)
+    original_datetime = portfolio_module.datetime
+    portfolio_module.datetime = _portfolio_fixture_datetime(fixture_finalized)
+    try:
+        finalized = _call_finalize_fixture(fixture)
+    finally:
+        portfolio_module.datetime = original_datetime
+    assert portfolio_module.datetime is original_datetime
+    assert finalized['finalized_utc'] == fixture_finalized.isoformat().replace('+00:00', 'Z')
+    return finalized
 
 
 def test_finalize_project_and_validate_exact_six_byte_identical_projections(
@@ -2137,6 +2168,39 @@ def test_finalize_project_and_validate_exact_six_byte_identical_projections(
     assert {
         relative: portfolio_module.file_sha256(repository / relative) for relative in expected_paths
     } == before_tracked
+
+
+def test_finalize_rejects_realtime_before_review_and_restores_clock(
+    tmp_path: Path,
+) -> None:
+    fixture = _prepared_finalize_fixture(tmp_path)
+    review = _read_json(Path(fixture['review_path']))
+    reviewed_utc = datetime.fromisoformat(str(review['reviewed_utc']).replace('Z', '+00:00'))
+    original_datetime = portfolio_module.datetime
+    portfolio_module.datetime = _portfolio_fixture_datetime(
+        reviewed_utc - timedelta(microseconds=1)
+    )
+    try:
+        with pytest.raises(
+            EvidenceError, match='portfolio finalization predates human visual review'
+        ):
+            _call_finalize_fixture(fixture)
+    finally:
+        portfolio_module.datetime = original_datetime
+    assert portfolio_module.datetime is original_datetime
+    attempt = Path(fixture['attempt'])
+    failure = _read_json(attempt / 'failure.json')
+    assert failure['attempt_id'] == fixture['attempt_id']
+    assert failure['candidate_git_sha'] == fixture['candidate_sha']
+    assert failure['producer'] == 'robotest_phase5/portfolio_finalize'
+    assert failure['stage'] == 'portfolio_finalize'
+    assert failure['status'] == 'FAIL'
+    assert failure['error'] == 'portfolio finalization predates human visual review'
+    portfolio_module._utc_timestamp(failure['failed_utc'], 'failure timestamp')
+    assert not (attempt / 'finalize-report.json').exists()
+    assert not (attempt / 'SHA256SUMS').exists()
+    assert not (attempt / 'visual-review.json').exists()
+    assert not (attempt / 'projection').exists()
 
 
 def test_finalize_refuses_review_hash_drift_and_preserves_stage_failure(tmp_path: Path) -> None:

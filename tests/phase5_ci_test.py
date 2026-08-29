@@ -22,7 +22,7 @@ import subprocess
 import sys
 import tempfile
 import zlib
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 
 import pytest
@@ -4954,6 +4954,21 @@ def _phase5_fixture_png() -> bytes:
     )
 
 
+def _portfolio_fixture_datetime(now_utc: datetime) -> type[datetime]:
+    """Return a datetime class whose realtime sample is fixture-controlled."""
+    if now_utc.tzinfo is None:
+        raise ValueError('portfolio fixture time must be timezone-aware')
+    fixed_utc = now_utc.astimezone(UTC)
+
+    class _PortfolioFixtureDateTime(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            del cls
+            return fixed_utc.replace(tzinfo=None) if tz is None else fixed_utc.astimezone(tz)
+
+    return _PortfolioFixtureDateTime
+
+
 def _finalize_portfolio_fixture(
     repository: Path,
     candidate_root: Path,
@@ -5015,16 +5030,24 @@ def _finalize_portfolio_fixture(
     }
     visual_review = repository.parent / 'portfolio-visual-review.json'
     _canonical_file(visual_review, review)
-    finalized = portfolio_module.finalize_portfolio(
-        repository,
-        candidate_sha,
-        candidate_root,
-        attempt_id,
-        architecture_svg,
-        release_flow_svg,
-        visual_review,
-    )
+    fixture_finalized = prepared + timedelta(microseconds=1)
+    original_datetime = portfolio_module.datetime
+    portfolio_module.datetime = _portfolio_fixture_datetime(fixture_finalized)
+    try:
+        finalized = portfolio_module.finalize_portfolio(
+            repository,
+            candidate_sha,
+            candidate_root,
+            attempt_id,
+            architecture_svg,
+            release_flow_svg,
+            visual_review,
+        )
+    finally:
+        portfolio_module.datetime = original_datetime
+    assert portfolio_module.datetime is original_datetime
     assert finalized['status'] == 'PASS'
+    assert finalized['finalized_utc'] == fixture_finalized.isoformat().replace('+00:00', 'Z')
     portfolio_root = repository / portfolio_module.PORTFOLIO_RAW_PREFIX / candidate_sha
     raw_proof = repository / str(finalized['portfolio_proof_path'])
     return portfolio_root, raw_proof, attempt_id
