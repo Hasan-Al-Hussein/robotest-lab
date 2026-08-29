@@ -4670,6 +4670,32 @@ def _remote_proof(
     }
 
 
+def _configure_fixture_git(repository: Path) -> None:
+    """Keep disposable fixture repositories free of detached maintenance workers."""
+
+    for key, value in (('maintenance.auto', 'false'), ('gc.auto', '0')):
+        subprocess.run(
+            ['git', 'config', '--local', key, value],
+            cwd=repository,
+            check=True,
+        )
+
+
+def _remove_release_fixture_repository(repository: Path) -> None:
+    """Remove a fixture while tolerating files concurrently retired by Git."""
+
+    def raise_unless_missing(
+        _function: object,
+        _path: str,
+        error: BaseException,
+    ) -> None:
+        if isinstance(error, FileNotFoundError):
+            return
+        raise error
+
+    shutil.rmtree(repository, onexc=raise_unless_missing)
+
+
 def _commit_all(repository: Path, message: str) -> None:
     subprocess.run(['git', 'add', '-A'], cwd=repository, check=True)
     subprocess.run(
@@ -5184,6 +5210,7 @@ PY
         verifier.chmod(0o755)
     (repository / 'scripts/verify_all.sh').chmod(0o755)
     subprocess.run(['git', 'init', '-q'], cwd=repository, check=True)
+    _configure_fixture_git(repository)
     _commit_all(repository, 'candidate')
     candidate_sha = subprocess.run(
         ['git', 'rev-parse', 'HEAD'],
@@ -6445,7 +6472,7 @@ def _release_fixture(tmp_path: Path) -> dict[str, Path | str]:
     previous_repository = _RELEASE_FIXTURE_LAST_REPOSITORY
     if previous_repository is not None and previous_repository.is_dir():
         assert previous_repository.name == 'repository'
-        shutil.rmtree(previous_repository)
+        _remove_release_fixture_repository(previous_repository)
     repository.mkdir()
     subprocess.run(
         ['cp', '-a', '--', f'{template_repository}/.', str(repository)],
@@ -7349,11 +7376,93 @@ def test_release_evidence_rejects_foreign_renamed_phase3_profile_candidate(
         _validate_release_fixture(fixture)
 
 
+def test_release_fixture_git_disables_background_maintenance(tmp_path: Path) -> None:
+    repository = tmp_path / 'repository'
+    repository.mkdir()
+    subprocess.run(['git', 'init', '-q'], cwd=repository, check=True)
+
+    _configure_fixture_git(repository)
+
+    for key, expected in (('maintenance.auto', 'false'), ('gc.auto', '0')):
+        actual = subprocess.run(
+            ['git', 'config', '--local', '--get', key],
+            cwd=repository,
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout.strip()
+        assert actual == expected
+
+
+@pytest.mark.parametrize('entry_name', ('maintenance.lock', 'bitmap-ref-tips_fixture'))
+def test_release_fixture_cleanup_tolerates_disappearing_git_maintenance_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_name: str,
+) -> None:
+    repository = tmp_path / 'repository'
+    objects = repository / '.git/objects'
+    objects.mkdir(parents=True)
+    (objects / entry_name).write_text('temporary\n', encoding='utf-8')
+    original_unlink = os.unlink
+    externally_removed = False
+
+    def unlink_after_external_removal(path: str, *args: object, **kwargs: object) -> None:
+        nonlocal externally_removed
+        if not externally_removed and os.fsdecode(path) == entry_name:
+            original_unlink(path, *args, **kwargs)
+            externally_removed = True
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'unlink', unlink_after_external_removal)
+
+    _remove_release_fixture_repository(repository)
+
+    assert externally_removed is True
+    assert not repository.exists()
+
+
+def test_release_fixture_cleanup_preserves_nonmissing_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / 'repository'
+    objects = repository / '.git/objects'
+    objects.mkdir(parents=True)
+    denied_name = 'protected-object'
+    (objects / denied_name).write_text('protected\n', encoding='utf-8')
+    original_unlink = os.unlink
+
+    def deny_one_unlink(path: str, *args: object, **kwargs: object) -> None:
+        if os.fsdecode(path) == denied_name:
+            raise PermissionError('fixture cleanup permission failure')
+        original_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, 'unlink', deny_one_unlink)
+        with pytest.raises(PermissionError, match='fixture cleanup permission failure'):
+            _remove_release_fixture_repository(repository)
+
+    shutil.rmtree(repository)
+
+
 def test_release_fixture_clones_are_self_contained_and_reload_producers(
     tmp_path: Path,
 ) -> None:
+    def assert_automatic_maintenance_disabled(repository: Path) -> None:
+        for key, expected in (('maintenance.auto', 'false'), ('gc.auto', '0')):
+            actual = subprocess.run(
+                ['git', 'config', '--local', '--get', key],
+                cwd=repository,
+                capture_output=True,
+                check=True,
+                text=True,
+            ).stdout.strip()
+            assert actual == expected
+
     first = _release_fixture(tmp_path / 'first')
     first_repository = Path(first['repository'])
+    assert_automatic_maintenance_disabled(first_repository)
     first_report = _validate_release_fixture(first)
     first_profile = _fixture_smoke_profile(first)
     template_repository = Path(_release_fixture_template()['repository'])
@@ -7370,6 +7479,7 @@ def test_release_fixture_clones_are_self_contained_and_reload_producers(
 
     second = _release_fixture(tmp_path / 'second')
     second_repository = Path(second['repository'])
+    assert_automatic_maintenance_disabled(second_repository)
     second_report = _validate_release_fixture(second)
     second_profile = _fixture_smoke_profile(second)
     assert second_report['phase3']['smoke_profile_sha256'] == phase5_module.file_sha256(
