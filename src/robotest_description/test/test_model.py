@@ -163,6 +163,45 @@ def test_every_physical_link_has_valid_dynamics(robot_xml: ET.Element) -> None:
         assert moments[2] <= moments[0] + moments[1] + 1e-12
 
 
+def test_portfolio_visuals_do_not_expand_physics_envelopes(robot_xml: ET.Element) -> None:
+    links = {link.attrib['name']: link for link in robot_xml.findall('link')}
+
+    base = links['base_link']
+    assert {visual.attrib['name'] for visual in base.findall('visual')} == {
+        'lower_chassis_visual',
+        'upper_chassis_visual',
+        'top_deck_visual',
+        'front_bumper_visual',
+        'left_headlight_visual',
+        'right_headlight_visual',
+        'lidar_mast_visual',
+    }
+    assert [collision.attrib['name'] for collision in base.findall('collision')] == [
+        'base_link_collision'
+    ]
+
+    for side in ('left', 'right'):
+        wheel = links[f'{side}_wheel_link']
+        assert {visual.attrib['name'] for visual in wheel.findall('visual')} == {
+            f'{side}_wheel_tire_visual',
+            f'{side}_wheel_rim_visual',
+            f'{side}_wheel_hub_visual',
+        }
+        assert [collision.attrib['name'] for collision in wheel.findall('collision')] == [
+            f'{side}_wheel_collision'
+        ]
+
+    lidar = links['lidar_link']
+    assert {visual.attrib['name'] for visual in lidar.findall('visual')} == {
+        'lidar_lower_housing_visual',
+        'lidar_scan_head_visual',
+        'lidar_top_cap_visual',
+    }
+    assert [collision.attrib['name'] for collision in lidar.findall('collision')] == [
+        'lidar_link_collision'
+    ]
+
+
 def test_sensor_contract(robot_xml: ET.Element) -> None:
     lidar = _sensor(robot_xml, 'lidar')
     assert lidar.attrib['type'] == 'gpu_lidar'

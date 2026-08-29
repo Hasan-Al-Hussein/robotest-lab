@@ -6,12 +6,26 @@
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
   <xacro:macro name="robotest_wheel" params="side y">
     <link name="${side}_wheel_link">
-      <visual>
+      <visual name="${side}_wheel_tire_visual">
         <origin xyz="0 0 0" rpy="${pi / 2.0} 0 0"/>
         <geometry>
           <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
         </geometry>
         <material name="robotest_dark"/>
+      </visual>
+      <visual name="${side}_wheel_rim_visual">
+        <origin xyz="0 0 0" rpy="${pi / 2.0} 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius * 0.55}" length="${wheel_width + 0.006}"/>
+        </geometry>
+        <material name="robotest_silver"/>
+      </visual>
+      <visual name="${side}_wheel_hub_visual">
+        <origin xyz="0 0 0" rpy="${pi / 2.0} 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius * 0.22}" length="${wheel_width + 0.012}"/>
+        </geometry>
+        <material name="robotest_sensor"/>
       </visual>
       <collision name="${side}_wheel_collision">
         <origin xyz="0 0 0" rpy="${pi / 2.0} 0 0"/>
@@ -62,11 +76,56 @@
     <link name="base_footprint"/>
 
     <link name="base_link">
-      <visual>
+      <!-- Presentation geometry is deliberately separate from the frozen
+           collision and inertial envelopes below. -->
+      <visual name="lower_chassis_visual">
+        <origin xyz="0 0 -0.015" rpy="0 0 0"/>
         <geometry>
-          <box size="${base_length} ${base_width} ${base_height}"/>
+          <box size="${base_length} ${base_width} 0.09"/>
+        </geometry>
+        <material name="robotest_navy"/>
+      </visual>
+      <visual name="upper_chassis_visual">
+        <origin xyz="-0.015 0 0.06" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.39 0.27 0.085"/>
         </geometry>
         <material name="robotest_blue"/>
+      </visual>
+      <visual name="top_deck_visual">
+        <origin xyz="-0.005 0 0.1125" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.32 0.23 0.02"/>
+        </geometry>
+        <material name="robotest_silver"/>
+      </visual>
+      <visual name="front_bumper_visual">
+        <origin xyz="0.245 0 -0.0125" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.03 0.34 0.055"/>
+        </geometry>
+        <material name="robotest_sensor"/>
+      </visual>
+      <visual name="left_headlight_visual">
+        <origin xyz="0.262 0.09 0.035" rpy="0 0 0"/>
+        <geometry>
+          <sphere radius="0.024"/>
+        </geometry>
+        <material name="robotest_light"/>
+      </visual>
+      <visual name="right_headlight_visual">
+        <origin xyz="0.262 -0.09 0.035" rpy="0 0 0"/>
+        <geometry>
+          <sphere radius="0.024"/>
+        </geometry>
+        <material name="robotest_light"/>
+      </visual>
+      <visual name="lidar_mast_visual">
+        <origin xyz="${lidar_x} 0 0.095" rpy="0 0 0"/>
+        <geometry>
+          <cylinder radius="0.047" length="0.07"/>
+        </geometry>
+        <material name="robotest_navy"/>
       </visual>
       <collision name="base_link_collision">
         <geometry>

@@ -13,4 +13,13 @@
   <material name="robotest_sensor">
     <color rgba="0.94 0.48 0.10 1.0"/>
   </material>
+  <material name="robotest_navy">
+    <color rgba="0.03 0.08 0.18 1.0"/>
+  </material>
+  <material name="robotest_silver">
+    <color rgba="0.62 0.68 0.76 1.0"/>
+  </material>
+  <material name="robotest_light">
+    <color rgba="0.86 0.95 1.0 1.0"/>
+  </material>
 </robot>

@@ -621,6 +621,69 @@ def test_world_is_local_enclosed_and_deterministic_friendly() -> None:
     assert heartbeat.find('topic') is None
 
 
+def test_portfolio_test_bay_is_visual_only_and_route_aligned() -> None:
+    root = ET.parse(PACKAGE / 'models' / 'portfolio_test_bay.sdf').getroot()
+    assert root.attrib['version'] == '1.10'
+    model = root.find('model')
+    assert model is not None and model.attrib['name'] == 'portfolio_test_bay'
+    assert model.findtext('static') == 'true'
+    assert model.findall('.//collision') == []
+    assert model.findall('.//sensor') == []
+    assert model.findall('.//plugin') == []
+    assert model.findall('.//joint') == []
+    assert model.findall('.//inertial') == []
+
+    visuals = {
+        visual.attrib['name']: visual
+        for visual in model.findall("./link[@name='visuals']/visual")
+    }
+    assert {
+        'graphite_floor',
+        'route_segment_1',
+        'route_segment_2',
+        'route_segment_3',
+        'start_pad',
+        'waypoint_1_pad',
+        'waypoint_2_pad',
+        'waypoint_3_pad',
+        'west_obstacle_cladding',
+        'east_obstacle_cladding',
+        'cylinder_obstacle_cladding',
+    } <= visuals.keys()
+
+    expected_pads = {
+        'start_pad': (0.0, -3.5),
+        'waypoint_1_pad': (-2.0, -3.5),
+        'waypoint_2_pad': (-0.2, 0.0),
+        'waypoint_3_pad': (-0.2, 3.5),
+    }
+    for name, expected_xy in expected_pads.items():
+        pose = tuple(float(value) for value in visuals[name].findtext('pose').split())
+        assert pose[:2] == expected_xy
+
+    expected_routes = {
+        'route_segment_1': ((-1.0, -3.5, 0.026, 0.0, 0.0, 0.0), (2.0, 0.085, 0.018)),
+        'route_segment_2': ((-1.1, -1.75, 0.026, 0.0, 0.0, 1.095), (3.936, 0.085, 0.018)),
+        'route_segment_3': (
+            (-0.2, 1.75, 0.026, 0.0, 0.0, 1.57079632679),
+            (3.5, 0.085, 0.018),
+        ),
+    }
+    for name, (expected_pose, expected_size) in expected_routes.items():
+        pose = tuple(float(value) for value in visuals[name].findtext('pose').split())
+        size = tuple(
+            float(value)
+            for value in visuals[name].findtext('./geometry/box/size').split()
+        )
+        assert pose == expected_pose
+        assert size == expected_size
+
+    assert tuple(
+        float(value)
+        for value in visuals['graphite_floor'].findtext('./geometry/box/size').split()
+    ) == (11.8, 11.8, 0.012)
+
+
 def test_bridge_matches_the_frozen_data_plane() -> None:
     bridges = yaml.safe_load((PACKAGE / 'config' / 'bridge.yaml').read_text(encoding='utf-8'))
     assert isinstance(bridges, list)

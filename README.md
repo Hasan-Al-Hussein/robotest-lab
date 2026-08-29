@@ -2,8 +2,9 @@
 
 # RoboTest Lab
 
-**An evidence-first, CPU-only ROS 2 lab for testing autonomous navigation,
-sensor faults, measured outcomes, and bounded recovery.**
+### ROS 2 navigation reliability testbench
+
+**Controlled sensor faults · Independent metrics · Reproducible evidence**
 
 ![ROS 2 Jazzy](https://img.shields.io/badge/ROS_2-Jazzy-22314E?style=for-the-badge&logo=ros&logoColor=white)
 ![Gazebo Harmonic](https://img.shields.io/badge/Gazebo-Harmonic-F58113?style=for-the-badge)
@@ -11,129 +12,104 @@ sensor faults, measured outcomes, and bounded recovery.**
 [![RoboTest CI](https://github.com/Hasan-Al-Hussein/robotest-lab/actions/workflows/robotest-ci.yml/badge.svg?branch=main)](https://github.com/Hasan-Al-Hussein/robotest-lab/actions/workflows/robotest-ci.yml)
 [![Apache 2.0](https://img.shields.io/badge/LICENSE-Apache_2.0-57A143?style=for-the-badge)](LICENSE)
 
-[Problem](#the-problem) · [Evidence](#evidence-at-a-glance) ·
-[Visual demo](#see-the-robot-and-sensors) · [Pipeline](docs/pipeline.md) ·
-[Demo guide](docs/demo-script.md) · [Architecture](#architecture) ·
+[Why it exists](#why-this-is-more-than-a-robot-demo) ·
+[See the lab](#genuine-gazebo-views) · [Engineering](#engineering-surface) ·
+[Pipeline](docs/pipeline.md) · [Demo guide](docs/demo-script.md) ·
 [Verification](#phase-1-verification)
 
 </div>
 
-RoboTest Lab is a software-in-the-loop test platform for a small autonomous
-differential-drive robot. It runs the robot, world, sensors, Nav2 navigation,
-fault controls, independent metrics, and recovery tooling on a laptop without
-requiring a physical robot or dedicated GPU.
+<div align="center">
+  <a href="docs/showcase/robotest-test-bay-hero.png"><img src="docs/showcase/robotest-test-bay-hero.png" width="100%" alt="RoboTest differential-drive rover in a Gazebo navigation test bay with a marked route, waypoint pads, and obstacles" /></a>
+  <br />
+  <sub>Genuine Gazebo capture. Route and waypoint markers are presentation geometry; engineering results come from logged runs, not the screenshot.</sub>
+</div>
 
-> [!IMPORTANT]
-> Phase 1 and Phase 2 are bounded development evidence. For Phase 3 through
-> Phase 5, treat the bounded **Final acceptance status** block below and its
-> linked evidence as authoritative; this overview does not promote a static or
-> visual check into runtime or release acceptance.
+RoboTest Lab is a software-in-the-loop reliability testbench for a small
+differential-drive robot. It runs a complete ROS 2 Jazzy navigation stack in
+Gazebo Harmonic, introduces controlled sensor faults at an explicit validation
+boundary, measures behavior independently, and preserves machine-readable
+evidence for every bounded result.
+
+## Why this is more than a robot demo
+
+A robot moving once proves very little. A useful test platform must also answer:
+Did the mission finish? Did sensor data remain valid? What changed during a
+dropout or drift fault? Did the process stay within resource limits? Can another
+engineer reproduce the outcome?
+
+RoboTest connects those questions to concrete engineering controls:
+
+| Reliability challenge | RoboTest response |
+| --- | --- |
+| Sensor behavior changes during a run | C++ validation and fault proxy for deterministic LiDAR dropout and planar odometry drift |
+| Navigation can appear successful while measurements are biased | Observer-only collectors for ground truth, TF, odometry, scans, plans, commands, contacts, lifecycle state, and resources |
+| A screenshot cannot prove a result | Canonical JSON/CSV, source and configuration binding, SHA-256 manifests, and bounded verifiers |
+| Robot processes fail in different ways | Go supervisor with owned process groups, bounded restart policy, systemd integration, and Debian packaging |
+
+## A run, end to end
+
+**Gazebo** simulates the robot and sensors → an allowlisted **ROS–Gazebo
+bridge** carries raw data → the **fault proxy** validates or alters sensors →
+**AMCL and Nav2** localize, plan, and control → a bounded **mission runner**
+sends ordered waypoints → independent **metrics** record the outcome →
+verification binds the result to its source and configuration.
+
+The [code-connected pipeline](docs/pipeline.md) traces every stage to its main
+source file. The [demo guide](docs/demo-script.md) provides a visual inspection,
+a moving waypoint demonstration, and the bounded development verifier.
+
+## Genuine Gazebo views
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <a href="docs/showcase/robotest-test-bay-wide.png"><img src="docs/showcase/robotest-test-bay-wide.png" width="100%" alt="Wide Gazebo view of the RoboTest navigation test bay, route, waypoint pads, divider walls, and obstacles" /></a><br />
+      <sub><strong>Test-bay context</strong> — route, waypoints, dividers, and obstacle geometry.</sub>
+    </td>
+    <td width="50%" align="center">
+      <a href="docs/showcase/robotest-rover-close.png"><img src="docs/showcase/robotest-rover-close.png" width="100%" alt="Close Gazebo view of the RoboTest differential-drive rover with wheels, bumper, headlights, and LiDAR assembly" /></a><br />
+      <sub><strong>Rover detail</strong> — Xacro model, differential drive, bumper, headlights, and LiDAR assembly.</sub>
+    </td>
+  </tr>
+</table>
+
+These are genuine simulator captures for presentation and inspection. They do
+not replace the action result, metric files, manifests, or acceptance checks.
+
+## Engineering surface
+
+| Layer | What is implemented |
+| --- | --- |
+| Simulation | Original Xacro differential-drive robot, Gazebo Harmonic world, LiDAR, IMU, odometry, contact observation, and explicit `ros_gz_bridge` allowlist |
+| Autonomy | ROS 2 Jazzy, Nav2, AMCL, TF2, lifecycle-managed startup, collision monitoring, velocity smoothing, and `FollowWaypoints` action ownership |
+| Faults and measurement | Deterministic LiDAR dropout and odometry drift; observer-only navigation, localization, path, safety, recovery, and resource metrics |
+| Runtime control | Bounded Python mission and scenario orchestration plus a Go process supervisor with process-group recovery |
+| Delivery and proof | Colcon/ament, Pytest, Ruff, Debian packaging, systemd, canonical JSON/CSV, SHA-256 manifests, and GitHub Actions gates |
+
+## Evidence at a glance
+
+| Demonstrated result | Recorded evidence | Scope |
+| --- | --- | --- |
+| Robot, sensor boundary, and headless runtime | [103-test development result](docs/results/phase-1/20260825T200725Z-1333.md) with measured real-time factor and resource use | Bounded development evidence |
+| Ordered Nav2 waypoint mission | [3/3 waypoint development result](docs/results/phase-2/20260826T010218Z-466.md), matching JSON/CSV, and independent post-run audit | Bounded seeded mission evidence |
+| Fault campaigns and metrics | LiDAR dropout, odometry drift, scenario orchestration, collection, analysis, and aggregation are implemented and statically verified | No completed 15-run campaign is claimed |
+| Recovery and packaging | Go supervision, systemd, Debian packaging, and lifecycle verification surfaces are implemented and statically verified | No privileged lifecycle acceptance is claimed |
 
 <!-- ROBOTEST_RELEASE_STATUS_START -->
 ## Final acceptance status
 
-Implementation and static verification are complete. Authoritative Phase 3
-campaign evidence, Phase 4 privileged acceptance evidence, and Phase 5 public-CI
-and release-evidence validation remain pending.
+At the last verified baseline (`14529a6`), the local and hosted non-live CI
+gates passed. The latest one-shot live smoke (`phase3-14529a6-001`) met the
+frozen real-time-factor thresholds, but navigation aborted at waypoint 1.
+
+No 15-run campaign, privileged lifecycle acceptance, or final release
+qualification is claimed.
 <!-- ROBOTEST_RELEASE_STATUS_END -->
 
-## The problem
-
-A robot can look successful in one simulation and still be difficult to trust.
-A one-off demo usually does not answer important questions: Did every waypoint
-finish? Did sensor data stay valid? What happened during a dropout? Did a
-process exceed its resource limit? Can another engineer reproduce the result?
-
-RoboTest treats autonomous navigation as a testable system, not only a moving
-model. It connects a project-owned robot and world to validation boundaries,
-repeatable missions, fault scenarios, independent measurements, bounded
-process recovery, and checksummed evidence.
-
-## What RoboTest does
-
-The lab starts a simulated robot in Gazebo, passes its raw sensors through a
-controlled validation and fault layer, lets Nav2 localize and plan, sends an
-ordered waypoint mission, and records what happened in machine-readable JSON
-and CSV artifacts. Later gates exercise sensor-fault campaigns, process
-supervision, Debian packaging, and release proof.
-
-The core rule is simple: a visual success is useful for understanding, but only
-a bounded verifier may produce an engineering result.
-
-## Evidence at a glance
-
-| Surface | Current evidence | Boundary |
-| --- | --- | --- |
-| Robot, world, and sensors | Phase 1 development run passed 103 tests with calculated real-time-factor median `0.9999` | Separate dirty-worktree development run, not release evidence |
-| Autonomous waypoint mission | Phase 2 development run reached all 3 ordered waypoints; 213 tests passed | Bounded seeded mission evidence, not full Scenario 1 acceptance |
-| Fault campaigns and metrics | LiDAR-dropout, odometry-drift, collection, analysis, and aggregation surfaces are implemented and statically verified | Runtime acceptance is controlled by the final-status block and exact 15-run evidence |
-| Recovery and packaging | Go supervisor, systemd, Debian packaging, and lifecycle acceptance surfaces are implemented and statically verified | Lifecycle acceptance is controlled by the final-status block and exact privileged evidence |
-| Public release | Local and hosted-CI gate surfaces are implemented | Release eligibility is controlled by the final-status block and exact read-only release decision |
-
-Measured Phase 1 and Phase 2 details are linked in their sections below. No
-later-phase runtime or final release result is claimed before its authoritative
-gate completes.
-
-## See the robot and sensors
-
-<div align="center">
-  <a href="docs/results/phase-1/rviz-phase1.png"><img src="docs/results/phase-1/rviz-phase1.png" width="900" alt="RViz showing the RoboTest robot model, coordinate frames, odometry, grid, and red laser scan points" /></a>
-  <br />
-  <strong><a href="docs/results/phase-1/rviz-phase1.png">Open the genuine Phase 1 RViz capture at full resolution</a></strong>
-</div>
-
-The red points are LiDAR returns from nearby geometry, not error indicators.
-The image came from a separate bounded Phase 1 development inspection. It
-confirms that the robot model, TF, validated scan, and validated odometry were
-visible together. It does not show autonomous motion and is not Phase 3
-benchmark or final release evidence.
-
-For the same two-minute visual inspection, open PowerShell and run:
-
-```powershell
-wsl.exe -d Ubuntu -- bash -lc 'cd /home/hasan/robotest-lab && scripts/run_phase1_rviz_inspection.sh'
-```
-
-RViz closes automatically after about 120 seconds. If it asks whether to save
-changes, choose **Discard**. The [demo guide](docs/demo-script.md) explains what
-to look for, how to stop safely, how to run the optional moving demonstration,
-and which command produces the bounded Phase 2 result.
-
-## End-to-end pipeline
-
-1. **Simulate:** Gazebo loads the original world, robot body, wheels, LiDAR,
-   IMU, odometry, and contact observation.
-2. **Validate:** an explicit ROS-Gazebo bridge allowlist carries raw data into
-   a C++ sensor proxy that publishes the validated sensor boundary.
-3. **Navigate:** AMCL estimates the robot pose, Nav2 plans a route, and the
-   controller sends velocity commands through smoothing and collision checks.
-4. **Execute:** a bounded Python action client sends the ordered waypoint goal
-   and records its exact terminal outcome.
-5. **Measure:** observer-only collectors calculate navigation, safety,
-   localization, path, recovery, and resource results without controlling the
-   robot.
-6. **Recover:** a Go supervisor applies bounded restart policy to owned process
-   groups and records each lifecycle decision.
-7. **Prove:** verification scripts bind source, configuration, runtime results,
-   checksums, and release status instead of treating screenshots as proof.
-
-Follow the [simple code-connected pipeline](docs/pipeline.md) for one complete
-mission example and the source file behind every stage.
-
-## What I engineered
-
-- Built the original Xacro differential-drive robot, Gazebo Harmonic world,
-  bridge allowlist, contact aggregation, and generated RViz view.
-- Designed a C++ validation and fault boundary for pass-through sensing,
-  deterministic LiDAR dropout, and planar odometry drift.
-- Integrated ROS 2 Jazzy Nav2 with a generated map, constrained behavior tree,
-  namespaced command chain, and bounded lifecycle startup.
-- Implemented a bounded `FollowWaypoints` client with action ownership,
-  timeout, cancellation, fault-control, and canonical JSON/CSV contracts.
-- Developed observer-only metrics, scenario orchestration, cold-run campaign
-  controls, resource accounting, artifact manifests, and deterministic reports.
-- Added a Go process supervisor, systemd and Debian packaging, reproducibility
-  checks, and evidence-bound local and public CI gates.
+This boundary is intentional: static or visual success is never promoted into
+a runtime or release claim. The detailed development evidence and reproducible
+commands remain below for reviewers who want to audit the result.
 
 ## Technology
 
