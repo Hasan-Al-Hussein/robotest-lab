@@ -634,8 +634,7 @@ def test_portfolio_test_bay_is_visual_only_and_route_aligned() -> None:
     assert model.findall('.//inertial') == []
 
     visuals = {
-        visual.attrib['name']: visual
-        for visual in model.findall("./link[@name='visuals']/visual")
+        visual.attrib['name']: visual for visual in model.findall("./link[@name='visuals']/visual")
     }
     assert {
         'graphite_floor',
@@ -672,15 +671,13 @@ def test_portfolio_test_bay_is_visual_only_and_route_aligned() -> None:
     for name, (expected_pose, expected_size) in expected_routes.items():
         pose = tuple(float(value) for value in visuals[name].findtext('pose').split())
         size = tuple(
-            float(value)
-            for value in visuals[name].findtext('./geometry/box/size').split()
+            float(value) for value in visuals[name].findtext('./geometry/box/size').split()
         )
         assert pose == expected_pose
         assert size == expected_size
 
     assert tuple(
-        float(value)
-        for value in visuals['graphite_floor'].findtext('./geometry/box/size').split()
+        float(value) for value in visuals['graphite_floor'].findtext('./geometry/box/size').split()
     ) == (11.8, 11.8, 0.012)
 
 
