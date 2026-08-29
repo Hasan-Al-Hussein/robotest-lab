@@ -22,6 +22,18 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from robotest_scenarios.constants import (
+    ACTOR_CLEANUP_OBSERVATION_NS,
+    ACTOR_CLEANUP_QUIET_NS,
+    DDS_DRAIN_GRACE_S,
+    DEFAULT_SERVICE_TIMEOUT_S,
+)
+from robotest_scenarios.provenance import (
+    configuration_sha256,
+    controller_configuration,
+    source_binding,
+)
+
 from robotest_metrics.artifacts import canonical_sha256
 from robotest_metrics.constants import (
     LOG_MAX_BYTES,
@@ -80,6 +92,54 @@ _SCENARIO_NAMES = {
     4: 'temporary_lidar_dropout',
     5: 'deterministic_odometry_drift',
 }
+_ACTOR_SCENARIO_IDS = frozenset({2, 3})
+_CLEANUP_FIELDS = frozenset(
+    {
+        'actor_absent',
+        'delete_attempt_count',
+        'delete_success',
+        'proof',
+        'required',
+    }
+)
+_SCENARIO_CONFIGURATION_FIELDS = frozenset(
+    {
+        'actor_asset_sha256',
+        'controller_configuration',
+        'controller_configuration_sha256',
+        'service_timeout_s',
+        'source_binding',
+        'wall_timeout_s',
+    }
+)
+_CLEANUP_PROOF_FIELDS = frozenset(
+    {
+        'kind',
+        'dds_drain_complete_steady_ns',
+        'dds_drain_grace_ns',
+        'dds_drain_spin_count',
+        'dds_drain_start_steady_ns',
+        'observation_deadline_sim_stamp_ns',
+        'pose_source_publishers_after',
+        'pose_source_publishers_before',
+        'post_delete_pose_count',
+        'post_delete_pose_first_sequence',
+        'post_delete_pose_first_sim_stamp_ns',
+        'post_delete_pose_latest_sequence',
+        'post_delete_pose_latest_sim_stamp_ns',
+        'post_delete_pose_source_heartbeat_count',
+        'post_delete_pose_source_latest_sequence',
+        'post_delete_pose_source_latest_sim_stamp_ns',
+        'quiet_restart_count',
+        'quiet_start_sim_stamp_ns',
+        'quiet_until_sim_stamp_ns',
+        'request_sequence',
+        'request_stamp_ns',
+        'response_sequence',
+        'response_stamp_ns',
+    }
+)
+_CLEANUP_PROOF_KIND = 'successful_blocking_delete_and_bounded_pose_absence'
 _S2_CRITERIA = {
     'all_segments_avoid',
     'clearance_passed',
@@ -134,6 +194,204 @@ def _sha256(value: Any, name: str) -> str:
 def _passed(value: Any, name: str) -> None:
     if value is not True:
         raise MetricUnavailable(f'{name} did not pass')
+
+
+def _validate_actor_cleanup_proof(value: Any) -> None:
+    proof = _mapping(value, 'scenario.cleanup.proof')
+    if set(proof) != _CLEANUP_PROOF_FIELDS or proof.get('kind') != _CLEANUP_PROOF_KIND:
+        raise MetricUnavailable('scenario actor cleanup proof has an invalid shape or kind')
+
+    request_sequence = require_int(
+        proof.get('request_sequence'), 'scenario.cleanup.proof.request_sequence'
+    )
+    response_sequence = require_int(
+        proof.get('response_sequence'), 'scenario.cleanup.proof.response_sequence'
+    )
+    request_stamp_ns = require_int(
+        proof.get('request_stamp_ns'), 'scenario.cleanup.proof.request_stamp_ns'
+    )
+    response_stamp_ns = require_int(
+        proof.get('response_stamp_ns'), 'scenario.cleanup.proof.response_stamp_ns'
+    )
+    observation_deadline_ns = require_int(
+        proof.get('observation_deadline_sim_stamp_ns'),
+        'scenario.cleanup.proof.observation_deadline_sim_stamp_ns',
+    )
+    quiet_start_ns = require_int(
+        proof.get('quiet_start_sim_stamp_ns'),
+        'scenario.cleanup.proof.quiet_start_sim_stamp_ns',
+    )
+    quiet_until_ns = require_int(
+        proof.get('quiet_until_sim_stamp_ns'),
+        'scenario.cleanup.proof.quiet_until_sim_stamp_ns',
+    )
+    source_latest_stamp_ns = require_int(
+        proof.get('post_delete_pose_source_latest_sim_stamp_ns'),
+        'scenario.cleanup.proof.post_delete_pose_source_latest_sim_stamp_ns',
+    )
+    source_latest_sequence = require_int(
+        proof.get('post_delete_pose_source_latest_sequence'),
+        'scenario.cleanup.proof.post_delete_pose_source_latest_sequence',
+    )
+    source_heartbeat_count = require_int(
+        proof.get('post_delete_pose_source_heartbeat_count'),
+        'scenario.cleanup.proof.post_delete_pose_source_heartbeat_count',
+    )
+    transition_count = require_int(
+        proof.get('post_delete_pose_count'),
+        'scenario.cleanup.proof.post_delete_pose_count',
+    )
+    quiet_restart_count = require_int(
+        proof.get('quiet_restart_count'),
+        'scenario.cleanup.proof.quiet_restart_count',
+    )
+    publishers_before = require_int(
+        proof.get('pose_source_publishers_before'),
+        'scenario.cleanup.proof.pose_source_publishers_before',
+    )
+    publishers_after = require_int(
+        proof.get('pose_source_publishers_after'),
+        'scenario.cleanup.proof.pose_source_publishers_after',
+    )
+    drain_grace_ns = require_int(
+        proof.get('dds_drain_grace_ns'),
+        'scenario.cleanup.proof.dds_drain_grace_ns',
+    )
+    drain_spin_count = require_int(
+        proof.get('dds_drain_spin_count'),
+        'scenario.cleanup.proof.dds_drain_spin_count',
+    )
+    drain_start_ns = require_int(
+        proof.get('dds_drain_start_steady_ns'),
+        'scenario.cleanup.proof.dds_drain_start_steady_ns',
+    )
+    drain_complete_ns = require_int(
+        proof.get('dds_drain_complete_steady_ns'),
+        'scenario.cleanup.proof.dds_drain_complete_steady_ns',
+    )
+    expected_drain_grace_ns = round(DDS_DRAIN_GRACE_S * 1_000_000_000)
+    if (
+        request_sequence < 1
+        or response_sequence <= request_sequence
+        or request_stamp_ns < 0
+        or response_stamp_ns < request_stamp_ns
+        or observation_deadline_ns != response_stamp_ns + ACTOR_CLEANUP_OBSERVATION_NS
+        or quiet_start_ns <= response_stamp_ns
+        or quiet_until_ns != quiet_start_ns + ACTOR_CLEANUP_QUIET_NS
+        or quiet_until_ns > observation_deadline_ns
+        or source_latest_stamp_ns < quiet_until_ns
+        or source_heartbeat_count < 2
+        or source_latest_sequence <= response_sequence
+        or source_latest_sequence - response_sequence != source_heartbeat_count + transition_count
+        or transition_count < 0
+        or quiet_restart_count < 0
+        or quiet_restart_count > transition_count
+        or publishers_before < 1
+        or publishers_after < 1
+        or drain_grace_ns != expected_drain_grace_ns
+        or drain_spin_count < 1
+        or drain_start_ns < 1
+        or drain_complete_ns - drain_start_ns < drain_grace_ns
+    ):
+        raise MetricUnavailable('scenario actor cleanup proof does not reconcile')
+
+    transition_fields = (
+        proof.get('post_delete_pose_first_sequence'),
+        proof.get('post_delete_pose_first_sim_stamp_ns'),
+        proof.get('post_delete_pose_latest_sequence'),
+        proof.get('post_delete_pose_latest_sim_stamp_ns'),
+    )
+    if transition_count == 0:
+        if any(field is not None for field in transition_fields):
+            raise MetricUnavailable('scenario cleanup transition fields must be null at zero count')
+        return
+
+    first_sequence = require_int(
+        transition_fields[0], 'scenario.cleanup.proof.post_delete_pose_first_sequence'
+    )
+    first_stamp_ns = require_int(
+        transition_fields[1], 'scenario.cleanup.proof.post_delete_pose_first_sim_stamp_ns'
+    )
+    latest_sequence = require_int(
+        transition_fields[2], 'scenario.cleanup.proof.post_delete_pose_latest_sequence'
+    )
+    latest_stamp_ns = require_int(
+        transition_fields[3], 'scenario.cleanup.proof.post_delete_pose_latest_sim_stamp_ns'
+    )
+    if (
+        first_sequence <= response_sequence
+        or latest_sequence < first_sequence
+        or latest_sequence - first_sequence < transition_count - 1
+        or source_latest_sequence <= latest_sequence
+        or first_stamp_ns < 1
+        or latest_stamp_ns < first_stamp_ns
+        or latest_stamp_ns >= quiet_start_ns
+    ):
+        raise MetricUnavailable('scenario cleanup transition evidence does not reconcile')
+
+
+def _validate_scenario_cleanup(value: Any, scenario_id: int) -> Mapping[str, Any]:
+    cleanup = _mapping(value, 'scenario.result.cleanup')
+    if set(cleanup) != _CLEANUP_FIELDS:
+        raise MetricUnavailable('scenario cleanup has an invalid shape')
+    if scenario_id not in _ACTOR_SCENARIO_IDS:
+        proof = _mapping(cleanup.get('proof'), 'scenario.cleanup.proof')
+        if (
+            cleanup.get('actor_absent') is not True
+            or cleanup.get('delete_attempt_count') != 0
+            or cleanup.get('delete_success') is not None
+            or cleanup.get('required') is not False
+            or dict(proof) != {'kind': 'scenario_declares_no_actor'}
+        ):
+            raise MetricUnavailable('actorless scenario cleanup evidence is invalid')
+        return cleanup
+    if (
+        cleanup.get('actor_absent') is not True
+        or cleanup.get('delete_attempt_count') != 1
+        or cleanup.get('delete_success') is not True
+        or cleanup.get('required') is not True
+    ):
+        raise MetricUnavailable('scenario actor cleanup did not succeed')
+    _validate_actor_cleanup_proof(cleanup.get('proof'))
+    return cleanup
+
+
+def _validate_scenario_configuration(value: Any) -> Mapping[str, Any]:
+    configuration = _mapping(value, 'scenario.result.configuration')
+    if set(configuration) != _SCENARIO_CONFIGURATION_FIELDS:
+        raise MetricUnavailable('scenario configuration has an invalid shape')
+    observed_controller = _mapping(
+        configuration.get('controller_configuration'),
+        'scenario.configuration.controller_configuration',
+    )
+    observed_source_binding = _mapping(
+        configuration.get('source_binding'),
+        'scenario.configuration.source_binding',
+    )
+    if (
+        dict(observed_controller) != controller_configuration()
+        or _sha256(
+            configuration.get('controller_configuration_sha256'),
+            'scenario.configuration.controller_configuration_sha256',
+        )
+        != configuration_sha256()
+        or dict(observed_source_binding) != source_binding()
+        or require_finite(
+            configuration.get('service_timeout_s'),
+            'scenario.configuration.service_timeout_s',
+        )
+        != DEFAULT_SERVICE_TIMEOUT_S
+        or require_finite(
+            configuration.get('wall_timeout_s'),
+            'scenario.configuration.wall_timeout_s',
+        )
+        != 300.0
+    ):
+        raise MetricUnavailable('scenario configuration does not match the frozen source policy')
+    actor_asset_sha256 = configuration.get('actor_asset_sha256')
+    if actor_asset_sha256 is not None:
+        _sha256(actor_asset_sha256, 'scenario.configuration.actor_asset_sha256')
+    return configuration
 
 
 def _finite_equal(value: Any, expected: float, name: str, *, tolerance: float = 1e-12) -> None:
@@ -561,6 +819,7 @@ def validate_scenario_component(
     _match_identity(component_identity, identity, 'scenario')
     if component_identity.get('scenario_name') != identity.get('scenario_name'):
         raise MetricUnavailable('scenario component name mismatch')
+    configuration = _validate_scenario_configuration(result.get('configuration'))
     binding = _mapping(result.get('binding'), 'scenario.result.binding')
     if binding.get('goal_uuid') != mission_measurements.get('accepted_goal_uuid'):
         raise MetricUnavailable('scenario goal UUID does not match mission')
@@ -594,15 +853,41 @@ def validate_scenario_component(
             raise MetricUnavailable(f'scenario buffer {name} is not complete')
         if buffer.get('overflow_count') != 0 or buffer.get('invalid_count') != 0:
             raise MetricUnavailable(f'scenario buffer {name} has invalid/overflow evidence')
-    cleanup = _mapping(result.get('cleanup'), 'scenario.result.cleanup')
-    _passed(cleanup.get('actor_absent'), 'scenario.cleanup.actor_absent')
-    if cleanup.get('required') is True and cleanup.get('delete_success') is not True:
-        raise MetricUnavailable('scenario actor cleanup did not succeed')
-    interaction = _mapping(result.get('interaction'), 'scenario.result.interaction')
     scenario_id = require_int(identity.get('scenario_id'), 'identity.scenario_id')
+    cleanup = _validate_scenario_cleanup(result.get('cleanup'), scenario_id)
+    if scenario_id in _ACTOR_SCENARIO_IDS:
+        terminal_sequence = require_int(
+            binding.get('terminal_observed_sequence'),
+            'scenario.result.binding.terminal_observed_sequence',
+        )
+        terminal_stamp_ns = require_int(
+            binding.get('terminal_observed_stamp_ns'),
+            'scenario.result.binding.terminal_observed_stamp_ns',
+        )
+        cleanup_proof = _mapping(cleanup.get('proof'), 'scenario.cleanup.proof')
+        if (
+            require_int(
+                cleanup_proof.get('request_sequence'),
+                'scenario.cleanup.proof.request_sequence',
+            )
+            <= terminal_sequence
+            or require_int(
+                cleanup_proof.get('request_stamp_ns'),
+                'scenario.cleanup.proof.request_stamp_ns',
+            )
+            < terminal_stamp_ns
+        ):
+            raise MetricUnavailable('scenario actor cleanup did not follow terminal observation')
+    interaction = _mapping(result.get('interaction'), 'scenario.result.interaction')
     expected_kind = {2: 'static_obstacle', 3: 'pose_controlled_obstacle'}.get(scenario_id, 'none')
     if interaction.get('kind') != expected_kind:
         raise MetricUnavailable('scenario interaction kind does not match scenario')
+    if scenario_id in _ACTOR_SCENARIO_IDS:
+        actor = _mapping(interaction.get('actor'), 'scenario.interaction.actor')
+        if configuration.get('actor_asset_sha256') != actor.get('asset_sha256'):
+            raise MetricUnavailable('scenario actor asset configuration does not match evidence')
+    elif configuration.get('actor_asset_sha256') is not None:
+        raise MetricUnavailable('actorless scenario configuration names an actor asset')
     metrics_validation: dict[str, Any] = {}
     if scenario_id == 2:
         _scenario2_proof(interaction, mission_measurements)

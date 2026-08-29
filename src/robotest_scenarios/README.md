@@ -77,6 +77,15 @@ cleanup, so preparation, the one non-idempotent spawn response, and every
 pre-arm or motion wait stop at the precomputed 25 s operational boundary.
 READY, ARM, ARMED, and cleanup never reset either bound.
 
+Both cleanup paths call the blocking Gazebo remove bridge, then require a
+permanent ground-plane heartbeat newer than the response and all delivered
+target poses in source-time and collector-sequence order. Every target callback
+after the response is retained even when its source stamp is older. A target
+delivered during the 0.25 s simulation-time quiet interval or frozen 50 ms
+steady-wall DDS drain restarts observation from a later heartbeat. Activity
+must converge within the one-second simulation-time deadline. This is bounded
+observation across distinct writers, not a causal absence assertion.
+
 Both executables use relative RoboTest names under their launch namespace.
 The standardized Gazebo `/clock` topic is the single global-name exception.
 Artifacts are canonical UTF-8 JSON written atomically with a sibling

@@ -36,6 +36,7 @@ def file_sha256(path: Path) -> str:
 def controller_configuration() -> dict[str, object]:
     """Return every scenario policy literal used outside the input document."""
     return {
+        'actor_cleanup_observation_ns': constants.ACTOR_CLEANUP_OBSERVATION_NS,
         'actor_cleanup_quiet_ns': constants.ACTOR_CLEANUP_QUIET_NS,
         'actor_initial_position_tolerance_m': (constants.ACTOR_INITIAL_POSITION_TOLERANCE_M),
         'actor_observation_latency_ns': constants.ACTOR_OBSERVATION_LATENCY_NS,
@@ -51,6 +52,7 @@ def controller_configuration() -> dict[str, object]:
         },
         'ground_truth_alignment_ns': constants.GROUND_TRUTH_ALIGNMENT_NS,
         'dds_drain_grace_s': constants.DDS_DRAIN_GRACE_S,
+        'delete_service_mode': constants.DELETE_SERVICE_MODE,
         'names': {
             'action': constants.ACTION_NAME,
             'cancel_service': constants.ACTION_CANCEL_SERVICE,
@@ -141,6 +143,7 @@ def contact_control_arm_protocol_sha256() -> str:
 def contact_control_configuration() -> dict[str, object]:
     """Return every frozen policy literal used by the positive-control driver."""
     return {
+        'actor_cleanup_observation_ns': constants.ACTOR_CLEANUP_OBSERVATION_NS,
         'arm_protocol': contact_control_arm_protocol(),
         'capacities': {
             'actor_state': constants.ACTOR_STATE_CAPACITY,
@@ -152,6 +155,7 @@ def contact_control_configuration() -> dict[str, object]:
         'cleanup_reserve_s': constants.CONTROL_CLEANUP_RESERVE_S,
         'contact_deadline_ns': constants.CONTROL_CONTACT_DEADLINE_NS,
         'dds_drain_grace_s': constants.DDS_DRAIN_GRACE_S,
+        'delete_service_mode': constants.DELETE_SERVICE_MODE,
         'contact_release_gap_ns': constants.CONTACT_RELEASE_GAP_NS,
         'forward_mps': constants.CONTROL_FORWARD_MPS,
         'hold_ns': constants.CONTROL_HOLD_NS,

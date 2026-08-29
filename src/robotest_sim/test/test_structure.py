@@ -717,6 +717,7 @@ def test_launch_uses_context_safe_headless_logic_and_all_core_stages() -> None:
         'ros_gz_interfaces/srv/SpawnEntity',
         'ros_gz_interfaces/srv/SetEntityPose',
         'ros_gz_interfaces/srv/DeleteEntity',
+        '/world/robotest_lab/remove/blocking',
         'scenario/spawn_entity',
         'scenario/set_entity_pose',
         'scenario/delete_entity',
@@ -731,6 +732,8 @@ def test_launch_uses_context_safe_headless_logic_and_all_core_stages() -> None:
         'rviz2',
     ):
         assert token in text
+    assert "'/world/robotest_lab/remove@ros_gz_interfaces/srv/DeleteEntity'" not in text
+    assert "('/world/robotest_lab/remove', 'scenario/delete_entity')" not in text
     string_constants = {
         node.targets[0].id: node.value.value
         for node in tree.body

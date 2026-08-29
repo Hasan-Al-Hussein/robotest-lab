@@ -169,6 +169,16 @@ final clock-bracket checks remain unchanged.
 | P3-07 Suite independence, resources, and cleanup | Orchestrator ledger, source/install binding, canonical profiled-smoke prerequisite, per-run process/resource probes, exact ordered run IDs, and post-run process/graph audit | Clean commit; the source-bound profiler and smoke both PASS before campaign mutation; exactly 15 immutable runs execute in order with unique domains/partitions/PGIDs; reset confirmed; retries zero; every run meets affinity/RSS/RTF/isolation/integrity gates; no survivor or reused state | Missing/failed/rebound profile or smoke, dirty source, replacement attempt, warm state, resource miss, validation leak, orphan, checksum, or provenance mismatch | Preserve the failed evidence and suite; clean only owned processes; fix/commit and restart qualification before all 15 candidate runs |
 | P3-08 Report integrity | Regenerate JSON/CSV/Markdown/HTML/PNG and aggregate tables from canonical run JSON, then verify hashes and caps | Sole per-run verdict and every displayed number resolve to source JSON/run ID; nearest-rank aggregation, target/measurement separation, byte caps, and full 3/3 denominators pass | Hand-entered/untraceable number, dropped failure, default percentile, JSON/CSV mismatch, cap overrun, or hash mismatch | Delete and regenerate only derived artifacts from preserved canonical data; never edit benchmark values manually |
 
+P3-03 cleanup also checks the blocking Gazebo delete boundary explicitly: a
+ground-plane heartbeat newer than the response and every delivered target in
+source-time and collector-sequence order starts the unchanged 0.25 s quiet
+interval. All post-response target deliveries remain retained. Any delivery
+during quiet or the frozen 50 ms steady-wall DDS drain restarts observation
+from a later heartbeat, and activity must converge before the one-second
+simulation-time deadline. This is bounded observation rather than a causal DDS
+barrier. An asynchronous binding, missing sequence watermark, exhausted
+deadline, incomplete drain, or clock-only absence claim is a cleanup failure.
+
 ## Phase 4 — supervision, service, and package
 
 Non-mutating preflight only (never a Phase 4 release verdict):

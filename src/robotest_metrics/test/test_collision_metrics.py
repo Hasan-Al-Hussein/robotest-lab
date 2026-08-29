@@ -95,6 +95,96 @@ def test_positive_control_is_hash_bound_and_must_pass() -> None:
         validate_collision_qualification(manifest, failed, binding)
 
 
+def test_positive_control_accepts_terminal_pose_before_cleanup_heartbeat_anchor() -> None:
+    manifest, positive, binding = collision_fixture()
+    proof = positive['cleanup']['proof']
+    proof.update(
+        {
+            'post_delete_pose_count': 1,
+            'post_delete_pose_first_sequence': 34,
+            'post_delete_pose_first_sim_stamp_ns': 2_780_000_000,
+            'post_delete_pose_latest_sequence': 34,
+            'post_delete_pose_latest_sim_stamp_ns': 2_780_000_000,
+            'post_delete_pose_source_latest_sequence': 36,
+        }
+    )
+    _rebind_positive_control(positive, binding)
+
+    assert validate_collision_qualification(manifest, positive, binding)['status'] == 'PASS'
+
+
+@pytest.mark.parametrize(
+    'mutation',
+    [
+        lambda proof: proof.update(
+            {
+                'post_delete_pose_count': 1,
+                'post_delete_pose_first_sequence': 34,
+                'post_delete_pose_first_sim_stamp_ns': 2_800_000_000,
+                'post_delete_pose_latest_sequence': 34,
+                'post_delete_pose_latest_sim_stamp_ns': (proof['quiet_start_sim_stamp_ns'] + 1),
+            }
+        ),
+        lambda proof: proof.update(
+            {
+                'post_delete_pose_count': 1,
+                'post_delete_pose_first_sequence': 34,
+                'post_delete_pose_first_sim_stamp_ns': proof['quiet_start_sim_stamp_ns'],
+                'post_delete_pose_latest_sequence': 34,
+                'post_delete_pose_latest_sim_stamp_ns': proof['quiet_start_sim_stamp_ns'],
+                'post_delete_pose_source_latest_sequence': 36,
+            }
+        ),
+        lambda proof: proof.__setitem__('post_delete_pose_first_sequence', 34),
+        lambda proof: proof.update(
+            {
+                'post_delete_pose_count': 1,
+                'post_delete_pose_first_sequence': 34,
+                'post_delete_pose_first_sim_stamp_ns': 2_780_000_000,
+                'post_delete_pose_latest_sequence': 34,
+                'post_delete_pose_latest_sim_stamp_ns': 2_780_000_000,
+                'post_delete_pose_source_latest_sequence': 35,
+            }
+        ),
+    ],
+)
+def test_positive_control_cleanup_transition_proof_fails_closed(mutation: Any) -> None:
+    manifest, positive, binding = collision_fixture()
+    mutation(positive['cleanup']['proof'])
+    _rebind_positive_control(positive, binding)
+
+    with pytest.raises(MetricUnavailable, match='cleanup proof'):
+        validate_collision_qualification(manifest, positive, binding)
+
+
+@pytest.mark.parametrize(
+    'mutation',
+    [
+        lambda proof: proof.__setitem__('dds_drain_spin_count', 0),
+        lambda proof: proof.__setitem__(
+            'dds_drain_complete_steady_ns',
+            proof['dds_drain_start_steady_ns'] + proof['dds_drain_grace_ns'] - 1,
+        ),
+        lambda proof: proof.__setitem__('dds_drain_grace_ns', 49_999_999),
+        lambda proof: proof.__setitem__(
+            'observation_deadline_sim_stamp_ns',
+            proof['observation_deadline_sim_stamp_ns'] - 1,
+        ),
+        lambda proof: proof.__setitem__('post_delete_pose_source_heartbeat_count', 1),
+        lambda proof: proof.__setitem__('post_delete_pose_source_latest_sequence', 34),
+        lambda proof: proof.__setitem__('post_delete_pose_source_latest_sequence', 36),
+        lambda proof: proof.__setitem__('quiet_restart_count', 1),
+    ],
+)
+def test_positive_control_cleanup_drain_proof_fails_closed(mutation: Any) -> None:
+    manifest, positive, binding = collision_fixture()
+    mutation(positive['cleanup']['proof'])
+    _rebind_positive_control(positive, binding)
+
+    with pytest.raises(MetricUnavailable, match='cleanup proof'):
+        validate_collision_qualification(manifest, positive, binding)
+
+
 def test_positive_control_precontrol_callback_skew_is_diagnostic() -> None:
     manifest, positive, binding = collision_fixture()
     snapshots = positive['control']['contact']['snapshots']
@@ -613,6 +703,18 @@ def test_positive_control_default_wall_asset_ignores_evidence_path_redirection(
                 'control_configuration', {}
             ),
             'driver control configuration',
+        ),
+        (
+            lambda positive, _manifest: positive['configuration'].__setitem__(
+                'service_timeout_s', 29.0
+            ),
+            'service timeout',
+        ),
+        (
+            lambda positive, _manifest: positive['configuration'].__setitem__(
+                'wall_timeout_s', 29.0
+            ),
+            'wall timeout',
         ),
         (
             lambda positive, _manifest: positive['configuration'].__setitem__(

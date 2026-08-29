@@ -368,7 +368,7 @@ namespace and exposes the following ROS interfaces:
 | --- | --- | --- |
 | `scenario/spawn_entity` | `ros_gz_interfaces/srv/SpawnEntity` | One-shot Scenario 2 insertion and pre-goal actor creation |
 | `scenario/set_entity_pose` | `ros_gz_interfaces/srv/SetEntityPose` | Scenario 3 pose control |
-| `scenario/delete_entity` | `ros_gz_interfaces/srv/DeleteEntity` | Bounded cleanup |
+| `scenario/delete_entity` | `ros_gz_interfaces/srv/DeleteEntity` | Blocking Gazebo remove plus bounded source-spanned cleanup |
 | `validation/scenario_entity_poses` | `tf2_msgs/msg/TFMessage` | Observed Gazebo world poses only |
 
 The scenario controller calls service names relative to its namespace; it does
@@ -377,10 +377,16 @@ VOLATILE, KEEP_LAST(10), contains observed Gazebo state rather than echoed
 targets, and must have no subscriber in Nav2, AMCL, the mission runner, the
 fault proxy data path, or the command chain. It is never published on `/tf` or
 `/tf_static`. A permanent 10 Hz `ground_plane` PosePublisher is merged into the
-same stream. After an actor's successful delete response, that heartbeat must
-span the full 0.25 s simulation-time quiet interval while no target-actor pose
-is observed; `/clock` alone is not accepted as proof that the pose path stayed
-live.
+same stream. The ROS service bridges Gazebo's blocking remove endpoint. Its
+response proves that the removal command ran, not that end-of-step removal and
+pose delivery are already complete. A ground-plane heartbeat must be newer in
+both source time and collector sequence than the response and all target poses
+delivered so far before it starts a quiet window. Any subsequently delivered
+target callback restarts the 0.25 s simulation-time interval from a later
+heartbeat, including during the frozen 50 ms steady-wall DDS drain. Repeated
+activity must converge within a one-second simulation-time observation
+deadline. This is an explicit bounded observation across distinct DDS writers,
+not a causal barrier; `/clock` alone is never accepted as pose-path liveness.
 
 Spawn/set/delete availability and response waits are steady-wall bounded.
 Entity names are unique within a trial, exact, and never repaired by suffixing
@@ -473,6 +479,19 @@ zero-probe waits, motion, release, and cleanup. The runner's READY wait is
 `35 s`, outside the complete fixture bound but inside the driver's `45 s`
 process wrapper, so it cannot terminate bounded cleanup first. READY, ARM, and
 ARMED do not start or reset any deadline.
+
+The cleanup anchor was corrected after the consumed
+`phase3-diag-70ed41d-dds-p1-default` control exposed one terminal wall pose
+after an otherwise successful asynchronous remove response. That diagnostic
+remains FAIL and was not retried; its UDP arm was never started. Gazebo removal
+is queued and processed at a simulation-step boundary, so response time was not
+a valid absence boundary. The corrected blocking-service plus sequence-bound
+heartbeat observation retains the same exactly-once deletion, 0.25 s quiet
+duration, source-liveness requirement, and fail-closed behavior. Every
+post-response target callback is retained; a delivery after quiet starts
+restarts the window and bounded DDS drain, up to the hard observation deadline.
+This does not claim cross-writer causality and does not relax a mission,
+collision, timing, or RTF threshold.
 
 The retained start sample may predate spawn. Its alignment error reconstructs
 the clock at start verification and must satisfy

@@ -2057,10 +2057,24 @@ def test_source_install_correspondence_requires_matching_runtime_bytes(
     installed_module.parent.mkdir(parents=True, exist_ok=True)
     module.write_text('VALUE = 1\n', encoding='utf-8')
     installed_module.write_bytes(module.read_bytes())
+    model = tmp_path / 'src/robotest_sim/models/phase3_static_obstacle/model.sdf'
+    installed_model = (
+        tmp_path
+        / 'install/robotest_sim/share/robotest_sim/models/'
+        / 'phase3_static_obstacle/model.sdf'
+    )
+    model.parent.mkdir(parents=True, exist_ok=True)
+    installed_model.parent.mkdir(parents=True, exist_ok=True)
+    model.write_text('<sdf version="1.10"/>\n', encoding='utf-8')
+    installed_model.write_bytes(model.read_bytes())
     result = orchestration.source_install_correspondence(tmp_path)
     assert result['all_match'] is True
-    assert result['file_count'] == len(orchestration.RUNTIME_PACKAGES) + 1
-    installed_module.write_text('VALUE = 2\n', encoding='utf-8')
+    assert result['file_count'] == len(orchestration.RUNTIME_PACKAGES) + 2
+    assert any(
+        record['source_path'] == 'src/robotest_sim/models/phase3_static_obstacle/model.sdf'
+        for record in result['records']
+    )
+    installed_model.write_text('<sdf version="1.9"/>\n', encoding='utf-8')
     with pytest.raises(orchestration.EvidenceError):
         orchestration.source_install_correspondence(tmp_path)
 

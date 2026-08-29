@@ -390,6 +390,23 @@ satisfy
 It is not required to equal the later first-control stamp because READY and ARM
 occur between preparation and motion.
 
+Cleanup bridges the blocking Gazebo remove service, but it does not treat that
+service response as proof of immediate absence: Gazebo still processes the
+removal at the end of the simulation step. A permanent ground-plane pose
+heartbeat whose source stamp is strictly newer than the response and whose
+collector sequence is later than every delivered wall pose starts a bounded
+observation window. Every wall-pose callback delivered after the response is
+tracked by collector sequence even when its source stamp predates the response.
+Any target callback delivered after a window starts restarts the unchanged
+0.25 s simulation-time quiet interval from a later heartbeat; repeated activity
+must converge before the frozen one-second simulation-time observation
+deadline. Since heartbeat and target poses have distinct DDS writers, the
+executor also drains callbacks for the frozen 50 ms steady-wall DDS grace after
+the quiet interval. A target callback during that drain restarts the window.
+This is a bounded observation, not a cross-writer causal barrier. The response,
+deadline, restart count, heartbeat sequence, quiet end, drain timing/spin count,
+and transition first/latest sequence and source stamps are all reconciled.
+
 Actuator-facing `cmd_vel` endpoints remain RELIABLE, VOLATILE, and
 KEEP_LAST(1). The independent metrics observer alone uses a bounded
 KEEP_LAST(4096) reader history equal to its retained command capacity, so a

@@ -196,11 +196,18 @@ Pass criteria for every trial:
 Moving the obstacle before the initial path, changing the map to include it, or
 counting repeated publication of the same path is failure.
 
-Actor cleanup is source-spanned: after the exact successful delete response,
-the permanent 10 Hz `ground_plane` pose heartbeat must advance through a
-0.25 s simulation-time quiet interval with no further target-actor pose. A
-delete response plus `/clock` advancement without that pose-path heartbeat is
-incomplete evidence.
+Actor cleanup is source-spanned and uses Gazebo's blocking remove endpoint.
+Because even a blocking response can precede end-of-step removal, a permanent
+10 Hz `ground_plane` heartbeat must be newer than the response and every target
+pose observed so far in both source-time and collector-sequence order before a
+quiet window starts. All target callbacks delivered after the response are
+accounted even if their source stamp predates it. A target delivered during the
+0.25 s simulation-time quiet interval or the frozen 50 ms steady-wall DDS drain
+restarts observation from a later heartbeat. Activity that does not converge
+within the one-second simulation-time deadline fails. This is bounded
+cross-writer observation, not a causal barrier; a response plus `/clock`
+advancement without pose-path heartbeat, sequence, quiet, and drain evidence is
+incomplete.
 
 ## Scenario 3 — Deterministic dynamic obstacle
 

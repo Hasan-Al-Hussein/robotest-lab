@@ -367,10 +367,108 @@
           }
         }
       },
-      "else": {"properties": {"verdict": {"properties": {"exit_code": {"enum": [20, 21, 22, 23, 24]}}}}}
+      "else": {
+        "properties": {
+          "verdict": {"properties": {"exit_code": {"enum": [20, 21, 22, 23, 24]}}},
+          "cleanup": {
+            "properties": {
+              "proof": {
+                "oneOf": [
+                  {"$ref": "#/$defs/simpleCleanupFailureProof"},
+                  {"$ref": "#/$defs/deleteTransactionProof"},
+                  {"$ref": "#/$defs/pendingCleanupProof"},
+                  {"$ref": "#/$defs/cleanupProof"}
+                ]
+              }
+            }
+          }
+        }
+      }
     }
   ],
   "$defs": {
+    "simpleCleanupFailureProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "spawn_not_committed",
+            "spawn_request_send_attempted_cleanup_pending",
+            "spawn_request_sent_cleanup_pending"
+          ]
+        }
+      }
+    },
+    "deleteTransactionProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "error", "failure_stage", "kind", "request_sequence",
+        "request_stamp_ns", "response_sequence", "response_stamp_ns"
+      ],
+      "properties": {
+        "error": {"type": ["string", "null"], "maxLength": 4096},
+        "failure_stage": {
+          "type": ["string", "null"],
+          "enum": [null, "service_wait", "request_send", "response_wait", "response_timeout", "response_future", "response_null", "response_rejected"]
+        },
+        "kind": {
+          "enum": ["delete_request_pending", "delete_transaction_failed", "delete_response_did_not_prove_absence"]
+        },
+        "request_sequence": {"type": ["integer", "null"], "minimum": 1},
+        "request_stamp_ns": {"type": ["integer", "null"], "minimum": 0},
+        "response_sequence": {"type": ["integer", "null"], "minimum": 1},
+        "response_stamp_ns": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "pendingCleanupProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "dds_drain_complete_steady_ns", "dds_drain_grace_ns",
+        "dds_drain_spin_count", "dds_drain_start_steady_ns",
+        "observation_deadline_sim_stamp_ns", "pose_source_publishers_before",
+        "post_delete_pose_count", "post_delete_pose_first_sequence",
+        "post_delete_pose_first_sim_stamp_ns", "post_delete_pose_latest_sequence",
+        "post_delete_pose_latest_sim_stamp_ns", "post_delete_pose_source_heartbeat_count",
+        "post_delete_pose_source_latest_sequence",
+        "post_delete_pose_source_latest_sim_stamp_ns", "quiet_restart_count",
+        "quiet_start_sim_stamp_ns", "quiet_until_sim_stamp_ns", "request_sequence",
+        "request_stamp_ns", "response_sequence", "response_stamp_ns"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "successful_blocking_delete_response_cleanup_anchor_pending",
+            "successful_blocking_delete_response_cleanup_quiet_pending",
+            "successful_blocking_delete_response_cleanup_drain_pending"
+          ]
+        },
+        "dds_drain_complete_steady_ns": {"type": ["integer", "null"], "minimum": 1},
+        "dds_drain_grace_ns": {"const": 50000000},
+        "dds_drain_spin_count": {"type": "integer", "minimum": 0},
+        "dds_drain_start_steady_ns": {"type": ["integer", "null"], "minimum": 1},
+        "observation_deadline_sim_stamp_ns": {"type": "integer", "minimum": 1},
+        "pose_source_publishers_before": {"type": "integer", "minimum": 0},
+        "post_delete_pose_count": {"type": "integer", "minimum": 0},
+        "post_delete_pose_first_sequence": {"type": ["integer", "null"], "minimum": 1},
+        "post_delete_pose_first_sim_stamp_ns": {"type": ["integer", "null"], "minimum": 1},
+        "post_delete_pose_latest_sequence": {"type": ["integer", "null"], "minimum": 1},
+        "post_delete_pose_latest_sim_stamp_ns": {"type": ["integer", "null"], "minimum": 1},
+        "post_delete_pose_source_heartbeat_count": {"type": "integer", "minimum": 0},
+        "post_delete_pose_source_latest_sequence": {"type": ["integer", "null"], "minimum": 1},
+        "post_delete_pose_source_latest_sim_stamp_ns": {"type": ["integer", "null"], "minimum": 1},
+        "quiet_restart_count": {"type": "integer", "minimum": 0},
+        "quiet_start_sim_stamp_ns": {"type": ["integer", "null"], "minimum": 1},
+        "quiet_until_sim_stamp_ns": {"type": ["integer", "null"], "minimum": 1},
+        "request_sequence": {"type": "integer", "minimum": 1},
+        "request_stamp_ns": {"type": "integer", "minimum": 0},
+        "response_sequence": {"type": "integer", "minimum": 1},
+        "response_stamp_ns": {"type": "integer", "minimum": 0}
+      }
+    },
     "armRequest": {
       "type": "object",
       "additionalProperties": false,
@@ -477,18 +575,36 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "kind", "pose_source_publishers_after", "pose_source_publishers_before",
-        "post_delete_pose_count", "post_delete_pose_source_heartbeat_count",
-        "post_delete_pose_source_latest_sim_stamp_ns", "quiet_until_sim_stamp_ns",
-        "request_sequence", "request_stamp_ns", "response_sequence", "response_stamp_ns"
+        "kind", "dds_drain_complete_steady_ns", "dds_drain_grace_ns",
+        "dds_drain_spin_count", "dds_drain_start_steady_ns", "observation_deadline_sim_stamp_ns",
+        "pose_source_publishers_after", "pose_source_publishers_before",
+        "post_delete_pose_count", "post_delete_pose_first_sequence",
+        "post_delete_pose_first_sim_stamp_ns", "post_delete_pose_latest_sequence",
+        "post_delete_pose_latest_sim_stamp_ns", "post_delete_pose_source_heartbeat_count",
+        "post_delete_pose_source_latest_sequence",
+        "post_delete_pose_source_latest_sim_stamp_ns", "quiet_restart_count",
+        "quiet_until_sim_stamp_ns", "quiet_start_sim_stamp_ns", "request_sequence", "request_stamp_ns",
+        "response_sequence", "response_stamp_ns"
       ],
       "properties": {
-        "kind": {"const": "successful_delete_response_and_pose_quiet_interval"},
+        "kind": {"const": "successful_blocking_delete_and_bounded_pose_absence"},
+        "dds_drain_complete_steady_ns": {"type": "integer", "minimum": 1},
+        "dds_drain_grace_ns": {"const": 50000000},
+        "dds_drain_spin_count": {"type": "integer", "minimum": 1},
+        "dds_drain_start_steady_ns": {"type": "integer", "minimum": 1},
+        "observation_deadline_sim_stamp_ns": {"type": "integer", "minimum": 1},
         "pose_source_publishers_after": {"type": "integer", "minimum": 1},
         "pose_source_publishers_before": {"type": "integer", "minimum": 1},
-        "post_delete_pose_count": {"const": 0},
-        "post_delete_pose_source_heartbeat_count": {"type": "integer", "minimum": 1},
+        "post_delete_pose_count": {"type": "integer", "minimum": 0},
+        "post_delete_pose_first_sequence": {"type": ["integer", "null"], "minimum": 1},
+        "post_delete_pose_first_sim_stamp_ns": {"type": ["integer", "null"], "minimum": 1},
+        "post_delete_pose_latest_sequence": {"type": ["integer", "null"], "minimum": 1},
+        "post_delete_pose_latest_sim_stamp_ns": {"type": ["integer", "null"], "minimum": 1},
+        "post_delete_pose_source_heartbeat_count": {"type": "integer", "minimum": 2},
+        "post_delete_pose_source_latest_sequence": {"type": "integer", "minimum": 1},
         "post_delete_pose_source_latest_sim_stamp_ns": {"type": "integer", "minimum": 1},
+        "quiet_restart_count": {"type": "integer", "minimum": 0},
+        "quiet_start_sim_stamp_ns": {"type": "integer", "minimum": 1},
         "quiet_until_sim_stamp_ns": {"type": "integer", "minimum": 1},
         "request_sequence": {"type": "integer", "minimum": 1},
         "request_stamp_ns": {"type": "integer", "minimum": 0},

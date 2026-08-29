@@ -60,6 +60,7 @@ from robotest_scenarios.artifacts import (
 )
 from robotest_scenarios.bounded import PrefixBuffer
 from robotest_scenarios.constants import (
+    ACTOR_CLEANUP_OBSERVATION_NS,
     ACTOR_CLEANUP_QUIET_NS,
     ACTOR_INITIAL_POSITION_TOLERANCE_M,
     ACTOR_STATE_CAPACITY,
@@ -357,6 +358,7 @@ class ContactControlNode(Node):
         self.pre_clock_contact_message_count = 0
         self.contact_max_gap_ns = 0
         self.fatal_error: RobotestScenarioError | None = None
+        self.cleanup_fatal_error: RobotestScenarioError | None = None
         self.cleanup_mode = False
         self.protocol_error_count = 0
         self.spawn_request_sequence: int | None = None
@@ -368,8 +370,14 @@ class ContactControlNode(Node):
         self.entity_pose_message_count = 0
         self.last_entity_pose_heartbeat_stamp_ns: int | None = None
         self.post_delete_entity_message_count = 0
+        self.post_delete_entity_latest_sequence: int | None = None
         self.post_delete_entity_latest_sim_stamp_ns: int | None = None
         self.post_delete_wall_pose_count = 0
+        self.post_delete_wall_pose_first_sequence: int | None = None
+        self.post_delete_wall_pose_first_sim_stamp_ns: int | None = None
+        self.post_delete_wall_pose_latest_sequence: int | None = None
+        self.post_delete_wall_pose_latest_sim_stamp_ns: int | None = None
+        self.delete_response_sequence: int | None = None
         self.delete_response_stamp_ns: int | None = None
         self.control_started_stamp_ns: int | None = None
         self.contact_deadline_ns: int | None = None
@@ -466,9 +474,16 @@ class ContactControlNode(Node):
             try:
                 callback(message)
             except RobotestScenarioError as exc:
-                self.set_fatal(exc)
+                if self.cleanup_mode and allow_during_cleanup:
+                    self.set_cleanup_fatal(exc)
+                else:
+                    self.set_fatal(exc)
             except Exception as exc:
-                self.set_fatal(ProtocolError(f'unhandled contact callback error: {exc}'))
+                error = ProtocolError(f'unhandled contact callback error: {exc}')
+                if self.cleanup_mode and allow_during_cleanup:
+                    self.set_cleanup_fatal(error)
+                else:
+                    self.set_fatal(error)
 
         return guarded
 
@@ -480,6 +495,13 @@ class ContactControlNode(Node):
         """Latch the first callback failure without escaping the executor."""
         if self.fatal_error is None:
             self.fatal_error = error
+            if isinstance(error, ProtocolError):
+                self.protocol_error_count += 1
+
+    def set_cleanup_fatal(self, error: RobotestScenarioError) -> None:
+        """Latch the first cleanup callback failure independently of a primary failure."""
+        if self.cleanup_fatal_error is None:
+            self.cleanup_fatal_error = error
             if isinstance(error, ProtocolError):
                 self.protocol_error_count += 1
 
@@ -721,7 +743,9 @@ class ContactControlNode(Node):
                     raise ProtocolError('entity-pose heartbeat has an invalid frame')
                 self.last_entity_pose_heartbeat_stamp_ns = heartbeat_stamp_ns
                 if self.delete_response_stamp_ns is not None:
+                    heartbeat_sequence = self._next_sequence()
                     self.post_delete_entity_message_count += 1
+                    self.post_delete_entity_latest_sequence = heartbeat_sequence
                     self.post_delete_entity_latest_sim_stamp_ns = heartbeat_stamp_ns
             if transform.child_frame_id != WALL_NAME:
                 continue
@@ -748,10 +772,15 @@ class ContactControlNode(Node):
             sequence = self._next_sequence()
             evidence = WallPoseEvidence(sequence, stamp_ns, *values, yaw)
             if (
-                self.delete_response_stamp_ns is not None
-                and stamp_ns > self.delete_response_stamp_ns
+                self.delete_response_sequence is not None
+                and sequence > self.delete_response_sequence
             ):
                 self.post_delete_wall_pose_count += 1
+                if self.post_delete_wall_pose_first_sequence is None:
+                    self.post_delete_wall_pose_first_sequence = sequence
+                    self.post_delete_wall_pose_first_sim_stamp_ns = stamp_ns
+                self.post_delete_wall_pose_latest_sequence = sequence
+                self.post_delete_wall_pose_latest_sim_stamp_ns = stamp_ns
             previous = self.last_wall_pose
             changed = previous is None or any(
                 abs(current - prior) > 1e-12
@@ -961,12 +990,14 @@ class ContactControlApp:
         self.executor: SingleThreadedExecutor | None = None
         self.wall_asset: Path | None = None
         self.wall_asset_sha256: str | None = None
+        self.wall_spawn_request_send_attempted = False
         self.wall_spawn_request_sent = False
         self.wall_spawn_committed = False
         self.spawn_attempt_count = 0
         self.delete_attempt_count = 0
         self.last_graph_check_ns = 0
         self.graph_gate_active = False
+        self.final_graph_observation_complete = False
         self.last_publisher_count = 0
         self.last_source_publisher_counts = {
             'contacts': 0,
@@ -1277,7 +1308,14 @@ class ContactControlApp:
     def _spin_once(self, timeout_s: float = 0.02, *, check_fatal: bool = True) -> None:
         self._require_wall_budget()
         remaining_s = max(0.0, self.wall_deadline - time.monotonic())
-        self._executor.spin_once(timeout_sec=min(timeout_s, remaining_s))
+        try:
+            self._executor.spin_once(timeout_sec=min(timeout_s, remaining_s))
+        except RobotestScenarioError:
+            raise
+        except Exception as exc:
+            raise InfrastructureError(f'contact-control executor spin failed: {exc}') from exc
+        if self._node.cleanup_fatal_error is not None:
+            raise self._node.cleanup_fatal_error
         if check_fatal and self._node.fatal_error is not None:
             raise self._node.fatal_error
         now_ns = time.monotonic_ns()
@@ -1300,11 +1338,48 @@ class ContactControlApp:
     ) -> None:
         while True:
             self._require_wall_budget()
+            if self._node.cleanup_fatal_error is not None:
+                raise self._node.cleanup_fatal_error
+            if (
+                sim_deadline_ns is not None
+                and self._node.clock_seen
+                and self._node.current_sim_stamp_ns > sim_deadline_ns
+            ):
+                raise ScenarioFailureError(reason)
             satisfied = predicate()
             self._require_wall_budget()
+            if (
+                sim_deadline_ns is not None
+                and self._node.clock_seen
+                and self._node.current_sim_stamp_ns > sim_deadline_ns
+            ):
+                raise ScenarioFailureError(reason)
             if satisfied:
                 return
+            if (
+                sim_deadline_ns is not None
+                and self._node.clock_seen
+                and self._node.current_sim_stamp_ns >= sim_deadline_ns
+            ):
+                raise ScenarioFailureError(reason)
             self._spin_once(check_fatal=check_fatal)
+            self._require_wall_budget()
+            if (
+                sim_deadline_ns is not None
+                and self._node.clock_seen
+                and self._node.current_sim_stamp_ns > sim_deadline_ns
+            ):
+                raise ScenarioFailureError(reason)
+            satisfied = predicate()
+            self._require_wall_budget()
+            if (
+                sim_deadline_ns is not None
+                and self._node.clock_seen
+                and self._node.current_sim_stamp_ns > sim_deadline_ns
+            ):
+                raise ScenarioFailureError(reason)
+            if satisfied:
+                return
             if (
                 sim_deadline_ns is not None
                 and self._node.clock_seen
@@ -1312,11 +1387,20 @@ class ContactControlApp:
             ):
                 raise ScenarioFailureError(reason)
 
-    def _wait_service(self, client: Any, *, name: str, check_fatal: bool = True) -> None:
+    def _wait_service(self, client: Any, *, name: str, check_fatal: bool = True) -> float:
         deadline = min(self.wall_deadline, time.monotonic() + self.service_timeout_s)
-        while not client.service_is_ready():
+        while True:
+            self._require_wall_budget()
+            if self._node.cleanup_fatal_error is not None:
+                raise self._node.cleanup_fatal_error
             if time.monotonic() >= deadline:
                 raise InfrastructureError(f'service unavailable before deadline: {name}')
+            ready = bool(client.service_is_ready())
+            self._require_wall_budget()
+            if time.monotonic() >= deadline:
+                raise InfrastructureError(f'service unavailable before deadline: {name}')
+            if ready:
+                return deadline
             self._spin_once(check_fatal=check_fatal)
 
     def _call_service(
@@ -1326,25 +1410,99 @@ class ContactControlApp:
         *,
         name: str,
         check_fatal: bool = True,
+        evidence: dict[str, Any] | None = None,
     ) -> tuple[Any, int, int]:
-        self._wait_service(client, name=name, check_fatal=check_fatal)
+        def retain_failure(stage: str, error: BaseException) -> None:
+            if evidence is None:
+                return
+            evidence['error'] = bounded_diagnostic(error)
+            if 'failure_stage' in evidence:
+                evidence['failure_stage'] = stage
+                evidence['kind'] = 'delete_transaction_failed'
+
+        try:
+            service_deadline = self._wait_service(client, name=name, check_fatal=check_fatal)
+            self._require_wall_budget()
+            if time.monotonic() >= service_deadline:
+                raise InfrastructureError(f'service unavailable before deadline: {name}')
+        except RobotestScenarioError as exc:
+            retain_failure('service_wait', exc)
+            raise
+        except Exception as exc:
+            error = InfrastructureError(f'{name} service readiness check failed: {exc}')
+            retain_failure('service_wait', error)
+            raise error from exc
         request_sequence = self._node._next_sequence()
         request_stamp_ns = self._node.current_sim_stamp_ns
+        if evidence is not None:
+            evidence['request_sequence'] = request_sequence
+            evidence['request_stamp_ns'] = request_stamp_ns
+        try:
+            self._require_wall_budget()
+            if time.monotonic() >= service_deadline:
+                raise InfrastructureError(f'service unavailable before deadline: {name}')
+        except RobotestScenarioError as exc:
+            retain_failure('service_wait', exc)
+            raise
         try:
             future = client.call_async(request)
         except Exception as exc:
-            raise InfrastructureError(f'{name} request could not be sent: {exc}') from exc
+            error = InfrastructureError(f'{name} request could not be sent: {exc}')
+            retain_failure('request_send', error)
+            raise error from exc
         deadline = min(self.wall_deadline, time.monotonic() + self.service_timeout_s)
-        while not future.done():
-            if time.monotonic() >= deadline:
-                raise InfrastructureError(f'{name} response timed out')
-            self._spin_once(check_fatal=check_fatal)
+        while True:
+            try:
+                self._require_wall_budget()
+                if time.monotonic() >= deadline:
+                    raise InfrastructureError(f'{name} response timed out')
+                response_done = bool(future.done())
+                self._require_wall_budget()
+                if time.monotonic() >= deadline:
+                    raise InfrastructureError(f'{name} response timed out')
+            except RobotestScenarioError as exc:
+                stage = (
+                    'response_timeout'
+                    if str(exc) == f'{name} response timed out'
+                    else 'response_wait'
+                )
+                retain_failure(stage, exc)
+                raise
+            except Exception as exc:
+                error = InfrastructureError(f'{name} response readiness check failed: {exc}')
+                retain_failure('response_wait', error)
+                raise error from exc
+            if response_done:
+                break
+            try:
+                self._spin_once(check_fatal=check_fatal)
+            except RobotestScenarioError as exc:
+                retain_failure('response_wait', exc)
+                raise
+            except Exception as exc:
+                error = InfrastructureError(f'{name} response wait failed: {exc}')
+                retain_failure('response_wait', error)
+                raise error from exc
         try:
             response = future.result()
         except Exception as exc:
-            raise InfrastructureError(f'{name} response failed: {exc}') from exc
+            error = InfrastructureError(f'{name} response failed: {exc}')
+            retain_failure('response_future', error)
+            raise error from exc
+        try:
+            self._require_wall_budget()
+            if time.monotonic() >= deadline:
+                raise InfrastructureError(f'{name} response timed out')
+        except RobotestScenarioError as exc:
+            stage = (
+                'response_timeout' if str(exc) == f'{name} response timed out' else 'response_wait'
+            )
+            retain_failure(stage, exc)
+            raise
         if response is None:
-            raise InfrastructureError(f'{name} returned no response')
+            error = InfrastructureError(f'{name} returned no response')
+            retain_failure('response_null', error)
+            raise error
         return response, request_sequence, request_stamp_ns
 
     def _resolve_wall_asset(self) -> None:
@@ -1399,11 +1557,37 @@ class ContactControlApp:
         request.entity_factory.sdf_filename = str(self.wall_asset)
         request.entity_factory.pose = _wall_pose_message()
         request.entity_factory.relative_to = 'world'
-        self._wait_service(self._node.spawn_client, name=SPAWN_SERVICE)
+        try:
+            service_deadline = self._wait_service(self._node.spawn_client, name=SPAWN_SERVICE)
+            self._require_wall_budget()
+            if time.monotonic() >= service_deadline:
+                raise InfrastructureError(f'service unavailable before deadline: {SPAWN_SERVICE}')
+        except RobotestScenarioError as exc:
+            spawn_evidence['error'] = bounded_diagnostic(exc)
+            raise
+        except Exception as exc:
+            error = InfrastructureError(f'{SPAWN_SERVICE} service readiness check failed: {exc}')
+            spawn_evidence['error'] = bounded_diagnostic(error)
+            raise error from exc
         self._node.spawn_request_sequence = self._node._next_sequence()
         self._node.spawn_request_stamp_ns = self._node.current_sim_stamp_ns
         spawn_evidence['request_sequence'] = self._node.spawn_request_sequence
         spawn_evidence['request_stamp_ns'] = self._node.spawn_request_stamp_ns
+        try:
+            self._require_wall_budget()
+            if time.monotonic() >= service_deadline:
+                raise InfrastructureError(f'service unavailable before deadline: {SPAWN_SERVICE}')
+        except RobotestScenarioError as exc:
+            spawn_evidence['error'] = bounded_diagnostic(exc)
+            raise
+        self.wall_spawn_request_send_attempted = True
+        self.cleanup = {
+            'actor_absent': False,
+            'delete_attempt_count': 0,
+            'delete_success': None,
+            'proof': {'kind': 'spawn_request_send_attempted_cleanup_pending'},
+            'required': True,
+        }
         try:
             future = self._node.spawn_client.call_async(request)
             self.wall_spawn_request_sent = True
@@ -1421,14 +1605,23 @@ class ContactControlApp:
             # This request is non-idempotent and cannot be retried safely after a
             # delayed response. Keep spinning on the one future until the precomputed
             # operational deadline; the outer fixture deadline retains its cleanup tail.
-            while not future.done():
+            while True:
+                self._require_wall_budget()
+                response_done = bool(future.done())
+                self._require_wall_budget()
+                if response_done:
+                    break
                 self._spin_once()
-            self._require_wall_budget()
         except WallTimeoutError as exc:
             spawn_evidence['error'] = (
                 'spawn response did not complete before the reserved cleanup window'
             )
             raise InfrastructureError(f'{SPAWN_SERVICE} response timed out') from exc
+        except Exception as exc:
+            spawn_evidence['error'] = bounded_diagnostic(exc)
+            if isinstance(exc, RobotestScenarioError):
+                raise
+            raise InfrastructureError(f'{SPAWN_SERVICE} response wait failed: {exc}') from exc
         response = future.result()
         if response is None or not bool(response.success):
             spawn_evidence['success'] = False
@@ -2001,17 +2194,33 @@ class ContactControlApp:
 
     def _cleanup_wall(self) -> None:
         node = self._node
-        if not self.wall_spawn_request_sent:
+        if not (self.wall_spawn_request_send_attempted or self.wall_spawn_request_sent):
             return
         if self.delete_attempt_count != 0:
             raise ProtocolError('contact-control wall delete may be attempted exactly once')
-        source_publishers_before = node.count_publishers(ENTITY_POSE_TOPIC)
+        source_publishers_before_error: InfrastructureError | None = None
+        try:
+            source_publishers_before = node.count_publishers(ENTITY_POSE_TOPIC)
+        except Exception as exc:
+            source_publishers_before = 0
+            source_publishers_before_error = InfrastructureError(
+                f'entity-pose source publisher pre-delete query failed: {exc}'
+            )
         self.delete_attempt_count = 1
+        transaction_proof: dict[str, Any] = {
+            'error': None,
+            'failure_stage': None,
+            'kind': 'delete_request_pending',
+            'request_sequence': None,
+            'request_stamp_ns': None,
+            'response_sequence': None,
+            'response_stamp_ns': None,
+        }
         self.cleanup = {
             'actor_absent': False,
             'delete_attempt_count': 1,
             'delete_success': None,
-            'proof': {'kind': 'delete_request_pending'},
+            'proof': transaction_proof,
             'required': True,
         }
         request = DeleteEntity.Request()
@@ -2022,80 +2231,253 @@ class ContactControlApp:
             request,
             name=DELETE_SERVICE,
             check_fatal=False,
+            evidence=transaction_proof,
         )
+        response_sequence = node._next_sequence()
+        response_stamp_ns = node.current_sim_stamp_ns
+        transaction_proof['response_sequence'] = response_sequence
+        transaction_proof['response_stamp_ns'] = response_stamp_ns
         success = bool(response.success)
         if not success:
+            error = InfrastructureError(f'{DELETE_SERVICE} rejected contact wall cleanup')
+            transaction_proof['error'] = bounded_diagnostic(error)
+            transaction_proof['failure_stage'] = 'response_rejected'
+            transaction_proof['kind'] = 'delete_response_did_not_prove_absence'
             self.cleanup = {
                 'actor_absent': False,
                 'delete_attempt_count': 1,
                 'delete_success': False,
-                'proof': {
-                    'kind': 'delete_response_did_not_prove_absence',
-                    'request_sequence': request_sequence,
-                    'request_stamp_ns': request_stamp_ns,
-                },
+                'proof': transaction_proof,
                 'required': True,
             }
-            raise InfrastructureError(f'{DELETE_SERVICE} rejected contact wall cleanup')
-        response_sequence = node._next_sequence()
-        response_stamp_ns = node.current_sim_stamp_ns
+            raise error
+        node.delete_response_sequence = response_sequence
         node.delete_response_stamp_ns = response_stamp_ns
         node.post_delete_entity_message_count = 0
+        node.post_delete_entity_latest_sequence = None
         node.post_delete_entity_latest_sim_stamp_ns = None
         node.post_delete_wall_pose_count = 0
-        quiet_until_ns = response_stamp_ns + ACTOR_CLEANUP_QUIET_NS
-        self.cleanup = {
-            'actor_absent': False,
-            'delete_attempt_count': 1,
-            'delete_success': True,
-            'proof': {
-                'kind': 'successful_delete_response_cleanup_quiet_pending',
+        node.post_delete_wall_pose_first_sequence = None
+        node.post_delete_wall_pose_first_sim_stamp_ns = None
+        node.post_delete_wall_pose_latest_sequence = None
+        node.post_delete_wall_pose_latest_sim_stamp_ns = None
+        drain_grace_ns = round(DDS_DRAIN_GRACE_S * 1_000_000_000)
+        drain_start_steady_ns: int | None = None
+        drain_complete_steady_ns: int | None = None
+        drain_spin_count = 0
+        observation_deadline_ns = response_stamp_ns + ACTOR_CLEANUP_OBSERVATION_NS
+        quiet_restart_count = 0
+
+        def cleanup_proof(
+            kind: str,
+            *,
+            quiet_start_ns: int | None,
+            quiet_until_ns: int | None,
+        ) -> dict[str, Any]:
+            return {
+                'kind': kind,
+                'dds_drain_complete_steady_ns': drain_complete_steady_ns,
+                'dds_drain_grace_ns': drain_grace_ns,
+                'dds_drain_spin_count': drain_spin_count,
+                'dds_drain_start_steady_ns': drain_start_steady_ns,
+                'observation_deadline_sim_stamp_ns': observation_deadline_ns,
                 'pose_source_publishers_before': source_publishers_before,
-                'post_delete_pose_count': 0,
-                'post_delete_pose_source_heartbeat_count': 0,
-                'post_delete_pose_source_latest_sim_stamp_ns': None,
+                'post_delete_pose_count': node.post_delete_wall_pose_count,
+                'post_delete_pose_first_sequence': (node.post_delete_wall_pose_first_sequence),
+                'post_delete_pose_first_sim_stamp_ns': (
+                    node.post_delete_wall_pose_first_sim_stamp_ns
+                ),
+                'post_delete_pose_latest_sequence': (node.post_delete_wall_pose_latest_sequence),
+                'post_delete_pose_latest_sim_stamp_ns': (
+                    node.post_delete_wall_pose_latest_sim_stamp_ns
+                ),
+                'post_delete_pose_source_heartbeat_count': (node.post_delete_entity_message_count),
+                'post_delete_pose_source_latest_sequence': (
+                    node.post_delete_entity_latest_sequence
+                ),
+                'post_delete_pose_source_latest_sim_stamp_ns': (
+                    node.post_delete_entity_latest_sim_stamp_ns
+                ),
+                'quiet_start_sim_stamp_ns': quiet_start_ns,
+                'quiet_restart_count': quiet_restart_count,
                 'quiet_until_sim_stamp_ns': quiet_until_ns,
                 'request_sequence': request_sequence,
                 'request_stamp_ns': request_stamp_ns,
                 'response_sequence': response_sequence,
                 'response_stamp_ns': response_stamp_ns,
-            },
+            }
+
+        pending_kind = 'successful_blocking_delete_response_cleanup_anchor_pending'
+        self.cleanup = {
+            'actor_absent': False,
+            'delete_attempt_count': 1,
+            'delete_success': True,
+            'proof': cleanup_proof(
+                pending_kind,
+                quiet_start_ns=None,
+                quiet_until_ns=None,
+            ),
             'required': True,
         }
-        self._wait_for(
-            lambda: (
-                node.current_sim_stamp_ns >= quiet_until_ns
-                and node.post_delete_entity_latest_sim_stamp_ns is not None
-                and node.post_delete_entity_latest_sim_stamp_ns >= quiet_until_ns
-            ),
-            reason='entity-pose source did not span the wall cleanup quiet interval',
-            sim_deadline_ns=quiet_until_ns + ACTOR_CLEANUP_QUIET_NS,
-            check_fatal=False,
+        quiet_start_ns: int | None = None
+        quiet_until_ns: int | None = None
+        anchor_floor_ns = response_stamp_ns
+        try:
+            while True:
+                latest_wall_stamp_ns = node.post_delete_wall_pose_latest_sim_stamp_ns
+                anchor_after_ns = max(anchor_floor_ns, latest_wall_stamp_ns or 0)
+                anchor_after_sequence = max(
+                    response_sequence,
+                    node.post_delete_wall_pose_latest_sequence or 0,
+                )
+
+                def source_advanced(
+                    anchor_after_ns: int = anchor_after_ns,
+                    anchor_after_sequence: int = anchor_after_sequence,
+                ) -> bool:
+                    return (
+                        node.post_delete_entity_latest_sim_stamp_ns is not None
+                        and node.post_delete_entity_latest_sim_stamp_ns > anchor_after_ns
+                        and node.post_delete_entity_latest_sequence is not None
+                        and node.post_delete_entity_latest_sequence > anchor_after_sequence
+                    )
+
+                self._wait_for(
+                    source_advanced,
+                    reason='entity-pose source did not establish a post-delete heartbeat anchor',
+                    sim_deadline_ns=observation_deadline_ns,
+                    check_fatal=False,
+                )
+                assert node.post_delete_entity_latest_sim_stamp_ns is not None
+                latest_wall_stamp_ns = node.post_delete_wall_pose_latest_sim_stamp_ns
+                if (
+                    latest_wall_stamp_ns is not None
+                    and node.post_delete_entity_latest_sim_stamp_ns <= latest_wall_stamp_ns
+                ):
+                    continue
+                quiet_start_ns = node.post_delete_entity_latest_sim_stamp_ns
+                quiet_until_ns = quiet_start_ns + ACTOR_CLEANUP_QUIET_NS
+                anchor_pose_count = node.post_delete_wall_pose_count
+                if quiet_until_ns > observation_deadline_ns:
+                    raise ScenarioFailureError(
+                        'wall cleanup observation window exceeded its simulation deadline'
+                    )
+                pending_kind = 'successful_blocking_delete_response_cleanup_quiet_pending'
+                self.cleanup['proof'] = cleanup_proof(
+                    pending_kind,
+                    quiet_start_ns=quiet_start_ns,
+                    quiet_until_ns=quiet_until_ns,
+                )
+
+                self._wait_for(
+                    lambda anchor_pose_count=anchor_pose_count, quiet_until_ns=quiet_until_ns: (
+                        (node.post_delete_wall_pose_count > anchor_pose_count)
+                        or (
+                            node.post_delete_entity_latest_sim_stamp_ns is not None
+                            and node.post_delete_entity_latest_sim_stamp_ns >= quiet_until_ns
+                        )
+                    ),
+                    reason='entity-pose source did not span the wall cleanup quiet interval',
+                    sim_deadline_ns=observation_deadline_ns,
+                    check_fatal=False,
+                )
+                if node.post_delete_wall_pose_count > anchor_pose_count:
+                    quiet_restart_count += 1
+                    anchor_floor_ns = quiet_start_ns
+                    quiet_start_ns = None
+                    quiet_until_ns = None
+                    pending_kind = 'successful_blocking_delete_response_cleanup_anchor_pending'
+                    self.cleanup['proof'] = cleanup_proof(
+                        pending_kind,
+                        quiet_start_ns=None,
+                        quiet_until_ns=None,
+                    )
+                    continue
+
+                pending_kind = 'successful_blocking_delete_response_cleanup_drain_pending'
+                drain_start_steady_ns = time.monotonic_ns()
+                drain_complete_steady_ns = None
+                drain_spin_count = 0
+                drain_deadline_steady_ns = drain_start_steady_ns + drain_grace_ns
+                self.cleanup['proof'] = cleanup_proof(
+                    pending_kind,
+                    quiet_start_ns=quiet_start_ns,
+                    quiet_until_ns=quiet_until_ns,
+                )
+                restart_after_drain = False
+                while drain_spin_count == 0 or time.monotonic_ns() < drain_deadline_steady_ns:
+                    remaining_s = max(
+                        0.0,
+                        (drain_deadline_steady_ns - time.monotonic_ns()) / 1_000_000_000,
+                    )
+                    self._spin_once(timeout_s=min(0.02, remaining_s), check_fatal=False)
+                    drain_spin_count += 1
+                    if node.post_delete_wall_pose_count > anchor_pose_count:
+                        restart_after_drain = True
+                        break
+                if node.post_delete_wall_pose_count > anchor_pose_count:
+                    restart_after_drain = True
+                if restart_after_drain:
+                    quiet_restart_count += 1
+                    anchor_floor_ns = quiet_start_ns
+                    quiet_start_ns = None
+                    quiet_until_ns = None
+                    drain_start_steady_ns = None
+                    drain_complete_steady_ns = None
+                    drain_spin_count = 0
+                    pending_kind = 'successful_blocking_delete_response_cleanup_anchor_pending'
+                    self.cleanup['proof'] = cleanup_proof(
+                        pending_kind,
+                        quiet_start_ns=None,
+                        quiet_until_ns=None,
+                    )
+                    continue
+                drain_complete_steady_ns = time.monotonic_ns()
+                break
+        except RobotestScenarioError:
+            self.cleanup['proof'] = cleanup_proof(
+                pending_kind,
+                quiet_start_ns=quiet_start_ns,
+                quiet_until_ns=quiet_until_ns,
+            )
+            raise
+        assert quiet_start_ns is not None
+        assert quiet_until_ns is not None
+        self.cleanup['proof'] = cleanup_proof(
+            pending_kind,
+            quiet_start_ns=quiet_start_ns,
+            quiet_until_ns=quiet_until_ns,
         )
+        self._require_wall_budget()
         source_publishers_after = node.count_publishers(ENTITY_POSE_TOPIC)
+        self._require_wall_budget()
+        if source_publishers_before_error is not None:
+            raise source_publishers_before_error
+        if source_publishers_before < 1 or source_publishers_after < 1:
+            raise ScenarioFailureError(
+                'entity-pose source publisher was missing during wall cleanup observation'
+            )
         actor_absent = (
-            node.post_delete_wall_pose_count == 0
-            and node.post_delete_entity_message_count >= 1
-            and source_publishers_after >= 1
+            (
+                node.post_delete_wall_pose_latest_sim_stamp_ns is None
+                or node.post_delete_wall_pose_latest_sim_stamp_ns < quiet_start_ns
+            )
+            and node.post_delete_entity_message_count >= 2
+            and node.post_delete_entity_latest_sequence is not None
+            and node.post_delete_entity_latest_sequence - response_sequence
+            == node.post_delete_entity_message_count + node.post_delete_wall_pose_count
         )
         self.cleanup = {
             'actor_absent': actor_absent,
             'delete_attempt_count': 1,
             'delete_success': True,
             'proof': {
-                'kind': 'successful_delete_response_and_pose_quiet_interval',
-                'pose_source_publishers_after': source_publishers_after,
-                'pose_source_publishers_before': source_publishers_before,
-                'post_delete_pose_count': node.post_delete_wall_pose_count,
-                'post_delete_pose_source_heartbeat_count': (node.post_delete_entity_message_count),
-                'post_delete_pose_source_latest_sim_stamp_ns': (
-                    node.post_delete_entity_latest_sim_stamp_ns
+                **cleanup_proof(
+                    'successful_blocking_delete_and_bounded_pose_absence',
+                    quiet_start_ns=quiet_start_ns,
+                    quiet_until_ns=quiet_until_ns,
                 ),
-                'quiet_until_sim_stamp_ns': quiet_until_ns,
-                'request_sequence': request_sequence,
-                'request_stamp_ns': request_stamp_ns,
-                'response_sequence': response_sequence,
-                'response_stamp_ns': response_stamp_ns,
+                'pose_source_publishers_after': source_publishers_after,
             },
             'required': True,
         }
@@ -2108,7 +2490,7 @@ class ContactControlApp:
         try:
             if not self.node.commands.items or self.node.commands.items[-1]['linear_x'] != 0.0:
                 self.node.publish_command(0.0, phase='FAIL_SAFE_ZERO')
-        except RobotestScenarioError:
+        except Exception:
             pass
 
     def _criteria(self) -> dict[str, bool]:
@@ -2293,11 +2675,8 @@ class ContactControlApp:
     def _result(self, error: RobotestScenarioError | None) -> tuple[dict[str, Any], int]:
         if error is not None:
             return self._result_without_graph(error)
-        self.graph_gate_active = False
-        self._wait_for(
-            self._enforce_graph_isolation,
-            reason='final contact-control observation sources did not stabilize',
-        )
+        if not self.final_graph_observation_complete:
+            raise ProtocolError('final contact-control graph observation was not completed')
         criteria = self._criteria()
         if error is None and not all(criteria.values()):
             error = ScenarioFailureError('positive-control frozen criteria did not all pass')
@@ -2342,6 +2721,17 @@ class ContactControlApp:
         }
         return result, exit_code
 
+    def _finalize_graph_observation(self) -> None:
+        """Freeze the final graph audit before cleanup begins and proof state is sealed."""
+        if self.final_graph_observation_complete:
+            raise ProtocolError('final contact-control graph observation may run exactly once')
+        self.graph_gate_active = False
+        self._wait_for(
+            self._enforce_graph_isolation,
+            reason='final contact-control observation sources did not stabilize',
+        )
+        self.final_graph_observation_complete = True
+
     def run(self) -> int:
         """Run, fail-safe, clean up, write evidence, and return a stable exit code."""
         error: RobotestScenarioError | None = None
@@ -2362,17 +2752,37 @@ class ContactControlApp:
         finally:
             if self.node is not None and self.executor is not None:
                 self._begin_cleanup_window()
-                self.node.begin_cleanup()
                 self._best_effort_zero()
+                if error is None:
+                    try:
+                        self._finalize_graph_observation()
+                    except RobotestScenarioError as graph_error:
+                        error = graph_error
+                    except Exception as graph_error:
+                        error = InfrastructureError(
+                            f'final contact-control graph observation failed: {graph_error}'
+                        )
+                self.node.begin_cleanup()
                 try:
                     self._cleanup_wall()
                 except RobotestScenarioError as cleanup_error:
                     if error is None:
                         error = cleanup_error
+                except Exception as cleanup_error:
+                    if error is None:
+                        error = InfrastructureError(
+                            f'contact-control cleanup failed: {cleanup_error}'
+                        )
                 try:
                     result, exit_code = self._result(error)
                 except RobotestScenarioError as result_error:
                     result, exit_code = self._result_without_graph(result_error)
+                except Exception as result_error:
+                    result, exit_code = self._result_without_graph(
+                        InfrastructureError(
+                            f'contact-control result finalization failed: {result_error}'
+                        )
+                    )
                 try:
                     schema = load_schema(package_schema_path('contact-control-result.schema.json'))
                     write_canonical_json(self.output_path, result, schema=schema)

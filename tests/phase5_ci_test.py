@@ -3721,16 +3721,30 @@ def _phase3_bundle(
             {
                 'accepted_goal_stamp_ns': accepted_goal_stamp_ns,
                 'goal_uuid': goal_uuid,
+                'terminal_observed_sequence': 500,
+                'terminal_observed_stamp_ns': 34_000_000_000,
                 'terminal_status': 4,
             }
         )
-        if scenario_id == 3:
-            scenario['binding'].update(
-                {
-                    'terminal_observed_sequence': 500,
-                    'terminal_observed_stamp_ns': 34_000_000_000,
-                }
-            )
+        cleanup_proof = scenario['cleanup']['proof']
+        cleanup_response_sequence = 502
+        cleanup_proof.update(
+            {
+                'observation_deadline_sim_stamp_ns': 36_200_000_000,
+                'post_delete_pose_source_latest_sequence': (
+                    cleanup_response_sequence
+                    + cleanup_proof['post_delete_pose_source_heartbeat_count']
+                    + cleanup_proof['post_delete_pose_count']
+                ),
+                'post_delete_pose_source_latest_sim_stamp_ns': 35_700_000_000,
+                'quiet_start_sim_stamp_ns': 35_400_000_000,
+                'quiet_until_sim_stamp_ns': 35_650_000_000,
+                'request_sequence': 501,
+                'request_stamp_ns': 35_100_000_000,
+                'response_sequence': cleanup_response_sequence,
+                'response_stamp_ns': 35_200_000_000,
+            }
+        )
     else:
         scenario = metrics_fixture._scenario_result(identity, mission_measurements)
     orchestrator = copy.deepcopy(request_fixture['orchestrator'])

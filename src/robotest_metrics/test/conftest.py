@@ -27,10 +27,13 @@ from robotest_scenarios.contact_evidence import (
     EXPECTED_CONTACT_STREAM_POLICY,
 )
 from robotest_scenarios.provenance import (
+    configuration_sha256,
     contact_control_configuration,
     contact_control_configuration_sha256,
     contact_source_binding,
+    controller_configuration,
     file_sha256,
+    source_binding,
 )
 
 EMPTY_FAULT_SCHEDULE_SHA256 = '26080d7dc8f4108a369962ecad1d2e29941a991af68beb415067eae1dc1de6f8'
@@ -107,11 +110,18 @@ def _scenario_result(identity: dict[str, Any], measurements: dict[str, Any]) -> 
         'cleanup': {
             'actor_absent': True,
             'delete_attempt_count': 0,
-            'delete_success': True,
-            'proof': {},
+            'delete_success': None,
+            'proof': {'kind': 'scenario_declares_no_actor'},
             'required': False,
         },
-        'configuration': {},
+        'configuration': {
+            'actor_asset_sha256': None,
+            'controller_configuration': controller_configuration(),
+            'controller_configuration_sha256': configuration_sha256(),
+            'service_timeout_s': 2.0,
+            'source_binding': source_binding(),
+            'wall_timeout_s': 300.0,
+        },
         'identity': {
             key: identity[key]
             for key in (
@@ -555,17 +565,29 @@ def collision_fixture() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]
             'delete_attempt_count': 1,
             'delete_success': True,
             'proof': {
-                'kind': 'successful_delete_response_and_pose_quiet_interval',
+                'kind': 'successful_blocking_delete_and_bounded_pose_absence',
+                'dds_drain_complete_steady_ns': 4_050_000_000,
+                'dds_drain_grace_ns': 50_000_000,
+                'dds_drain_spin_count': 3,
+                'dds_drain_start_steady_ns': 4_000_000_000,
+                'observation_deadline_sim_stamp_ns': 3_790_000_000,
                 'pose_source_publishers_after': 1,
                 'pose_source_publishers_before': 1,
                 'post_delete_pose_count': 0,
-                'post_delete_pose_source_heartbeat_count': 1,
+                'post_delete_pose_first_sequence': None,
+                'post_delete_pose_first_sim_stamp_ns': None,
+                'post_delete_pose_latest_sequence': None,
+                'post_delete_pose_latest_sim_stamp_ns': None,
+                'post_delete_pose_source_heartbeat_count': 2,
+                'post_delete_pose_source_latest_sequence': 35,
                 'post_delete_pose_source_latest_sim_stamp_ns': 3_050_000_000,
+                'quiet_restart_count': 0,
+                'quiet_start_sim_stamp_ns': 2_800_000_000,
                 'quiet_until_sim_stamp_ns': 3_050_000_000,
                 'request_sequence': 32,
                 'request_stamp_ns': 2_710_000_000,
                 'response_sequence': 33,
-                'response_stamp_ns': 2_800_000_000,
+                'response_stamp_ns': 2_790_000_000,
             },
             'required': True,
         },

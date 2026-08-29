@@ -15,6 +15,7 @@
 """Installed result-schema shape tests."""
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from robotest_scenarios.artifacts import load_schema, validate_against_schema
@@ -35,6 +36,381 @@ def _buffer() -> dict:
         'overflow_count': 0,
         'retained_count': 0,
     }
+
+
+def _cleanup_proof() -> dict:
+    return {
+        'kind': 'successful_blocking_delete_and_bounded_pose_absence',
+        'dds_drain_complete_steady_ns': 70_000_000,
+        'dds_drain_grace_ns': 50_000_000,
+        'dds_drain_spin_count': 3,
+        'dds_drain_start_steady_ns': 20_000_000,
+        'observation_deadline_sim_stamp_ns': 17_100_000_000,
+        'pose_source_publishers_after': 1,
+        'pose_source_publishers_before': 1,
+        'post_delete_pose_count': 0,
+        'post_delete_pose_first_sequence': None,
+        'post_delete_pose_first_sim_stamp_ns': None,
+        'post_delete_pose_latest_sequence': None,
+        'post_delete_pose_latest_sim_stamp_ns': None,
+        'post_delete_pose_source_heartbeat_count': 3,
+        'post_delete_pose_source_latest_sequence': 205,
+        'post_delete_pose_source_latest_sim_stamp_ns': 16_600_000_000,
+        'quiet_restart_count': 0,
+        'quiet_start_sim_stamp_ns': 16_300_000_000,
+        'quiet_until_sim_stamp_ns': 16_550_000_000,
+        'request_sequence': 200,
+        'request_stamp_ns': 16_000_000_000,
+        'response_sequence': 201,
+        'response_stamp_ns': 16_100_000_000,
+    }
+
+
+def _scenario_pass_result(scenario_id: int) -> dict:
+    actor_scenario = scenario_id in {2, 3}
+    plan_pose_stream = _buffer()
+    plan_pose_stream['capacity'] = 65_536
+    if scenario_id == 2:
+        interaction = {
+            'actor': {},
+            'clearance': {},
+            'criteria': {
+                name: True
+                for name in (
+                    'all_segments_avoid',
+                    'clearance_passed',
+                    'geometry_hash_changed',
+                    'observed_by_deadline',
+                    'plan_before_request',
+                    'replan_observed_after_request',
+                    'replan_stamp_after_request',
+                    'spawn_exactly_once',
+                )
+            },
+            'initial_plan': {},
+            'kind': 'static_obstacle',
+            'observed_pose': {},
+            'replan': {},
+            'spawn': {},
+            'trigger': {},
+        }
+    elif scenario_id == 3:
+        interaction = {
+            'actor': {},
+            'criteria': {
+                name: True
+                for name in (
+                    'all_targets_observed',
+                    'all_transactions_succeeded',
+                    'exact_schedule',
+                    'exact_single_attempts',
+                    'exact_target_count',
+                    'final_endpoint',
+                    'finished_before_terminal_status_observation',
+                    'latency_within_limit',
+                    'monotonic_and_dwell',
+                    'no_early_motion',
+                    'ordered_feedback_anchor',
+                    'pose_errors_within_limit',
+                    'preloaded_before_goal',
+                )
+            },
+            'feedback_anchor': {},
+            'kind': 'pose_controlled_obstacle',
+            'metrics_owned': {},
+            'preload': {},
+            'spawn': {},
+            'trajectory': {
+                'expected_target_count': 121,
+                'set_attempt_count': 121,
+                'set_success_count': 121,
+                'targets': [{} for _ in range(121)],
+                'terminal_basis': 'follow_waypoints_status_observation',
+            },
+        }
+    else:
+        interaction = {
+            'criteria': {'bound_goal_terminal_succeeded': True},
+            'kind': 'none',
+        }
+    if actor_scenario:
+        cleanup = {
+            'actor_absent': True,
+            'delete_attempt_count': 1,
+            'delete_success': True,
+            'proof': _cleanup_proof(),
+            'required': True,
+        }
+    else:
+        cleanup = {
+            'actor_absent': True,
+            'delete_attempt_count': 0,
+            'delete_success': None,
+            'proof': {'kind': 'scenario_declares_no_actor'},
+            'required': False,
+        }
+    return {
+        'binding': {},
+        'cleanup': cleanup,
+        'configuration': {
+            'actor_asset_sha256': 'a' * 64 if actor_scenario else None,
+            'controller_configuration': {'delete_service_mode': 'blocking'},
+            'controller_configuration_sha256': 'b' * 64,
+            'service_timeout_s': 2.0,
+            'source_binding': {
+                'aggregate_sha256': 'c' * 64,
+                'files': [{'name': 'scenario_controller.py', 'sha256': 'd' * 64}],
+            },
+            'wall_timeout_s': 300.0,
+        },
+        'identity': {
+            'candidate_id': 'candidate-1',
+            'repetition_index': 0,
+            'run_id': f'run-{scenario_id}',
+            'scenario_id': scenario_id,
+            'scenario_name': (
+                {
+                    1: 'baseline_navigation',
+                    2: 'deterministic_static_obstacle_replan',
+                    3: 'deterministic_dynamic_obstacle',
+                }[scenario_id]
+            ),
+            'scenario_sha256': str(scenario_id) * 64,
+            'suite_index': 0,
+        },
+        'interaction': interaction,
+        'producer': 'robotest_scenarios/scenario_controller',
+        'quality': {
+            'all_buffers_bounded': True,
+            'buffers': {
+                name: _buffer()
+                for name in ('actor_state', 'feedback', 'ground_truth', 'plans', 'status')
+            },
+            'clock': {
+                'first_stamp_ns': 1,
+                'latest_stamp_ns': 2,
+                'max_gap_ns': 1,
+                'regression_count': 0,
+                'sample_count': 2,
+            },
+            'immutable_t0': True,
+            'overflow_free': True,
+            'plan_pose_stream': plan_pose_stream,
+            'protocol_error_count': 0,
+            'relative_project_names': True,
+            'single_goal_binding': True,
+        },
+        'schema_version': 1,
+        'status': 'PASS',
+        'verdict': {
+            'authority': 'component_only',
+            'benchmark_pass': None,
+            'exit_code': 0,
+            'reason': 'component complete',
+        },
+    }
+
+
+@pytest.mark.parametrize('scenario_id', [2, 3])
+def test_scenario_pass_schema_requires_bounded_actor_cleanup_proof(scenario_id: int) -> None:
+    schema = load_schema(SCHEMA_DIR / 'scenario-result.schema.json')
+    value = _scenario_pass_result(scenario_id)
+    validate_against_schema(value, schema)
+
+    del value['cleanup']['proof']['quiet_restart_count']
+    with pytest.raises(ArtifactError, match='schema violation'):
+        validate_against_schema(value, schema)
+
+
+@pytest.mark.parametrize(
+    'mutation',
+    [
+        lambda configuration: configuration.pop('controller_configuration_sha256'),
+        lambda configuration: configuration.__setitem__('unexpected', True),
+        lambda configuration: configuration.__setitem__('source_binding', {}),
+        lambda configuration: configuration.__setitem__('service_timeout_s', 0.0),
+        lambda configuration: configuration.__setitem__('wall_timeout_s', 301.0),
+    ],
+)
+def test_scenario_configuration_schema_rejects_invalid_shape(mutation: Any) -> None:
+    schema = load_schema(SCHEMA_DIR / 'scenario-result.schema.json')
+    value = _scenario_pass_result(2)
+    mutation(value['configuration'])
+
+    with pytest.raises(ArtifactError, match='schema violation'):
+        validate_against_schema(value, schema)
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        ('kind', 'successful_blocking_delete_and_pose_quiet_interval'),
+        ('dds_drain_grace_ns', 49_999_999),
+        ('post_delete_pose_source_heartbeat_count', 1),
+        ('post_delete_pose_source_latest_sequence', 0),
+        ('pose_source_publishers_after', 0),
+    ],
+)
+def test_scenario_cleanup_proof_schema_rejects_mutations(field: str, value: object) -> None:
+    schema = load_schema(SCHEMA_DIR / 'scenario-result.schema.json')
+    proof_schema = {
+        '$schema': schema['$schema'],
+        '$defs': schema['$defs'],
+        '$ref': '#/$defs/cleanupProof',
+    }
+    proof = _cleanup_proof()
+    validate_against_schema(proof, proof_schema)
+    proof[field] = value
+    with pytest.raises(ArtifactError, match='schema violation'):
+        validate_against_schema(proof, proof_schema)
+
+
+@pytest.mark.parametrize(
+    'schema_name',
+    ['contact-control-result.schema.json', 'scenario-result.schema.json'],
+)
+def test_pending_cleanup_proof_allows_source_to_disappear_before_observation(
+    schema_name: str,
+) -> None:
+    schema = load_schema(SCHEMA_DIR / schema_name)
+    proof_schema = {
+        '$schema': schema['$schema'],
+        '$defs': schema['$defs'],
+        '$ref': '#/$defs/pendingCleanupProof',
+    }
+    proof = _cleanup_proof()
+    proof.pop('pose_source_publishers_after')
+    proof.update(
+        {
+            'kind': 'successful_blocking_delete_response_cleanup_anchor_pending',
+            'dds_drain_complete_steady_ns': None,
+            'dds_drain_spin_count': 0,
+            'dds_drain_start_steady_ns': None,
+            'pose_source_publishers_before': 0,
+            'post_delete_pose_source_heartbeat_count': 0,
+            'post_delete_pose_source_latest_sequence': None,
+            'post_delete_pose_source_latest_sim_stamp_ns': None,
+            'quiet_start_sim_stamp_ns': None,
+            'quiet_until_sim_stamp_ns': None,
+        }
+    )
+    validate_against_schema(proof, proof_schema)
+
+
+@pytest.mark.parametrize(
+    'schema_name',
+    ['contact-control-result.schema.json', 'scenario-result.schema.json'],
+)
+def test_pending_cleanup_proof_preserves_completed_drain_when_source_disappears(
+    schema_name: str,
+) -> None:
+    schema = load_schema(SCHEMA_DIR / schema_name)
+    proof_schema = {
+        '$schema': schema['$schema'],
+        '$defs': schema['$defs'],
+        '$ref': '#/$defs/pendingCleanupProof',
+    }
+    proof = _cleanup_proof()
+    proof.pop('pose_source_publishers_after')
+    proof['kind'] = 'successful_blocking_delete_response_cleanup_drain_pending'
+    validate_against_schema(proof, proof_schema)
+
+
+def test_scenario_failure_schema_accepts_source_loss_after_completed_drain() -> None:
+    schema = load_schema(SCHEMA_DIR / 'scenario-result.schema.json')
+    value = _scenario_pass_result(2)
+    proof = _cleanup_proof()
+    proof.pop('pose_source_publishers_after')
+    proof['kind'] = 'successful_blocking_delete_response_cleanup_drain_pending'
+    value['status'] = 'FAIL'
+    value['verdict']['exit_code'] = 24
+    value['verdict']['reason'] = 'entity-pose source publisher was missing'
+    value['cleanup'] = {
+        'actor_absent': False,
+        'delete_attempt_count': 1,
+        'delete_success': True,
+        'proof': proof,
+        'required': True,
+    }
+    validate_against_schema(value, schema)
+
+
+def test_actorless_scenario_schema_preserves_no_delete_cleanup() -> None:
+    schema = load_schema(SCHEMA_DIR / 'scenario-result.schema.json')
+    value = _scenario_pass_result(1)
+    validate_against_schema(value, schema)
+
+    value['cleanup']['proof'] = {}
+    with pytest.raises(ArtifactError, match='schema violation'):
+        validate_against_schema(value, schema)
+
+
+def test_scenario_failure_schema_requires_structured_delete_transaction_proof() -> None:
+    schema = load_schema(SCHEMA_DIR / 'scenario-result.schema.json')
+    value = _scenario_pass_result(2)
+    value['status'] = 'FAIL'
+    value['verdict']['exit_code'] = 22
+    value['verdict']['reason'] = 'delete response timed out'
+    value['cleanup'] = {
+        'actor_absent': False,
+        'delete_attempt_count': 1,
+        'delete_success': None,
+        'proof': {
+            'error': 'scenario/delete_entity response timed out',
+            'failure_stage': 'response_timeout',
+            'kind': 'delete_transaction_failed',
+            'request_sequence': 20,
+            'request_stamp_ns': 1_000_000_000,
+            'response_sequence': None,
+            'response_stamp_ns': None,
+        },
+        'required': True,
+    }
+    validate_against_schema(value, schema)
+
+    value['cleanup']['proof'] = {}
+    with pytest.raises(ArtifactError, match='schema violation'):
+        validate_against_schema(value, schema)
+
+
+def test_scenario_failure_schema_accepts_spawn_sent_cleanup_pending_proof() -> None:
+    schema = load_schema(SCHEMA_DIR / 'scenario-result.schema.json')
+    value = _scenario_pass_result(2)
+    value['status'] = 'FAIL'
+    value['verdict']['exit_code'] = 22
+    value['verdict']['reason'] = 'pose-source graph query failed before delete'
+    value['cleanup'] = {
+        'actor_absent': False,
+        'delete_attempt_count': 0,
+        'delete_success': None,
+        'proof': {'kind': 'spawn_request_sent_cleanup_pending'},
+        'required': True,
+    }
+    validate_against_schema(value, schema)
+
+
+@pytest.mark.parametrize(
+    ('schema_name', 'definition_name'),
+    [
+        (
+            'contact-control-result.schema.json',
+            'simpleCleanupFailureProof',
+        ),
+        (
+            'scenario-result.schema.json',
+            'simpleActorFailureProof',
+        ),
+    ],
+)
+def test_failure_schema_accepts_ambiguous_spawn_send_cleanup_obligation(
+    schema_name: str,
+    definition_name: str,
+) -> None:
+    schema = load_schema(SCHEMA_DIR / schema_name)
+    validate_against_schema(
+        {'kind': 'spawn_request_send_attempted_cleanup_pending'},
+        schema['$defs'][definition_name],
+    )
 
 
 def _contact_graph_endpoint(endpoint_gid: str) -> dict:
@@ -177,7 +553,7 @@ def test_contact_failure_artifact_shape_is_valid() -> None:
             'actor_absent': True,
             'delete_attempt_count': 0,
             'delete_success': None,
-            'proof': {},
+            'proof': {'kind': 'spawn_not_committed'},
             'required': False,
         },
         'configuration': {
@@ -323,3 +699,24 @@ def test_contact_failure_artifact_shape_is_valid() -> None:
     }
     schema = load_schema(SCHEMA_DIR / 'contact-control-result.schema.json')
     validate_against_schema(value, schema)
+
+    value['cleanup'] = {
+        'actor_absent': False,
+        'delete_attempt_count': 1,
+        'delete_success': None,
+        'proof': {
+            'error': 'scenario/delete_entity response timed out',
+            'failure_stage': 'response_timeout',
+            'kind': 'delete_transaction_failed',
+            'request_sequence': 20,
+            'request_stamp_ns': 1_000_000_000,
+            'response_sequence': None,
+            'response_stamp_ns': None,
+        },
+        'required': True,
+    }
+    validate_against_schema(value, schema)
+
+    del value['cleanup']['proof']['failure_stage']
+    with pytest.raises(ArtifactError, match='schema violation'):
+        validate_against_schema(value, schema)

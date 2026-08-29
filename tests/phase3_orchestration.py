@@ -661,6 +661,7 @@ PACKAGE_SHARE_SOURCE_DIRECTORIES = (
     'launch',
     'maps',
     'meshes',
+    'models',
     'msg',
     'rviz',
     'schema',

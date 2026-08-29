@@ -49,11 +49,17 @@ an unsignalled in-place sensor-SDF edit violates that writer contract.
 Phase 3 also exposes bounded Gazebo user-command services below
 `/robotest/scenario/{spawn_entity,set_entity_pose,delete_entity}` and bridges
 the observed 10 Hz actor pose streams plus a permanent ground-plane heartbeat
-to `/robotest/validation/scenario_entity_poses`. The world and fixed actor SDF
+to `/robotest/validation/scenario_entity_poses`. Deletion uses Gazebo's
+blocking remove service; a ground heartbeat newer than the response and every
+delivered target pose in both source time and collector sequence starts a
+bounded quiet observation. Target delivery during the quiet interval or 50 ms
+steady-wall executor drain restarts from a later heartbeat, up to a hard
+simulation-time deadline. This bounds but does not causally order the distinct
+DDS writers. The world and fixed actor SDF
 assets embed Gazebo PosePublisher systems; the validation stream therefore
 reports simulator state, not controller request echoes. Cleanup requires the
-ground-plane source to span the post-delete quiet interval while the deleted
-actor remains absent.
+ground-plane source to span the final quiet interval after the last delivered
+target callback.
 The configured Gaussian LiDAR and IMU noise is deterministic only relative to
 the recorded simulator seed and identical simulation inputs. Gazebo remains
 tolerance-repeatable rather than bitwise deterministic across platforms.

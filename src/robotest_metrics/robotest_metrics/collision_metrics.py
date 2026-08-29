@@ -24,11 +24,15 @@ from pathlib import Path
 from typing import Any
 
 from robotest_scenarios.constants import (
+    ACTOR_CLEANUP_OBSERVATION_NS,
     ACTOR_CLEANUP_QUIET_NS,
     ACTOR_INITIAL_POSITION_TOLERANCE_M,
     ACTOR_YAW_TOLERANCE_RAD,
     CONTROL_ROBOT_START,
     CONTROL_WALL_POSE,
+    DDS_DRAIN_GRACE_S,
+    DEFAULT_CONTROL_WALL_TIMEOUT_S,
+    DEFAULT_SERVICE_TIMEOUT_S,
 )
 from robotest_scenarios.contact_evidence import (
     EXPECTED_CONTACT_GATE_SOURCE_PATHS,
@@ -1014,6 +1018,18 @@ def _positive_control_evidence(
     configuration = positive_control.get('configuration')
     if not isinstance(configuration, Mapping) or set(configuration) != _CONFIGURATION_FIELDS:
         raise MetricUnavailable('positive-control configuration is missing')
+    service_timeout_s = require_finite(
+        configuration.get('service_timeout_s'),
+        'positive_control.configuration.service_timeout_s',
+    )
+    wall_timeout_s = require_finite(
+        configuration.get('wall_timeout_s'),
+        'positive_control.configuration.wall_timeout_s',
+    )
+    if service_timeout_s != DEFAULT_SERVICE_TIMEOUT_S:
+        raise MetricUnavailable('positive-control service timeout changed')
+    if wall_timeout_s != DEFAULT_CONTROL_WALL_TIMEOUT_S:
+        raise MetricUnavailable('positive-control wall timeout changed')
     for field in (
         'control_configuration_sha256',
         'coverage_manifest_sha256',
@@ -1593,9 +1609,21 @@ def _positive_control_evidence(
         'kind',
         'pose_source_publishers_after',
         'pose_source_publishers_before',
+        'dds_drain_complete_steady_ns',
+        'dds_drain_grace_ns',
+        'dds_drain_spin_count',
+        'dds_drain_start_steady_ns',
+        'observation_deadline_sim_stamp_ns',
         'post_delete_pose_count',
+        'post_delete_pose_first_sequence',
+        'post_delete_pose_first_sim_stamp_ns',
+        'post_delete_pose_latest_sequence',
+        'post_delete_pose_latest_sim_stamp_ns',
         'post_delete_pose_source_heartbeat_count',
+        'post_delete_pose_source_latest_sequence',
         'post_delete_pose_source_latest_sim_stamp_ns',
+        'quiet_start_sim_stamp_ns',
+        'quiet_restart_count',
         'quiet_until_sim_stamp_ns',
         'request_sequence',
         'request_stamp_ns',
@@ -1615,7 +1643,7 @@ def _positive_control_evidence(
     if (
         not isinstance(cleanup_proof, Mapping)
         or set(cleanup_proof) != cleanup_proof_fields
-        or cleanup_proof.get('kind') != 'successful_delete_response_and_pose_quiet_interval'
+        or cleanup_proof.get('kind') != 'successful_blocking_delete_and_bounded_pose_absence'
     ):
         raise MetricUnavailable('positive-control actor cleanup proof is incomplete')
     cleanup_request_sequence = require_int(
@@ -1638,9 +1666,83 @@ def _positive_control_evidence(
         cleanup_proof.get('quiet_until_sim_stamp_ns'),
         'positive_control.cleanup.quiet_until_sim_stamp_ns',
     )
+    cleanup_quiet_start = require_int(
+        cleanup_proof.get('quiet_start_sim_stamp_ns'),
+        'positive_control.cleanup.quiet_start_sim_stamp_ns',
+    )
+    cleanup_observation_deadline = require_int(
+        cleanup_proof.get('observation_deadline_sim_stamp_ns'),
+        'positive_control.cleanup.observation_deadline_sim_stamp_ns',
+    )
+    cleanup_quiet_restart_count = require_int(
+        cleanup_proof.get('quiet_restart_count'),
+        'positive_control.cleanup.quiet_restart_count',
+    )
     cleanup_latest_pose_stamp = require_int(
         cleanup_proof.get('post_delete_pose_source_latest_sim_stamp_ns'),
         'positive_control.cleanup.post_delete_pose_source_latest_sim_stamp_ns',
+    )
+    cleanup_latest_pose_sequence = require_int(
+        cleanup_proof.get('post_delete_pose_source_latest_sequence'),
+        'positive_control.cleanup.post_delete_pose_source_latest_sequence',
+    )
+    cleanup_heartbeat_count = require_int(
+        cleanup_proof.get('post_delete_pose_source_heartbeat_count'),
+        'positive_control.cleanup.post_delete_pose_source_heartbeat_count',
+    )
+    transition_pose_count = require_int(
+        cleanup_proof.get('post_delete_pose_count'),
+        'positive_control.cleanup.post_delete_pose_count',
+    )
+    transition_fields = (
+        cleanup_proof.get('post_delete_pose_first_sequence'),
+        cleanup_proof.get('post_delete_pose_first_sim_stamp_ns'),
+        cleanup_proof.get('post_delete_pose_latest_sequence'),
+        cleanup_proof.get('post_delete_pose_latest_sim_stamp_ns'),
+    )
+    transition_is_consistent = all(field is None for field in transition_fields)
+    transition_latest_sequence = cleanup_response_sequence
+    if transition_pose_count > 0:
+        first_sequence = require_int(
+            transition_fields[0],
+            'positive_control.cleanup.post_delete_pose_first_sequence',
+        )
+        first_stamp = require_int(
+            transition_fields[1],
+            'positive_control.cleanup.post_delete_pose_first_sim_stamp_ns',
+        )
+        latest_sequence = require_int(
+            transition_fields[2],
+            'positive_control.cleanup.post_delete_pose_latest_sequence',
+        )
+        transition_latest_sequence = latest_sequence
+        latest_stamp = require_int(
+            transition_fields[3],
+            'positive_control.cleanup.post_delete_pose_latest_sim_stamp_ns',
+        )
+        transition_is_consistent = (
+            first_sequence > cleanup_response_sequence
+            and latest_sequence >= first_sequence
+            and latest_sequence - first_sequence >= transition_pose_count - 1
+            and first_stamp > 0
+            and latest_stamp >= first_stamp
+            and latest_stamp < cleanup_quiet_start
+        )
+    drain_grace_ns = require_int(
+        cleanup_proof.get('dds_drain_grace_ns'),
+        'positive_control.cleanup.dds_drain_grace_ns',
+    )
+    drain_start_steady_ns = require_int(
+        cleanup_proof.get('dds_drain_start_steady_ns'),
+        'positive_control.cleanup.dds_drain_start_steady_ns',
+    )
+    drain_complete_steady_ns = require_int(
+        cleanup_proof.get('dds_drain_complete_steady_ns'),
+        'positive_control.cleanup.dds_drain_complete_steady_ns',
+    )
+    drain_spin_count = require_int(
+        cleanup_proof.get('dds_drain_spin_count'),
+        'positive_control.cleanup.dds_drain_spin_count',
     )
     max_pre_cleanup_sequence = max(
         response_sequence,
@@ -1655,18 +1757,24 @@ def _positive_control_evidence(
         or cleanup_response_sequence <= cleanup_request_sequence
         or cleanup_request_stamp != release_observed_clock_stamp
         or cleanup_response_stamp < cleanup_request_stamp
-        or cleanup_quiet_until != cleanup_response_stamp + ACTOR_CLEANUP_QUIET_NS
+        or cleanup_quiet_start <= cleanup_response_stamp
+        or cleanup_observation_deadline != cleanup_response_stamp + ACTOR_CLEANUP_OBSERVATION_NS
+        or cleanup_quiet_start > cleanup_observation_deadline - ACTOR_CLEANUP_QUIET_NS
+        or cleanup_quiet_until != cleanup_quiet_start + ACTOR_CLEANUP_QUIET_NS
+        or cleanup_quiet_until > cleanup_observation_deadline
         or cleanup_latest_pose_stamp < cleanup_quiet_until
-        or require_int(
-            cleanup_proof.get('post_delete_pose_source_heartbeat_count'),
-            'positive_control.cleanup.post_delete_pose_source_heartbeat_count',
-        )
-        < 1
-        or require_int(
-            cleanup_proof.get('post_delete_pose_count'),
-            'positive_control.cleanup.post_delete_pose_count',
-        )
-        != 0
+        or cleanup_latest_pose_sequence <= transition_latest_sequence
+        or cleanup_latest_pose_sequence - cleanup_response_sequence
+        != cleanup_heartbeat_count + transition_pose_count
+        or drain_grace_ns != round(DDS_DRAIN_GRACE_S * 1_000_000_000)
+        or drain_start_steady_ns < 1
+        or drain_complete_steady_ns - drain_start_steady_ns < drain_grace_ns
+        or drain_spin_count < 1
+        or transition_pose_count < 0
+        or cleanup_quiet_restart_count < 0
+        or cleanup_quiet_restart_count > transition_pose_count
+        or not transition_is_consistent
+        or cleanup_heartbeat_count < 2
         or require_int(
             cleanup_proof.get('pose_source_publishers_before'),
             'positive_control.cleanup.pose_source_publishers_before',

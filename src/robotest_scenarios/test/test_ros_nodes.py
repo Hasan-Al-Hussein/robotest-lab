@@ -40,6 +40,7 @@ from robotest_scenarios.constants import (
     CONTROL_COMMAND_PROGRESS_SCHEMA_VERSION,
     CONTROL_COMMAND_REQUIRED_SUBSCRIPTION_COUNT,
     CONTROL_REVERSE_MPS,
+    ExitCode,
 )
 from robotest_scenarios.contact_control_driver import (
     ContactControlApp,
@@ -93,6 +94,27 @@ def _init_ros() -> None:
     rclpy.init(args=['--ros-args', '-r', '__ns:=/robotest'])
 
 
+def _install_cleanup_drain_clock(
+    app: object,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    on_spin: object | None = None,
+) -> SimpleNamespace:
+    clock = SimpleNamespace(now_ns=4_000_000_000, spin_count=0)
+    monkeypatch.setattr(time, 'monotonic_ns', lambda: clock.now_ns)
+
+    def spin_once(*, timeout_s: float = 0.02, check_fatal: bool = True) -> None:
+        assert check_fatal is False
+        clock.spin_count += 1
+        clock.now_ns += max(1, round(timeout_s * 1_000_000_000))
+        if on_spin is not None:
+            assert callable(on_spin)
+            on_spin(clock.spin_count)
+
+    monkeypatch.setattr(app, '_spin_once', spin_once)
+    return clock
+
+
 class _FakeCommandPublisher:
     def __init__(self) -> None:
         self.matched_subscription_count = 1
@@ -113,6 +135,7 @@ class _ArmTestNode:
         self.control_started_stamp_ns = None
         self.current_sim_stamp_ns = 2_000_000_000
         self.command_publisher = _FakeCommandPublisher()
+        self.cleanup_fatal_error = None
         self.fatal_error = None
         self.first_qualifying_contact = None
         self.motion_armed = False
@@ -232,7 +255,7 @@ def test_contact_spawn_success_returns_complete_ready_and_result_projection(
         resolve_topic_name=lambda name: name,
         spawn_client=SimpleNamespace(call_async=lambda _request: future),
     )
-    monkeypatch.setattr(app, '_wait_service', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(app, '_wait_service', lambda *_args, **_kwargs: app.wall_deadline)
 
     spawn = app._spawn_wall()
     expected_keys = {
@@ -286,7 +309,7 @@ def test_contact_spawn_waits_for_one_delayed_response_until_operational_deadline
         current_sim_stamp_ns=5_000_000_000,
         spawn_client=SimpleNamespace(call_async=call_async),
     )
-    monkeypatch.setattr(app, '_wait_service', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(app, '_wait_service', lambda *_args, **_kwargs: app.wall_deadline)
     monkeypatch.setattr(app, '_spin_once', lambda: setattr(clock, 'now', clock.now + 1.1))
     monkeypatch.setattr(
         'robotest_scenarios.contact_control_driver.time.monotonic',
@@ -301,14 +324,215 @@ def test_contact_spawn_waits_for_one_delayed_response_until_operational_deadline
     assert spawn['attempt_count'] == 1
 
 
+def test_contact_spawn_does_not_send_after_service_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _spawn_test_app(tmp_path, run_id='spawn-pre-send-deadline-test')
+    clock = SimpleNamespace(now=10.0)
+    send_count = 0
+
+    def next_sequence() -> int:
+        clock.now = 10.2
+        return 41
+
+    def call_async(_request: object) -> object:
+        nonlocal send_count
+        send_count += 1
+        return SimpleNamespace()
+
+    app.node = SimpleNamespace(
+        _next_sequence=next_sequence,
+        current_sim_stamp_ns=5_000_000_000,
+        spawn_client=SimpleNamespace(call_async=call_async),
+    )
+    app.wall_deadline = 100.0
+    monkeypatch.setattr(app, '_wait_service', lambda *_args, **_kwargs: 10.1)
+    monkeypatch.setattr(time, 'monotonic', lambda: clock.now)
+
+    with pytest.raises(InfrastructureError, match='service unavailable before deadline'):
+        app._spawn_wall()
+
+    assert send_count == 0
+    assert app.setup_evidence['spawn']['request_sequence'] == 41
+    assert isinstance(app.setup_evidence['spawn']['error'], str)
+
+
+def test_scenario_spawn_does_not_send_after_service_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = load_scenario(str(REPOSITORY / 'scenarios/phase3_s2_static_obstacle.yaml'))
+    app = ScenarioControllerApp(
+        document=document,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        identity={},
+        wall_timeout_s=30.0,
+        service_timeout_s=0.1,
+        raw_ros_args=[],
+    )
+    app.actor_asset = tmp_path / 'actor.sdf'
+    clock = SimpleNamespace(now=10.0)
+    send_count = 0
+
+    def next_sequence() -> int:
+        clock.now = 10.2
+        return 41
+
+    def call_async(_request: object) -> object:
+        nonlocal send_count
+        send_count += 1
+        return SimpleNamespace()
+
+    app.node = SimpleNamespace(
+        _next_sequence=next_sequence,
+        current_sim_stamp_ns=5_000_000_000,
+        spawn_client=SimpleNamespace(call_async=call_async),
+    )
+    app.wall_deadline = 100.0
+    monkeypatch.setattr(app, '_wait_service', lambda *_args, **_kwargs: 10.1)
+    monkeypatch.setattr(time, 'monotonic', lambda: clock.now)
+
+    with pytest.raises(InfrastructureError, match='service unavailable before deadline'):
+        app._spawn_actor()
+
+    assert send_count == 0
+    assert app.spawn_evidence['request_sequence'] == 41
+    assert isinstance(app.spawn_evidence['error'], str)
+
+
+def test_scenario_spawn_rejects_response_observed_after_service_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = load_scenario(str(REPOSITORY / 'scenarios/phase3_s2_static_obstacle.yaml'))
+    app = ScenarioControllerApp(
+        document=document,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        identity={},
+        wall_timeout_s=30.0,
+        service_timeout_s=0.1,
+        raw_ros_args=[],
+    )
+    app.actor_asset = tmp_path / 'actor.sdf'
+    clock = SimpleNamespace(now=10.0)
+
+    def response_done() -> bool:
+        clock.now = 10.2
+        return True
+
+    app.node = SimpleNamespace(
+        _next_sequence=iter((41,)).__next__,
+        current_sim_stamp_ns=5_000_000_000,
+        spawn_client=SimpleNamespace(
+            call_async=lambda _request: SimpleNamespace(
+                done=response_done,
+                result=lambda: SimpleNamespace(success=True),
+            )
+        ),
+    )
+    app.wall_deadline = 100.0
+    monkeypatch.setattr(app, '_wait_service', lambda *_args, **_kwargs: 10.1)
+    monkeypatch.setattr(time, 'monotonic', lambda: clock.now)
+
+    with pytest.raises(InfrastructureError, match='response timed out'):
+        app._spawn_actor()
+
+    assert app.actor_spawn_request_sent is True
+    assert 'response timed out' in str(app.spawn_evidence['error'])
+
+
+@pytest.mark.parametrize('app_kind', ['contact', 'scenario'])
+def test_spawn_call_exception_retains_conservative_cleanup_obligation(
+    app_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    send_count = 0
+    delete_call_count = 0
+    sequences = iter((41, 43))
+
+    def call_async(_request: object) -> object:
+        nonlocal send_count
+        send_count += 1
+        raise RuntimeError('post-send client failure')
+
+    if app_kind == 'contact':
+        app = _spawn_test_app(tmp_path, run_id='ambiguous-contact-spawn-test')
+        app.node = SimpleNamespace(
+            _next_sequence=lambda: next(sequences),
+            current_sim_stamp_ns=5_000_000_000,
+            delete_client=object(),
+            spawn_client=SimpleNamespace(call_async=call_async),
+        )
+        attempted_attr = 'wall_spawn_request_send_attempted'
+        sent_attr = 'wall_spawn_request_sent'
+        spawn = app._spawn_wall
+        cleanup = app._cleanup_wall
+        cleanup_error = 'rejected contact wall cleanup'
+    else:
+        document = load_scenario(str(REPOSITORY / 'scenarios/phase3_s2_static_obstacle.yaml'))
+        app = ScenarioControllerApp(
+            document=document,
+            output_path=tmp_path / 'result.json',
+            ready_path=tmp_path / 'ready.json',
+            identity={},
+            wall_timeout_s=30.0,
+            service_timeout_s=2.0,
+            raw_ros_args=[],
+        )
+        app.actor_asset = tmp_path / 'actor.sdf'
+        app.node = SimpleNamespace(
+            _next_sequence=lambda: next(sequences),
+            current_sim_stamp_ns=5_000_000_000,
+            delete_client=object(),
+            spawn_client=SimpleNamespace(call_async=call_async),
+        )
+        attempted_attr = 'actor_spawn_request_send_attempted'
+        sent_attr = 'actor_spawn_request_sent'
+        spawn = app._spawn_actor
+        cleanup = app._cleanup_actor
+        cleanup_error = 'rejected actor cleanup'
+
+    monkeypatch.setattr(app, '_wait_service', lambda *_args, **_kwargs: app.wall_deadline)
+
+    with pytest.raises(InfrastructureError, match='request could not be sent'):
+        spawn()
+
+    assert send_count == 1
+    assert getattr(app, attempted_attr) is True
+    assert getattr(app, sent_attr) is False
+    assert app.cleanup['proof'] == {'kind': 'spawn_request_send_attempted_cleanup_pending'}
+    app.node.count_publishers = lambda _topic: (_ for _ in ()).throw(
+        RuntimeError('cleanup reached')
+    )
+
+    def reject_delete(*_args: object, **_kwargs: object) -> tuple[object, int, int]:
+        nonlocal delete_call_count
+        delete_call_count += 1
+        return SimpleNamespace(success=False), 42, 5_100_000_000
+
+    monkeypatch.setattr(app, '_call_service', reject_delete)
+    with pytest.raises(InfrastructureError, match=cleanup_error):
+        cleanup()
+    assert delete_call_count == 1
+    assert app.delete_attempt_count == 1
+
+
 def test_contact_spawn_timeout_runs_reserved_exactly_once_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    clock = SimpleNamespace(now=100.0)
+    clock = SimpleNamespace(now=100.0, now_ns=100_000_000_000)
     monkeypatch.setattr(
         'robotest_scenarios.contact_control_driver.time.monotonic',
         lambda: clock.now,
+    )
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.time.monotonic_ns',
+        lambda: clock.now_ns,
     )
     app = _spawn_test_app(tmp_path, run_id='spawn-wall-deadline-test')
     assert app.wall_deadline == 125.0
@@ -331,6 +555,11 @@ def test_contact_spawn_timeout_runs_reserved_exactly_once_cleanup(
             self.post_delete_entity_latest_sim_stamp_ns = None
             self.post_delete_entity_message_count = 0
             self.post_delete_wall_pose_count = 0
+            self.post_delete_wall_pose_first_sequence = None
+            self.post_delete_wall_pose_first_sim_stamp_ns = None
+            self.post_delete_wall_pose_latest_sequence = None
+            self.post_delete_wall_pose_latest_sim_stamp_ns = None
+            self.delete_response_sequence = None
             self.sequence = 60
             self.spawn_client = SimpleNamespace(call_async=spawn_call_async)
 
@@ -376,9 +605,17 @@ def test_contact_spawn_timeout_runs_reserved_exactly_once_cleanup(
     monkeypatch.setattr(
         'robotest_scenarios.contact_control_driver.rclpy.try_shutdown', lambda: None
     )
-    monkeypatch.setattr(app, '_wait_service', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(app, '_wait_service', lambda *_args, **_kwargs: app.wall_deadline)
 
-    def spin_to_operational_deadline() -> None:
+    def spin_to_operational_deadline(
+        timeout_s: float = 0.02,
+        *,
+        check_fatal: bool = True,
+    ) -> None:
+        if node.delete_response_sequence is not None:
+            assert check_fatal is False
+            clock.now_ns += max(1, round(timeout_s * 1_000_000_000))
+            return
         clock.now += 5.0
         app._require_wall_budget()
 
@@ -388,12 +625,14 @@ def test_contact_spawn_timeout_runs_reserved_exactly_once_cleanup(
         assert app.cleanup_window_active
         assert app.wall_deadline == 130.0
         assert clock.now == 125.0
+        node.sequence = 62
         return SimpleNamespace(success=True), 62, node.current_sim_stamp_ns
 
     def prove_absence(*_args: object, **_kwargs: object) -> None:
         node.current_sim_stamp_ns += 250_000_000
+        node.post_delete_entity_latest_sequence = node._next_sequence()
         node.post_delete_entity_latest_sim_stamp_ns = node.current_sim_stamp_ns
-        node.post_delete_entity_message_count = 1
+        node.post_delete_entity_message_count += 1
 
     def result(error: object) -> tuple[dict[str, object], int]:
         assert isinstance(error, InfrastructureError)
@@ -1288,6 +1527,99 @@ def test_scenario_app_cleans_node_after_executor_setup_failure(
         assert f'scenario_controller: teardown warning: {failure}' in capsys.readouterr().err
 
 
+def test_scenario_run_normalizes_cleanup_exception_and_still_finalizes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    document = load_scenario(str(REPOSITORY / 'scenarios/phase3_s1_baseline.yaml'))
+    app = ScenarioControllerApp(
+        document=document,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        identity={},
+        wall_timeout_s=30.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    events: list[str] = []
+
+    class FakeNode:
+        def __init__(self) -> None:
+            self.bound_uuid = None
+            self.context = object()
+            self.terminal_status = None
+
+        @staticmethod
+        def begin_cleanup() -> None:
+            events.append('begin_cleanup')
+
+        @staticmethod
+        def destroy_node() -> None:
+            events.append('destroy_node')
+
+    class FakeExecutor:
+        def __init__(self, *, context: object) -> None:
+            assert context is node.context
+
+        @staticmethod
+        def add_node(added_node: object) -> bool:
+            assert added_node is node
+            return True
+
+        @staticmethod
+        def remove_node(removed_node: object) -> None:
+            assert removed_node is node
+            events.append('remove_node')
+
+        @staticmethod
+        def shutdown(*, timeout_sec: float) -> bool:
+            assert timeout_sec == 1.0
+            events.append('shutdown')
+            return True
+
+    def result(error: object) -> tuple[dict[str, object], int]:
+        assert isinstance(error, InfrastructureError)
+        assert 'scenario controller cleanup failed' in str(error)
+        events.append('result')
+        return {}, int(ExitCode.INFRASTRUCTURE_ERROR)
+
+    node = FakeNode()
+    monkeypatch.setattr(scenario_controller, 'ScenarioControllerNode', lambda _document: node)
+    monkeypatch.setattr(scenario_controller, 'SingleThreadedExecutor', FakeExecutor)
+    monkeypatch.setattr(scenario_controller.rclpy, 'init', lambda **_: events.append('init'))
+    monkeypatch.setattr(
+        scenario_controller.rclpy,
+        'try_shutdown',
+        lambda: events.append('rclpy_shutdown'),
+    )
+    monkeypatch.setattr(app, '_workflow', lambda: events.append('workflow'))
+    monkeypatch.setattr(
+        app,
+        '_cleanup_actor',
+        lambda: (_ for _ in ()).throw(RuntimeError('cleanup transport failed')),
+    )
+    monkeypatch.setattr(app, '_result', result)
+    monkeypatch.setattr(scenario_controller, 'load_schema', lambda _path: {})
+    monkeypatch.setattr(
+        scenario_controller,
+        'write_canonical_json',
+        lambda *_args, **_kwargs: events.append('write_result'),
+    )
+
+    assert app.run() == int(ExitCode.INFRASTRUCTURE_ERROR)
+    assert events == [
+        'init',
+        'workflow',
+        'begin_cleanup',
+        'result',
+        'write_result',
+        'remove_node',
+        'shutdown',
+        'destroy_node',
+        'rclpy_shutdown',
+    ]
+
+
 @pytest.mark.parametrize('executor_shutdown_outcome', ('false', 'none', 'raise'))
 def test_scenario_app_rejects_incomplete_executor_shutdown(
     tmp_path: Path,
@@ -2018,7 +2350,9 @@ def test_contact_node_uses_permanent_pose_heartbeat_after_wall_delete() -> None:
     manifest = load_coverage_manifest(str(REPOSITORY / 'config' / 'collision-coverage.yaml'))
     node = ContactControlNode(manifest)
     try:
+        node.delete_response_sequence = node._next_sequence()
         node.delete_response_stamp_ns = 1_000_000_000
+        node.spawn_request_sequence = 1
         transform = TransformStamped()
         transform.header.frame_id = 'world'
         transform.header.stamp.sec = 1
@@ -2033,14 +2367,33 @@ def test_contact_node_uses_permanent_pose_heartbeat_after_wall_delete() -> None:
         transform.child_frame_id = 'ground_plane'
         node._on_entity_poses(TFMessage(transforms=[transform]))
         assert node.post_delete_entity_message_count == 1
+        assert node.post_delete_entity_latest_sequence is not None
         assert node.post_delete_entity_latest_sim_stamp_ns == 1_300_000_000
         assert node.post_delete_wall_pose_count == 0
 
+        transform.child_frame_id = 'phase3_contact_control_wall'
+        transform.header.stamp.sec = 0
+        transform.header.stamp.nanosec = 900_000_000
+        transform.transform.translation.x = 0.7
+        transform.transform.translation.y = -3.5
+        transform.transform.translation.z = 0.4
+        node._on_entity_poses(TFMessage(transforms=[transform]))
+        assert node.post_delete_wall_pose_count == 1
+        assert node.post_delete_wall_pose_first_sequence is not None
+        assert node.post_delete_wall_pose_first_sequence > node.post_delete_entity_latest_sequence
+        assert node.post_delete_wall_pose_first_sim_stamp_ns == 900_000_000
+        assert node.post_delete_wall_pose_latest_sequence == (
+            node.post_delete_wall_pose_first_sequence
+        )
+        assert node.post_delete_wall_pose_latest_sim_stamp_ns == 900_000_000
+
         transform.header.stamp.nanosec = 200_000_000
+        transform.child_frame_id = 'ground_plane'
         with pytest.raises(ProtocolError, match='heartbeat stamp regressed'):
             node._on_entity_poses(TFMessage(transforms=[transform]))
 
         transform.header.frame_id = 'map'
+        transform.header.stamp.sec = 1
         transform.header.stamp.nanosec = 400_000_000
         with pytest.raises(ProtocolError, match='heartbeat has an invalid frame'):
             node._on_entity_poses(TFMessage(transforms=[transform]))
@@ -2054,7 +2407,10 @@ def test_scenario_node_uses_permanent_pose_heartbeat_after_actor_delete() -> Non
     document = load_scenario(str(REPOSITORY / 'scenarios' / 'phase3_s2_static_obstacle.yaml'))
     node = ScenarioControllerNode(document)
     try:
+        node.delete_response_sequence = node._next_sequence()
         node.delete_response_stamp_ns = 2_000_000_000
+        node.spawn_request_sequence = 1
+        node.spawn_request_stamp_ns = 1_900_000_000
         transform = TransformStamped()
         transform.header.frame_id = 'robotest_lab'
         transform.header.stamp.sec = 2
@@ -2069,8 +2425,20 @@ def test_scenario_node_uses_permanent_pose_heartbeat_after_actor_delete() -> Non
         transform.child_frame_id = 'ground_plane'
         node._on_entity_poses(TFMessage(transforms=[transform]))
         assert node.post_delete_entity_message_count == 1
+        assert node.post_delete_entity_latest_sequence is not None
         assert node.post_delete_entity_latest_sim_stamp_ns == 2_300_000_000
         assert node.post_delete_pose_count == 0
+
+        transform.child_frame_id = document.actor_name
+        transform.header.stamp.sec = 1
+        transform.header.stamp.nanosec = 950_000_000
+        node._on_entity_poses(TFMessage(transforms=[transform]))
+        assert node.post_delete_pose_count == 1
+        assert node.post_delete_pose_first_sequence is not None
+        assert node.post_delete_pose_first_sequence > node.post_delete_entity_latest_sequence
+        assert node.post_delete_pose_first_sim_stamp_ns == 1_950_000_000
+        assert node.post_delete_pose_latest_sequence == node.post_delete_pose_first_sequence
+        assert node.post_delete_pose_latest_sim_stamp_ns == 1_950_000_000
     finally:
         node.destroy_node()
         rclpy.try_shutdown()
@@ -2114,8 +2482,11 @@ def test_contact_cleanup_retains_successful_response_when_quiet_wait_fails(
         assert app.cleanup['delete_attempt_count'] == 1
         assert app.cleanup['delete_success'] is True
         assert app.cleanup['actor_absent'] is False
-        assert app.cleanup['proof']['kind'] == 'successful_delete_response_cleanup_quiet_pending'
+        assert app.cleanup['proof']['kind'] == (
+            'successful_blocking_delete_response_cleanup_anchor_pending'
+        )
         assert app.cleanup['proof']['response_stamp_ns'] == 1_000_000_000
+        assert app.cleanup['proof']['quiet_start_sim_stamp_ns'] is None
     finally:
         node.destroy_node()
         rclpy.try_shutdown()
@@ -2156,11 +2527,1498 @@ def test_scenario_cleanup_retains_successful_response_when_quiet_wait_fails(
         assert app.cleanup['delete_attempt_count'] == 1
         assert app.cleanup['delete_success'] is True
         assert app.cleanup['actor_absent'] is False
-        assert app.cleanup['proof']['kind'] == 'successful_delete_response_cleanup_quiet_pending'
+        assert app.cleanup['proof']['kind'] == (
+            'successful_blocking_delete_response_cleanup_anchor_pending'
+        )
         assert app.cleanup['proof']['response_stamp_ns'] == 2_000_000_000
+        assert app.cleanup['proof']['quiet_start_sim_stamp_ns'] is None
     finally:
         node.destroy_node()
         rclpy.try_shutdown()
+
+
+def test_contact_cleanup_rejected_response_retains_response_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_ros()
+    manifest = load_coverage_manifest(str(REPOSITORY / 'config/collision-coverage.yaml'))
+    node = ContactControlNode(manifest)
+    app = ContactControlApp(
+        manifest=manifest,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        arm_path=tmp_path / 'arm.json',
+        armed_path=tmp_path / 'armed.json',
+        command_progress_path=tmp_path / 'command-progress.json',
+        run_id='cleanup-reject-test',
+        wall_timeout_s=30.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    app.node = node
+    app.wall_spawn_request_sent = True
+    node.current_sim_stamp_ns = 1_000_000_000
+    monkeypatch.setattr(node, 'count_publishers', lambda _topic: 4)
+
+    def reject(*_args: object, **kwargs: object) -> tuple[object, int, int]:
+        evidence = kwargs['evidence']
+        assert isinstance(evidence, dict)
+        evidence['request_sequence'] = 7
+        evidence['request_stamp_ns'] = 900_000_000
+        node.sequence = 7
+        return SimpleNamespace(success=False), 7, 900_000_000
+
+    monkeypatch.setattr(app, '_call_service', reject)
+    try:
+        with pytest.raises(InfrastructureError, match='rejected contact wall cleanup'):
+            app._cleanup_wall()
+        proof = app.cleanup['proof']
+        assert proof['kind'] == 'delete_response_did_not_prove_absence'
+        assert proof['failure_stage'] == 'response_rejected'
+        assert proof['error'] == 'scenario/delete_entity rejected contact wall cleanup'
+        assert proof['request_sequence'] == 7
+        assert proof['request_stamp_ns'] == 900_000_000
+        assert proof['response_sequence'] > proof['request_sequence']
+        assert proof['response_stamp_ns'] == 1_000_000_000
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_scenario_cleanup_rejected_response_retains_response_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_ros()
+    document = load_scenario(str(REPOSITORY / 'scenarios/phase3_s2_static_obstacle.yaml'))
+    node = ScenarioControllerNode(document)
+    app = ScenarioControllerApp(
+        document=document,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        identity={},
+        wall_timeout_s=30.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    app.node = node
+    app.actor_spawn_request_sent = True
+    node.current_sim_stamp_ns = 2_000_000_000
+    monkeypatch.setattr(node, 'count_publishers', lambda _topic: 4)
+
+    def reject(*_args: object, **kwargs: object) -> tuple[object, int, int]:
+        evidence = kwargs['evidence']
+        assert isinstance(evidence, dict)
+        evidence['request_sequence'] = 9
+        evidence['request_stamp_ns'] = 1_900_000_000
+        node.sequence = 9
+        return SimpleNamespace(success=False), 9, 1_900_000_000
+
+    monkeypatch.setattr(app, '_call_service', reject)
+    try:
+        with pytest.raises(InfrastructureError, match='rejected actor cleanup'):
+            app._cleanup_actor()
+        proof = app.cleanup['proof']
+        assert proof['kind'] == 'delete_response_did_not_prove_absence'
+        assert proof['failure_stage'] == 'response_rejected'
+        assert proof['error'] == 'scenario/delete_entity rejected actor cleanup'
+        assert proof['request_sequence'] == 9
+        assert proof['request_stamp_ns'] == 1_900_000_000
+        assert proof['response_sequence'] > proof['request_sequence']
+        assert proof['response_stamp_ns'] == 2_000_000_000
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_contact_cleanup_retains_pending_proof_when_dds_drain_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_ros()
+    manifest = load_coverage_manifest(str(REPOSITORY / 'config/collision-coverage.yaml'))
+    node = ContactControlNode(manifest)
+    app = ContactControlApp(
+        manifest=manifest,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        arm_path=tmp_path / 'arm.json',
+        armed_path=tmp_path / 'armed.json',
+        command_progress_path=tmp_path / 'command-progress.json',
+        run_id='cleanup-drain-failure-test',
+        wall_timeout_s=30.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    app.node = node
+    app.wall_spawn_request_sent = True
+    node.current_sim_stamp_ns = 1_000_000_000
+    monkeypatch.setattr(node, 'count_publishers', lambda _topic: 4)
+    monkeypatch.setattr(
+        app,
+        '_call_service',
+        lambda *_args, **_kwargs: (SimpleNamespace(success=True), 7, 900_000_000),
+    )
+    wait_count = 0
+
+    def wait_for(predicate: object, **_kwargs: object) -> None:
+        nonlocal wait_count
+        wait_count += 1
+        stamp_ns = 1_200_000_000 if wait_count == 1 else 1_500_000_000
+        node.current_sim_stamp_ns = stamp_ns
+        node.post_delete_entity_latest_sequence = node._next_sequence()
+        node.post_delete_entity_latest_sim_stamp_ns = stamp_ns
+        node.post_delete_entity_message_count += 1
+        assert callable(predicate) and predicate()
+
+    monkeypatch.setattr(app, '_wait_for', wait_for)
+    monkeypatch.setattr(time, 'monotonic_ns', lambda: 4_000_000_000)
+
+    def fail_drain(*_args: object, **_kwargs: object) -> None:
+        raise ScenarioFailureError('drain failed')
+
+    monkeypatch.setattr(app, '_spin_once', fail_drain)
+    try:
+        with pytest.raises(ScenarioFailureError, match='drain failed'):
+            app._cleanup_wall()
+        proof = app.cleanup['proof']
+        assert app.cleanup['actor_absent'] is False
+        assert proof['kind'] == 'successful_blocking_delete_response_cleanup_drain_pending'
+        assert proof['dds_drain_start_steady_ns'] == 4_000_000_000
+        assert proof['dds_drain_complete_steady_ns'] is None
+        assert proof['dds_drain_spin_count'] == 0
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_scenario_cleanup_retains_pending_proof_when_dds_drain_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_ros()
+    document = load_scenario(str(REPOSITORY / 'scenarios/phase3_s2_static_obstacle.yaml'))
+    node = ScenarioControllerNode(document)
+    app = ScenarioControllerApp(
+        document=document,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        identity={},
+        wall_timeout_s=30.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    app.node = node
+    app.actor_spawn_request_sent = True
+    node.current_sim_stamp_ns = 2_000_000_000
+    node.spawn_request_sequence = 1
+    node.spawn_request_stamp_ns = 1_800_000_000
+    monkeypatch.setattr(node, 'count_publishers', lambda _topic: 4)
+    monkeypatch.setattr(
+        app,
+        '_call_service',
+        lambda *_args, **_kwargs: (SimpleNamespace(success=True), 9, 1_900_000_000),
+    )
+    wait_count = 0
+
+    def wait_for(predicate: object, **_kwargs: object) -> None:
+        nonlocal wait_count
+        wait_count += 1
+        stamp_ns = 2_200_000_000 if wait_count == 1 else 2_500_000_000
+        node.current_sim_stamp_ns = stamp_ns
+        node.post_delete_entity_latest_sequence = node._next_sequence()
+        node.post_delete_entity_latest_sim_stamp_ns = stamp_ns
+        node.post_delete_entity_message_count += 1
+        assert callable(predicate) and predicate()
+
+    monkeypatch.setattr(app, '_wait_for', wait_for)
+    monkeypatch.setattr(time, 'monotonic_ns', lambda: 5_000_000_000)
+
+    def fail_drain(*_args: object, **_kwargs: object) -> None:
+        raise ScenarioFailureError('drain failed')
+
+    monkeypatch.setattr(app, '_spin_once', fail_drain)
+    try:
+        with pytest.raises(ScenarioFailureError, match='drain failed'):
+            app._cleanup_actor()
+        proof = app.cleanup['proof']
+        assert app.cleanup['actor_absent'] is False
+        assert proof['kind'] == 'successful_blocking_delete_response_cleanup_drain_pending'
+        assert proof['dds_drain_start_steady_ns'] == 5_000_000_000
+        assert proof['dds_drain_complete_steady_ns'] is None
+        assert proof['dds_drain_spin_count'] == 0
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+@pytest.mark.parametrize(
+    ('deliver_terminal_during_drain', 'source_disappears', 'final_query_expires'),
+    [(False, False, False), (True, False, False), (False, True, False), (False, False, True)],
+)
+def test_contact_cleanup_drains_callbacks_after_source_spanned_quiet_interval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    deliver_terminal_during_drain: bool,
+    source_disappears: bool,
+    final_query_expires: bool,
+) -> None:
+    _init_ros()
+    manifest = load_coverage_manifest(str(REPOSITORY / 'config/collision-coverage.yaml'))
+    node = ContactControlNode(manifest)
+    app = ContactControlApp(
+        manifest=manifest,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        arm_path=tmp_path / 'arm.json',
+        armed_path=tmp_path / 'armed.json',
+        command_progress_path=tmp_path / 'command-progress.json',
+        run_id='cleanup-terminal-pose-test',
+        wall_timeout_s=30.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    app.node = node
+    app.wall_spawn_request_sent = True
+    node.current_sim_stamp_ns = 1_000_000_000
+    node.sequence = 7
+    node.spawn_request_sequence = 1
+    wall_clock = SimpleNamespace(now=9.0)
+    app.wall_deadline = 10.0
+    monkeypatch.setattr(time, 'monotonic', lambda: wall_clock.now)
+    publisher_query_count = 0
+
+    def count_publishers(_topic: str) -> int:
+        nonlocal publisher_query_count
+        publisher_query_count += 1
+        if final_query_expires and publisher_query_count > 1:
+            wall_clock.now = app.wall_deadline
+        return 0 if source_disappears and publisher_query_count > 1 else 4
+
+    monkeypatch.setattr(node, 'count_publishers', count_publishers)
+    monkeypatch.setattr(
+        app,
+        '_call_service',
+        lambda *_args, **_kwargs: (SimpleNamespace(success=True), 7, 900_000_000),
+    )
+    wait_count = 0
+
+    def wait_for(predicate: object, **_kwargs: object) -> None:
+        nonlocal wait_count
+        wait_count += 1
+        transform = TransformStamped()
+        transform.header.frame_id = 'world'
+        transform.transform.rotation.w = 1.0
+        stamps = (
+            [1_200_000_000, 1_500_000_000, 1_600_000_000, 1_900_000_000]
+            if deliver_terminal_during_drain
+            else [1_200_000_000, 1_500_000_000]
+        )
+        stamp_ns = stamps[wait_count - 1]
+        transform.header.stamp.sec, transform.header.stamp.nanosec = divmod(stamp_ns, 1_000_000_000)
+        transform.child_frame_id = 'ground_plane'
+        node.current_sim_stamp_ns = stamp_ns
+        node._on_entity_poses(TFMessage(transforms=[transform]))
+        assert callable(predicate) and predicate()
+
+    monkeypatch.setattr(app, '_wait_for', wait_for)
+
+    def drain_callback(spin_count: int) -> None:
+        if spin_count != 1 or not deliver_terminal_during_drain:
+            return
+        wall = TransformStamped()
+        wall.header.frame_id = 'world'
+        wall.header.stamp.sec = 1
+        wall.header.stamp.nanosec = 200_000_000
+        wall.child_frame_id = 'phase3_contact_control_wall'
+        wall.transform.translation.x = 0.7
+        wall.transform.translation.y = -3.5
+        wall.transform.translation.z = 0.4
+        wall.transform.rotation.w = 1.0
+        node._on_entity_poses(TFMessage(transforms=[wall]))
+
+    drain_clock = _install_cleanup_drain_clock(
+        app,
+        monkeypatch,
+        on_spin=drain_callback,
+    )
+    try:
+        if final_query_expires:
+            with pytest.raises(WallTimeoutError, match='deadline elapsed'):
+                app._cleanup_wall()
+            assert app.cleanup['actor_absent'] is False
+            assert (
+                app.cleanup['proof']['kind']
+                == 'successful_blocking_delete_response_cleanup_drain_pending'
+            )
+            return
+        if source_disappears:
+            with pytest.raises(ScenarioFailureError, match='source publisher was missing'):
+                app._cleanup_wall()
+            assert app.cleanup['actor_absent'] is False
+            assert (
+                app.cleanup['proof']['kind']
+                == 'successful_blocking_delete_response_cleanup_drain_pending'
+            )
+            assert 'pose_source_publishers_after' not in app.cleanup['proof']
+            return
+        app._cleanup_wall()
+        assert wait_count == (4 if deliver_terminal_during_drain else 2)
+        assert drain_clock.spin_count == (4 if deliver_terminal_during_drain else 3)
+        assert app.cleanup['actor_absent'] is True
+        proof = app.cleanup['proof']
+        assert proof['kind'] == 'successful_blocking_delete_and_bounded_pose_absence'
+        assert proof['post_delete_pose_count'] == int(deliver_terminal_during_drain)
+        expected_stamp = 1_200_000_000 if deliver_terminal_during_drain else None
+        assert proof['post_delete_pose_first_sim_stamp_ns'] == expected_stamp
+        assert proof['post_delete_pose_latest_sim_stamp_ns'] == expected_stamp
+        if deliver_terminal_during_drain:
+            assert (
+                proof['post_delete_pose_source_latest_sequence']
+                > proof['post_delete_pose_latest_sequence']
+            )
+        expected_quiet_start = 1_600_000_000 if deliver_terminal_during_drain else 1_200_000_000
+        assert proof['quiet_start_sim_stamp_ns'] == expected_quiet_start
+        assert proof['quiet_until_sim_stamp_ns'] == expected_quiet_start + 250_000_000
+        assert proof['quiet_restart_count'] == int(deliver_terminal_during_drain)
+        assert proof['dds_drain_grace_ns'] == 50_000_000
+        assert (
+            proof['dds_drain_complete_steady_ns'] - proof['dds_drain_start_steady_ns']
+            >= (proof['dds_drain_grace_ns'])
+        )
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_contact_cleanup_restarts_quiet_window_after_newer_pose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_ros()
+    manifest = load_coverage_manifest(str(REPOSITORY / 'config/collision-coverage.yaml'))
+    node = ContactControlNode(manifest)
+    app = ContactControlApp(
+        manifest=manifest,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        arm_path=tmp_path / 'arm.json',
+        armed_path=tmp_path / 'armed.json',
+        command_progress_path=tmp_path / 'command-progress.json',
+        run_id='cleanup-persistent-pose-test',
+        wall_timeout_s=30.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    app.node = node
+    app.wall_spawn_request_sent = True
+    node.current_sim_stamp_ns = 1_000_000_000
+    node.sequence = 7
+    node.spawn_request_sequence = 1
+    monkeypatch.setattr(node, 'count_publishers', lambda _topic: 4)
+    monkeypatch.setattr(
+        app,
+        '_call_service',
+        lambda *_args, **_kwargs: (SimpleNamespace(success=True), 7, 900_000_000),
+    )
+    wait_count = 0
+
+    def wait_for(predicate: object, **_kwargs: object) -> None:
+        nonlocal wait_count
+        wait_count += 1
+        heartbeat = TransformStamped()
+        heartbeat.header.frame_id = 'world'
+        heartbeat.header.stamp.sec = 1
+        stamp_ns = {
+            1: 1_200_000_000,
+            2: 1_500_000_000,
+            3: 1_600_000_000,
+            4: 1_900_000_000,
+        }[wait_count]
+        heartbeat.header.stamp.sec, heartbeat.header.stamp.nanosec = divmod(stamp_ns, 1_000_000_000)
+        heartbeat.child_frame_id = 'ground_plane'
+        heartbeat.transform.rotation.w = 1.0
+        node.current_sim_stamp_ns = stamp_ns
+        node._on_entity_poses(TFMessage(transforms=[heartbeat]))
+        assert callable(predicate) and predicate()
+
+    monkeypatch.setattr(app, '_wait_for', wait_for)
+
+    def drain_callback(spin_count: int) -> None:
+        if spin_count != 1:
+            return
+        wall = TransformStamped()
+        wall.header.frame_id = 'world'
+        wall.header.stamp.sec = 1
+        wall.header.stamp.nanosec = 300_000_000
+        wall.child_frame_id = 'phase3_contact_control_wall'
+        wall.transform.translation.x = 0.7
+        wall.transform.translation.y = -3.5
+        wall.transform.translation.z = 0.4
+        wall.transform.rotation.w = 1.0
+        node._on_entity_poses(TFMessage(transforms=[wall]))
+
+    _install_cleanup_drain_clock(app, monkeypatch, on_spin=drain_callback)
+    try:
+        app._cleanup_wall()
+        assert wait_count == 4
+        assert app.cleanup['actor_absent'] is True
+        assert app.cleanup['proof']['quiet_restart_count'] == 1
+        assert app.cleanup['proof']['quiet_start_sim_stamp_ns'] == 1_600_000_000
+        assert app.cleanup['proof']['quiet_until_sim_stamp_ns'] == 1_850_000_000
+        assert app.cleanup['proof']['post_delete_pose_count'] == 1
+        assert app.cleanup['proof']['post_delete_pose_latest_sim_stamp_ns'] == 1_300_000_000
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+@pytest.mark.parametrize(
+    ('deliver_terminal_during_drain', 'source_disappears', 'final_query_expires'),
+    [(False, False, False), (True, False, False), (False, True, False), (False, False, True)],
+)
+def test_scenario_cleanup_drains_callbacks_after_source_spanned_quiet_interval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    deliver_terminal_during_drain: bool,
+    source_disappears: bool,
+    final_query_expires: bool,
+) -> None:
+    _init_ros()
+    document = load_scenario(str(REPOSITORY / 'scenarios/phase3_s2_static_obstacle.yaml'))
+    node = ScenarioControllerNode(document)
+    app = ScenarioControllerApp(
+        document=document,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        identity={},
+        wall_timeout_s=30.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    app.node = node
+    app.actor_spawn_request_sent = True
+    node.current_sim_stamp_ns = 2_000_000_000
+    node.sequence = 9
+    node.spawn_request_sequence = 1
+    node.spawn_request_stamp_ns = 1_800_000_000
+    wall_clock = SimpleNamespace(now=9.0)
+    app.wall_deadline = 10.0
+    monkeypatch.setattr(time, 'monotonic', lambda: wall_clock.now)
+    publisher_query_count = 0
+
+    def count_publishers(_topic: str) -> int:
+        nonlocal publisher_query_count
+        publisher_query_count += 1
+        if final_query_expires and publisher_query_count > 1:
+            wall_clock.now = app.wall_deadline
+        return 0 if source_disappears and publisher_query_count > 1 else 4
+
+    monkeypatch.setattr(node, 'count_publishers', count_publishers)
+    monkeypatch.setattr(
+        app,
+        '_call_service',
+        lambda *_args, **_kwargs: (SimpleNamespace(success=True), 9, 1_900_000_000),
+    )
+    wait_count = 0
+
+    def wait_for(predicate: object, **_kwargs: object) -> None:
+        nonlocal wait_count
+        wait_count += 1
+        transform = TransformStamped()
+        transform.header.frame_id = 'robotest_lab'
+        transform.transform.rotation.w = 1.0
+        stamps = (
+            [2_200_000_000, 2_500_000_000, 2_600_000_000, 2_900_000_000]
+            if deliver_terminal_during_drain
+            else [2_200_000_000, 2_500_000_000]
+        )
+        stamp_ns = stamps[wait_count - 1]
+        transform.header.stamp.sec, transform.header.stamp.nanosec = divmod(stamp_ns, 1_000_000_000)
+        transform.child_frame_id = 'ground_plane'
+        node.current_sim_stamp_ns = stamp_ns
+        node._on_entity_poses(TFMessage(transforms=[transform]))
+        assert callable(predicate) and predicate()
+
+    monkeypatch.setattr(app, '_wait_for', wait_for)
+
+    def drain_callback(spin_count: int) -> None:
+        if spin_count != 1 or not deliver_terminal_during_drain:
+            return
+        actor = TransformStamped()
+        actor.header.frame_id = 'robotest_lab'
+        actor.header.stamp.sec = 2
+        actor.header.stamp.nanosec = 200_000_000
+        actor.child_frame_id = document.actor_name
+        actor.transform.rotation.w = 1.0
+        node._on_entity_poses(TFMessage(transforms=[actor]))
+
+    drain_clock = _install_cleanup_drain_clock(
+        app,
+        monkeypatch,
+        on_spin=drain_callback,
+    )
+    try:
+        if final_query_expires:
+            with pytest.raises(WallTimeoutError, match='escape timeout elapsed'):
+                app._cleanup_actor()
+            assert app.cleanup['actor_absent'] is False
+            assert (
+                app.cleanup['proof']['kind']
+                == 'successful_blocking_delete_response_cleanup_drain_pending'
+            )
+            return
+        if source_disappears:
+            with pytest.raises(ScenarioFailureError, match='source publisher was missing'):
+                app._cleanup_actor()
+            assert app.cleanup['actor_absent'] is False
+            assert (
+                app.cleanup['proof']['kind']
+                == 'successful_blocking_delete_response_cleanup_drain_pending'
+            )
+            assert 'pose_source_publishers_after' not in app.cleanup['proof']
+            return
+        app._cleanup_actor()
+        assert wait_count == (4 if deliver_terminal_during_drain else 2)
+        assert drain_clock.spin_count == (4 if deliver_terminal_during_drain else 3)
+        assert app.cleanup['actor_absent'] is True
+        proof = app.cleanup['proof']
+        assert proof['kind'] == 'successful_blocking_delete_and_bounded_pose_absence'
+        assert proof['post_delete_pose_count'] == int(deliver_terminal_during_drain)
+        expected_stamp = 2_200_000_000 if deliver_terminal_during_drain else None
+        assert proof['post_delete_pose_first_sim_stamp_ns'] == expected_stamp
+        assert proof['post_delete_pose_latest_sim_stamp_ns'] == expected_stamp
+        if deliver_terminal_during_drain:
+            assert (
+                proof['post_delete_pose_source_latest_sequence']
+                > proof['post_delete_pose_latest_sequence']
+            )
+        expected_quiet_start = 2_600_000_000 if deliver_terminal_during_drain else 2_200_000_000
+        assert proof['quiet_start_sim_stamp_ns'] == expected_quiet_start
+        assert proof['quiet_until_sim_stamp_ns'] == expected_quiet_start + 250_000_000
+        assert proof['quiet_restart_count'] == int(deliver_terminal_during_drain)
+        assert proof['dds_drain_grace_ns'] == 50_000_000
+        assert (
+            proof['dds_drain_complete_steady_ns'] - proof['dds_drain_start_steady_ns']
+            >= (proof['dds_drain_grace_ns'])
+        )
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_scenario_cleanup_restarts_quiet_window_after_newer_pose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_ros()
+    document = load_scenario(str(REPOSITORY / 'scenarios/phase3_s2_static_obstacle.yaml'))
+    node = ScenarioControllerNode(document)
+    app = ScenarioControllerApp(
+        document=document,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        identity={},
+        wall_timeout_s=30.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    app.node = node
+    app.actor_spawn_request_sent = True
+    node.current_sim_stamp_ns = 2_000_000_000
+    node.sequence = 9
+    node.spawn_request_sequence = 1
+    node.spawn_request_stamp_ns = 1_800_000_000
+    monkeypatch.setattr(node, 'count_publishers', lambda _topic: 4)
+    monkeypatch.setattr(
+        app,
+        '_call_service',
+        lambda *_args, **_kwargs: (SimpleNamespace(success=True), 9, 1_900_000_000),
+    )
+    wait_count = 0
+
+    def wait_for(predicate: object, **_kwargs: object) -> None:
+        nonlocal wait_count
+        wait_count += 1
+        heartbeat = TransformStamped()
+        heartbeat.header.frame_id = 'robotest_lab'
+        heartbeat.header.stamp.sec = 2
+        stamp_ns = {
+            1: 2_200_000_000,
+            2: 2_500_000_000,
+            3: 2_600_000_000,
+            4: 2_900_000_000,
+        }[wait_count]
+        heartbeat.header.stamp.sec, heartbeat.header.stamp.nanosec = divmod(stamp_ns, 1_000_000_000)
+        heartbeat.child_frame_id = 'ground_plane'
+        heartbeat.transform.rotation.w = 1.0
+        node.current_sim_stamp_ns = stamp_ns
+        node._on_entity_poses(TFMessage(transforms=[heartbeat]))
+        assert callable(predicate) and predicate()
+
+    monkeypatch.setattr(app, '_wait_for', wait_for)
+
+    def drain_callback(spin_count: int) -> None:
+        if spin_count != 1:
+            return
+        actor = TransformStamped()
+        actor.header.frame_id = 'robotest_lab'
+        actor.header.stamp.sec = 2
+        actor.header.stamp.nanosec = 300_000_000
+        actor.child_frame_id = document.actor_name
+        actor.transform.rotation.w = 1.0
+        node._on_entity_poses(TFMessage(transforms=[actor]))
+
+    _install_cleanup_drain_clock(app, monkeypatch, on_spin=drain_callback)
+    try:
+        app._cleanup_actor()
+        assert wait_count == 4
+        assert app.cleanup['actor_absent'] is True
+        assert app.cleanup['proof']['quiet_restart_count'] == 1
+        assert app.cleanup['proof']['quiet_start_sim_stamp_ns'] == 2_600_000_000
+        assert app.cleanup['proof']['quiet_until_sim_stamp_ns'] == 2_850_000_000
+        assert app.cleanup['proof']['post_delete_pose_count'] == 1
+        assert app.cleanup['proof']['post_delete_pose_latest_sim_stamp_ns'] == 2_300_000_000
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_contact_cleanup_persistent_pose_activity_exhausts_bounded_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_ros()
+    manifest = load_coverage_manifest(str(REPOSITORY / 'config/collision-coverage.yaml'))
+    node = ContactControlNode(manifest)
+    app = ContactControlApp(
+        manifest=manifest,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        arm_path=tmp_path / 'arm.json',
+        armed_path=tmp_path / 'armed.json',
+        command_progress_path=tmp_path / 'command-progress.json',
+        run_id='cleanup-persistent-deadline-test',
+        wall_timeout_s=30.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    app.node = node
+    app.wall_spawn_request_sent = True
+    node.current_sim_stamp_ns = 1_000_000_000
+    node.sequence = 7
+    node.spawn_request_sequence = 1
+    monkeypatch.setattr(node, 'count_publishers', lambda _topic: 4)
+    monkeypatch.setattr(
+        app,
+        '_call_service',
+        lambda *_args, **_kwargs: (SimpleNamespace(success=True), 7, 900_000_000),
+    )
+    wait_count = 0
+
+    def wait_for(predicate: object, *, reason: str, **_kwargs: object) -> None:
+        nonlocal wait_count
+        wait_count += 1
+        if wait_count == 3:
+            node.current_sim_stamp_ns = 2_000_000_000
+            raise ScenarioFailureError(reason)
+        transforms: list[TransformStamped] = []
+        heartbeat_stamp_ns = 1_200_000_000 if wait_count == 1 else 1_500_000_000
+        heartbeat = TransformStamped()
+        heartbeat.header.frame_id = 'world'
+        heartbeat.header.stamp.sec, heartbeat.header.stamp.nanosec = divmod(
+            heartbeat_stamp_ns, 1_000_000_000
+        )
+        heartbeat.child_frame_id = 'ground_plane'
+        heartbeat.transform.rotation.w = 1.0
+        transforms.append(heartbeat)
+        if wait_count == 2:
+            wall = TransformStamped()
+            wall.header.frame_id = 'world'
+            wall.header.stamp.sec = 1
+            wall.header.stamp.nanosec = 300_000_000
+            wall.child_frame_id = 'phase3_contact_control_wall'
+            wall.transform.rotation.w = 1.0
+            transforms.append(wall)
+        node.current_sim_stamp_ns = heartbeat_stamp_ns
+        node._on_entity_poses(TFMessage(transforms=transforms))
+        assert callable(predicate) and predicate()
+
+    monkeypatch.setattr(app, '_wait_for', wait_for)
+    try:
+        with pytest.raises(ScenarioFailureError, match='heartbeat anchor'):
+            app._cleanup_wall()
+        proof = app.cleanup['proof']
+        assert app.cleanup['actor_absent'] is False
+        assert proof['kind'].endswith('cleanup_anchor_pending')
+        assert proof['observation_deadline_sim_stamp_ns'] == 2_000_000_000
+        assert proof['quiet_restart_count'] == 1
+        assert proof['post_delete_pose_count'] == 1
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_scenario_cleanup_persistent_pose_activity_exhausts_bounded_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_ros()
+    document = load_scenario(str(REPOSITORY / 'scenarios/phase3_s2_static_obstacle.yaml'))
+    node = ScenarioControllerNode(document)
+    app = ScenarioControllerApp(
+        document=document,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        identity={},
+        wall_timeout_s=30.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    app.node = node
+    app.actor_spawn_request_sent = True
+    node.current_sim_stamp_ns = 2_000_000_000
+    node.sequence = 9
+    node.spawn_request_sequence = 1
+    monkeypatch.setattr(node, 'count_publishers', lambda _topic: 4)
+    monkeypatch.setattr(
+        app,
+        '_call_service',
+        lambda *_args, **_kwargs: (SimpleNamespace(success=True), 9, 1_900_000_000),
+    )
+    wait_count = 0
+
+    def wait_for(predicate: object, *, reason: str, **_kwargs: object) -> None:
+        nonlocal wait_count
+        wait_count += 1
+        if wait_count == 3:
+            node.current_sim_stamp_ns = 3_000_000_000
+            raise ScenarioFailureError(reason)
+        transforms: list[TransformStamped] = []
+        heartbeat_stamp_ns = 2_200_000_000 if wait_count == 1 else 2_500_000_000
+        heartbeat = TransformStamped()
+        heartbeat.header.frame_id = 'robotest_lab'
+        heartbeat.header.stamp.sec, heartbeat.header.stamp.nanosec = divmod(
+            heartbeat_stamp_ns, 1_000_000_000
+        )
+        heartbeat.child_frame_id = 'ground_plane'
+        heartbeat.transform.rotation.w = 1.0
+        transforms.append(heartbeat)
+        if wait_count == 2:
+            actor = TransformStamped()
+            actor.header.frame_id = 'robotest_lab'
+            actor.header.stamp.sec = 2
+            actor.header.stamp.nanosec = 300_000_000
+            actor.child_frame_id = document.actor_name
+            actor.transform.rotation.w = 1.0
+            transforms.append(actor)
+        node.current_sim_stamp_ns = heartbeat_stamp_ns
+        node._on_entity_poses(TFMessage(transforms=transforms))
+        assert callable(predicate) and predicate()
+
+    monkeypatch.setattr(app, '_wait_for', wait_for)
+    try:
+        with pytest.raises(ScenarioFailureError, match='heartbeat anchor'):
+            app._cleanup_actor()
+        proof = app.cleanup['proof']
+        assert app.cleanup['actor_absent'] is False
+        assert proof['kind'].endswith('cleanup_anchor_pending')
+        assert proof['observation_deadline_sim_stamp_ns'] == 3_000_000_000
+        assert proof['quiet_restart_count'] == 1
+        assert proof['post_delete_pose_count'] == 1
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+@pytest.mark.parametrize('app_type', [ContactControlApp, ScenarioControllerApp])
+@pytest.mark.parametrize(
+    ('boundary', 'expected_stage', 'expected_send_count'),
+    [
+        ('readiness_service_deadline', 'service_wait', 0),
+        ('readiness_wall_deadline', 'service_wait', 0),
+        ('pre_send_service_deadline', 'service_wait', 0),
+        ('response_service_deadline', 'response_timeout', 1),
+    ],
+)
+def test_service_transactions_never_cross_hard_deadlines(
+    app_type: type[object],
+    boundary: str,
+    expected_stage: str,
+    expected_send_count: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = object.__new__(app_type)
+    clock = SimpleNamespace(now=10.0)
+    send_count = 0
+
+    def next_sequence() -> int:
+        if boundary == 'pre_send_service_deadline':
+            clock.now = 10.2
+        return 41
+
+    app.node = SimpleNamespace(
+        _next_sequence=next_sequence,
+        cleanup_fatal_error=None,
+        current_sim_stamp_ns=2_000_000_000,
+    )
+    app.service_timeout_s = 0.1 if boundary != 'readiness_wall_deadline' else 10.0
+    app.wall_deadline = 10.1 if boundary == 'readiness_wall_deadline' else 100.0
+    if app_type is ContactControlApp:
+        app.cleanup_window_active = True
+    monkeypatch.setattr(time, 'monotonic', lambda: clock.now)
+
+    def service_is_ready() -> bool:
+        if boundary.startswith('readiness_'):
+            clock.now = 10.2
+        return True
+
+    def response_done() -> bool:
+        if boundary == 'response_service_deadline':
+            clock.now = 10.2
+        return True
+
+    def call_async(_request: object) -> object:
+        nonlocal send_count
+        send_count += 1
+        return SimpleNamespace(done=response_done, result=lambda: SimpleNamespace(success=True))
+
+    client = SimpleNamespace(service_is_ready=service_is_ready, call_async=call_async)
+    if boundary in {'pre_send_service_deadline', 'response_service_deadline'}:
+        monkeypatch.setattr(app, '_wait_service', lambda *_args, **_kwargs: 10.1)
+    evidence = {
+        'error': None,
+        'failure_stage': None,
+        'kind': 'delete_request_pending',
+        'request_sequence': None,
+        'request_stamp_ns': None,
+        'response_sequence': None,
+        'response_stamp_ns': None,
+    }
+
+    with pytest.raises((InfrastructureError, WallTimeoutError)):
+        app._call_service(
+            client,
+            object(),
+            name='scenario/delete_entity',
+            check_fatal=False,
+            evidence=evidence,
+        )
+
+    assert send_count == expected_send_count
+    assert evidence['kind'] == 'delete_transaction_failed'
+    assert evidence['failure_stage'] == expected_stage
+    assert isinstance(evidence['error'], str) and evidence['error']
+
+
+@pytest.mark.parametrize('app_type', [ContactControlApp, ScenarioControllerApp])
+@pytest.mark.parametrize(
+    ('failure_mode', 'expected_stage'),
+    [
+        ('service_wait', 'service_wait'),
+        ('service_wait_exception', 'service_wait'),
+        ('request_send', 'request_send'),
+        ('response_wait_spin', 'response_wait'),
+        ('response_wait_ready_check', 'response_wait'),
+        ('response_timeout', 'response_timeout'),
+        ('response_future', 'response_future'),
+        ('response_null', 'response_null'),
+    ],
+)
+def test_delete_service_failures_retain_transaction_evidence(
+    app_type: type[object],
+    failure_mode: str,
+    expected_stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = object.__new__(app_type)
+    sequence = iter([41])
+    app.node = SimpleNamespace(
+        _next_sequence=lambda: next(sequence),
+        current_sim_stamp_ns=2_000_000_000,
+    )
+    app.service_timeout_s = 0.1
+    app.wall_deadline = 100.0
+    clock = SimpleNamespace(now=10.0)
+    monkeypatch.setattr(time, 'monotonic', lambda: clock.now)
+    monkeypatch.setattr(app, '_spin_once', lambda **_kwargs: setattr(clock, 'now', 10.2))
+    if failure_mode == 'service_wait':
+        monkeypatch.setattr(
+            app,
+            '_wait_service',
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                InfrastructureError('delete service unavailable')
+            ),
+        )
+    elif failure_mode == 'service_wait_exception':
+        monkeypatch.setattr(
+            app,
+            '_wait_service',
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError('readiness failed')),
+        )
+    else:
+        monkeypatch.setattr(app, '_wait_service', lambda *_args, **_kwargs: app.wall_deadline)
+
+    if failure_mode == 'request_send':
+        client = SimpleNamespace(
+            call_async=lambda _request: (_ for _ in ()).throw(RuntimeError('send failed'))
+        )
+    elif failure_mode == 'response_wait_spin':
+        monkeypatch.setattr(
+            app,
+            '_spin_once',
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError('response wait spin failed')),
+        )
+        client = SimpleNamespace(call_async=lambda _request: SimpleNamespace(done=lambda: False))
+    elif failure_mode == 'response_wait_ready_check':
+        client = SimpleNamespace(
+            call_async=lambda _request: SimpleNamespace(
+                done=lambda: (_ for _ in ()).throw(RuntimeError('ready check failed'))
+            )
+        )
+    elif failure_mode == 'response_timeout':
+        client = SimpleNamespace(call_async=lambda _request: SimpleNamespace(done=lambda: False))
+    elif failure_mode == 'response_future':
+        client = SimpleNamespace(
+            call_async=lambda _request: SimpleNamespace(
+                done=lambda: True,
+                result=lambda: (_ for _ in ()).throw(RuntimeError('future failed')),
+            )
+        )
+    else:
+        client = SimpleNamespace(
+            call_async=lambda _request: SimpleNamespace(done=lambda: True, result=lambda: None)
+        )
+    evidence = {
+        'error': None,
+        'failure_stage': None,
+        'kind': 'delete_request_pending',
+        'request_sequence': None,
+        'request_stamp_ns': None,
+        'response_sequence': None,
+        'response_stamp_ns': None,
+    }
+
+    with pytest.raises(InfrastructureError):
+        app._call_service(
+            client,
+            object(),
+            name='scenario/delete_entity',
+            check_fatal=False,
+            evidence=evidence,
+        )
+
+    assert evidence['kind'] == 'delete_transaction_failed'
+    assert evidence['failure_stage'] == expected_stage
+    assert isinstance(evidence['error'], str) and evidence['error']
+    assert evidence['response_sequence'] is None
+    assert evidence['response_stamp_ns'] is None
+    if failure_mode in {'service_wait', 'service_wait_exception'}:
+        assert evidence['request_sequence'] is None
+    else:
+        assert evidence['request_sequence'] == 41
+        assert evidence['request_stamp_ns'] == 2_000_000_000
+
+
+def test_contact_cleanup_preserves_service_wait_failure_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_ros()
+    manifest = load_coverage_manifest(str(REPOSITORY / 'config/collision-coverage.yaml'))
+    node = ContactControlNode(manifest)
+    app = ContactControlApp(
+        manifest=manifest,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        arm_path=tmp_path / 'arm.json',
+        armed_path=tmp_path / 'armed.json',
+        command_progress_path=tmp_path / 'command-progress.json',
+        run_id='cleanup-service-wait-test',
+        wall_timeout_s=30.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    app.node = node
+    app.wall_spawn_request_sent = True
+    node.current_sim_stamp_ns = 1_000_000_000
+    monkeypatch.setattr(node, 'count_publishers', lambda _topic: 4)
+    monkeypatch.setattr(
+        app,
+        '_wait_service',
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            InfrastructureError('delete service unavailable')
+        ),
+    )
+    try:
+        with pytest.raises(InfrastructureError, match='delete service unavailable'):
+            app._cleanup_wall()
+        assert app.cleanup['actor_absent'] is False
+        assert app.cleanup['delete_success'] is None
+        assert app.cleanup['proof']['kind'] == 'delete_transaction_failed'
+        assert app.cleanup['proof']['failure_stage'] == 'service_wait'
+        assert app.cleanup['proof']['request_sequence'] is None
+        assert app.cleanup['proof']['response_sequence'] is None
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_scenario_cleanup_preserves_service_wait_failure_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _init_ros()
+    document = load_scenario(str(REPOSITORY / 'scenarios/phase3_s2_static_obstacle.yaml'))
+    node = ScenarioControllerNode(document)
+    app = ScenarioControllerApp(
+        document=document,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        identity={},
+        wall_timeout_s=30.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    app.node = node
+    app.actor_spawn_request_sent = True
+    node.current_sim_stamp_ns = 1_000_000_000
+    monkeypatch.setattr(node, 'count_publishers', lambda _topic: 4)
+    monkeypatch.setattr(
+        app,
+        '_wait_service',
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            InfrastructureError('delete service unavailable')
+        ),
+    )
+    try:
+        with pytest.raises(InfrastructureError, match='delete service unavailable'):
+            app._cleanup_actor()
+        assert app.cleanup['actor_absent'] is False
+        assert app.cleanup['delete_success'] is None
+        assert app.cleanup['proof']['kind'] == 'delete_transaction_failed'
+        assert app.cleanup['proof']['failure_stage'] == 'service_wait'
+        assert app.cleanup['proof']['request_sequence'] is None
+        assert app.cleanup['proof']['response_sequence'] is None
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_scenario_cleanup_retains_valid_pending_proof_when_source_query_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _init_ros()
+    document = load_scenario(str(REPOSITORY / 'scenarios/phase3_s2_static_obstacle.yaml'))
+    node = ScenarioControllerNode(document)
+    app = ScenarioControllerApp(
+        document=document,
+        output_path=tmp_path / 'result.json',
+        ready_path=tmp_path / 'ready.json',
+        identity={},
+        wall_timeout_s=30.0,
+        service_timeout_s=1.0,
+        raw_ros_args=[],
+    )
+    app.node = node
+    app.actor_spawn_request_sent = True
+    node.current_sim_stamp_ns = 2_000_000_000
+    node.sequence = 9
+    node.spawn_request_sequence = 1
+    node.spawn_request_stamp_ns = 1_800_000_000
+    publisher_query_count = 0
+
+    def count_publishers(_topic: str) -> int:
+        nonlocal publisher_query_count
+        publisher_query_count += 1
+        if publisher_query_count == 1:
+            raise RuntimeError('graph query failed')
+        return 4
+
+    monkeypatch.setattr(node, 'count_publishers', count_publishers)
+    delete_call_count = 0
+
+    def delete(*_args: object, **_kwargs: object) -> tuple[object, int, int]:
+        nonlocal delete_call_count
+        delete_call_count += 1
+        return SimpleNamespace(success=True), 9, 1_900_000_000
+
+    monkeypatch.setattr(app, '_call_service', delete)
+    wait_count = 0
+
+    def wait_for(predicate: object, **_kwargs: object) -> None:
+        nonlocal wait_count
+        wait_count += 1
+        stamp_ns = 2_200_000_000 if wait_count == 1 else 2_500_000_000
+        node.current_sim_stamp_ns = stamp_ns
+        node.post_delete_entity_latest_sequence = node._next_sequence()
+        node.post_delete_entity_latest_sim_stamp_ns = stamp_ns
+        node.post_delete_entity_message_count += 1
+        assert callable(predicate) and predicate()
+
+    monkeypatch.setattr(app, '_wait_for', wait_for)
+    _install_cleanup_drain_clock(app, monkeypatch)
+    try:
+        with pytest.raises(InfrastructureError, match='pre-delete query failed'):
+            app._cleanup_actor()
+        assert delete_call_count == 1
+        assert app.cleanup['actor_absent'] is False
+        assert app.cleanup['delete_attempt_count'] == 1
+        assert app.cleanup['delete_success'] is True
+        assert (
+            app.cleanup['proof']['kind']
+            == 'successful_blocking_delete_response_cleanup_drain_pending'
+        )
+        assert app.cleanup['proof']['pose_source_publishers_before'] == 0
+        assert 'pose_source_publishers_after' not in app.cleanup['proof']
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_cleanup_callback_protocol_errors_remain_fatal_during_contact_cleanup() -> None:
+    _init_ros()
+    manifest = load_coverage_manifest(str(REPOSITORY / 'config/collision-coverage.yaml'))
+    node = ContactControlNode(manifest)
+    try:
+        node.fatal_error = ScenarioFailureError('primary control failure')
+        node.begin_cleanup()
+        heartbeat = TransformStamped()
+        heartbeat.header.frame_id = 'invalid'
+        heartbeat.header.stamp.sec = 1
+        heartbeat.child_frame_id = 'ground_plane'
+        heartbeat.transform.rotation.w = 1.0
+        node.entity_pose_subscription.callback(TFMessage(transforms=[heartbeat]))
+        assert isinstance(node.cleanup_fatal_error, ProtocolError)
+
+        app = object.__new__(ContactControlApp)
+        app.node = node
+        app.executor = SimpleNamespace(spin_once=lambda **_kwargs: None)
+        app.wall_deadline = time.monotonic() + 10.0
+        app.cleanup_window_active = True
+        app.graph_gate_active = False
+        with pytest.raises(ProtocolError, match='invalid frame'):
+            app._spin_once(check_fatal=False)
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_cleanup_callback_protocol_errors_remain_fatal_during_scenario_cleanup() -> None:
+    _init_ros()
+    document = load_scenario(str(REPOSITORY / 'scenarios/phase3_s2_static_obstacle.yaml'))
+    node = ScenarioControllerNode(document)
+    try:
+        node.fatal_error = ScenarioFailureError('primary scenario failure')
+        node.begin_cleanup()
+        heartbeat = TransformStamped()
+        heartbeat.header.frame_id = 'invalid'
+        heartbeat.header.stamp.sec = 1
+        heartbeat.child_frame_id = 'ground_plane'
+        heartbeat.transform.rotation.w = 1.0
+        node.entity_pose_subscription.callback(TFMessage(transforms=[heartbeat]))
+        assert isinstance(node.cleanup_fatal_error, ProtocolError)
+
+        app = object.__new__(ScenarioControllerApp)
+        app.node = node
+        app.executor = SimpleNamespace(spin_once=lambda **_kwargs: None)
+        app.wall_deadline = time.monotonic() + 10.0
+        with pytest.raises(ProtocolError, match='invalid frame'):
+            app._spin_once(check_fatal=False)
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+@pytest.mark.parametrize('app_type', [ContactControlApp, ScenarioControllerApp])
+def test_cleanup_wait_rejects_prelatched_error_before_true_predicate(
+    app_type: type[object],
+) -> None:
+    app = object.__new__(app_type)
+    app.node = SimpleNamespace(
+        cleanup_fatal_error=ProtocolError('prelatched cleanup failure'),
+        clock_seen=True,
+        current_sim_stamp_ns=1,
+    )
+    app.wall_deadline = time.monotonic() + 10.0
+    if app_type is ContactControlApp:
+        app.cleanup_window_active = True
+
+    with pytest.raises(ProtocolError, match='prelatched cleanup failure'):
+        app._wait_for(lambda: True, reason='must not return', check_fatal=False)
+
+
+@pytest.mark.parametrize('app_type', [ContactControlApp, ScenarioControllerApp])
+def test_cleanup_wait_fails_at_exact_sim_deadline_without_extra_spin(
+    app_type: type[object],
+) -> None:
+    app = object.__new__(app_type)
+    app.node = SimpleNamespace(
+        cleanup_fatal_error=None,
+        clock_seen=True,
+        current_sim_stamp_ns=1_000_000_000,
+    )
+    app.executor = SimpleNamespace(
+        spin_once=lambda **_kwargs: pytest.fail('deadline must be checked before another spin')
+    )
+    app.wall_deadline = time.monotonic() + 10.0
+    if app_type is ContactControlApp:
+        app.cleanup_window_active = True
+
+    with pytest.raises(ScenarioFailureError, match='exact deadline'):
+        app._wait_for(
+            lambda: False,
+            reason='exact deadline',
+            sim_deadline_ns=1_000_000_000,
+            check_fatal=False,
+        )
+
+
+@pytest.mark.parametrize('app_type', [ContactControlApp, ScenarioControllerApp])
+def test_cleanup_wait_accepts_satisfied_predicate_at_exact_sim_deadline(
+    app_type: type[object],
+) -> None:
+    app = object.__new__(app_type)
+    app.node = SimpleNamespace(
+        cleanup_fatal_error=None,
+        clock_seen=True,
+        current_sim_stamp_ns=1_000_000_000,
+    )
+    app.executor = SimpleNamespace(
+        spin_once=lambda **_kwargs: pytest.fail('satisfied boundary must not spin')
+    )
+    app.wall_deadline = time.monotonic() + 10.0
+    if app_type is ContactControlApp:
+        app.cleanup_window_active = True
+
+    app._wait_for(
+        lambda: True,
+        reason='exact satisfied deadline',
+        sim_deadline_ns=1_000_000_000,
+        check_fatal=False,
+    )
+
+
+@pytest.mark.parametrize('app_type', [ContactControlApp, ScenarioControllerApp])
+def test_cleanup_wait_rejects_satisfied_predicate_past_sim_deadline(
+    app_type: type[object],
+) -> None:
+    app = object.__new__(app_type)
+    app.node = SimpleNamespace(
+        cleanup_fatal_error=None,
+        clock_seen=True,
+        current_sim_stamp_ns=1_000_000_001,
+    )
+    app.executor = SimpleNamespace(
+        spin_once=lambda **_kwargs: pytest.fail('expired deadline must not spin')
+    )
+    app.wall_deadline = time.monotonic() + 10.0
+    if app_type is ContactControlApp:
+        app.cleanup_window_active = True
+
+    with pytest.raises(ScenarioFailureError, match='past deadline'):
+        app._wait_for(
+            lambda: True,
+            reason='past deadline',
+            sim_deadline_ns=1_000_000_000,
+            check_fatal=False,
+        )
+
+
+def test_scenario_spin_rechecks_wall_deadline_after_executor_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = SimpleNamespace(now=9.0)
+    app = object.__new__(ScenarioControllerApp)
+    app.node = SimpleNamespace(cleanup_fatal_error=None, fatal_error=None)
+
+    def cross_deadline(*, timeout_sec: float) -> None:
+        assert timeout_sec == pytest.approx(0.02)
+        clock.now = 10.0
+
+    app.executor = SimpleNamespace(spin_once=cross_deadline)
+    app.wall_deadline = 10.0
+    monkeypatch.setattr(time, 'monotonic', lambda: clock.now)
+
+    with pytest.raises(WallTimeoutError, match='steady-wall escape timeout elapsed'):
+        app._spin_once(check_fatal=False)
+
+
+def test_scenario_wait_predicate_cannot_cross_wall_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = SimpleNamespace(now=9.0)
+    app = object.__new__(ScenarioControllerApp)
+    app.node = SimpleNamespace(
+        cleanup_fatal_error=None,
+        clock_seen=True,
+        current_sim_stamp_ns=1,
+    )
+    app.executor = SimpleNamespace(
+        spin_once=lambda **_kwargs: pytest.fail('expired predicate must not spin')
+    )
+    app.wall_deadline = 10.0
+    monkeypatch.setattr(time, 'monotonic', lambda: clock.now)
+
+    def cross_deadline() -> bool:
+        clock.now = 10.0
+        return True
+
+    with pytest.raises(WallTimeoutError, match='steady-wall escape timeout elapsed'):
+        app._wait_for(cross_deadline, reason='must not pass', check_fatal=False)
+
+
+def test_contact_final_graph_observation_precedes_cleanup_and_result_is_spin_free() -> None:
+    run_source = inspect.getsource(ContactControlApp.run)
+    result_source = inspect.getsource(ContactControlApp._result)
+
+    assert run_source.index('self._finalize_graph_observation()') < run_source.index(
+        'self.node.begin_cleanup()'
+    )
+    assert run_source.index('self.node.begin_cleanup()') < run_source.index('self._cleanup_wall()')
+    assert '_wait_for(' not in result_source
+
+
+def test_contact_run_calls_final_graph_before_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _spawn_test_app(tmp_path, run_id='final-graph-order-test')
+    events: list[str] = []
+
+    class FakeNode:
+        def begin_cleanup(self) -> None:
+            events.append('begin_cleanup')
+
+        @staticmethod
+        def destroy_node() -> None:
+            return None
+
+    class FakeExecutor:
+        @staticmethod
+        def add_node(_node: object) -> None:
+            return None
+
+        @staticmethod
+        def remove_node(_node: object) -> None:
+            return None
+
+        @staticmethod
+        def shutdown(*, timeout_sec: float) -> None:
+            assert timeout_sec == 1.0
+
+    node = FakeNode()
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.ContactControlNode',
+        lambda _manifest: node,
+    )
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.SingleThreadedExecutor',
+        FakeExecutor,
+    )
+    monkeypatch.setattr('robotest_scenarios.contact_control_driver.rclpy.init', lambda **_: None)
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.rclpy.try_shutdown', lambda: None
+    )
+    monkeypatch.setattr(app, '_prepare', lambda: None)
+    monkeypatch.setattr(app, '_wait_for_arm', lambda: None)
+    monkeypatch.setattr(app, '_run_control', lambda: None)
+    monkeypatch.setattr(app, '_begin_cleanup_window', lambda: events.append('cleanup_window'))
+    monkeypatch.setattr(app, '_best_effort_zero', lambda: events.append('zero'))
+    monkeypatch.setattr(
+        app,
+        '_finalize_graph_observation',
+        lambda: events.append('final_graph'),
+    )
+    monkeypatch.setattr(app, '_cleanup_wall', lambda: events.append('delete_cleanup'))
+    monkeypatch.setattr(app, '_result', lambda _error: ({}, 0))
+    monkeypatch.setattr('robotest_scenarios.contact_control_driver.load_schema', lambda _path: {})
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.write_canonical_json',
+        lambda *_args, **_kwargs: events.append('write_result'),
+    )
+
+    assert app.run() == 0
+    assert events == [
+        'cleanup_window',
+        'zero',
+        'final_graph',
+        'begin_cleanup',
+        'delete_cleanup',
+        'write_result',
+    ]
+
+
+def test_contact_run_normalizes_final_graph_exception_and_still_cleans_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _spawn_test_app(tmp_path, run_id='final-graph-failure-test')
+    events: list[str] = []
+
+    class FakeNode:
+        def begin_cleanup(self) -> None:
+            events.append('begin_cleanup')
+
+        @staticmethod
+        def destroy_node() -> None:
+            events.append('destroy_node')
+
+    class FakeExecutor:
+        @staticmethod
+        def add_node(_node: object) -> None:
+            return None
+
+        @staticmethod
+        def remove_node(_node: object) -> None:
+            events.append('remove_node')
+
+        @staticmethod
+        def shutdown(*, timeout_sec: float) -> None:
+            assert timeout_sec == 1.0
+            events.append('shutdown')
+
+    def result(error: object) -> tuple[dict[str, object], int]:
+        assert isinstance(error, InfrastructureError)
+        assert 'final contact-control graph observation failed' in str(error)
+        events.append('result')
+        return {}, int(ExitCode.INFRASTRUCTURE_ERROR)
+
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.ContactControlNode',
+        lambda _manifest: FakeNode(),
+    )
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.SingleThreadedExecutor',
+        FakeExecutor,
+    )
+    monkeypatch.setattr('robotest_scenarios.contact_control_driver.rclpy.init', lambda **_: None)
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.rclpy.try_shutdown',
+        lambda: events.append('rclpy_shutdown'),
+    )
+    monkeypatch.setattr(app, '_prepare', lambda: None)
+    monkeypatch.setattr(app, '_wait_for_arm', lambda: None)
+    monkeypatch.setattr(app, '_run_control', lambda: None)
+    monkeypatch.setattr(app, '_begin_cleanup_window', lambda: events.append('cleanup_window'))
+    monkeypatch.setattr(app, '_best_effort_zero', lambda: events.append('zero'))
+    monkeypatch.setattr(
+        app,
+        '_finalize_graph_observation',
+        lambda: (_ for _ in ()).throw(RuntimeError('graph API failed')),
+    )
+    monkeypatch.setattr(app, '_cleanup_wall', lambda: events.append('delete_cleanup'))
+    monkeypatch.setattr(app, '_result', result)
+    monkeypatch.setattr('robotest_scenarios.contact_control_driver.load_schema', lambda _path: {})
+    monkeypatch.setattr(
+        'robotest_scenarios.contact_control_driver.write_canonical_json',
+        lambda *_args, **_kwargs: events.append('write_result'),
+    )
+
+    assert app.run() == int(ExitCode.INFRASTRUCTURE_ERROR)
+    assert events == [
+        'cleanup_window',
+        'zero',
+        'begin_cleanup',
+        'delete_cleanup',
+        'result',
+        'write_result',
+        'remove_node',
+        'shutdown',
+        'destroy_node',
+        'rclpy_shutdown',
+    ]
 
 
 def test_contact_control_phase_boundaries_publish_only_the_new_phase(

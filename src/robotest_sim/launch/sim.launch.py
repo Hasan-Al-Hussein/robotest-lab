@@ -187,12 +187,12 @@ def _launch_runtime(context):
         arguments=[
             '/world/robotest_lab/create@ros_gz_interfaces/srv/SpawnEntity',
             '/world/robotest_lab/set_pose@ros_gz_interfaces/srv/SetEntityPose',
-            '/world/robotest_lab/remove@ros_gz_interfaces/srv/DeleteEntity',
+            '/world/robotest_lab/remove/blocking@ros_gz_interfaces/srv/DeleteEntity',
         ],
         remappings=[
             ('/world/robotest_lab/create', 'scenario/spawn_entity'),
             ('/world/robotest_lab/set_pose', 'scenario/set_entity_pose'),
-            ('/world/robotest_lab/remove', 'scenario/delete_entity'),
+            ('/world/robotest_lab/remove/blocking', 'scenario/delete_entity'),
         ],
         parameters=[
             {'use_sim_time': ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool)}
