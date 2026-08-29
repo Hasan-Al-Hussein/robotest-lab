@@ -514,6 +514,21 @@ diagnostics. Failure to advance and complete the full drain, a stamp regression,
 or collector overflow invalidates `collision_count` rather than treating the
 undrained stream as quiet.
 
+`contact-progress.json` is a transient atomic projection of the retained
+contact prefix, not a second contact evidence stream. The contact callback
+never performs filesystem I/O: it updates the in-memory latest stamp/count and
+marks the projection dirty. The executor writes the first dirty state
+immediately and coalesces later writes to no more than one per steady-wall
+second, measured after completion of the prior durable write. Scheduling and
+storage latency can make visibility slower; the runner therefore retains its
+existing bounded five-second advancement wait. After callbacks stop, the
+collector freezes the canonical capture, force-writes the projection from
+that exact contact list, and only then writes `capture.json`. Final analysis
+still requires exact equality of the marker count and latest stamp with the
+frozen capture. A marker-write or monotonic-clock failure is fatal, while a
+timeout or ROS shutdown before any contact retains the documented partial
+capture without fabricating a marker.
+
 Store event start/end, counterpart model, every robot/counterpart collision
 pair seen, sampled snapshot-record count, maximum delivered-snapshot
 penetration depth, maximum delivered-snapshot reported normal force when

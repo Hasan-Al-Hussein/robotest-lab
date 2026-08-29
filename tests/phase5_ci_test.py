@@ -1444,7 +1444,7 @@ def _write_phase3_profile_proc_host(
     )
     some = 'some avg10=0.10 avg60=0.20 avg300=0.30 total=10\n'
     full = 'full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n'
-    (proc_root / 'pressure/cpu').write_text(some, encoding='ascii')
+    (proc_root / 'pressure/cpu').write_text(some + full, encoding='ascii')
     (proc_root / 'pressure/io').write_text(some + full, encoding='ascii')
     (proc_root / 'pressure/memory').write_text(some + full, encoding='ascii')
     owner = proc_root / '40'

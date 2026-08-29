@@ -28,8 +28,19 @@ the stop file. READY is emitted only after the collector has observed a positive
 and retained a subsequent authoritative public contact snapshot. Contact
 callbacks that arrive before the first positive `/clock` callback are counted in READY
 and discarded as a pre-evidence prefix; they are never assigned a fabricated
-delivery-clock value. The collector writes `capture.json` atomically even when
-its wall deadline expires. Exit codes are:
+delivery-clock value.
+
+The contact callback retains every admissible snapshot in memory and never
+writes the progress file directly. The executor writes the first dirty
+progress marker immediately, coalesces later durable updates to at most one
+per steady-wall second, and force-writes the exact final retained count and
+latest stamp from the frozen capture before writing `capture.json`. The runner
+keeps a bounded five-second wait for marker advancement, so the projection is
+coordination evidence rather than a timing guarantee. Any marker write or
+monotonic-clock failure fails closed.
+
+The collector writes `capture.json` atomically even when its wall deadline
+expires. Exit codes are:
 
 | Exit | Meaning |
 | ---: | --- |

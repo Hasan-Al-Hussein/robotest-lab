@@ -500,6 +500,72 @@ def test_host_parsers_capture_run_queue_vmstat_and_psi(tmp_path: Path) -> None:
     assert sample['pressure']['cpu']['some']['total'] == 10
 
 
+def test_host_parser_accepts_modern_cpu_full_pressure_row(tmp_path: Path) -> None:
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    full = 'full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n'
+    with (proc_root / 'pressure/cpu').open('a', encoding='ascii') as stream:
+        stream.write(full)
+
+    sample = profiler.read_host_sample(proc_root)
+
+    assert set(sample['pressure']['cpu']) == {'full', 'some'}
+    assert sample['pressure']['cpu']['full']['total'] == 0
+
+
+@pytest.mark.parametrize('rows', ('full_only', 'unknown'))
+def test_host_sample_validator_rejects_invalid_cpu_pressure_rows(
+    tmp_path: Path,
+    rows: str,
+) -> None:
+    proc_root = tmp_path / 'proc'
+    _host_proc(proc_root)
+    sample = profiler.read_host_sample(proc_root)
+    row = copy.deepcopy(sample['pressure']['cpu']['some'])
+    if rows == 'full_only':
+        sample['pressure']['cpu'] = {'full': row}
+    else:
+        sample['pressure']['cpu']['unexpected'] = row
+
+    with pytest.raises(profiler.ProfileError, match='cpu PSI rows differ'):
+        profiler._validate_host_sample(sample, 'sample 0 host')
+
+
+def test_command_identity_preserves_trailing_nul_padding(tmp_path: Path) -> None:
+    proc_root = tmp_path / 'proc'
+    process_root = proc_root / '101'
+    process_root.mkdir(parents=True)
+    payload = b'/usr/bin/ruby3.2\0gz sim server\0' + b'\0' * 3
+    (process_root / 'cmdline').write_bytes(payload)
+    executable = tmp_path / 'ruby3.2'
+    executable.write_bytes(b'ruby')
+    (process_root / 'exe').symlink_to(executable)
+
+    identity = profiler._command_identity(proc_root, 101)
+
+    reconstructed = b'\0'.join(item.encode() for item in identity['cmdline']) + b'\0'
+    assert reconstructed == payload
+    assert identity['cmdline'][-1] == ''
+    assert identity['cmdline_size_bytes'] == len(payload)
+    assert identity['cmdline_sha256'] == __import__('hashlib').sha256(payload).hexdigest()
+
+
+def test_command_identity_rejects_nonterminated_or_non_utf8_payload(
+    tmp_path: Path,
+) -> None:
+    proc_root = tmp_path / 'proc'
+    process_root = proc_root / '101'
+    process_root.mkdir(parents=True)
+    cmdline = process_root / 'cmdline'
+    cmdline.write_bytes(b'/usr/bin/ruby3.2')
+    with pytest.raises(profiler.ProfileError, match='not NUL-terminated'):
+        profiler._command_identity(proc_root, 101)
+
+    cmdline.write_bytes(b'/usr/bin/ruby3.2\0\xff\0')
+    with pytest.raises(profiler.ProfileError, match='not UTF-8'):
+        profiler._command_identity(proc_root, 101)
+
+
 def test_static_identity_binds_clean_candidate_and_producer(tmp_path: Path) -> None:
     config, plugin, producer = _fixture_config(tmp_path)
 
@@ -2745,6 +2811,55 @@ def test_campaign_profile_validator_returns_only_portable_binding(tmp_path: Path
     )
     assert not any(key in binding for key in ('device', 'inode', 'mtime_ns', 'path'))
     assert not (config.candidate_root / 'smoke/result/run-result.json.sha256').exists()
+
+
+def test_campaign_profile_validator_accepts_modern_cpu_pressure_rows(
+    tmp_path: Path,
+) -> None:
+    config, original, _profile_hash = _write_complete_campaign_profile_fixture(tmp_path)
+    document = copy.deepcopy(original)
+    for sample in document['sampling']['samples']:
+        sample['host']['pressure']['cpu']['full'] = {
+            'avg10': 0.0,
+            'avg60': 0.0,
+            'avg300': 0.0,
+            'total': 0,
+        }
+    _rewrite_profile(config, document)
+
+    profiler.validate_campaign_smoke_profile(
+        config.workspace,
+        config.candidate_root,
+        config.candidate_id,
+    )
+
+
+def test_campaign_profile_validator_accepts_lossless_anchor_cmdline_padding(
+    tmp_path: Path,
+) -> None:
+    config, original, _profile_hash = _write_complete_campaign_profile_fixture(tmp_path)
+    document = copy.deepcopy(original)
+    anchor = document['anchor']
+    lifecycle = next(
+        item for item in document['process_lifecycles'] if item['pid'] == anchor['pid']
+    )
+    previous_size = lifecycle['cmdline_size_bytes']
+    padded_cmdline = [*lifecycle['cmdline'], '', '']
+    lifecycle['cmdline'] = padded_cmdline
+    encoded = b'\0'.join(item.encode() for item in lifecycle['cmdline']) + b'\0'
+    lifecycle['cmdline_size_bytes'] = len(encoded)
+    lifecycle['cmdline_sha256'] = __import__('hashlib').sha256(encoded).hexdigest()
+    anchor['cmdline'] = list(padded_cmdline)
+    anchor['cmdline_size_bytes'] = lifecycle['cmdline_size_bytes']
+    anchor['cmdline_sha256'] = lifecycle['cmdline_sha256']
+    document['sampling']['retained_cmdline_bytes'] += len(encoded) - previous_size
+    _rewrite_profile(config, document)
+
+    profiler.validate_campaign_smoke_profile(
+        config.workspace,
+        config.candidate_root,
+        config.candidate_id,
+    )
 
 
 def test_campaign_profile_validator_accepts_delayed_anchor_and_intact_clone(

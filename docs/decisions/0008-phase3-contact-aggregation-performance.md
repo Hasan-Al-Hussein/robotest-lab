@@ -1,7 +1,8 @@
 # ADR 0008: Phase 3 Contact-Aggregation Performance
 
-- Status: Accepted; fresh live qualification required
+- Status: Accepted; first live qualification rejected, revised candidate required
 - Date: 2026-08-27
+- Revised: 2026-08-29
 - Decision owners: RoboTest Lab simulation, safety, metrics, and benchmark gate
 
 ## Context
@@ -66,6 +67,39 @@ validation, contact projection, interval storage, another Gazebo system, or
 host scheduling. This decision therefore authorizes a fidelity-preserving
 optimization and its measurement; it does not claim that RTF improved.
 
+### First live qualification result
+
+The first source-frozen qualification candidate,
+`phase3-5cbd36c-001`, used clean Git revision
+`5cbd36cee03ecd0aa2b7c8f5dc7121a56c3fb7e6`. Preparation and the bounded
+positive control passed. Its one required profiled smoke was retained as a
+failure and was not retried; campaign mode was never started. The smoke result
+had exit code 30, calculated RTF median `0.4173456773`, calculated RTF p5
+`0.1270685792`, and an aborted waypoint-1 mission after one zero-pose
+controller result and repeated planning failures. The independently launched
+passive profiler exited 0 and emitted status PASS with 338 samples at the
+unchanged 0.5-second cadence and no cadence overruns.
+
+The retained profile shows broad CPU contention but does not prove one source
+root cause. The contact system performed exactly one exhaustive rescan, and
+the five measured contact timing buckets recorded 8.4635 seconds of
+instrumented contact-path time. The
+byte-identical contact DSO nevertheless ran about 75 percent slower per
+observation than the retained `phase3-bdf220a-001` diagnostic. CPU pressure
+was elevated throughout, while host load and runnable entities rose sharply
+and were high for much of the failed smoke. These facts reject the candidate;
+they do not authorize a lower RTF threshold, a navigation-tolerance change, a
+slower evidence cadence, or a transport change.
+
+The subsequent campaign-admission audit exposed two deterministic profile
+portability defects despite the producer's status PASS. Modern Linux can emit
+both `some` and `full` rows for CPU pressure, while the validator accepted only
+the legacy `some`-only form. A Ruby/Gazebo process-title rewrite also left
+valid trailing NUL padding in `/proc/PID/cmdline`; the producer hashed those
+raw bytes but discarded the empty fields needed to reconstruct them. Both
+defects require a clean source revision and a new candidate even though
+neither caused the smoke's functional or RTF failure.
+
 ## Decision
 
 The contact pipeline keeps its externally observable contract unchanged:
@@ -82,7 +116,8 @@ The contact pipeline keeps its externally observable contract unchanged:
   threshold, physics rate, source rate, sensor, ray count, controller, nor
   evidence stream may be reduced to make the candidate pass.
 
-Only two internal work reductions are accepted for controlled evaluation.
+Only the following bounded internal work reductions are accepted for
+controlled evaluation.
 
 ### Locked binding validation
 
@@ -165,6 +200,35 @@ same executor during startup and steady-state collection. It removes the node
 and shuts the executor down once during finalization. This bounded executor
 lifecycle is a companion reduction; the measured duplicate-reader cost is the
 primary optimization.
+
+### Coalesced contact-progress projection
+
+The canonical contact capture still retains every admissible public contact
+snapshot. The small `contact-progress.json` coordination projection is no
+longer durably rewritten from the contact callback for every retained item.
+The callback only updates in-memory count/stamp state and marks it dirty. The
+single-threaded executor writes the first dirty marker immediately, then writes
+later dirty states no more often than once per steady-wall second, measured
+from completion of the preceding durable write. This is an I/O reduction, not
+a contact sampling or evidence reduction.
+
+On shutdown, the collector freezes its canonical capture and force-writes the
+marker from that exact retained contact list before writing `capture.json`.
+The final marker therefore still has the exact retained count and latest stamp
+required by the existing reconciliation contract. A write failure or monotonic
+clock regression remains fail-closed. A startup timeout or ROS shutdown with
+no retained contact writes no marker and still preserves the documented
+partial capture and original exit status. The marker remains schema version 1.
+
+### Portable pressure and command identity
+
+Profile schema version 1 accepts either the legacy CPU PSI row set `{some}` or
+the modern set `{some, full}`. Memory and I/O still require both rows, and all
+row fields and numeric bounds remain unchanged. Process command lines remain a
+bounded UTF-8 string array plus raw size and SHA-256. The producer now retains
+empty elements before the final NUL terminator so reconstructing the array
+reproduces legitimate procfs padding byte for byte. Missing termination,
+invalid UTF-8, size drift, or hash drift fails closed.
 
 ## Required measurement
 

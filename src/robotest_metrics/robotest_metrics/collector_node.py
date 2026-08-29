@@ -63,6 +63,8 @@ FeedbackMessage = FollowWaypoints.Impl.FeedbackMessage
 PUBLIC_CONTACT_SNAPSHOT_TOPIC = '/robotest/validation/contacts'
 PUBLIC_COMMAND_TOPIC = '/robotest/cmd_vel'
 COMMAND_PROGRESS_MAX_BYTES = 4_096
+CONTACT_PROGRESS_MAX_BYTES = 16_384
+CONTACT_PROGRESS_FLUSH_INTERVAL_NS = 1_000_000_000
 
 
 def _qos(depth: int, *, reliable: bool) -> QoSProfile:
@@ -373,6 +375,8 @@ class MetricsCollectorNode(Node):
         self.command_progress_path = command_progress_path
         self.command_progress_run_id = command_progress_run_id
         self.command_progress_written = False
+        self.contact_progress_dirty = False
+        self.contact_progress_last_write_ns: int | None = None
         self.retained_contact_message_count = 0
         self.latest_retained_contact_stamp_ns: int | None = None
         self.pre_clock_contact_message_count = 0
@@ -531,18 +535,54 @@ class MetricsCollectorNode(Node):
             return
         self.retained_contact_message_count += 1
         self.latest_retained_contact_stamp_ns = int(item['stamp_ns'])
-        if self.contact_progress_path is not None:
-            write_json_atomic(
-                {
-                    'latest_retained_stamp_ns': int(item['stamp_ns']),
-                    'producer': 'robotest_metrics/metrics_collector',
-                    'public_topic': PUBLIC_CONTACT_SNAPSHOT_TOPIC,
-                    'retained_message_count': self.retained_contact_message_count,
-                    'schema_version': 1,
-                },
-                self.contact_progress_path,
-                maximum_bytes=16_384,
-            )
+        self.contact_progress_dirty = True
+
+    def flush_contact_progress(
+        self,
+        *,
+        force: bool = False,
+        retained_contacts: Sequence[dict[str, Any]] | None = None,
+        now_ns: int | None = None,
+    ) -> bool:
+        """Durably publish a coalesced contact marker without dropping evidence."""
+        if self.contact_progress_path is None:
+            return False
+        if retained_contacts is not None and not force:
+            raise ValueError('retained_contacts requires a forced contact-progress flush')
+        if not force and not self.contact_progress_dirty:
+            return False
+        observed_ns = time.monotonic_ns() if now_ns is None else now_ns
+        if self.contact_progress_last_write_ns is not None:
+            elapsed_ns = observed_ns - self.contact_progress_last_write_ns
+            if elapsed_ns < 0:
+                raise ArtifactError('contact-progress monotonic clock regressed')
+            if not force and elapsed_ns < CONTACT_PROGRESS_FLUSH_INTERVAL_NS:
+                return False
+        if retained_contacts is None:
+            retained_count = self.retained_contact_message_count
+            latest_stamp_ns = self.latest_retained_contact_stamp_ns
+        else:
+            retained_count = len(retained_contacts)
+            latest_stamp_ns = int(retained_contacts[-1]['stamp_ns']) if retained_contacts else None
+        if retained_count <= 0 or latest_stamp_ns is None:
+            raise ArtifactError('contact progress cannot be written without retained contacts')
+        write_json_atomic(
+            {
+                'latest_retained_stamp_ns': latest_stamp_ns,
+                'producer': 'robotest_metrics/metrics_collector',
+                'public_topic': PUBLIC_CONTACT_SNAPSHOT_TOPIC,
+                'retained_message_count': retained_count,
+                'schema_version': 1,
+            },
+            self.contact_progress_path,
+            maximum_bytes=CONTACT_PROGRESS_MAX_BYTES,
+        )
+        completed_ns = time.monotonic_ns() if now_ns is None else now_ns
+        if completed_ns < observed_ns:
+            raise ArtifactError('contact-progress monotonic clock regressed during write')
+        self.contact_progress_dirty = False
+        self.contact_progress_last_write_ns = completed_ns
+        return True
 
     @property
     def startup_ready(self) -> bool:
@@ -657,6 +697,7 @@ def _wait_for_startup_ready(
         if time.monotonic() >= deadline:
             return False
         executor.spin_once(timeout_sec=0.1)
+        node.flush_contact_progress()
     return rclpy.ok() and node.startup_ready
 
 
@@ -745,10 +786,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     timed_out = True
                     break
                 executor.spin_once(timeout_sec=0.1)
+                node.flush_contact_progress()
         elif rclpy.ok() and not arguments.stop_file.exists():
             timed_out = True
         runtime_interrupted = not rclpy.ok() and not arguments.stop_file.exists()
         capture = node.core.snapshot()
+        retained_contacts = capture['streams']['contacts']['items']
+        if retained_contacts or node.retained_contact_message_count:
+            node.flush_contact_progress(
+                force=True,
+                retained_contacts=retained_contacts,
+            )
         capture.update(
             {
                 'capture_schema_version': 1,

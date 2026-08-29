@@ -681,7 +681,7 @@ def _parse_named_ints(text: str, required: Sequence[str], label: str) -> dict[st
 
 
 def parse_psi(text: str, resource: str) -> dict[str, dict[str, float | int]]:
-    """Parse PSI rows, allowing CPU's normal some-only file."""
+    """Parse PSI rows, allowing legacy and modern CPU file shapes."""
     result: dict[str, dict[str, float | int]] = {}
     for line in text.splitlines():
         fields = line.split()
@@ -1055,6 +1055,12 @@ def _plugin_maps(proc_root: Path, pid: int, plugin: Mapping[str, Any]) -> list[d
 
 def _command_identity(proc_root: Path, pid: int) -> dict[str, Any]:
     payload = _bounded_proc_read(proc_root / str(pid) / 'cmdline', CMDLINE_MAX_BYTES, 'cmdline')
+    if payload and not payload.endswith(b'\0'):
+        raise ProfileError('incomplete_profile', f'PID {pid} command line is not NUL-terminated')
+    try:
+        cmdline = [item.decode() for item in payload[:-1].split(b'\0')] if payload else []
+    except UnicodeError as exc:
+        raise ProfileError('incomplete_profile', f'PID {pid} command line is not UTF-8') from exc
     executable_path = proc_root / str(pid) / 'exe'
     try:
         executable_link = os.readlink(executable_path)
@@ -1068,7 +1074,7 @@ def _command_identity(proc_root: Path, pid: int) -> dict[str, Any]:
             )
         raise ProfileError('missing_identity', f'cannot read PID {pid} executable') from exc
     return {
-        'cmdline': [item.decode(errors='replace') for item in payload.split(b'\0') if item],
+        'cmdline': cmdline,
         'cmdline_sha256': hashlib.sha256(payload).hexdigest(),
         'cmdline_size_bytes': len(payload),
         'executable_link': executable_link,
@@ -3107,8 +3113,10 @@ def _validate_host_sample(value: object, label: str) -> None:
     pressure = _profile_mapping(host.get('pressure'), f'{label} PSI', {'cpu', 'io', 'memory'})
     for resource in ('cpu', 'io', 'memory'):
         rows = _profile_mapping(pressure.get(resource), f'{label} {resource} PSI')
-        expected_rows = {'some'} if resource == 'cpu' else {'full', 'some'}
-        if set(rows) != expected_rows:
+        allowed_row_sets = (
+            ({'some'}, {'full', 'some'}) if resource == 'cpu' else ({'full', 'some'},)
+        )
+        if set(rows) not in allowed_row_sets:
             raise ProfileError('invalid_profile', f'{label} {resource} PSI rows differ')
         for row_name, row_value in rows.items():
             row = _profile_mapping(

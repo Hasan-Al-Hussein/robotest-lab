@@ -339,6 +339,130 @@ def test_collector_waits_for_post_clock_contact_and_destroys_cleanly(
             rclpy.try_shutdown()
 
 
+def test_contact_progress_coalesces_writes_without_dropping_contacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    progress_path = tmp_path / 'contact-progress.json'
+    writes: list[dict[str, object]] = []
+
+    def capture_write(
+        document: dict[str, object],
+        path: Path,
+        *,
+        maximum_bytes: int,
+    ) -> None:
+        assert path == progress_path
+        assert maximum_bytes == collector_node.CONTACT_PROGRESS_MAX_BYTES
+        writes.append(document)
+
+    monkeypatch.setattr(collector_node, 'write_json_atomic', capture_write)
+    rclpy.init()
+    node = collector_node.MetricsCollectorNode(contact_progress_path=progress_path)
+    try:
+        node.latest_clock_ns = 10_000_000_000
+
+        def retain(stamp: int) -> None:
+            message = Contacts()
+            message.header.stamp.sec = stamp
+            message.contacts = [Contact()]
+            node._on_contacts(message)
+
+        retain(1)
+        assert writes == []
+        assert node.flush_contact_progress(now_ns=0) is True
+        assert writes[-1]['retained_message_count'] == 1
+
+        retain(2)
+        assert node.flush_contact_progress(now_ns=100_000_000) is False
+        retain(3)
+        assert node.flush_contact_progress(now_ns=900_000_000) is False
+        assert len(writes) == 1
+        assert node.core.snapshot()['streams']['contacts']['quality']['retained_count'] == 3
+
+        assert node.flush_contact_progress(now_ns=1_000_000_000) is True
+        assert writes[-1]['latest_retained_stamp_ns'] == 3_000_000_000
+        assert writes[-1]['retained_message_count'] == 3
+        assert node.flush_contact_progress(now_ns=1_100_000_000) is False
+
+        retained = node.core.snapshot()['streams']['contacts']['items']
+        assert node.flush_contact_progress(
+            force=True,
+            retained_contacts=retained,
+            now_ns=1_100_000_000,
+        )
+        assert writes[-1]['latest_retained_stamp_ns'] == retained[-1]['stamp_ns']
+        assert writes[-1]['retained_message_count'] == len(retained)
+        assert len(writes) == 3
+        assert 'write_json_atomic' not in inspect.getsource(node._on_contacts)
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_failed_contact_progress_write_remains_dirty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    progress_path = tmp_path / 'contact-progress.json'
+    rclpy.init()
+    node = collector_node.MetricsCollectorNode(contact_progress_path=progress_path)
+    try:
+        node.latest_clock_ns = 2_000_000_000
+        message = Contacts()
+        message.header.stamp.sec = 1
+        message.contacts = [Contact()]
+        node._on_contacts(message)
+
+        def fail_write(*_args: object, **_kwargs: object) -> None:
+            raise collector_node.ArtifactError('durable write failed')
+
+        monkeypatch.setattr(collector_node, 'write_json_atomic', fail_write)
+        with pytest.raises(collector_node.ArtifactError, match='durable write failed'):
+            node.flush_contact_progress(now_ns=1)
+        assert node.contact_progress_dirty is True
+        assert node.contact_progress_last_write_ns is None
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_contact_progress_interval_starts_after_durable_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    progress_path = tmp_path / 'contact-progress.json'
+    writes: list[dict[str, object]] = []
+    clock = iter((0, 1_500_000_000, 1_600_000_000))
+    monkeypatch.setattr(collector_node.time, 'monotonic_ns', lambda: next(clock))
+    monkeypatch.setattr(
+        collector_node,
+        'write_json_atomic',
+        lambda document, *_args, **_kwargs: writes.append(document),
+    )
+    rclpy.init()
+    node = collector_node.MetricsCollectorNode(contact_progress_path=progress_path)
+    try:
+        node.latest_clock_ns = 3_000_000_000
+        first = Contacts()
+        first.header.stamp.sec = 1
+        first.contacts = [Contact()]
+        node._on_contacts(first)
+        assert node.flush_contact_progress() is True
+        assert node.contact_progress_last_write_ns == 1_500_000_000
+
+        second = Contacts()
+        second.header.stamp.sec = 2
+        second.contacts = [Contact()]
+        node._on_contacts(second)
+        assert node.flush_contact_progress() is False
+        assert len(writes) == 1
+        assert node.contact_progress_dirty is True
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
 def test_scan_normalization_retains_only_bounded_metadata_and_payload_hash() -> None:
     message = LaserScan()
     message.header.frame_id = 'laser'
@@ -609,7 +733,10 @@ def test_main_uses_one_dedicated_executor_and_cleans_up_add_failures(
     class FakeCore:
         @staticmethod
         def snapshot() -> dict[str, object]:
-            return {'quality': {'collector_overflow': False}}
+            return {
+                'quality': {'collector_overflow': False},
+                'streams': {'contacts': {'items': [{'stamp_ns': 1}]}},
+            }
 
     class FakeNode:
         def __init__(self) -> None:
@@ -626,6 +753,15 @@ def test_main_uses_one_dedicated_executor_and_cleans_up_add_failures(
         @staticmethod
         def destroy_node() -> None:
             calls.append('destroy_node')
+
+        @staticmethod
+        def flush_contact_progress(
+            *,
+            force: bool = False,
+            retained_contacts: object = None,
+        ) -> bool:
+            calls.append(('flush_contact_progress', force, retained_contacts))
+            return True
 
     node = FakeNode()
 
@@ -699,7 +835,10 @@ def test_main_uses_one_dedicated_executor_and_cleans_up_add_failures(
             'executor_init',
             'add_node',
             ('spin_once', 1),
+            ('flush_contact_progress', False, None),
             ('spin_once', 2),
+            ('flush_contact_progress', False, None),
+            ('flush_contact_progress', True, [{'stamp_ns': 1}]),
             'remove_node',
             'executor_shutdown',
             'destroy_node',
@@ -723,6 +862,88 @@ def test_main_uses_one_dedicated_executor_and_cleans_up_add_failures(
             assert f'metrics collector teardown warning: {failure}' in capsys.readouterr().err
     assert 'rclpy.spin_once' not in inspect.getsource(collector_node.main)
     assert 'rclpy.spin_once' not in inspect.getsource(collector_node._wait_for_startup_ready)
+
+
+@pytest.mark.parametrize(
+    ('runtime_ok', 'monotonic_values', 'expected_status', 'stop_reason'),
+    (
+        (True, (0.0, 361.0), 20, 'wall_timeout'),
+        (False, (0.0,), 23, 'runtime_shutdown'),
+    ),
+)
+def test_main_preserves_no_contact_timeout_and_shutdown_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_ok: bool,
+    monotonic_values: tuple[float, ...],
+    expected_status: int,
+    stop_reason: str,
+) -> None:
+    writes: list[tuple[Path, dict[str, object]]] = []
+    clock = iter(monotonic_values)
+
+    class FakeCore:
+        @staticmethod
+        def snapshot() -> dict[str, object]:
+            return {
+                'quality': {'collector_overflow': False},
+                'streams': {'contacts': {'items': []}},
+            }
+
+    class FakeNode:
+        context = object()
+        core = FakeCore()
+        latest_retained_contact_stamp_ns = None
+        pre_clock_contact_message_count = 0
+        retained_contact_message_count = 0
+        startup_ready = False
+
+        @staticmethod
+        def flush_contact_progress(**_kwargs: object) -> bool:
+            pytest.fail('empty captures must not write contact progress')
+
+        @staticmethod
+        def destroy_node() -> None:
+            return None
+
+    class FakeExecutor:
+        def __init__(self, *, context: object) -> None:
+            assert context is FakeNode.context
+
+        @staticmethod
+        def add_node(node: object) -> bool:
+            assert isinstance(node, FakeNode)
+            return True
+
+        @staticmethod
+        def spin_once(*, timeout_sec: float) -> None:
+            pytest.fail(f'no-contact boundary must not spin: {timeout_sec}')
+
+        @staticmethod
+        def remove_node(node: object) -> None:
+            assert isinstance(node, FakeNode)
+
+        @staticmethod
+        def shutdown(*, timeout_sec: float) -> bool:
+            assert timeout_sec == 1.0
+            return True
+
+    def capture_write(document: dict[str, object], path: Path, **_kwargs: object) -> None:
+        writes.append((path, document))
+
+    monkeypatch.setattr(collector_node, 'MetricsCollectorNode', lambda **_: FakeNode())
+    monkeypatch.setattr(collector_node, 'SingleThreadedExecutor', FakeExecutor)
+    monkeypatch.setattr(collector_node.rclpy, 'init', lambda **_: None)
+    monkeypatch.setattr(collector_node.rclpy, 'ok', lambda: runtime_ok)
+    monkeypatch.setattr(collector_node.rclpy, 'shutdown', lambda: None)
+    monkeypatch.setattr(collector_node.time, 'monotonic', lambda: next(clock))
+    monkeypatch.setattr(collector_node.time, 'monotonic_ns', lambda: 1)
+    monkeypatch.setattr(collector_node, 'write_json_atomic', capture_write)
+
+    assert collector_node.main(_collector_cli_arguments(tmp_path)) == expected_status
+    assert [path for path, _document in writes] == [tmp_path / 'capture.json']
+    assert writes[0][1]['stop_reason'] == stop_reason
+    assert not (tmp_path / 'contact-progress.json').exists()
 
 
 def test_invalid_and_nonretained_commands_do_not_write_progress(

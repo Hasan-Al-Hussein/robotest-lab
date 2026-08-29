@@ -1307,6 +1307,54 @@ def test_trial_collector_and_drain_wait_share_exact_contact_progress_path(
     assert progress['latest_retained_stamp_ns'] == 600_000_000
 
 
+def test_contact_progress_wait_polls_until_atomic_marker_advances(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    progress_path = tmp_path / 'contact-progress.json'
+    document = {
+        'latest_retained_stamp_ns': 400_000_000,
+        'producer': 'robotest_metrics/metrics_collector',
+        'public_topic': '/robotest/validation/contacts',
+        'retained_message_count': 2,
+        'schema_version': 1,
+    }
+    orchestration.atomic_write_json(progress_path, document)
+    now = 0.0
+    sleep_count = 0
+
+    def monotonic() -> float:
+        return now
+
+    def sleep(duration: float) -> None:
+        nonlocal now, sleep_count
+        now += duration
+        sleep_count += 1
+        if sleep_count == 1:
+            orchestration.atomic_write_json(
+                progress_path,
+                {
+                    **document,
+                    'latest_retained_stamp_ns': 600_000_000,
+                    'retained_message_count': 3,
+                },
+            )
+
+    monkeypatch.setattr(runner.time, 'monotonic', monotonic)
+    monkeypatch.setattr(runner.time, 'sleep', sleep)
+
+    progress = runner._wait_for_contact_progress(
+        progress_path,
+        qualifying_stamp_ns=500_000_000,
+        timeout_s=1.0,
+        watched=(),
+    )
+
+    assert sleep_count == 1
+    assert progress['latest_retained_stamp_ns'] == 600_000_000
+    assert progress['retained_message_count'] == 3
+
+
 def test_positive_control_allows_sim_fault_proxy_but_forbids_navigation() -> None:
     assert 'fault_proxy' not in runtime_gate.POSITIVE_FORBIDDEN_NODES
     assert 'collision_monitor' in runtime_gate.POSITIVE_FORBIDDEN_NODES
