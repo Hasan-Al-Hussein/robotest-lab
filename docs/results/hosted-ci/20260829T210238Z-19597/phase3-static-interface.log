@@ -1,0 +1,6 @@
+Usage: scripts/verify_phase3.sh
+
+Builds and tests the Phase 3 overlay with at most four workers, runs static and
+pure orchestration gates, validates installed CLI entry points, and writes a
+source/install build-binding artifact. It never starts Gazebo and never starts
+the positive-control, smoke, or 15-run candidate campaign.

@@ -1,0 +1,1 @@
+{"forbidden_pattern_count":8,"live_test_registration_found":false,"scanned_file_count":69,"verification_scope":"L0 registration scan before colcon test; node-level unit tests may create an isolated ROS context, but no launch, Gazebo, systemd, campaign, or privileged path is registered"}

@@ -1,0 +1,1118 @@
+Starting >>> robotest_interfaces
+Starting >>> robotest_description
+--- output: robotest_description
+-- The C compiler identification is GNU 13.3.0
+-- The CXX compiler identification is GNU 13.3.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found ament_cmake: 2.5.6 (/opt/ros/jazzy/share/ament_cmake/cmake)
+-- Found Python3: /usr/bin/python3 (found version "3.12.3") found components: Interpreter
+-- Override CMake install command with custom implementation using symlinks instead of copying resources
+-- Found ament_cmake_pytest: 2.5.6 (/opt/ros/jazzy/share/ament_cmake_pytest/cmake)
+-- Found ament_lint_auto: 0.17.5 (/opt/ros/jazzy/share/ament_lint_auto/cmake)
+-- Added test 'copyright' to check source files copyright and LICENSE
+-- Added test 'flake8' to check Python code syntax and style conventions
+-- Configured 'flake8' exclude dirs and/or files: 
+-- Added test 'lint_cmake' to check CMake code style
+-- Added test 'pep257' to check Python code against some of the docstring style conventions in PEP 257
+-- Added test 'xmllint' to check XML markup files
+-- Configuring done (1.8s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/robotest-phase5.hYpbNh/build/robotest_description
+-- Install configuration: "RelWithDebInfo"
+-- Execute custom install script
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/launch/view_model.launch.py
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/urdf/robotest.urdf.xacro
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/urdf/robotest_base.xacro
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/urdf/robotest_gazebo.xacro
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/urdf/robotest_inertials.xacro
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/urdf/robotest_materials.xacro
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/urdf/robotest_properties.xacro
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/urdf/robotest_sensors.xacro
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/LICENSE
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/README.md
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/lib/robotest_description/generate_collision_coverage.py
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/ament_index/resource_index/package_run_dependencies/robotest_description
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/ament_index/resource_index/parent_prefix_path/robotest_description
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/environment/ament_prefix_path.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/environment/ament_prefix_path.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/environment/path.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/environment/path.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/local_setup.bash
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/local_setup.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/local_setup.zsh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/local_setup.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/package.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/ament_index/resource_index/packages/robotest_description
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/cmake/robotest_descriptionConfig.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/cmake/robotest_descriptionConfig-version.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_description/share/robotest_description/package.xml
+---
+Finished <<< robotest_description [6.59s]
+--- output: robotest_interfaces
+CMake Deprecation Warning at CMakeLists.txt:4 (cmake_minimum_required):
+  Compatibility with CMake < 3.10 will be removed from a future version of
+  CMake.
+
+  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+  to tell CMake that the project requires at least <min> but has been updated
+  to work with policies introduced by <max> or earlier.
+
+
+-- The C compiler identification is GNU 13.3.0
+-- The CXX compiler identification is GNU 13.3.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found ament_cmake: 2.5.6 (/opt/ros/jazzy/share/ament_cmake/cmake)
+-- Found Python3: /usr/bin/python3 (found version "3.12.3") found components: Interpreter
+-- Override CMake install command with custom implementation using symlinks instead of copying resources
+-- Found builtin_interfaces: 2.0.4 (/opt/ros/jazzy/share/builtin_interfaces/cmake)
+-- Found rosidl_generator_c: 4.6.9 (/opt/ros/jazzy/share/rosidl_generator_c/cmake)
+-- Found rosidl_generator_cpp: 4.6.9 (/opt/ros/jazzy/share/rosidl_generator_cpp/cmake)
+-- Using all available rosidl_typesupport_c: rosidl_typesupport_fastrtps_c;rosidl_typesupport_introspection_c
+-- Using all available rosidl_typesupport_cpp: rosidl_typesupport_fastrtps_cpp;rosidl_typesupport_introspection_cpp
+-- Found rosidl_default_generators: 1.6.1 (/opt/ros/jazzy/share/rosidl_default_generators/cmake)
+-- Found rosidl_adapter: 4.6.9 (/opt/ros/jazzy/share/rosidl_adapter/cmake)
+-- Found std_msgs: 5.3.8 (/opt/ros/jazzy/share/std_msgs/cmake)
+-- Found unique_identifier_msgs: 2.5.1 (/opt/ros/jazzy/share/unique_identifier_msgs/cmake)
+-- Found ament_cmake_ros: 0.12.1 (/opt/ros/jazzy/share/ament_cmake_ros/cmake)
+-- Using all available rosidl_typesupport_c: rosidl_typesupport_fastrtps_c;rosidl_typesupport_introspection_c
+-- Using all available rosidl_typesupport_cpp: rosidl_typesupport_fastrtps_cpp;rosidl_typesupport_introspection_cpp
+-- Found python_cmake_module: 0.11.1 (/opt/ros/jazzy/share/python_cmake_module/cmake)
+-- Found PythonExtra: /usr/bin/python3
+-- Found Python3: /usr/bin/python3 (found version "3.12.3") found components: Interpreter Development NumPy Development.Module Development.Embed
+-- Found Python3: /usr/bin/python3 (found version "3.12.3") found components: Interpreter
+-- Found ament_lint_auto: 0.17.5 (/opt/ros/jazzy/share/ament_lint_auto/cmake)
+-- Added test 'copyright' to check source files copyright and LICENSE
+-- Added test 'lint_cmake' to check CMake code style
+-- Added test 'xmllint' to check XML markup files
+-- Configuring done (3.6s)
+-- Generating done (0.1s)
+-- Build files have been written to: /tmp/robotest-phase5.hYpbNh/build/robotest_interfaces
+[  1%] Generating type hashes for ROS interfaces
+[  3%] Generating Rust code for ROS interfaces
+[  3%] Built target ament_cmake_python_symlink_robotest_interfaces
+running egg_info
+creating robotest_interfaces.egg-info
+writing robotest_interfaces.egg-info/PKG-INFO
+writing dependency_links to robotest_interfaces.egg-info/dependency_links.txt
+writing top-level names to robotest_interfaces.egg-info/top_level.txt
+writing manifest file 'robotest_interfaces.egg-info/SOURCES.txt'
+reading manifest file 'robotest_interfaces.egg-info/SOURCES.txt'
+writing manifest file 'robotest_interfaces.egg-info/SOURCES.txt'
+[  3%] Built target ament_cmake_python_build_robotest_interfaces_egg
+[  3%] Built target robotest_interfaces__rs
+[  3%] Built target robotest_interfaces__rosidl_generator_type_description
+[  4%] Generating C code for ROS interfaces
+[  6%] Generating C++ code for ROS interfaces
+[  6%] Built target robotest_interfaces__cpp
+[  7%] Building C object CMakeFiles/robotest_interfaces__rosidl_generator_c.dir/rosidl_generator_c/robotest_interfaces/msg/detail/fault_spec__description.c.o
+[  9%] Building C object CMakeFiles/robotest_interfaces__rosidl_generator_c.dir/rosidl_generator_c/robotest_interfaces/msg/detail/fault_spec__functions.c.o
+[ 10%] Building C object CMakeFiles/robotest_interfaces__rosidl_generator_c.dir/rosidl_generator_c/robotest_interfaces/msg/detail/fault_spec__type_support.c.o
+[ 12%] Building C object CMakeFiles/robotest_interfaces__rosidl_generator_c.dir/rosidl_generator_c/robotest_interfaces/msg/detail/fault_event__description.c.o
+[ 13%] Building C object CMakeFiles/robotest_interfaces__rosidl_generator_c.dir/rosidl_generator_c/robotest_interfaces/msg/detail/fault_event__functions.c.o
+[ 15%] Building C object CMakeFiles/robotest_interfaces__rosidl_generator_c.dir/rosidl_generator_c/robotest_interfaces/msg/detail/fault_event__type_support.c.o
+[ 16%] Building C object CMakeFiles/robotest_interfaces__rosidl_generator_c.dir/rosidl_generator_c/robotest_interfaces/srv/detail/arm_fault_schedule__description.c.o
+[ 18%] Building C object CMakeFiles/robotest_interfaces__rosidl_generator_c.dir/rosidl_generator_c/robotest_interfaces/srv/detail/arm_fault_schedule__functions.c.o
+[ 20%] Building C object CMakeFiles/robotest_interfaces__rosidl_generator_c.dir/rosidl_generator_c/robotest_interfaces/srv/detail/arm_fault_schedule__type_support.c.o
+[ 21%] Building C object CMakeFiles/robotest_interfaces__rosidl_generator_c.dir/rosidl_generator_c/robotest_interfaces/srv/detail/preload_fault_schedule__description.c.o
+[ 23%] Building C object CMakeFiles/robotest_interfaces__rosidl_generator_c.dir/rosidl_generator_c/robotest_interfaces/srv/detail/preload_fault_schedule__functions.c.o
+[ 24%] Building C object CMakeFiles/robotest_interfaces__rosidl_generator_c.dir/rosidl_generator_c/robotest_interfaces/srv/detail/preload_fault_schedule__type_support.c.o
+[ 26%] Linking C shared library librobotest_interfaces__rosidl_generator_c.so
+[ 26%] Built target robotest_interfaces__rosidl_generator_c
+[ 27%] Generating C type support for eProsima Fast-RTPS
+[ 29%] Generating C++ type support for eProsima Fast-RTPS
+[ 30%] Generating C introspection for ROS interfaces
+[ 32%] Generating C type support dispatch for ROS interfaces
+[ 33%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_c.dir/rosidl_typesupport_c/robotest_interfaces/msg/fault_spec__type_support.cpp.o
+[ 35%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_c.dir/rosidl_typesupport_c/robotest_interfaces/msg/fault_event__type_support.cpp.o
+[ 36%] Building C object CMakeFiles/robotest_interfaces__rosidl_typesupport_introspection_c.dir/rosidl_typesupport_introspection_c/robotest_interfaces/msg/detail/fault_spec__type_support.c.o
+[ 38%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_c.dir/rosidl_typesupport_c/robotest_interfaces/srv/arm_fault_schedule__type_support.cpp.o
+[ 40%] Building C object CMakeFiles/robotest_interfaces__rosidl_typesupport_introspection_c.dir/rosidl_typesupport_introspection_c/robotest_interfaces/msg/detail/fault_event__type_support.c.o
+[ 41%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_c.dir/rosidl_typesupport_c/robotest_interfaces/srv/preload_fault_schedule__type_support.cpp.o
+[ 43%] Building C object CMakeFiles/robotest_interfaces__rosidl_typesupport_introspection_c.dir/rosidl_typesupport_introspection_c/robotest_interfaces/srv/detail/arm_fault_schedule__type_support.c.o
+[ 44%] Linking CXX shared library librobotest_interfaces__rosidl_typesupport_c.so
+[ 44%] Built target robotest_interfaces__rosidl_typesupport_c
+[ 46%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_fastrtps_cpp.dir/rosidl_typesupport_fastrtps_cpp/robotest_interfaces/msg/detail/dds_fastrtps/fault_spec__type_support.cpp.o
+[ 47%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_fastrtps_cpp.dir/rosidl_typesupport_fastrtps_cpp/robotest_interfaces/msg/detail/dds_fastrtps/fault_event__type_support.cpp.o
+[ 49%] Building C object CMakeFiles/robotest_interfaces__rosidl_typesupport_introspection_c.dir/rosidl_typesupport_introspection_c/robotest_interfaces/srv/detail/preload_fault_schedule__type_support.c.o
+[ 50%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_fastrtps_c.dir/rosidl_typesupport_fastrtps_c/robotest_interfaces/msg/detail/fault_spec__type_support_c.cpp.o
+[ 52%] Linking C shared library librobotest_interfaces__rosidl_typesupport_introspection_c.so
+[ 52%] Built target robotest_interfaces__rosidl_typesupport_introspection_c
+[ 53%] Generating C++ introspection for ROS interfaces
+[ 55%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_fastrtps_cpp.dir/rosidl_typesupport_fastrtps_cpp/robotest_interfaces/srv/detail/dds_fastrtps/arm_fault_schedule__type_support.cpp.o
+[ 56%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_fastrtps_c.dir/rosidl_typesupport_fastrtps_c/robotest_interfaces/msg/detail/fault_event__type_support_c.cpp.o
+[ 58%] Generating C++ type support dispatch for ROS interfaces
+[ 60%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_introspection_cpp.dir/rosidl_typesupport_introspection_cpp/robotest_interfaces/msg/detail/fault_spec__type_support.cpp.o
+[ 61%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_introspection_cpp.dir/rosidl_typesupport_introspection_cpp/robotest_interfaces/msg/detail/fault_event__type_support.cpp.o
+[ 63%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_fastrtps_c.dir/rosidl_typesupport_fastrtps_c/robotest_interfaces/srv/detail/arm_fault_schedule__type_support_c.cpp.o
+[ 64%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_cpp.dir/rosidl_typesupport_cpp/robotest_interfaces/msg/fault_spec__type_support.cpp.o
+[ 66%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_introspection_cpp.dir/rosidl_typesupport_introspection_cpp/robotest_interfaces/srv/detail/arm_fault_schedule__type_support.cpp.o
+[ 67%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_fastrtps_cpp.dir/rosidl_typesupport_fastrtps_cpp/robotest_interfaces/srv/detail/dds_fastrtps/preload_fault_schedule__type_support.cpp.o
+[ 69%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_cpp.dir/rosidl_typesupport_cpp/robotest_interfaces/msg/fault_event__type_support.cpp.o
+[ 70%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_cpp.dir/rosidl_typesupport_cpp/robotest_interfaces/srv/arm_fault_schedule__type_support.cpp.o
+[ 72%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_fastrtps_c.dir/rosidl_typesupport_fastrtps_c/robotest_interfaces/srv/detail/preload_fault_schedule__type_support_c.cpp.o
+[ 73%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_introspection_cpp.dir/rosidl_typesupport_introspection_cpp/robotest_interfaces/srv/detail/preload_fault_schedule__type_support.cpp.o
+[ 75%] Building CXX object CMakeFiles/robotest_interfaces__rosidl_typesupport_cpp.dir/rosidl_typesupport_cpp/robotest_interfaces/srv/preload_fault_schedule__type_support.cpp.o
+[ 76%] Linking CXX shared library librobotest_interfaces__rosidl_typesupport_fastrtps_c.so
+[ 78%] Linking CXX shared library librobotest_interfaces__rosidl_typesupport_fastrtps_cpp.so
+[ 78%] Built target robotest_interfaces__rosidl_typesupport_fastrtps_c
+[ 78%] Built target robotest_interfaces__rosidl_typesupport_fastrtps_cpp
+[ 80%] Linking CXX shared library librobotest_interfaces__rosidl_typesupport_cpp.so
+[ 81%] Linking CXX shared library librobotest_interfaces__rosidl_typesupport_introspection_cpp.so
+[ 81%] Built target robotest_interfaces__rosidl_typesupport_cpp
+[ 81%] Built target robotest_interfaces__rosidl_typesupport_introspection_cpp
+[ 81%] Built target robotest_interfaces
+[ 83%] Generating Python code for ROS interfaces
+[ 83%] Built target robotest_interfaces__py
+[ 84%] Building C object CMakeFiles/robotest_interfaces__rosidl_generator_py.dir/rosidl_generator_py/robotest_interfaces/msg/_fault_event_s.c.o
+[ 86%] Building C object CMakeFiles/robotest_interfaces__rosidl_generator_py.dir/rosidl_generator_py/robotest_interfaces/msg/_fault_spec_s.c.o
+[ 87%] Building C object CMakeFiles/robotest_interfaces__rosidl_generator_py.dir/rosidl_generator_py/robotest_interfaces/srv/_preload_fault_schedule_s.c.o
+[ 89%] Building C object CMakeFiles/robotest_interfaces__rosidl_generator_py.dir/rosidl_generator_py/robotest_interfaces/srv/_arm_fault_schedule_s.c.o
+[ 90%] Linking C shared library librobotest_interfaces__rosidl_generator_py.so
+[ 90%] Built target robotest_interfaces__rosidl_generator_py
+[ 92%] Building C object CMakeFiles/robotest_interfaces_s__rosidl_typesupport_fastrtps_c.dir/rosidl_generator_py/robotest_interfaces/_robotest_interfaces_s.ep.rosidl_typesupport_fastrtps_c.c.o
+[ 93%] Building C object CMakeFiles/robotest_interfaces_s__rosidl_typesupport_introspection_c.dir/rosidl_generator_py/robotest_interfaces/_robotest_interfaces_s.ep.rosidl_typesupport_introspection_c.c.o
+[ 95%] Building C object CMakeFiles/robotest_interfaces_s__rosidl_typesupport_c.dir/rosidl_generator_py/robotest_interfaces/_robotest_interfaces_s.ep.rosidl_typesupport_c.c.o
+[ 96%] Linking C shared module rosidl_generator_py/robotest_interfaces/robotest_interfaces_s__rosidl_typesupport_c.so
+[ 96%] Built target robotest_interfaces_s__rosidl_typesupport_c
+[ 98%] Linking C shared module rosidl_generator_py/robotest_interfaces/robotest_interfaces_s__rosidl_typesupport_introspection_c.so
+[100%] Linking C shared module rosidl_generator_py/robotest_interfaces/robotest_interfaces_s__rosidl_typesupport_fastrtps_c.so
+[100%] Built target robotest_interfaces_s__rosidl_typesupport_introspection_c
+[100%] Built target robotest_interfaces_s__rosidl_typesupport_fastrtps_c
+-- Install configuration: "RelWithDebInfo"
+-- Execute custom install script
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/ament_index/resource_index/rosidl_interfaces/robotest_interfaces
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/msg/FaultSpec.json
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/msg/FaultEvent.json
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/srv/ArmFaultSchedule.json
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/srv/PreloadFaultSchedule.json
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_event__functions.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_event__struct.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_event__type_support.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_spec__functions.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_spec__struct.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_spec__type_support.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/fault_event.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/fault_spec.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/rosidl_generator_c__visibility_control.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/arm_fault_schedule.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/arm_fault_schedule__functions.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/arm_fault_schedule__struct.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/arm_fault_schedule__type_support.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/preload_fault_schedule__functions.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/preload_fault_schedule__struct.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/preload_fault_schedule__type_support.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/preload_fault_schedule.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/environment/library_path.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/environment/library_path.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_event__rosidl_typesupport_fastrtps_c.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_spec__rosidl_typesupport_fastrtps_c.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/rosidl_typesupport_fastrtps_c__visibility_control.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/arm_fault_schedule__rosidl_typesupport_fastrtps_c.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/preload_fault_schedule__rosidl_typesupport_fastrtps_c.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_event__builder.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_event__struct.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_event__traits.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_event__type_support.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_spec__builder.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_spec__struct.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_spec__traits.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_spec__type_support.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/fault_event.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/fault_spec.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/rosidl_generator_cpp__visibility_control.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/arm_fault_schedule.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/arm_fault_schedule__builder.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/arm_fault_schedule__struct.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/arm_fault_schedule__traits.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/arm_fault_schedule__type_support.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/preload_fault_schedule__builder.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/preload_fault_schedule__struct.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/preload_fault_schedule__traits.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/preload_fault_schedule__type_support.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/preload_fault_schedule.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_event__rosidl_typesupport_fastrtps_cpp.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_spec__rosidl_typesupport_fastrtps_cpp.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/rosidl_typesupport_fastrtps_cpp__visibility_control.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/arm_fault_schedule__rosidl_typesupport_fastrtps_cpp.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/preload_fault_schedule__rosidl_typesupport_fastrtps_cpp.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_event__rosidl_typesupport_introspection_c.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_spec__rosidl_typesupport_introspection_c.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/rosidl_typesupport_introspection_c__visibility_control.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/arm_fault_schedule__rosidl_typesupport_introspection_c.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/preload_fault_schedule__rosidl_typesupport_introspection_c.h
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_event__rosidl_typesupport_introspection_cpp.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/msg/detail/fault_spec__rosidl_typesupport_introspection_cpp.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/arm_fault_schedule__rosidl_typesupport_introspection_cpp.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/include/robotest_interfaces/robotest_interfaces/srv/detail/preload_fault_schedule__rosidl_typesupport_introspection_cpp.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/environment/pythonpath.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/environment/pythonpath.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces-0.1.0-py3.12.egg-info/PKG-INFO
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces-0.1.0-py3.12.egg-info/SOURCES.txt
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces-0.1.0-py3.12.egg-info/dependency_links.txt
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces-0.1.0-py3.12.egg-info/top_level.txt
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/__init__.py
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/_robotest_interfaces_s.ep.rosidl_typesupport_c.c
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/_robotest_interfaces_s.ep.rosidl_typesupport_fastrtps_c.c
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/_robotest_interfaces_s.ep.rosidl_typesupport_introspection_c.c
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/msg/__init__.py
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/msg/_fault_event.py
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/msg/_fault_event_s.c
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/msg/_fault_spec.py
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/msg/_fault_spec_s.c
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/robotest_interfaces_s__rosidl_typesupport_c.so
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/robotest_interfaces_s__rosidl_typesupport_fastrtps_c.so
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/robotest_interfaces_s__rosidl_typesupport_introspection_c.so
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/srv/__init__.py
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/srv/_arm_fault_schedule.py
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/srv/_arm_fault_schedule_s.c
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/srv/_preload_fault_schedule.py
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/srv/_preload_fault_schedule_s.c
+-- Up-to-date symlink: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/robotest_interfaces_s__rosidl_typesupport_fastrtps_c.so
+-- Up-to-date symlink: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/robotest_interfaces_s__rosidl_typesupport_introspection_c.so
+-- Up-to-date symlink: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/robotest_interfaces_s__rosidl_typesupport_c.so
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/ament_index/resource_index/rust_packages/robotest_interfaces
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/rust/Cargo.toml
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/rust/build.rs
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/rust/src/lib.rs
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/rust/src/msg.rs
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/rust/src/msg/rmw.rs
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/rust/src/srv.rs
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/rust/src/srv/rmw.rs
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/msg/FaultSpec.idl
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/msg/FaultEvent.idl
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/srv/ArmFaultSchedule.idl
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/srv/PreloadFaultSchedule.idl
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/msg/FaultSpec.msg
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/msg/FaultEvent.msg
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/srv/ArmFaultSchedule.srv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/srv/PreloadFaultSchedule.srv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/LICENSE
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/README.md
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/ament_index/resource_index/package_run_dependencies/robotest_interfaces
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/ament_index/resource_index/parent_prefix_path/robotest_interfaces
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/environment/ament_prefix_path.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/environment/ament_prefix_path.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/environment/path.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/environment/path.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/local_setup.bash
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/local_setup.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/local_setup.zsh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/local_setup.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/package.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/ament_index/resource_index/packages/robotest_interfaces
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/rosidl_cmake-extras.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/ament_cmake_export_dependencies-extras.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/ament_cmake_export_include_directories-extras.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/ament_cmake_export_libraries-extras.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/ament_cmake_export_targets-extras.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/rosidl_cmake_export_typesupport_targets-extras.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/rosidl_cmake_export_typesupport_libraries-extras.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/rosidl_cmake_aggregate_target-extras.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/robotest_interfacesConfig.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/robotest_interfacesConfig-version.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/package.xml
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/librobotest_interfaces__rosidl_generator_c.so
+-- Set non-toolchain portion of runtime path of "/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/librobotest_interfaces__rosidl_generator_c.so" to ""
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/librobotest_interfaces__rosidl_typesupport_fastrtps_c.so
+-- Set non-toolchain portion of runtime path of "/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/librobotest_interfaces__rosidl_typesupport_fastrtps_c.so" to ""
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/librobotest_interfaces__rosidl_typesupport_fastrtps_cpp.so
+-- Set non-toolchain portion of runtime path of "/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/librobotest_interfaces__rosidl_typesupport_fastrtps_cpp.so" to ""
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/librobotest_interfaces__rosidl_typesupport_introspection_c.so
+-- Set non-toolchain portion of runtime path of "/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/librobotest_interfaces__rosidl_typesupport_introspection_c.so" to ""
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/librobotest_interfaces__rosidl_typesupport_c.so
+-- Set non-toolchain portion of runtime path of "/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/librobotest_interfaces__rosidl_typesupport_c.so" to ""
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/librobotest_interfaces__rosidl_typesupport_introspection_cpp.so
+-- Set non-toolchain portion of runtime path of "/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/librobotest_interfaces__rosidl_typesupport_introspection_cpp.so" to ""
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/librobotest_interfaces__rosidl_typesupport_cpp.so
+-- Set non-toolchain portion of runtime path of "/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/librobotest_interfaces__rosidl_typesupport_cpp.so" to ""
+Listing '/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces'...
+Compiling '/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/__init__.py'...
+Listing '/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/msg'...
+Compiling '/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/msg/__init__.py'...
+Compiling '/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/msg/_fault_event.py'...
+Compiling '/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/msg/_fault_spec.py'...
+Listing '/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/srv'...
+Compiling '/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/srv/__init__.py'...
+Compiling '/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/srv/_arm_fault_schedule.py'...
+Compiling '/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/python3.12/site-packages/robotest_interfaces/srv/_preload_fault_schedule.py'...
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/librobotest_interfaces__rosidl_generator_py.so
+-- Set non-toolchain portion of runtime path of "/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/lib/librobotest_interfaces__rosidl_generator_py.so" to ""
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/export_robotest_interfaces__rosidl_generator_cExport.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/export_robotest_interfaces__rosidl_generator_cExport-relwithdebinfo.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/export_robotest_interfaces__rosidl_typesupport_fastrtps_cExport.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/export_robotest_interfaces__rosidl_typesupport_fastrtps_cExport-relwithdebinfo.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/export_robotest_interfaces__rosidl_generator_cppExport.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/export_robotest_interfaces__rosidl_typesupport_fastrtps_cppExport.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/export_robotest_interfaces__rosidl_typesupport_fastrtps_cppExport-relwithdebinfo.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/robotest_interfaces__rosidl_typesupport_introspection_cExport.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/robotest_interfaces__rosidl_typesupport_introspection_cExport-relwithdebinfo.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/robotest_interfaces__rosidl_typesupport_cExport.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/robotest_interfaces__rosidl_typesupport_cExport-relwithdebinfo.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/robotest_interfaces__rosidl_typesupport_introspection_cppExport.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/robotest_interfaces__rosidl_typesupport_introspection_cppExport-relwithdebinfo.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/robotest_interfaces__rosidl_typesupport_cppExport.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/robotest_interfaces__rosidl_typesupport_cppExport-relwithdebinfo.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/export_robotest_interfaces__rosidl_generator_pyExport.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake/export_robotest_interfaces__rosidl_generator_pyExport-relwithdebinfo.cmake
+---
+--- stderr: robotest_interfaces
+CMake Deprecation Warning at CMakeLists.txt:4 (cmake_minimum_required):
+  Compatibility with CMake < 3.10 will be removed from a future version of
+  CMake.
+
+  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+  to tell CMake that the project requires at least <min> but has been updated
+  to work with policies introduced by <max> or earlier.
+
+
+---
+Finished <<< robotest_interfaces [19.4s]
+Starting >>> robotest_faults
+Starting >>> robotest_missions
+--- output: robotest_missions
+running develop
+/usr/lib/python3/dist-packages/setuptools/command/easy_install.py:363: UserWarning: Unbuilt egg for pytest-repeat [unknown version] (/usr/lib/python3/dist-packages)
+  self.local_index = Environment(self.shadow_path + sys.path)
+running egg_info
+creating robotest_missions.egg-info
+writing robotest_missions.egg-info/PKG-INFO
+writing dependency_links to robotest_missions.egg-info/dependency_links.txt
+writing entry points to robotest_missions.egg-info/entry_points.txt
+writing requirements to robotest_missions.egg-info/requires.txt
+writing top-level names to robotest_missions.egg-info/top_level.txt
+writing manifest file 'robotest_missions.egg-info/SOURCES.txt'
+reading manifest file 'robotest_missions.egg-info/SOURCES.txt'
+adding license file 'LICENSE'
+writing manifest file 'robotest_missions.egg-info/SOURCES.txt'
+running build_ext
+Creating /tmp/robotest-phase5.hYpbNh/install/robotest_missions/lib/python3.12/site-packages/robotest-missions.egg-link (link to .)
+Installing mission_runner script to /tmp/robotest-phase5.hYpbNh/install/robotest_missions/lib/robotest_missions
+
+Installed /tmp/robotest-phase5.hYpbNh/build/robotest_missions
+running symlink_data
+creating /tmp/robotest-phase5.hYpbNh/install/robotest_missions/share/ament_index
+creating /tmp/robotest-phase5.hYpbNh/install/robotest_missions/share/ament_index/resource_index
+creating /tmp/robotest-phase5.hYpbNh/install/robotest_missions/share/ament_index/resource_index/packages
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_missions/resource/robotest_missions -> /tmp/robotest-phase5.hYpbNh/install/robotest_missions/share/ament_index/resource_index/packages
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_missions/package.xml -> /tmp/robotest-phase5.hYpbNh/install/robotest_missions/share/robotest_missions
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_missions/README.md -> /tmp/robotest-phase5.hYpbNh/install/robotest_missions/share/robotest_missions
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_missions/LICENSE -> /tmp/robotest-phase5.hYpbNh/install/robotest_missions/share/robotest_missions
+creating /tmp/robotest-phase5.hYpbNh/install/robotest_missions/share/robotest_missions/schema
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_missions/schema/mission.schema.json -> /tmp/robotest-phase5.hYpbNh/install/robotest_missions/share/robotest_missions/schema
+---
+--- stderr: robotest_missions
+/usr/lib/python3/dist-packages/setuptools/command/easy_install.py:363: UserWarning: Unbuilt egg for pytest-repeat [unknown version] (/usr/lib/python3/dist-packages)
+  self.local_index = Environment(self.shadow_path + sys.path)
+---
+Finished <<< robotest_missions [6.10s]
+[Processing: robotest_faults]
+--- output: robotest_faults
+CMake Deprecation Warning at CMakeLists.txt:4 (cmake_minimum_required):
+  Compatibility with CMake < 3.10 will be removed from a future version of
+  CMake.
+
+  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+  to tell CMake that the project requires at least <min> but has been updated
+  to work with policies introduced by <max> or earlier.
+
+
+-- The C compiler identification is GNU 13.3.0
+-- The CXX compiler identification is GNU 13.3.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found ament_cmake: 2.5.6 (/opt/ros/jazzy/share/ament_cmake/cmake)
+-- Found Python3: /usr/bin/python3 (found version "3.12.3") found components: Interpreter
+-- Override CMake install command with custom implementation using symlinks instead of copying resources
+-- Found builtin_interfaces: 2.0.4 (/opt/ros/jazzy/share/builtin_interfaces/cmake)
+-- Found rosidl_generator_c: 4.6.9 (/opt/ros/jazzy/share/rosidl_generator_c/cmake)
+-- Found rosidl_generator_cpp: 4.6.9 (/opt/ros/jazzy/share/rosidl_generator_cpp/cmake)
+-- Using all available rosidl_typesupport_c: rosidl_typesupport_fastrtps_c;rosidl_typesupport_introspection_c
+-- Using all available rosidl_typesupport_cpp: rosidl_typesupport_fastrtps_cpp;rosidl_typesupport_introspection_cpp
+-- Found geometry_msgs: 5.3.8 (/opt/ros/jazzy/share/geometry_msgs/cmake)
+-- Found nav_msgs: 5.3.8 (/opt/ros/jazzy/share/nav_msgs/cmake)
+-- Found nlohmann_json: /usr/share/cmake/nlohmann_json/nlohmann_jsonConfig.cmake (found version "3.11.3")
+-- Found OpenSSL: /usr/lib/x86_64-linux-gnu/libcrypto.so (found version "3.0.13")
+-- Found rclcpp: 28.1.21 (/opt/ros/jazzy/share/rclcpp/cmake)
+-- Found rmw_implementation_cmake: 7.3.3 (/opt/ros/jazzy/share/rmw_implementation_cmake/cmake)
+-- Found rmw_fastrtps_cpp: 8.4.4 (/opt/ros/jazzy/share/rmw_fastrtps_cpp/cmake)
+-- Found FastRTPS: /opt/ros/jazzy/include (Required is at least version "2.13")
+-- Using RMW implementation 'rmw_fastrtps_cpp' as default
+-- Found robotest_interfaces: 0.1.0 (/tmp/robotest-phase5.hYpbNh/install/robotest_interfaces/share/robotest_interfaces/cmake)
+-- Found sensor_msgs: 5.3.8 (/opt/ros/jazzy/share/sensor_msgs/cmake)
+-- Found std_srvs: 5.3.8 (/opt/ros/jazzy/share/std_srvs/cmake)
+-- Found tf2: 0.36.21 (/opt/ros/jazzy/share/tf2/cmake)
+-- Found tf2_geometry_msgs: 0.36.21 (/opt/ros/jazzy/share/tf2_geometry_msgs/cmake)
+-- Found eigen3_cmake_module: 0.3.1 (/opt/ros/jazzy/share/eigen3_cmake_module/cmake)
+-- Found Eigen3: TRUE (found version "3.4.0")
+-- Ensuring Eigen3 include directory is part of orocos-kdl CMake target
+-- Found ament_cmake_gtest: 2.5.6 (/opt/ros/jazzy/share/ament_cmake_gtest/cmake)
+-- Found ament_lint_auto: 0.17.5 (/opt/ros/jazzy/share/ament_lint_auto/cmake)
+-- Found gtest sources under '/opt/ros/jazzy/src/gtest_vendor': C++ tests using 'Google Test' will be built
+CMake Deprecation Warning at /opt/ros/jazzy/src/gtest_vendor/CMakeLists.txt:2 (cmake_minimum_required):
+  Compatibility with CMake < 3.10 will be removed from a future version of
+  CMake.
+
+  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+  to tell CMake that the project requires at least <min> but has been updated
+  to work with policies introduced by <max> or earlier.
+
+
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Added test 'copyright' to check source files copyright and LICENSE
+-- Added test 'cppcheck' to perform static code analysis on C / C++ code
+-- Configured cppcheck include dirs: $<BUILD_INTERFACE:/home/runner/work/robotest-lab/robotest-lab/src/robotest_faults/include>
+-- Configured cppcheck exclude dirs and/or files: 
+-- Added test 'cpplint' to check C / C++ code against the Google style
+-- Configured cpplint exclude dirs and/or files: 
+-- Added test 'flake8' to check Python code syntax and style conventions
+-- Configured 'flake8' exclude dirs and/or files: 
+-- Added test 'lint_cmake' to check CMake code style
+-- Added test 'pep257' to check Python code against some of the docstring style conventions in PEP 257
+-- Added test 'uncrustify' to check C / C++ code style
+-- Configured uncrustify additional arguments: 
+-- Added test 'xmllint' to check XML markup files
+-- Configuring done (2.1s)
+-- Generating done (0.1s)
+-- Build files have been written to: /tmp/robotest-phase5.hYpbNh/build/robotest_faults
+[  6%] Building CXX object CMakeFiles/robotest_faults_core.dir/src/fault_protocol.cpp.o
+[ 12%] Building CXX object gtest/CMakeFiles/gtest.dir/src/gtest-all.cc.o
+[ 18%] Building CXX object CMakeFiles/robotest_faults_core.dir/src/pass_through.cpp.o
+[ 25%] Building CXX object gtest/CMakeFiles/gtest_main.dir/src/gtest_main.cc.o
+[ 31%] Linking CXX static library libgtest_main.a
+[ 31%] Built target gtest_main
+[ 37%] Linking CXX shared library librobotest_faults_core.so
+[ 37%] Built target robotest_faults_core
+[ 43%] Building CXX object CMakeFiles/fault_proxy_node.dir/src/fault_proxy_node.cpp.o
+[ 50%] Building CXX object CMakeFiles/fault_proxy_node.dir/src/main.cpp.o
+[ 56%] Linking CXX static library libgtest.a
+[ 56%] Built target gtest
+[ 62%] Building CXX object CMakeFiles/test_pass_through.dir/test/test_pass_through.cpp.o
+[ 68%] Building CXX object CMakeFiles/test_fault_protocol.dir/test/test_fault_protocol.cpp.o
+[ 75%] Linking CXX executable test_pass_through
+[ 75%] Built target test_pass_through
+[ 81%] Building CXX object CMakeFiles/test_fault_application.dir/test/test_fault_application.cpp.o
+[ 87%] Linking CXX executable test_fault_protocol
+[ 87%] Built target test_fault_protocol
+[ 93%] Linking CXX executable test_fault_application
+[ 93%] Built target test_fault_application
+[100%] Linking CXX executable fault_proxy_node
+[100%] Built target fault_proxy_node
+-- Install configuration: "RelWithDebInfo"
+-- Execute custom install script
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/include/robotest_faults/fault_protocol.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/include/robotest_faults/fault_proxy_node.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/include/robotest_faults/pass_through.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/include/robotest_faults/qos_profiles.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/config/fault_proxy.yaml
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/launch/fault_proxy.launch.py
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/LICENSE
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/README.md
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/environment/library_path.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/environment/library_path.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/ament_index/resource_index/package_run_dependencies/robotest_faults
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/ament_index/resource_index/parent_prefix_path/robotest_faults
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/environment/ament_prefix_path.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/environment/ament_prefix_path.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/environment/path.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/environment/path.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/local_setup.bash
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/local_setup.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/local_setup.zsh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/local_setup.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/package.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/ament_index/resource_index/packages/robotest_faults
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/cmake/ament_cmake_export_targets-extras.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/cmake/ament_cmake_export_dependencies-extras.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/cmake/robotest_faultsConfig.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/cmake/robotest_faultsConfig-version.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/package.xml
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/lib/librobotest_faults_core.so
+-- Set non-toolchain portion of runtime path of "/tmp/robotest-phase5.hYpbNh/install/robotest_faults/lib/librobotest_faults_core.so" to ""
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/lib/robotest_faults/fault_proxy_node
+-- Set non-toolchain portion of runtime path of "/tmp/robotest-phase5.hYpbNh/install/robotest_faults/lib/robotest_faults/fault_proxy_node" to ""
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/cmake/export_robotest_faultsExport.cmake
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_faults/share/robotest_faults/cmake/export_robotest_faultsExport-relwithdebinfo.cmake
+---
+--- stderr: robotest_faults
+CMake Deprecation Warning at CMakeLists.txt:4 (cmake_minimum_required):
+  Compatibility with CMake < 3.10 will be removed from a future version of
+  CMake.
+
+  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+  to tell CMake that the project requires at least <min> but has been updated
+  to work with policies introduced by <max> or earlier.
+
+
+CMake Deprecation Warning at /opt/ros/jazzy/src/gtest_vendor/CMakeLists.txt:2 (cmake_minimum_required):
+  Compatibility with CMake < 3.10 will be removed from a future version of
+  CMake.
+
+  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+  to tell CMake that the project requires at least <min> but has been updated
+  to work with policies introduced by <max> or earlier.
+
+
+---
+Finished <<< robotest_faults [45.3s]
+Starting >>> robotest_sim
+[Processing: robotest_sim]
+--- output: robotest_sim
+-- The C compiler identification is GNU 13.3.0
+-- The CXX compiler identification is GNU 13.3.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found ament_cmake: 2.5.6 (/opt/ros/jazzy/share/ament_cmake/cmake)
+-- Found Python3: /usr/bin/python3 (found version "3.12.3") found components: Interpreter
+-- Override CMake install command with custom implementation using symlinks instead of copying resources
+-- Found builtin_interfaces: 2.0.4 (/opt/ros/jazzy/share/builtin_interfaces/cmake)
+-- Found rosidl_generator_c: 4.6.9 (/opt/ros/jazzy/share/rosidl_generator_c/cmake)
+-- Found rosidl_generator_cpp: 4.6.9 (/opt/ros/jazzy/share/rosidl_generator_cpp/cmake)
+-- Using all available rosidl_typesupport_c: rosidl_typesupport_fastrtps_c;rosidl_typesupport_introspection_c
+-- Using all available rosidl_typesupport_cpp: rosidl_typesupport_fastrtps_cpp;rosidl_typesupport_introspection_cpp
+-- Found geometry_msgs: 5.3.8 (/opt/ros/jazzy/share/geometry_msgs/cmake)
+-- Looking for gz-plugin2 -- found version 2.0.4
+-- Searching for dependencies of gz-plugin2
+-- Looking for gz-utils2 -- found version 2.2.1
+-- Searching for dependencies of gz-utils2
+-- Searching for <gz-utils2> component [cli]
+-- Looking for gz-utils2-cli -- found version 2.2.1
+-- Searching for dependencies of gz-utils2-cli
+-- Searching for <gz-plugin2> component [register]
+-- Looking for gz-plugin2-register -- found version 2.0.4
+-- Searching for dependencies of gz-plugin2-register
+-- Looking for gz-sim8 -- found version 8.11.0
+-- Searching for dependencies of gz-sim8
+-- Looking for sdformat14 -- found version 14.9.0
+-- Searching for dependencies of sdformat14
+-- Checking for module 'tinyxml2'
+--   Found tinyxml2, version 10.0.0
+-- Looking for gz-math7 -- found version 7.6.0
+-- Searching for dependencies of gz-math7
+-- Looking for gz-utils2 -- found version 2.2.1
+-- Looking for gz-utils2 -- found version 2.2.1
+-- Looking for gz-plugin2 -- found version 2.0.4
+-- Searching for dependencies of gz-plugin2
+-- Looking for gz-utils2 -- found version 2.2.1
+-- Searching for <gz-plugin2> component [loader]
+-- Looking for gz-plugin2-loader -- found version 2.0.4
+-- Searching for dependencies of gz-plugin2-loader
+-- Searching for <gz-plugin2> component [register]
+-- Looking for gz-transport13 -- found version 13.5.0
+-- Searching for dependencies of gz-transport13
+-- Found Protobuf: /usr/lib/x86_64-linux-gnu/libprotobuf.so (found version "3.21.12")
+-- Config-file not installed for ZeroMQ -- checking for pkg-config
+-- Checking for module 'libzmq >= 4'
+--   Found libzmq, version 4.3.5
+-- Found ZeroMQ: TRUE (Required is at least version "4")
+-- Checking for module 'uuid'
+--   Found uuid, version 2.39.3
+-- Found UUID: TRUE
+-- Looking for gz-utils2 -- found version 2.2.1
+-- Looking for gz-msgs10 -- found version 10.3.2
+-- Searching for dependencies of gz-msgs10
+-- Looking for gz-utils2 -- found version 2.2.1
+-- Looking for gz-math7 -- found version 7.6.0
+-- Searching for <gz-transport13> component [log]
+-- Looking for gz-transport13-log -- found version 13.5.0
+-- Searching for dependencies of gz-transport13-log
+-- Searching for <gz-transport13> component [parameters]
+-- Looking for gz-transport13-parameters -- found version 13.5.0
+-- Searching for dependencies of gz-transport13-parameters
+-- Looking for gz-msgs10 -- found version 10.3.2
+-- Looking for gz-common5 -- found version 5.8.0
+-- Searching for dependencies of gz-common5
+-- Looking for gz-utils2 -- found version 2.2.1
+-- Looking for dlfcn.h - found
+-- Looking for libdl - found
+-- Found DL: TRUE
+-- Searching for <gz-common5> component [av]
+-- Looking for gz-common5-av -- found version 5.8.0
+-- Searching for dependencies of gz-common5-av
+-- Checking for module 'libswscale'
+--   Found libswscale, version 7.5.100
+-- Found SWSCALE: TRUE
+-- Checking for module 'libavdevice >= 56.4.100'
+--   Found libavdevice, version 60.3.100
+-- Found AVDEVICE: TRUE (Required is at least version "56.4.100")
+-- Checking for module 'libavformat'
+--   Found libavformat, version 60.16.100
+-- Found AVFORMAT: TRUE
+-- Checking for module 'libavcodec'
+--   Found libavcodec, version 60.31.102
+-- Found AVCODEC: TRUE
+-- Checking for module 'libavutil'
+--   Found libavutil, version 58.29.100
+-- Found AVUTIL: TRUE
+-- Searching for <gz-common5> component [events]
+-- Looking for gz-common5-events -- found version 5.8.0
+-- Searching for dependencies of gz-common5-events
+-- Looking for gz-math7 -- found version 7.6.0
+-- Searching for <gz-common5> component [graphics]
+-- Looking for gz-common5-graphics -- found version 5.8.0
+-- Searching for dependencies of gz-common5-graphics
+-- Looking for gz-math7 -- found version 7.6.0
+-- Found GzAssimp: TRUE (found version "5.3.0")
+-- Searching for <gz-common5> component [io]
+-- Looking for gz-common5-io -- found version 5.8.0
+-- Searching for dependencies of gz-common5-io
+-- Searching for <gz-common5> component [profiler]
+-- Looking for gz-common5-profiler -- found version 5.8.0
+-- Searching for dependencies of gz-common5-profiler
+-- Looking for gz-fuel_tools9 -- found version 9.1.1
+-- Searching for dependencies of gz-fuel_tools9
+-- Found CURL: /usr/lib/x86_64-linux-gnu/libcurl.so (found version "8.5.0")
+-- Checking for module 'jsoncpp'
+--   Found jsoncpp, version 1.9.5
+-- Found JSONCPP: TRUE
+-- Checking for module 'yaml-0.1'
+--   Found yaml-0.1, version 0.2.5
+-- Found YAML: TRUE
+-- Checking for module 'libzip'
+--   Found libzip, version 1.7.3
+-- Found ZIP: TRUE
+-- Looking for gz-utils2 -- found version 2.2.1
+-- Looking for gz-common5 -- found version 5.8.0
+-- Searching for dependencies of gz-common5
+-- Looking for gz-utils2 -- found version 2.2.1
+-- Looking for dlfcn.h - found
+-- Looking for libdl - found
+-- Searching for <gz-common5> component [testing]
+-- Looking for gz-common5-testing -- found version 5.8.0
+-- Searching for dependencies of gz-common5-testing
+-- Looking for gz-math7 -- found version 7.6.0
+-- Looking for gz-msgs10 -- found version 10.3.2
+-- Looking for gz-gui8 -- found version 8.4.0
+-- Searching for dependencies of gz-gui8
+-- Looking for gz-utils2 -- found version 2.2.1
+-- Looking for gz-math7 -- found version 7.6.0
+-- Looking for gz-common5 -- found version 5.8.0
+-- Looking for gz-plugin2 -- found version 2.0.4
+-- Looking for gz-transport13 -- found version 13.5.0
+-- Looking for gz-rendering8 -- found version 8.2.3
+-- Searching for dependencies of gz-rendering8
+-- Looking for gz-math7 -- found version 7.6.0
+-- Searching for dependencies of gz-math7
+-- Looking for gz-utils2 -- found version 2.2.1
+-- Searching for <gz-math7> component [eigen3]
+-- Looking for gz-math7-eigen3 -- found version 7.6.0
+-- Searching for dependencies of gz-math7-eigen3
+-- Looking for gz-common5 -- found version 5.8.0
+-- Searching for dependencies of gz-common5
+-- Looking for gz-utils2 -- found version 2.2.1
+-- Looking for dlfcn.h - found
+-- Looking for libdl - found
+-- Searching for <gz-common5> component [graphics]
+-- Searching for <gz-common5> component [events]
+-- Searching for <gz-common5> component [geospatial]
+-- Looking for gz-common5-geospatial -- found version 5.8.0
+-- Searching for dependencies of gz-common5-geospatial
+-- Looking for gz-math7 -- found version 7.6.0
+-- Looking for gz-common5 -- found version 5.8.0
+-- Looking for gz-plugin2 -- found version 2.0.4
+-- Searching for dependencies of gz-plugin2
+-- Looking for gz-utils2 -- found version 2.2.1
+-- Searching for <gz-plugin2> component [all]
+-- Looking for all libraries of gz-plugin2 -- found version 2.0.4
+-- Looking for gz-plugin2 -- found version 2.0.4
+-- Looking for gz-utils2 -- found version 2.2.1
+-- Found OpenGL: /usr/lib/x86_64-linux-gnu/libOpenGL.so  found components: OpenGL
+-- Looking for gz-msgs10 -- found version 10.3.2
+-- Looking for gz-physics7 -- found version 7.6.0
+-- Searching for dependencies of gz-physics7
+-- Looking for gz-common5 -- found version 5.8.0
+-- Looking for gz-math7 -- found version 7.6.0
+-- Looking for gz-plugin2 -- found version 2.0.4
+-- Looking for gz-utils2 -- found version 2.2.1
+-- Searching for <gz-physics7> component [heightmap]
+-- Looking for gz-physics7-heightmap -- found version 7.6.0
+-- Searching for dependencies of gz-physics7-heightmap
+-- Looking for gz-common5 -- found version 5.8.0
+-- Searching for <gz-physics7> component [mesh]
+-- Looking for gz-physics7-mesh -- found version 7.6.0
+-- Searching for dependencies of gz-physics7-mesh
+-- Looking for gz-common5 -- found version 5.8.0
+-- Searching for <gz-physics7> component [sdf]
+-- Looking for gz-physics7-sdf -- found version 7.6.0
+-- Searching for dependencies of gz-physics7-sdf
+-- Looking for sdformat14 -- found version 14.9.0
+-- Looking for gz-sensors8 -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8
+-- Looking for gz-math7 -- found version 7.6.0
+-- Looking for gz-common5 -- found version 5.8.0
+-- Looking for gz-transport13 -- found version 13.5.0
+-- Looking for gz-rendering8 -- found version 8.2.3
+-- Looking for gz-msgs10 -- found version 10.3.2
+-- Looking for sdformat14 -- found version 14.9.0
+-- Searching for <gz-sensors8> component [air_pressure]
+-- Looking for gz-sensors8-air_pressure -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-air_pressure
+-- Searching for <gz-sensors8> component [air_speed]
+-- Looking for gz-sensors8-air_speed -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-air_speed
+-- Searching for <gz-sensors8> component [altimeter]
+-- Looking for gz-sensors8-altimeter -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-altimeter
+-- Searching for <gz-sensors8> component [imu]
+-- Looking for gz-sensors8-imu -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-imu
+-- Searching for <gz-sensors8> component [force_torque]
+-- Looking for gz-sensors8-force_torque -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-force_torque
+-- Searching for <gz-sensors8> component [logical_camera]
+-- Looking for gz-sensors8-logical_camera -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-logical_camera
+-- Searching for <gz-sensors8> component [magnetometer]
+-- Looking for gz-sensors8-magnetometer -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-magnetometer
+-- Searching for <gz-sensors8> component [navsat]
+-- Looking for gz-sensors8-navsat -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-navsat
+-- Searching for <gz-sensors8> component [dvl]
+-- Looking for gz-sensors8-dvl -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-dvl
+-- Looking for gz-sensors8 -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8
+-- Looking for gz-math7 -- found version 7.6.0
+-- Looking for gz-common5 -- found version 5.8.0
+-- Looking for gz-transport13 -- found version 13.5.0
+-- Looking for gz-rendering8 -- found version 8.2.3
+-- Looking for gz-msgs10 -- found version 10.3.2
+-- Looking for sdformat14 -- found version 14.9.0
+-- Searching for <gz-sensors8> component [rendering]
+-- Looking for gz-sensors8-rendering -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-rendering
+-- Searching for <gz-sensors8> component [rendering]
+-- Searching for <gz-sensors8> component [lidar]
+-- Looking for gz-sensors8-lidar -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-lidar
+-- Looking for gz-sensors8 -- found version 8.2.2
+-- Searching for <gz-sensors8> component [gpu_lidar]
+-- Looking for gz-sensors8-gpu_lidar -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-gpu_lidar
+-- Looking for gz-sensors8 -- found version 8.2.2
+-- Searching for <gz-sensors8> component [camera]
+-- Looking for gz-sensors8-camera -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-camera
+-- Looking for gz-sensors8 -- found version 8.2.2
+-- Searching for <gz-sensors8> component [boundingbox_camera]
+-- Looking for gz-sensors8-boundingbox_camera -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-boundingbox_camera
+-- Searching for <gz-sensors8> component [segmentation_camera]
+-- Looking for gz-sensors8-segmentation_camera -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-segmentation_camera
+-- Searching for <gz-sensors8> component [depth_camera]
+-- Looking for gz-sensors8-depth_camera -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-depth_camera
+-- Looking for gz-sensors8 -- found version 8.2.2
+-- Searching for <gz-sensors8> component [rgbd_camera]
+-- Looking for gz-sensors8-rgbd_camera -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-rgbd_camera
+-- Looking for gz-sensors8 -- found version 8.2.2
+-- Searching for <gz-sensors8> component [thermal_camera]
+-- Looking for gz-sensors8-thermal_camera -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-thermal_camera
+-- Looking for gz-sensors8 -- found version 8.2.2
+-- Searching for <gz-sensors8> component [wide_angle_camera]
+-- Looking for gz-sensors8-wide_angle_camera -- found version 8.2.2
+-- Searching for dependencies of gz-sensors8-wide_angle_camera
+-- Looking for gz-rendering8 -- found version 8.2.3
+-- Looking for gz-math7 -- found version 7.6.0
+-- Looking for gz-utils2 -- found version 2.2.1
+-- Found rclcpp: 28.1.21 (/opt/ros/jazzy/share/rclcpp/cmake)
+-- Found rmw_implementation_cmake: 7.3.3 (/opt/ros/jazzy/share/rmw_implementation_cmake/cmake)
+-- Found rmw_fastrtps_cpp: 8.4.4 (/opt/ros/jazzy/share/rmw_fastrtps_cpp/cmake)
+-- Found OpenSSL: /usr/lib/x86_64-linux-gnu/libcrypto.so (found version "3.0.13")
+-- Found FastRTPS: /opt/ros/jazzy/include (Required is at least version "2.13")
+-- Using RMW implementation 'rmw_fastrtps_cpp' as default
+-- Found ros_gz_interfaces: 1.0.22 (/opt/ros/jazzy/share/ros_gz_interfaces/cmake)
+-- Found ament_cmake_gtest: 2.5.6 (/opt/ros/jazzy/share/ament_cmake_gtest/cmake)
+-- Found ament_cmake_pytest: 2.5.6 (/opt/ros/jazzy/share/ament_cmake_pytest/cmake)
+-- Found gtest sources under '/opt/ros/jazzy/src/gtest_vendor': C++ tests using 'Google Test' will be built
+CMake Deprecation Warning at /opt/ros/jazzy/src/gtest_vendor/CMakeLists.txt:2 (cmake_minimum_required):
+  Compatibility with CMake < 3.10 will be removed from a future version of
+  CMake.
+
+  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+  to tell CMake that the project requires at least <min> but has been updated
+  to work with policies introduced by <max> or earlier.
+
+
+-- Found Threads: TRUE
+-- Configuring done (3.6s)
+-- Generating done (0.1s)
+-- Build files have been written to: /tmp/robotest-phase5.hYpbNh/build/robotest_sim
+[  6%] Building CXX object CMakeFiles/robotest_contact_aggregator_policy.dir/src/contact_aggregator.cpp.o
+[ 12%] Building CXX object CMakeFiles/robotest_contact_stream_policy.dir/src/contact_stream_gate.cpp.o
+[ 18%] Building CXX object gtest/CMakeFiles/gtest_main.dir/src/gtest_main.cc.o
+[ 25%] Building CXX object gtest/CMakeFiles/gtest.dir/src/gtest-all.cc.o
+[ 31%] Linking CXX static library libgtest_main.a
+[ 31%] Built target gtest_main
+[ 37%] Linking CXX static library librobotest_contact_stream_policy.a
+[ 37%] Built target robotest_contact_stream_policy
+[ 43%] Building CXX object CMakeFiles/contact_stream_gate.dir/src/contact_stream_gate_node.cpp.o
+[ 50%] Linking CXX static library librobotest_contact_aggregator_policy.a
+[ 50%] Built target robotest_contact_aggregator_policy
+[ 56%] Building CXX object CMakeFiles/robotest_contact_aggregator_system.dir/src/contact_aggregator_system.cpp.o
+[ 62%] Linking CXX static library libgtest.a
+[ 62%] Built target gtest
+[ 68%] Building CXX object CMakeFiles/test_contact_aggregator.dir/test/test_contact_aggregator.cpp.o
+[ 75%] Building CXX object CMakeFiles/test_contact_stream_gate.dir/test/test_contact_stream_gate.cpp.o
+[ 81%] Linking CXX shared library librobotest_contact_aggregator_system.so
+[ 81%] Built target robotest_contact_aggregator_system
+[ 87%] Linking CXX executable contact_stream_gate
+[ 87%] Built target contact_stream_gate
+[ 93%] Linking CXX executable test_contact_stream_gate
+[ 93%] Built target test_contact_stream_gate
+[100%] Linking CXX executable test_contact_aggregator
+[100%] Built target test_contact_aggregator
+-- Install configuration: "RelWithDebInfo"
+-- Execute custom install script
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/lib/robotest_sim/librobotest_contact_aggregator_system.so
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/lib/robotest_sim/contact_stream_gate
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/lib/librobotest_contact_aggregator_policy.a
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/lib/librobotest_contact_stream_policy.a
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/include/robotest_sim/contact_aggregator.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/include/robotest_sim/contact_stream_gate.hpp
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/config/bridge.yaml
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/launch/sim.launch.py
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/models/phase3_contact_control_wall.sdf
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/models/phase3_dynamic_block.sdf
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/models/phase3_static_block.sdf
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/models/portfolio_test_bay.sdf
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/rviz/robotest.rviz
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/worlds/robotest_lab.sdf
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/LICENSE
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/README.md
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/lib/robotest_sim/phase1_runtime_probe.py
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/ament_index/resource_index/package_run_dependencies/robotest_sim
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/ament_index/resource_index/parent_prefix_path/robotest_sim
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/environment/ament_prefix_path.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/environment/ament_prefix_path.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/environment/path.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/environment/path.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/local_setup.bash
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/local_setup.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/local_setup.zsh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/local_setup.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/package.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/ament_index/resource_index/packages/robotest_sim
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/cmake/ament_cmake_export_dependencies-extras.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/cmake/ament_cmake_export_include_directories-extras.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/cmake/robotest_simConfig.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/cmake/robotest_simConfig-version.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_sim/share/robotest_sim/package.xml
+---
+--- stderr: robotest_sim
+CMake Deprecation Warning at /opt/ros/jazzy/src/gtest_vendor/CMakeLists.txt:2 (cmake_minimum_required):
+  Compatibility with CMake < 3.10 will be removed from a future version of
+  CMake.
+
+  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+  to tell CMake that the project requires at least <min> but has been updated
+  to work with policies introduced by <max> or earlier.
+
+
+---
+Finished <<< robotest_sim [36.6s]
+Starting >>> robotest_scenarios
+Starting >>> robotest_navigation
+--- output: robotest_navigation
+CMake Deprecation Warning at CMakeLists.txt:4 (cmake_minimum_required):
+  Compatibility with CMake < 3.10 will be removed from a future version of
+  CMake.
+
+  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+  to tell CMake that the project requires at least <min> but has been updated
+  to work with policies introduced by <max> or earlier.
+
+
+-- The C compiler identification is GNU 13.3.0
+-- The CXX compiler identification is GNU 13.3.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Found ament_cmake: 2.5.6 (/opt/ros/jazzy/share/ament_cmake/cmake)
+-- Found Python3: /usr/bin/python3 (found version "3.12.3") found components: Interpreter
+-- Override CMake install command with custom implementation using symlinks instead of copying resources
+-- Found ament_cmake_pytest: 2.5.6 (/opt/ros/jazzy/share/ament_cmake_pytest/cmake)
+-- Found ament_lint_auto: 0.17.5 (/opt/ros/jazzy/share/ament_lint_auto/cmake)
+-- Added test 'copyright' to check source files copyright and LICENSE
+-- Added test 'flake8' to check Python code syntax and style conventions
+-- Configured 'flake8' exclude dirs and/or files: 
+-- Added test 'lint_cmake' to check CMake code style
+-- Added test 'pep257' to check Python code against some of the docstring style conventions in PEP 257
+-- Added test 'xmllint' to check XML markup files
+-- Configuring done (1.9s)
+-- Generating done (0.0s)
+-- Build files have been written to: /tmp/robotest-phase5.hYpbNh/build/robotest_navigation
+-- Install configuration: "RelWithDebInfo"
+-- Execute custom install script
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/behavior_trees/navigate_to_pose_actuation_free.xml
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/config/nav2_params.yaml
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/launch/phase2.launch.py
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/maps/robotest_lab.pgm
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/maps/robotest_lab.yaml
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/LICENSE
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/README.md
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/lib/robotest_navigation/generate_map.py
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/ament_index/resource_index/package_run_dependencies/robotest_navigation
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/ament_index/resource_index/parent_prefix_path/robotest_navigation
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/environment/ament_prefix_path.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/environment/ament_prefix_path.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/environment/path.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/environment/path.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/local_setup.bash
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/local_setup.sh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/local_setup.zsh
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/local_setup.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/package.dsv
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/ament_index/resource_index/packages/robotest_navigation
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/cmake/robotest_navigationConfig.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/cmake/robotest_navigationConfig-version.cmake
+-- Symlinking: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/share/robotest_navigation/package.xml
+-- Installing: /tmp/robotest-phase5.hYpbNh/install/robotest_navigation/lib/robotest_navigation/lifecycle_startup_trigger
+---
+--- stderr: robotest_navigation
+CMake Deprecation Warning at CMakeLists.txt:4 (cmake_minimum_required):
+  Compatibility with CMake < 3.10 will be removed from a future version of
+  CMake.
+
+  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+  to tell CMake that the project requires at least <min> but has been updated
+  to work with policies introduced by <max> or earlier.
+
+
+---
+Finished <<< robotest_navigation [3.33s]
+--- output: robotest_scenarios
+running develop
+/usr/lib/python3/dist-packages/setuptools/command/easy_install.py:363: UserWarning: Unbuilt egg for pytest-repeat [unknown version] (/usr/lib/python3/dist-packages)
+  self.local_index = Environment(self.shadow_path + sys.path)
+running egg_info
+creating robotest_scenarios.egg-info
+writing robotest_scenarios.egg-info/PKG-INFO
+writing dependency_links to robotest_scenarios.egg-info/dependency_links.txt
+writing entry points to robotest_scenarios.egg-info/entry_points.txt
+writing requirements to robotest_scenarios.egg-info/requires.txt
+writing top-level names to robotest_scenarios.egg-info/top_level.txt
+writing manifest file 'robotest_scenarios.egg-info/SOURCES.txt'
+reading manifest file 'robotest_scenarios.egg-info/SOURCES.txt'
+adding license file 'LICENSE'
+writing manifest file 'robotest_scenarios.egg-info/SOURCES.txt'
+running build_ext
+Creating /tmp/robotest-phase5.hYpbNh/install/robotest_scenarios/lib/python3.12/site-packages/robotest-scenarios.egg-link (link to .)
+Installing contact_control_driver script to /tmp/robotest-phase5.hYpbNh/install/robotest_scenarios/lib/robotest_scenarios
+Installing scenario_controller script to /tmp/robotest-phase5.hYpbNh/install/robotest_scenarios/lib/robotest_scenarios
+
+Installed /tmp/robotest-phase5.hYpbNh/build/robotest_scenarios
+running symlink_data
+creating /tmp/robotest-phase5.hYpbNh/install/robotest_scenarios/share/ament_index
+creating /tmp/robotest-phase5.hYpbNh/install/robotest_scenarios/share/ament_index/resource_index
+creating /tmp/robotest-phase5.hYpbNh/install/robotest_scenarios/share/ament_index/resource_index/packages
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_scenarios/resource/robotest_scenarios -> /tmp/robotest-phase5.hYpbNh/install/robotest_scenarios/share/ament_index/resource_index/packages
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_scenarios/package.xml -> /tmp/robotest-phase5.hYpbNh/install/robotest_scenarios/share/robotest_scenarios
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_scenarios/README.md -> /tmp/robotest-phase5.hYpbNh/install/robotest_scenarios/share/robotest_scenarios
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_scenarios/LICENSE -> /tmp/robotest-phase5.hYpbNh/install/robotest_scenarios/share/robotest_scenarios
+creating /tmp/robotest-phase5.hYpbNh/install/robotest_scenarios/share/robotest_scenarios/schema
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_scenarios/schema/contact-control-result.schema.json -> /tmp/robotest-phase5.hYpbNh/install/robotest_scenarios/share/robotest_scenarios/schema
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_scenarios/schema/scenario-result.schema.json -> /tmp/robotest-phase5.hYpbNh/install/robotest_scenarios/share/robotest_scenarios/schema
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_scenarios/schema/scenario-input.schema.json -> /tmp/robotest-phase5.hYpbNh/install/robotest_scenarios/share/robotest_scenarios/schema
+---
+--- stderr: robotest_scenarios
+/usr/lib/python3/dist-packages/setuptools/command/easy_install.py:363: UserWarning: Unbuilt egg for pytest-repeat [unknown version] (/usr/lib/python3/dist-packages)
+  self.local_index = Environment(self.shadow_path + sys.path)
+---
+Finished <<< robotest_scenarios [4.20s]
+Starting >>> robotest_metrics
+--- output: robotest_metrics
+running develop
+/usr/lib/python3/dist-packages/setuptools/command/easy_install.py:363: UserWarning: Unbuilt egg for pytest-repeat [unknown version] (/usr/lib/python3/dist-packages)
+  self.local_index = Environment(self.shadow_path + sys.path)
+running egg_info
+creating robotest_metrics.egg-info
+writing robotest_metrics.egg-info/PKG-INFO
+writing dependency_links to robotest_metrics.egg-info/dependency_links.txt
+writing entry points to robotest_metrics.egg-info/entry_points.txt
+writing requirements to robotest_metrics.egg-info/requires.txt
+writing top-level names to robotest_metrics.egg-info/top_level.txt
+writing manifest file 'robotest_metrics.egg-info/SOURCES.txt'
+reading manifest file 'robotest_metrics.egg-info/SOURCES.txt'
+adding license file 'LICENSE'
+writing manifest file 'robotest_metrics.egg-info/SOURCES.txt'
+running build_ext
+Creating /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/lib/python3.12/site-packages/robotest-metrics.egg-link (link to .)
+Installing metrics_aggregate script to /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/lib/robotest_metrics
+Installing metrics_analyze script to /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/lib/robotest_metrics
+Installing metrics_collector script to /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/lib/robotest_metrics
+Installing metrics_lifecycle_sampler script to /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/lib/robotest_metrics
+Installing metrics_report script to /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/lib/robotest_metrics
+
+Installed /tmp/robotest-phase5.hYpbNh/build/robotest_metrics
+running symlink_data
+creating /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/share/ament_index
+creating /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/share/ament_index/resource_index
+creating /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/share/ament_index/resource_index/packages
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_metrics/resource/robotest_metrics -> /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/share/ament_index/resource_index/packages
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_metrics/package.xml -> /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/share/robotest_metrics
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_metrics/README.md -> /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/share/robotest_metrics
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_metrics/LICENSE -> /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/share/robotest_metrics
+creating /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/share/robotest_metrics/schema
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_metrics/schema/lifecycle-snapshot.schema.json -> /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/share/robotest_metrics/schema
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_metrics/schema/analysis-request.schema.json -> /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/share/robotest_metrics/schema
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_metrics/schema/capture.schema.json -> /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/share/robotest_metrics/schema
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_metrics/schema/run-artifacts-manifest.schema.json -> /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/share/robotest_metrics/schema
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_metrics/schema/lifecycle-schedule.schema.json -> /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/share/robotest_metrics/schema
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_metrics/schema/trial-context.schema.json -> /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/share/robotest_metrics/schema
+symbolically linking /tmp/robotest-phase5.hYpbNh/build/robotest_metrics/schema/run-result.schema.json -> /tmp/robotest-phase5.hYpbNh/install/robotest_metrics/share/robotest_metrics/schema
+---
+--- stderr: robotest_metrics
+/usr/lib/python3/dist-packages/setuptools/command/easy_install.py:363: UserWarning: Unbuilt egg for pytest-repeat [unknown version] (/usr/lib/python3/dist-packages)
+  self.local_index = Environment(self.shadow_path + sys.path)
+---
+Finished <<< robotest_metrics [3.94s]
+
+Summary: 8 packages finished [1min 50s]
+  7 packages had stderr output: robotest_faults robotest_interfaces robotest_metrics robotest_missions robotest_navigation robotest_scenarios robotest_sim

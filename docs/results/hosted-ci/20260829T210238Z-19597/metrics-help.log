@@ -1,0 +1,13 @@
+usage: metrics_analyze [-h] [--input INPUT] --output-dir OUTPUT_DIR
+                       --trial-context TRIAL_CONTEXT
+
+Analyze a bounded RoboTest capture into the sole Phase 3 verdict.
+
+options:
+  -h, --help            show this help message and exit
+  --input INPUT         analysis-request JSON; omit only for a context-
+                        declared infrastructure failure
+  --output-dir OUTPUT_DIR
+  --trial-context TRIAL_CONTEXT
+                        immutable trial-context JSON created before trial
+                        mutation

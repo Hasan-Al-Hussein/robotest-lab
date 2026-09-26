@@ -170,5 +170,5 @@
     }
   ],
   "schema_version": 1,
-  "scope": "Quantitative and outcome claims published in README.md and the evidence-bounded CV bullets in docs/portfolio.md."
+  "scope": "Phase 1 and Phase 2 quantitative and outcome claims published in README.md and the evidence-bounded CV bullets in docs/portfolio.md."
 }

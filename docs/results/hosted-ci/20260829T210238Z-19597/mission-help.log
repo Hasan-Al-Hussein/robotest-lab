@@ -1,0 +1,17 @@
+usage: mission_runner [-h] --mission MISSION --json JSON_PATH --csv CSV_PATH
+                      [--run-id RUN_ID] [--candidate-id CANDIDATE_ID]
+                      [--repetition-index {0,1,2}]
+                      [--suite-index {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14}]
+
+Run one strict RoboTest FollowWaypoints mission.
+
+options:
+  -h, --help            show this help message and exit
+  --mission MISSION     strict mission YAML path
+  --json JSON_PATH      canonical JSON output
+  --csv CSV_PATH        matching one-row CSV output
+  --run-id RUN_ID       required bounded run identity for Phase 3
+  --candidate-id CANDIDATE_ID
+                        required candidate-suite identity for Phase 3
+  --repetition-index {0,1,2}
+  --suite-index {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14}
