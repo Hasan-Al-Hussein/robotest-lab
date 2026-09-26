@@ -1,0 +1,22 @@
+usage: scenario_controller [-h] --scenario SCENARIO --output OUTPUT
+                           --ready-file READY_FILE --run-id RUN_ID
+                           --candidate-id CANDIDATE_ID --repetition-index
+                           {0,1,2} --suite-index
+                           {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14}
+                           [--wall-timeout-s WALL_TIMEOUT_S]
+                           [--service-timeout-s SERVICE_TIMEOUT_S]
+
+Run one bounded ADR 0006 Phase 3 scenario controller.
+
+options:
+  -h, --help            show this help message and exit
+  --scenario SCENARIO   strict Phase 3 scenario YAML
+  --output OUTPUT       new scenario-result.json path
+  --ready-file READY_FILE
+                        new atomic readiness JSON path
+  --run-id RUN_ID
+  --candidate-id CANDIDATE_ID
+  --repetition-index {0,1,2}
+  --suite-index {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14}
+  --wall-timeout-s WALL_TIMEOUT_S
+  --service-timeout-s SERVICE_TIMEOUT_S

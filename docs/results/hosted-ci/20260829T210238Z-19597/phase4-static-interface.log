@@ -1,0 +1,11 @@
+Usage: scripts/verify_phase4.sh [--package-dir DIRECTORY] \
+  [--lifecycle-evidence FILE] [--apply]
+
+Without --apply, runs only static/unit/package-source checks and makes no
+installed-package, overlay, service, or process changes.
+
+--apply is the explicit privileged gate for immutable overlay staging,
+controlled systemd start/stop, and the live Scenario 6 nested-controller crash.
+The separately executed package lifecycle proof must be supplied or discoverable
+and must bind exactly to the selected installed candidate. Run --apply as root
+only after all shared Phase 3 source is stable.

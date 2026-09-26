@@ -1,0 +1,4 @@
+ok  	github.com/Hasan-Al-Hussein/robotest-lab/supervisor/cmd/robotest-supervisor	1.012s
+ok  	github.com/Hasan-Al-Hussein/robotest-lab/supervisor/internal/config	1.035s
+ok  	github.com/Hasan-Al-Hussein/robotest-lab/supervisor/internal/httpapi	1.013s
+ok  	github.com/Hasan-Al-Hussein/robotest-lab/supervisor/internal/supervisor	1.703s

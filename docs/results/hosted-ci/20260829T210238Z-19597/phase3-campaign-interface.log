@@ -1,0 +1,26 @@
+usage: phase3_benchmark_runner.py [-h] --mode
+                                  {prepare,positive-control,smoke,campaign}
+                                  --workspace WORKSPACE --candidate-id
+                                  CANDIDATE_ID --domain-base DOMAIN_BASE
+                                  --output-root OUTPUT_ROOT --build-binding
+                                  BUILD_BINDING
+                                  [--authorization AUTHORIZATION]
+
+Owned-process Phase 3 positive-control, smoke, and candidate runner. The CLI
+is intentionally staged. ``prepare`` freezes a clean candidate ledger,
+``positive-control`` qualifies the collision path, ``smoke`` executes one non-
+candidate integration run, and ``campaign`` is the only mode allowed to start
+the exact ordered 15 cold-stack trials. Campaign mode requires an explicit
+literal authorization and never retries or replaces an index.
+
+options:
+  -h, --help            show this help message and exit
+  --mode {prepare,positive-control,smoke,campaign}
+  --workspace WORKSPACE
+  --candidate-id CANDIDATE_ID
+  --domain-base DOMAIN_BASE
+  --output-root OUTPUT_ROOT
+  --build-binding BUILD_BINDING
+  --authorization AUTHORIZATION
+                        required only for campaign; exact value:
+                        I_AUTHORIZE_EXACTLY_15_COLD_STACK_TRIALS_NO_RETRIES

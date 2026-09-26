@@ -1,0 +1,10 @@
+usage: metrics_aggregate [-h] --input INPUT --metric METRIC --output-dir
+                         OUTPUT_DIR
+
+Aggregate exactly 15 ordered canonical Phase 3 run verdicts.
+
+options:
+  -h, --help            show this help message and exit
+  --input INPUT
+  --metric METRIC
+  --output-dir OUTPUT_DIR
